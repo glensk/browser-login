@@ -4,35 +4,44 @@ Conventions for AI coding agents (and humans) working in this repo.
 
 ## What this is
 
-<one-line purpose of browser-login — TODO>
+A single shared, logged-in Chromium (`bin/browser.py`) that CLI tools and AI agents
+drive over the Chrome DevTools Protocol (CDP), plus a generic multi-site auto-login
+framework. It is a **provider**: other repos depend on it, not the reverse. See
+`README.md` for the full story.
 
 ## Environment
 
-- Python projects use **`uv`** (preferred over Homebrew/system installs):
-  `uv sync` to install, `uv run <cmd>` to run, `uv tool install <tool>` for CLIs.
-  Prefer pip/uv-installable packages (including wheels that bundle native libs)
-  over `brew install`; fall back to a system package manager only when no wheel
-  exists.
-- Secrets live in `.env` (never commit). See `.env.example`.
+- Python via **`uv`** (preferred over Homebrew/system installs): `uv sync` for a
+  project-local venv. But note `bin/browser.py` **self-bootstraps** its own isolated
+  venv at `~/.cache/claude-browser/venv` on first run, so usually you just run it.
+- One-time browser binary: `uv run playwright install chromium`.
+- Secrets live in the macOS keychain / 1Password and are read at runtime — **never**
+  in `.env` or the source. `.env` is gitignored; `.env.example` documents env vars.
 
 ## Build / test / lint
 
-- Python: `ruff format . && ruff check . && mypy . && pylint <files>`
-- Shell: `shellcheck <files>`
+- Python: `ruff format bin/ && ruff check bin/ && mypy bin/browser.py && pylint bin/browser.py`
+- Shell: `shellcheck` (no shell scripts currently)
 - Pre-commit: `pre-commit run --all-files` (gitleaks secret scan)
+- Smoke test: `bin/browser.py -h` must exit 0; `browser.py up && browser.py status`.
 
 ## Conventions
 
-- Every script supports `-h/--help`.
-- Keep external services / LLM providers pluggable; selection is config, not code.
-- Declare every external repo/script or system executable in `_tooling/external_deps.py`
-  (`EXTERNAL_DEPS`); resolve via `require()` / `resolve()`. Never use a bare
-  `shutil.which` or a hard-coded sibling path. Optional deps stay opt-in (the rest of
-  the tool works without them); a missing one a chosen feature needs exits 3. See
-  `~/obsidian/42-Git/README_INTERDEPENDENCIES.md`.
+- Every subcommand supports `-h/--help`; every CLI flag has a short and long form.
+- This repo declares **no** `_tooling/external_deps.py` — it is a provider, not a
+  consumer. Its own external tools (`op`, `himalaya`, `security`, Playwright) are
+  **optional** and degrade gracefully (assisted fallback); they are documented in
+  `README.md` (Requirements), not enforced with fail-loud checks.
+- The CDP endpoint is always `http://127.0.0.1:<port>` — never `localhost` (Chrome's
+  debug port is IPv4-only; `localhost`→`::1` stalls on macOS).
+- A site's `logged_in` check must read a DOM sentinel on a stable post-login surface,
+  not "the URL isn't `/login`".
+- **No secrets, ever** — this is a public repo. Configuration is env vars + keychain
+  *labels* only. gitleaks must stay clean.
 
 ## Where things live
 
-- Design / roadmap: PLAN.md (if present)
-- Private/local notes: CLAUDE.local.md (gitignored); CLAUDE.md is a gitignored
+- The tool: `bin/browser.py` (single file).
+- Cross-repo overview of who consumes it: `~/obsidian/42-Git/README_AUTOLOGIN.md`.
+- Private/local notes: `CLAUDE.local.md` (gitignored); `CLAUDE.md` is a gitignored
   shim that imports this file.

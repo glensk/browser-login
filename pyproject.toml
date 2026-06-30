@@ -1,0 +1,25 @@
+[project]
+name = "browser-login"
+version = "1.0.0"
+description = "A single shared, logged-in Chromium that CLI tools and AI agents drive over CDP, plus a generic multi-site auto-login framework."
+readme = "README.md"
+requires-python = ">=3.10"
+license = "Apache-2.0"
+authors = [{ name = "Albert Glensk" }]
+keywords = ["playwright", "chromium", "cdp", "automation", "login", "totp", "keychain"]
+dependencies = [
+    "playwright>=1.40",
+    "pyotp>=2.9",
+    "requests>=2.31",
+]
+
+[project.urls]
+Homepage = "https://github.com/glensk/browser-login"
+Repository = "https://github.com/glensk/browser-login"
+
+[tool.uv]
+# This repo ships a single script (bin/browser.py), not an importable package.
+package = false
+# Note: browser.py ALSO self-bootstraps an isolated venv at
+# ~/.cache/claude-browser/venv on first run (it installs playwright/pyotp/requests
+# via uv), so `uv sync` here is optional — it just gives you a project-local .venv.
