@@ -1,0 +1,51 @@
+#.vscode/*
+#!.vscode/settings.json
+.vscode/
+__pycache__/
+
+# macOS
+.DS_Store
+
+# Editors / IDEs
+.idea/
+*.swp
+*.swo
+*~
+.direnv/
+
+# Python caching & environments
+*.py[cod]
+.mypy_cache/
+.pytest_cache/
+.venv/
+venv/
+env/
+.python-version
+
+# General Secrets & Logs — never commit values; allow templates explicitly
+.env
+.env.*
+!.env.example
+!.env.template
+!.env_template
+!.env.sample
+*.log
+*.key
+*.pem
+*.p12
+*.pfx
+credentials
+credentials.json
+credentials.yaml
+credentials.yml
+secrets.yaml
+secrets.yml
+.netrc
+.pgpass
+.aws/credentials
+
+Icon?
+
+# AI assistant private files (public conventions live in AGENTS.md)
+CLAUDE.md
+CLAUDE.local.md

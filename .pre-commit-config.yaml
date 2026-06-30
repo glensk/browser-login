@@ -1,0 +1,9 @@
+# Run secret scanning before each commit.
+# Setup (once per machine):  uv tool install pre-commit   (or: brew install pre-commit)
+# Setup (once per clone):    pre-commit install
+# The gitleaks binary is fetched automatically by the hook (no system install needed).
+repos:
+  - repo: https://github.com/gitleaks/gitleaks
+    rev: v8.30.1
+    hooks:
+      - id: gitleaks
