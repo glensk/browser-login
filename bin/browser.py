@@ -21,13 +21,16 @@ Generic lifecycle:
   eval JS   Run a JS expression in the active (or --url-matched) tab; print JSON.
 
 Generic multi-site login (a SITE is one of the entries in the SITES registry —
-currently ``cscs`` and ``anthropic``/``claude``; add more by registering a Site):
+currently ``cscs``, ``anthropic``/``claude`` and ``openai``/``chatgpt``; add
+more by registering a Site):
   login SITE        Ensure SITE is logged in in the shared browser. Automated for
                     sites with stored credentials (CSCS Keycloak). For claude.ai:
                     FULLY automatic when $ANTHROPIC_LOGIN_EMAIL is set and himalaya
                     is installed (triggers the magic-link email, reads it, opens
                     the link — no password, no code); otherwise ASSISTED (you
-                    complete the email login in the window). Records a login event.
+                    complete the email login in the window). For chatgpt.com:
+                    ASSISTED (Google SSO + 2FA once in the shared window; the
+                    session persists). Records a login event.
   logged-in SITE    Exit 0 if SITE is logged in, 2 if not (no login attempted).
   login-log SITE    Show how often a *real* login was actually needed for SITE
                     (count, first/last, average interval) — read from the log.
@@ -95,6 +98,15 @@ CLAUDE_HOME_URL = "https://claude.ai/"
 CLAUDE_LOGIN_URL = "https://claude.ai/login"
 CLAUDE_BILLING_URL = "https://claude.ai/admin-settings/billing"
 ANTHROPIC_LOGIN_EMAIL = os.environ.get("ANTHROPIC_LOGIN_EMAIL")  # optional convenience
+
+# --- chatgpt.com (ChatGPT Business admin) site ------------------------------
+# ChatGPT Business logs in via Google SSO + 2FA, which cannot be replayed from
+# stored credentials — so this site does ASSISTED login: we open the admin page
+# and you complete the SSO once in the shared window; the session then persists
+# in the profile. No token is extracted (openai-team.py drives the browser
+# directly over CDP). Logged-in sentinel = the 'Invite member' button on
+# /admin/members (same signal openai-team.py relies on).
+CHATGPT_ADMIN_URL = "https://chatgpt.com/admin/members"
 
 # Per-site log of REAL (cold) logins — one JSON object per line. Appended only
 # when `login <site>` actually had to sign in (never on a warm/already-logged-in
@@ -164,7 +176,9 @@ def parse_args() -> argparse.Namespace:
     pl = sub.add_parser(
         "login", help="Ensure SITE is logged in (automated or assisted)."
     )
-    pl.add_argument("site", help="Site to log into (e.g. cscs, anthropic/claude).")
+    pl.add_argument(
+        "site", help="Site to log into (e.g. cscs, anthropic/claude, openai/chatgpt)."
+    )
     pli = sub.add_parser(
         "logged-in", help="Exit 0 if SITE is logged in, 2 if not (no login)."
     )
@@ -1334,6 +1348,123 @@ def cmd_anthropic_logged_in(port: int) -> int:
 
 
 # ---------------------------------------------------------------------------
+# chatgpt.com (OpenAI / ChatGPT Business) — assisted Google-SSO login, no token
+# ---------------------------------------------------------------------------
+
+
+def _chatgpt_logged_in(page) -> bool:
+    """ACTIVE check: navigate to the ChatGPT Business admin members page and
+    confirm we land there logged in. The 'Invite member' button is the most
+    stable signal that we're on the right page AND have admin rights (same
+    sentinel openai-team.py uses). A bounce to the auth screen or away from
+    /admin/members means not logged in (or no admin rights)."""
+    from playwright.sync_api import Error as PlaywrightError
+
+    try:
+        page.goto(CHATGPT_ADMIN_URL, wait_until="domcontentloaded")
+        page.wait_for_timeout(2500)
+    except PlaywrightError:
+        return False
+    if "/admin/members" not in page.url:
+        return False
+    try:
+        page.wait_for_selector('button:has-text("Invite member")', timeout=15000)
+        return True
+    except PlaywrightError:
+        return False
+
+
+def _chatgpt_wait_for_login(page, timeout_s: int = 300) -> bool:
+    """PASSIVE poll: watch the login tab WITHOUT navigating it (so we don't
+    interrupt the SSO mid-flow). Once the tab leaves the auth screens for
+    chatgpt.com, confirm with an ACTIVE admin-members check. Heartbeats to
+    stderr; gives up after timeout_s."""
+    start = time.monotonic()
+    last_beat = 0.0
+    while time.monotonic() - start < timeout_s:
+        try:
+            url = page.url
+        except Exception:  # pylint: disable=broad-exception-caught
+            url = ""
+        past_auth = (
+            "chatgpt.com" in url
+            and "auth.openai.com" not in url
+            and "/auth/" not in url
+            and "login" not in url
+        )
+        if past_auth and _chatgpt_logged_in(page):
+            return True
+        elapsed = time.monotonic() - start
+        if elapsed - last_beat >= 30:
+            print(
+                f"  …waiting for you to finish the ChatGPT SSO login in the shared "
+                f"browser window ({int(elapsed)}s elapsed)…",
+                file=sys.stderr,
+            )
+            last_beat = elapsed
+        try:
+            page.wait_for_timeout(3000)
+        except Exception:  # pylint: disable=broad-exception-caught
+            time.sleep(3)
+    return False
+
+
+def cmd_openai_login(port: int) -> int:
+    """Ensure chatgpt.com (ChatGPT Business admin) is logged in. Idempotent (a
+    warm session just returns 0). ChatGPT logs in via Google SSO + 2FA, which
+    can't be replayed from stored credentials — a cold session is ASSISTED: you
+    complete the SSO once in the shared window; the session then persists."""
+    pw, browser = _connect(port)
+    try:
+        _ctx, page = _pick_page(browser, "chatgpt.com")
+        if _chatgpt_logged_in(page):
+            print("✓ Already logged into ChatGPT (chatgpt.com).")
+            return 0
+        from playwright.sync_api import Error as PlaywrightError
+
+        try:
+            page.bring_to_front()
+        except PlaywrightError:
+            pass
+        print(
+            "\n🔐 ChatGPT (chatgpt.com) needs a login.\n"
+            "   In the shared Chrome window (now in front):\n"
+            "     1. Log in on the page that opened (Google SSO + 2FA).\n"
+            "        If Google refuses ('this browser may not be secure'), use\n"
+            "        the account's email+password login instead of the SSO button.\n"
+            "     2. Land anywhere on chatgpt.com — success is auto-detected and\n"
+            "        admin access confirmed on chatgpt.com/admin/members.\n",
+            file=sys.stderr,
+        )
+        if not _chatgpt_wait_for_login(page, timeout_s=300):
+            return _fail(
+                "ChatGPT login not detected within 5 min. Finish the SSO login in "
+                "the shared browser, then re-run: browser.py login openai"
+            )
+        print("✓ Logged into ChatGPT (chatgpt.com).")
+        _record_login_event("openai", "assisted")
+        return 0
+    finally:
+        browser.close()
+        pw.stop()
+
+
+def cmd_openai_logged_in(port: int) -> int:
+    """Exit 0 if chatgpt.com admin is logged in ('Invite member' reachable), else 2."""
+    pw, browser = _connect(port)
+    try:
+        _ctx, page = _pick_page(browser, "chatgpt.com")
+        if _chatgpt_logged_in(page):
+            print("✓ Logged into ChatGPT (chatgpt.com).")
+            return 0
+        print("Not logged into ChatGPT (chatgpt.com).", file=sys.stderr)
+        return 2
+    finally:
+        browser.close()
+        pw.stop()
+
+
+# ---------------------------------------------------------------------------
 # Login-frequency log (how often a real login was actually needed)
 # ---------------------------------------------------------------------------
 
@@ -1432,6 +1563,13 @@ def _sites() -> list[Site]:
             blurb="claude.ai Team admin (assisted email-code login; no token)",
             login=cmd_anthropic_login,
             logged_in=cmd_anthropic_logged_in,
+        ),
+        Site(
+            name="openai",
+            aliases=("chatgpt", "chatgpt.com", "oai"),
+            blurb="chatgpt.com Business admin (assisted Google-SSO login; no token)",
+            login=cmd_openai_login,
+            logged_in=cmd_openai_logged_in,
         ),
     ]
 

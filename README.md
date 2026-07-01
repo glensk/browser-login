@@ -92,6 +92,7 @@ can measure how often re-auth actually happens.
 | :--------------------- | :------------------------------------------------------------------- |
 | `anthropic` (`claude`) | **Magic-link, fully automatic** when `ANTHROPIC_LOGIN_EMAIL` is set and `himalaya` reads that mailbox: triggers the email, extracts the `claude.ai/magic-link#<token>` URL, opens it. Otherwise **assisted** (you finish the email login once). |
 | `cscs`                 | **Keycloak, unattended.** `store-creds cscs` caches username/password/TOTP-seed in the macOS keychain (from 1Password, one last Touch ID); thereafter login runs with no fingerprint. TOTP codes are generated locally with `pyotp`. |
+| `openai` (`chatgpt`)   | **Assisted.** ChatGPT Business logs in via Google SSO + 2FA, which can't be replayed from a stored secret — you complete the SSO once in the shared window; the session persists. Logged-in sentinel: the 'Invite member' button on `chatgpt.com/admin/members`. |
 
 CSCS back-compat aliases (`token`, `cscs-login`, `cscs-store-creds`,
 `cscs-forget-creds`) are kept because downstream tools depend on their exact stdout
@@ -111,8 +112,9 @@ anywhere. Tools that use the external-dependency convention resolve it as
 `command="browser.py"` (PATH) → a conventional sibling clone → the `BROWSER_PY_BIN`
 override. So a colleague who has it on `$PATH` needs zero config.
 
-Current consumers: a CSCS portal client (token auto-refresh + re-login) and an
-Anthropic billing tool (claude.ai login to list/download invoices).
+Current consumers: a CSCS portal client (token auto-refresh + re-login), an
+Anthropic admin tool (claude.ai login for roster auto-export + invoice download),
+and a ChatGPT Business roster scraper (chatgpt.com admin login).
 
 ## Adding a new site
 
