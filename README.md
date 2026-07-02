@@ -77,7 +77,7 @@ subcommands dispatch through it:
 ```commands
 browser.py login SITE         # ensure logged in (automated or assisted)
 browser.py logged-in SITE     # exit 0 if logged in, 2 if not (no login attempted)
-browser.py login-log SITE     # how often a *real* (cold) login was actually needed
+browser.py login-log [SITE]   # how often a *real* login was needed (no SITE = all tools)
 browser.py store-creds SITE   # save credentials in the macOS keychain (cscs-style)
 browser.py forget-creds SITE  # delete them
 ```
@@ -88,8 +88,12 @@ Two sites also expose a **credential-print** command for their consumer (bearer 
 cached — xoxc rotates).
 
 Every time a site performs a **real (cold) login** — not a warm "already logged in"
-— one record is appended to `~/.cache/claude-browser/login-log/<site>.jsonl`, so you
-can measure how often re-auth actually happens.
+— one record is appended to `~/.cache/claude-browser/login-log/<site>.jsonl` (with a
+`mode`: `assisted` = you had to act, vs `auto`/`keychain`/… automated). Read it with
+`browser.py login-log` — **no arg = a live aggregate across every tool** (total real
+logins, how many you had to sign in for, per-site breakdown, recent events); add a
+SITE for just one. That's how you measure how often re-auth — and specifically a
+manual sign-in — actually happens.
 
 ### Bundled sites
 

@@ -209,9 +209,13 @@ def parse_args() -> argparse.Namespace:
     )
     pli.add_argument("site", help="Site to check.")
     pll = sub.add_parser(
-        "login-log", help="Show how often a real login was needed for SITE."
+        "login-log",
+        help="How often a real login was needed. No SITE = live aggregate across "
+        "every tool; with a SITE = just that one.",
     )
-    pll.add_argument("site", help="Site whose login log to show.")
+    pll.add_argument(
+        "site", nargs="?", default=None, help="Site to show (omit for all sites)."
+    )
     psc = sub.add_parser(
         "store-creds",
         help="Store SITE credentials in the macOS keychain (password+TOTP sites).",
@@ -885,6 +889,7 @@ def cmd_cscs_login(port: int) -> int:
             return _fail(f"Unexpected page (not portal, not Keycloak): {page.url}")
         else:
             creds = _keychain_creds()
+            cscs_login_mode = "keychain"
             if creds is not None:
                 print("Using CSCS credentials from the macOS keychain (no Touch ID).")
             else:
@@ -894,6 +899,7 @@ def cmd_cscs_login(port: int) -> int:
                     "make future logins fingerprint-free."
                 )
                 creds = _op_creds(CSCS_OP_ITEM, CSCS_OP_ACCOUNT)
+                cscs_login_mode = "1password"
             if creds is None:
                 return _fail(
                     "No CSCS credentials available. Either run "
@@ -928,6 +934,7 @@ def cmd_cscs_login(port: int) -> int:
                     f"or an unexpected page ({page.url})."
                 )
             print("✓ Logged into CSCS.")
+            _record_login_event("cscs", cscs_login_mode)
         # Capture the token from THIS connection — no second connect_over_cdp
         # (cmd_token would re-attach to every open tab again, costing seconds).
         rc = _capture_and_cache_token(ctx, page)
@@ -1728,41 +1735,93 @@ def _record_login_event(site_name: str, mode: str) -> None:
         pass
 
 
-def cmd_login_log(site_name: str) -> int:
-    """Show how often a *real* login was needed for SITE (count, first/last,
-    average interval, recent events)."""
-    site = _resolve_site(site_name)
-    path = LOGIN_LOG_DIR / f"{site.name}.jsonl"
+# Modes where a HUMAN had to act (vs. fully unattended re-auth). The aggregate
+# view highlights the assisted count — that's "how often we had to sign in".
+ASSISTED_MODES = {"assisted", "1password"}
+
+
+def _load_login_events(site_name: str) -> list[dict]:
+    """All recorded real-login events for one site, each tagged with `site`.
+    Empty list when nothing's recorded yet."""
+    path = LOGIN_LOG_DIR / f"{site_name}.jsonl"
     if not path.is_file():
-        print(
-            f"No real logins recorded yet for '{site.name}'. "
-            f"(Each time `login {site.name}` actually had to sign in is logged here.)"
-        )
-        return 0
+        return []
     events: list[dict] = []
     for line in path.read_text(encoding="utf-8").splitlines():
         line = line.strip()
         if not line:
             continue
         try:
-            events.append(json.loads(line))
+            e = json.loads(line)
         except ValueError:
             continue
-    if not events:
-        print(f"No real logins recorded yet for '{site.name}'.")
-        return 0
+        e.setdefault("site", site_name)
+        events.append(e)
+    return events
+
+
+def _print_login_stats(label: str, events: list[dict]) -> None:
+    """Shared header: total (+assisted), first/last, average interval."""
     events.sort(key=lambda e: e.get("ts", 0))
     n = len(events)
-    print(f"Login frequency for '{site.name}': {n} real login(s).")
+    assisted = sum(1 for e in events if e.get("mode") in ASSISTED_MODES)
+    print(
+        f"Login frequency — {label}: {n} real login(s)  [{assisted} you had to sign in]."
+    )
     print(f"  first: {events[0].get('iso', '?')}")
     print(f"  last:  {events[-1].get('iso', '?')}")
     if n >= 2:
         span_days = (events[-1]["ts"] - events[0]["ts"]) / 86400
         avg = span_days / (n - 1)
         print(f"  span:  {span_days:.1f} days  →  every ~{avg:.1f} days on average")
-    print("  recent:")
-    for e in events[-10:]:
-        print(f"    {e.get('iso', '?')}  ({e.get('mode', '?')})")
+
+
+def cmd_login_log(site_name: str | None) -> int:
+    """How often a *real* login was actually needed. With a SITE, that one site;
+    with no SITE, a LIVE aggregate across EVERY registered site (total, the count
+    where you had to sign in, per-site breakdown, and recent events)."""
+    if site_name:
+        site = _resolve_site(site_name)
+        events = _load_login_events(site.name)
+        if not events:
+            print(
+                f"No real logins recorded yet for '{site.name}'. "
+                f"(Each time `login {site.name}` actually had to sign in is logged.)"
+            )
+            return 0
+        _print_login_stats(f"'{site.name}'", events)
+        print("  recent:")
+        for e in sorted(events, key=lambda e: e.get("ts", 0))[-10:]:
+            print(f"    {e.get('iso', '?')}  ({e.get('mode', '?')})")
+        return 0
+
+    # Aggregate across all sites (the live "how often did we sign in" view).
+    per_site = {s.name: _load_login_events(s.name) for s in _sites()}
+    events = [e for evs in per_site.values() for e in evs]
+    if not events:
+        print(
+            "No real logins recorded on any site yet. Each time `browser.py login "
+            "<site>` actually has to sign in is logged under "
+            f"{LOGIN_LOG_DIR}/<site>.jsonl."
+        )
+        return 0
+    _print_login_stats("all sites", events)
+    print("  by site:")
+    for name in sorted(per_site, key=lambda k: -len(per_site[k])):
+        evs = sorted(per_site[name], key=lambda e: e.get("ts", 0))
+        if not evs:
+            continue
+        last = evs[-1]
+        print(
+            f"    {name:<11} {len(evs):>3}   last {last.get('iso', '?')}  "
+            f"({last.get('mode', '?')})"
+        )
+    print("  recent (all sites):")
+    for e in sorted(events, key=lambda e: e.get("ts", 0))[-12:]:
+        print(
+            f"    {e.get('iso', '?')}  {str(e.get('site', '?')):<11} "
+            f"({e.get('mode', '?')})"
+        )
     return 0
 
 
