@@ -113,6 +113,14 @@ CHATGPT_ADMIN_URL = "https://chatgpt.com/admin/members"
 # token is scope-blocked — exactly as the Manage-members admin UI does). No
 # token is cached (xoxc rotates); `slack-session` prints it fresh on demand.
 SLACK_APP_URL = "https://app.slack.com/client"
+# Land the assisted login straight on the SDSC workspace's sign-in (skips the
+# generic workspace picker). Override with $SLACK_WORKSPACE_URL if it ever moves.
+SLACK_WORKSPACE_URL = os.environ.get(
+    "SLACK_WORKSPACE_URL", "https://swiss-data-science.slack.com/"
+)
+# Pre-fill the sign-in email when set (best-effort; you still complete the
+# code/SSO step). Albert's is albert.glensk@epfl.ch — export it to persist.
+SLACK_LOGIN_EMAIL = os.environ.get("SLACK_LOGIN_EMAIL", "")
 SLACK_SIGNIN_MARKERS = (
     "workspace-signin",
     "/signin",
@@ -1547,57 +1555,111 @@ def _slack_logged_in(page) -> bool:
     return _slack_session_from_page(ctx, page) is not None
 
 
+def _slack_prefill_email(page) -> None:
+    """Best-effort: type SLACK_LOGIN_EMAIL into the sign-in email field so you
+    only complete the code/SSO step. Silent no-op if the field isn't present
+    (SSO screen, already past email, DOM changed) — never blocks the login."""
+    if not SLACK_LOGIN_EMAIL:
+        return
+    from playwright.sync_api import Error as PlaywrightError
+
+    for sel in (
+        'input[data-qa="signin_domain_email"]',
+        'input[type="email"]',
+        "#email",
+    ):
+        try:
+            field = page.query_selector(sel)
+            if field:
+                field.fill(SLACK_LOGIN_EMAIL)
+                return
+        except PlaywrightError:
+            continue
+
+
+def _slack_wait_for_login(page, timeout_s: int = 600) -> bool:
+    """PASSIVE poll: watch the login tab WITHOUT navigating it — navigating would
+    reload the page and wipe whatever you're typing (the bug that made login
+    'refresh too quickly'). Reading ``page.url`` + localStorage does NOT navigate,
+    so it never interrupts you. Returns True once a live session (xoxc token)
+    appears. Heartbeats to stderr; gives up after ``timeout_s``."""
+    start = time.monotonic()
+    last_beat = 0.0
+    while time.monotonic() - start < timeout_s:
+        try:
+            url = page.url
+        except Exception:  # pylint: disable=broad-exception-caught
+            url = ""
+        # Once we're on a workspace surface (past the signin/get-started pages),
+        # look for the session token — a read, never a navigation.
+        if url and not any(m in url for m in SLACK_SIGNIN_MARKERS):
+            try:
+                if _slack_session_from_page(page.context, page):
+                    return True
+            except Exception:  # pylint: disable=broad-exception-caught
+                pass
+        elapsed = time.monotonic() - start
+        if elapsed - last_beat >= 30:
+            print(
+                f"  …waiting for you to finish the Slack login in the shared "
+                f"browser window ({int(elapsed)}s elapsed, timeout {timeout_s}s)…",
+                file=sys.stderr,
+            )
+            last_beat = elapsed
+        try:
+            page.wait_for_timeout(3000)
+        except Exception:  # pylint: disable=broad-exception-caught
+            time.sleep(3)
+    return False
+
+
 def cmd_slack_login(port: int) -> int:
-    """Ensure app.slack.com is logged in. Idempotent (a warm session returns 0).
+    """Ensure Slack is logged in. Idempotent (a warm session returns 0).
 
     Slack web logs in via email-code / SSO, which can't be replayed from a stored
     secret — a cold session is ASSISTED: complete it once in the shared window;
-    the session then persists in the profile. `slack_api.py` reuses it via
-    `browser.py slack-session`."""
+    the session then persists in the profile (so this is a ONE-TIME step).
+    `slack_api.py` reuses it via `browser.py slack-session`. The wait is PASSIVE
+    (10 min) — the page is NOT reloaded while you type, and $SLACK_LOGIN_EMAIL is
+    pre-filled when set."""
     pw, browser = _connect(port)
     try:
         _ctx, page = _pick_page(browser, "slack.com")
         if _slack_logged_in(page):
-            print("✓ Already logged into Slack (app.slack.com).")
+            print("✓ Already logged into Slack — session persists; nothing to do.")
             return 0
         from playwright.sync_api import Error as PlaywrightError
 
+        # Land straight on the SDSC workspace sign-in (skips the workspace picker).
         try:
-            page.goto(SLACK_APP_URL, wait_until="domcontentloaded")
+            page.goto(SLACK_WORKSPACE_URL, wait_until="domcontentloaded")
             page.bring_to_front()
+            page.wait_for_timeout(1500)
+            _slack_prefill_email(page)
         except PlaywrightError:
             pass
+        email_note = (
+            f" (email pre-filled: {SLACK_LOGIN_EMAIL})"
+            if SLACK_LOGIN_EMAIL
+            else " (tip: export SLACK_LOGIN_EMAIL=albert.glensk@epfl.ch to pre-fill it)"
+        )
         print(
-            "\n🔐 Slack (app.slack.com) needs a login.\n"
-            "   In the shared Chrome window (now in front):\n"
-            "     1. Open the 'swiss-data-science' workspace (or enter its URL).\n"
-            "     2. Sign in (email-code or SSO) as an Owner/Admin.\n"
-            "     3. Land in the workspace — success is auto-detected.\n",
+            "\n🔐 Slack needs a ONE-TIME login (the session then persists).\n"
+            f"   In the shared Chrome window (now in front){email_note}:\n"
+            f"     1. Workspace: swiss-data-science ({SLACK_WORKSPACE_URL}).\n"
+            "     2. Sign in (email code or SSO) as an Owner/Admin.\n"
+            "     3. Land in the workspace — I detect success automatically.\n"
+            "   Take your time — the page is NOT reloaded while you type.\n",
             file=sys.stderr,
         )
-        deadline = time.monotonic() + 300
-        last_beat = 0.0
-        while time.monotonic() < deadline:
-            if _slack_logged_in(page):
-                print("✓ Logged into Slack (app.slack.com).")
-                _record_login_event("slack", "assisted")
-                return 0
-            elapsed = time.monotonic() - (deadline - 300)
-            if elapsed - last_beat >= 30:
-                print(
-                    f"  …waiting for you to finish the Slack login in the shared "
-                    f"browser window ({int(elapsed)}s elapsed)…",
-                    file=sys.stderr,
-                )
-                last_beat = elapsed
-            try:
-                page.wait_for_timeout(3000)
-            except PlaywrightError:
-                time.sleep(3)
-        return _fail(
-            "Slack login not detected within 5 min. Finish it in the shared "
-            "browser, then re-run: browser.py login slack"
-        )
+        if not _slack_wait_for_login(page, timeout_s=600):
+            return _fail(
+                "Slack login not detected within 10 min. Finish it in the shared "
+                "browser, then re-run: browser.py login slack"
+            )
+        print("✓ Logged into Slack — session saved in the shared profile.")
+        _record_login_event("slack", "assisted")
+        return 0
     finally:
         browser.close()
         pw.stop()
