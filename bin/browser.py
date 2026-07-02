@@ -108,6 +108,18 @@ ANTHROPIC_LOGIN_EMAIL = os.environ.get("ANTHROPIC_LOGIN_EMAIL")  # optional conv
 # /admin/members (same signal openai-team.py relies on).
 CHATGPT_ADMIN_URL = "https://chatgpt.com/admin/members"
 
+# Slack (assisted login; extracts the session xoxc token + `d` cookie so admin
+# calls like users.admin.setInactive work on the Pro plan — where the xoxp bot
+# token is scope-blocked — exactly as the Manage-members admin UI does). No
+# token is cached (xoxc rotates); `slack-session` prints it fresh on demand.
+SLACK_APP_URL = "https://app.slack.com/client"
+SLACK_SIGNIN_MARKERS = (
+    "workspace-signin",
+    "/signin",
+    "/sign-in",
+    "slack.com/get-started",
+)
+
 # Per-site log of REAL (cold) logins — one JSON object per line. Appended only
 # when `login <site>` actually had to sign in (never on a warm/already-logged-in
 # run), so `login-log <site>` shows how often you truly re-authenticated.
@@ -156,6 +168,11 @@ def parse_args() -> argparse.Namespace:
         help="Substring to pick the target tab (default: first/active tab).",
     )
     sub.add_parser("token", help="Cache the CSCS portal token from the portal tab.")
+    sub.add_parser(
+        "slack-session",
+        help="Print the logged-in Slack session creds as JSON {token,cookie,"
+        "team_domain} for slack_api.py (bearer creds → stdout only, never cached).",
+    )
     sub.add_parser(
         "cscs-login",
         help="Log into CSCS in the shared browser, then cache the token. Uses "
@@ -1465,6 +1482,170 @@ def cmd_openai_logged_in(port: int) -> int:
 
 
 # ---------------------------------------------------------------------------
+# Slack (app.slack.com) — assisted login; extracts session xoxc token + d cookie
+# ---------------------------------------------------------------------------
+
+
+def _slack_session_from_page(ctx, page) -> dict | None:
+    """Read the live Slack session creds from a logged-in app.slack.com tab:
+    the `xoxc-` token from the active team in ``localStorage.localConfig_v2`` and
+    the `d` (`xoxd-`) cookie from the browser context (httpOnly — invisible to
+    ``document.cookie``, but ``ctx.cookies()`` returns it). Returns
+    ``{token, cookie, team_domain}`` or ``None`` if not logged in / not found."""
+    from playwright.sync_api import Error as PlaywrightError
+
+    try:
+        info = page.evaluate(
+            "() => { try {"
+            " const c = JSON.parse(localStorage.getItem('localConfig_v2')||'{}');"
+            " const teams = Object.values(c.teams||{});"
+            " if(!teams.length) return null;"
+            " const active = c.lastActiveTeamId && c.teams[c.lastActiveTeamId];"
+            " const t = active || teams.find(x=>x.token) || teams[0];"
+            " return t && t.token ? {token:t.token, domain:t.domain||''} : null;"
+            "} catch(e){ return null; } }"
+        )
+    except PlaywrightError:
+        return None
+    if not info or not info.get("token"):
+        return None
+    cookie = None
+    try:
+        for ck in ctx.cookies():
+            if ck.get("name") == "d" and "slack.com" in str(ck.get("domain", "")):
+                cookie = str(ck.get("value", ""))
+                break
+    except PlaywrightError:
+        return None
+    if not cookie:
+        return None
+    return {
+        "token": str(info["token"]),
+        "cookie": cookie,
+        "team_domain": info.get("domain", ""),
+    }
+
+
+def _slack_logged_in(page) -> bool:
+    """ACTIVE check: navigate to the Slack web client and confirm a real session
+    (a team with an xoxc token in localStorage), not the workspace-signin page."""
+    from playwright.sync_api import Error as PlaywrightError
+
+    try:
+        page.goto(SLACK_APP_URL, wait_until="domcontentloaded")
+        page.wait_for_timeout(3000)
+    except PlaywrightError:
+        return False
+    url = ""
+    try:
+        url = page.url
+    except PlaywrightError:
+        return False
+    if any(m in url for m in SLACK_SIGNIN_MARKERS):
+        return False
+    ctx = page.context
+    return _slack_session_from_page(ctx, page) is not None
+
+
+def cmd_slack_login(port: int) -> int:
+    """Ensure app.slack.com is logged in. Idempotent (a warm session returns 0).
+
+    Slack web logs in via email-code / SSO, which can't be replayed from a stored
+    secret — a cold session is ASSISTED: complete it once in the shared window;
+    the session then persists in the profile. `slack_api.py` reuses it via
+    `browser.py slack-session`."""
+    pw, browser = _connect(port)
+    try:
+        _ctx, page = _pick_page(browser, "slack.com")
+        if _slack_logged_in(page):
+            print("✓ Already logged into Slack (app.slack.com).")
+            return 0
+        from playwright.sync_api import Error as PlaywrightError
+
+        try:
+            page.goto(SLACK_APP_URL, wait_until="domcontentloaded")
+            page.bring_to_front()
+        except PlaywrightError:
+            pass
+        print(
+            "\n🔐 Slack (app.slack.com) needs a login.\n"
+            "   In the shared Chrome window (now in front):\n"
+            "     1. Open the 'swiss-data-science' workspace (or enter its URL).\n"
+            "     2. Sign in (email-code or SSO) as an Owner/Admin.\n"
+            "     3. Land in the workspace — success is auto-detected.\n",
+            file=sys.stderr,
+        )
+        deadline = time.monotonic() + 300
+        last_beat = 0.0
+        while time.monotonic() < deadline:
+            if _slack_logged_in(page):
+                print("✓ Logged into Slack (app.slack.com).")
+                _record_login_event("slack", "assisted")
+                return 0
+            elapsed = time.monotonic() - (deadline - 300)
+            if elapsed - last_beat >= 30:
+                print(
+                    f"  …waiting for you to finish the Slack login in the shared "
+                    f"browser window ({int(elapsed)}s elapsed)…",
+                    file=sys.stderr,
+                )
+                last_beat = elapsed
+            try:
+                page.wait_for_timeout(3000)
+            except PlaywrightError:
+                time.sleep(3)
+        return _fail(
+            "Slack login not detected within 5 min. Finish it in the shared "
+            "browser, then re-run: browser.py login slack"
+        )
+    finally:
+        browser.close()
+        pw.stop()
+
+
+def cmd_slack_logged_in(port: int) -> int:
+    """Exit 0 if app.slack.com is logged in, 2 if not."""
+    pw, browser = _connect(port)
+    try:
+        _ctx, page = _pick_page(browser, "slack.com")
+        if _slack_logged_in(page):
+            print("✓ Logged into Slack (app.slack.com).")
+            return 0
+        print("Not logged into Slack (app.slack.com).", file=sys.stderr)
+        return 2
+    finally:
+        browser.close()
+        pw.stop()
+
+
+def cmd_slack_session(port: int) -> int:
+    """Print the live Slack session creds as JSON `{token, cookie, team_domain}`
+    for a consumer (slack_api.py) to make admin API calls. These are BEARER
+    credentials — emitted to stdout only (like `token` for CSCS), never cached to
+    disk (xoxc rotates) or logged. Exits 2 (with a hint) when not logged in."""
+    pw, browser = _connect(port)
+    try:
+        _ctx, page = _pick_page(browser, "slack.com")
+        if not _slack_logged_in(page):
+            page.bring_to_front()
+            print(
+                "Not logged into Slack. Run: browser.py login slack",
+                file=sys.stderr,
+            )
+            return 2
+        creds = _slack_session_from_page(page.context, page)
+        if not creds:
+            return _fail(
+                "Logged in, but no xoxc token / d cookie found in the Slack tab."
+            )
+        print(json.dumps(creds))
+        return 0
+    finally:
+        browser.close()
+        pw.stop()
+
+
+# ---------------------------------------------------------------------------
 # Login-frequency log (how often a real login was actually needed)
 # ---------------------------------------------------------------------------
 
@@ -1571,6 +1752,13 @@ def _sites() -> list[Site]:
             login=cmd_openai_login,
             logged_in=cmd_openai_logged_in,
         ),
+        Site(
+            name="slack",
+            aliases=("slack.com", "app.slack.com"),
+            blurb="app.slack.com (assisted login; `slack-session` prints xoxc+d creds)",
+            login=cmd_slack_login,
+            logged_in=cmd_slack_logged_in,
+        ),
     ]
 
 
@@ -1635,6 +1823,8 @@ def main() -> int:
         return cmd_eval(port, args.js, args.url)
     if args.cmd == "token":
         return cmd_token(port)
+    if args.cmd == "slack-session":
+        return cmd_slack_session(port)
     # Generic multi-site commands.
     if args.cmd == "login":
         return cmd_login(port, args.site)

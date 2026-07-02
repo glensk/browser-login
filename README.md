@@ -82,6 +82,11 @@ browser.py store-creds SITE   # save credentials in the macOS keychain (cscs-sty
 browser.py forget-creds SITE  # delete them
 ```
 
+Two sites also expose a **credential-print** command for their consumer (bearer creds
+→ stdout only, never logged): `browser.py token` (CSCS Waldur DRF token, also cached
+0600) and `browser.py slack-session` (Slack `{token,cookie,team_domain}` JSON; not
+cached — xoxc rotates).
+
 Every time a site performs a **real (cold) login** — not a warm "already logged in"
 — one record is appended to `~/.cache/claude-browser/login-log/<site>.jsonl`, so you
 can measure how often re-auth actually happens.
@@ -93,6 +98,7 @@ can measure how often re-auth actually happens.
 | `anthropic` (`claude`) | **Magic-link, fully automatic** when `ANTHROPIC_LOGIN_EMAIL` is set and `himalaya` reads that mailbox: triggers the email, extracts the `claude.ai/magic-link#<token>` URL, opens it. Otherwise **assisted** (you finish the email login once). |
 | `cscs`                 | **Keycloak, unattended.** `store-creds cscs` caches username/password/TOTP-seed in the macOS keychain (from 1Password, one last Touch ID); thereafter login runs with no fingerprint. TOTP codes are generated locally with `pyotp`. |
 | `openai` (`chatgpt`)   | **Assisted.** ChatGPT Business logs in via Google SSO + 2FA, which can't be replayed from a stored secret — you complete the SSO once in the shared window; the session persists. Logged-in sentinel: the 'Invite member' button on `chatgpt.com/admin/members`. |
+| `slack`                | **Assisted.** app.slack.com logs in via email-code / SSO; you sign in once and the session persists. Logged-in sentinel: a team with an `xoxc-` token in `localConfig_v2`. `browser.py slack-session` then prints `{token,cookie,team_domain}` (xoxc + httpOnly `d` cookie via CDP) so `slack-api` can call `users.admin.setInactive` on the Pro plan — where the API token is scope-blocked. Bearer creds → stdout only, never cached. |
 
 CSCS back-compat aliases (`token`, `cscs-login`, `cscs-store-creds`,
 `cscs-forget-creds`) are kept because downstream tools depend on their exact stdout
