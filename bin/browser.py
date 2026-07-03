@@ -21,8 +21,8 @@ Generic lifecycle:
   eval JS   Run a JS expression in the active (or --url-matched) tab; print JSON.
 
 Generic multi-site login (a SITE is one of the entries in the SITES registry —
-currently ``cscs``, ``anthropic``/``claude`` and ``openai``/``chatgpt``; add
-more by registering a Site):
+currently ``cscs``, ``anthropic``/``claude``, ``openai``/``chatgpt``, ``slack``
+and ``biopolwifi``; add more by registering a Site):
   login SITE        Ensure SITE is logged in in the shared browser. Automated for
                     sites with stored credentials (CSCS Keycloak). For claude.ai:
                     FULLY automatic when $ANTHROPIC_LOGIN_EMAIL is set and himalaya
@@ -128,6 +128,25 @@ SLACK_SIGNIN_MARKERS = (
     "slack.com/get-started",
 )
 
+# --- Biopol WiFi (Ruckus Cloudpath MDU portal) site -------------------------
+# The SDSC Biopole WiFi units are managed through a Ruckus Cloudpath MDU
+# property-management portal — a plain Vue SPA at cloudpath.edificom.cloud whose
+# login is an ordinary email+password form (no SSO, no TOTP). That makes this
+# site UNATTENDED like CSCS: we fill the form from two macOS-keychain items and
+# submit. Those two items are SHARED VERBATIM with sdsc/biopol-wifi/biopol-wifi.py
+# (the pure-`requests` CLI that drives the SAME portal's REST API) — do NOT rename
+# them, or the CLI stops finding its credentials. No token is extracted here; this
+# Site only keeps the GUI logged in for manual portal work. Logged-in sentinel =
+# the property name "SDSC - Biopole" / a "Properties" breadcrumb (the login form
+# page has neither; it shows input[placeholder="Email Address"]).
+BIOPOLWIFI_PORTAL_URL = (
+    "https://cloudpath.edificom.cloud/management-portal/"
+    "MduPortalAccess-ba2441af-c90a-47bd-9f00-847a817da979"
+    "?redirect=%2FMduPortalAccess-ba2441af-c90a-47bd-9f00-847a817da979%2Fproperties"
+)
+KEYCHAIN_SVC_BIOPOL_EMAIL = "biopol-wifi: email"
+KEYCHAIN_SVC_BIOPOL_PASS = "biopol-wifi: password"
+
 # Per-site log of REAL (cold) logins — one JSON object per line. Appended only
 # when `login <site>` actually had to sign in (never on a warm/already-logged-in
 # run), so `login-log <site>` shows how often you truly re-authenticated.
@@ -152,6 +171,8 @@ def parse_args() -> argparse.Namespace:
             "  ./browser.py token              # cache the CSCS portal token\n"
             "  ./browser.py cscs-store-creds   # one-time: cache CSCS creds in keychain\n"
             "  ./browser.py cscs-login         # auto-login to CSCS (keychain, no Touch ID)\n"
+            "  ./browser.py store-creds biopolwifi  # one-time: cache Cloudpath portal creds\n"
+            "  ./browser.py login biopolwifi   # auto-login to the Cloudpath MDU WiFi portal\n"
             "  ./browser.py down               # quit the shared browser\n"
         ),
     )
@@ -202,7 +223,9 @@ def parse_args() -> argparse.Namespace:
         "login", help="Ensure SITE is logged in (automated or assisted)."
     )
     pl.add_argument(
-        "site", help="Site to log into (e.g. cscs, anthropic/claude, openai/chatgpt)."
+        "site",
+        help="Site to log into (e.g. cscs, anthropic/claude, openai/chatgpt, "
+        "slack, biopolwifi).",
     )
     pli = sub.add_parser(
         "logged-in", help="Exit 0 if SITE is logged in, 2 if not (no login)."
@@ -1715,6 +1738,173 @@ def cmd_slack_session(port: int) -> int:
 
 
 # ---------------------------------------------------------------------------
+# Biopol WiFi (cloudpath.edificom.cloud) — unattended keychain email+password
+# ---------------------------------------------------------------------------
+
+
+def _biopolwifi_logged_in(page) -> bool:
+    """True on the settled, logged-in Cloudpath portal (the properties surface).
+
+    Sentinel is a DOM/text signal, NOT "the URL isn't the login form": the
+    logged-in portal renders the property name 'SDSC - Biopole' and a 'Properties'
+    breadcrumb, while the login form page (input[placeholder="Email Address"]) has
+    neither. Returns False on any Playwright error (page mid-navigation) so the
+    caller treats it as 'not confirmed yet'."""
+    from playwright.sync_api import Error as PlaywrightError
+
+    try:
+        return bool(
+            page.evaluate(
+                "() => { const t = document.body ? document.body.innerText : '';"
+                " return /SDSC - Biopole/.test(t) || /\\bProperties\\b/.test(t); }"
+            )
+        )
+    except PlaywrightError:
+        return False
+
+
+def cmd_biopolwifi_login(port: int) -> int:
+    """Ensure the Cloudpath MDU portal (cloudpath.edificom.cloud) is logged in.
+
+    UNATTENDED like CSCS: the portal login is a plain email+password Vue form, so
+    we fill it from the two macOS-keychain items (shared with biopol-wifi.py) and
+    submit — no SSO, no 1Password fallback for this site. Idempotent: a warm
+    session (the 'SDSC - Biopole' / 'Properties' sentinel already present) just
+    returns 0. No token is extracted; this only keeps the GUI logged in."""
+    pw, browser = _connect(port)
+    try:
+        from playwright.sync_api import Error as PlaywrightError
+
+        _ctx, page = _pick_page(browser, "cloudpath.edificom.cloud")
+        # If the picked tab isn't already on the portal (cold session reuses
+        # whatever content tab _pick_page returned), navigate there and settle.
+        if "cloudpath.edificom.cloud" not in page.url:
+            try:
+                page.goto(BIOPOLWIFI_PORTAL_URL, wait_until="domcontentloaded")
+                page.wait_for_timeout(2000)  # let the Vue SPA render
+            except PlaywrightError:
+                pass
+        # The Vue login form can render a beat after domcontentloaded — WAIT for
+        # the email field before deciding which state we're in (query_selector
+        # right away races the render and returns None). Skip the wait entirely
+        # when the logged-in sentinel is already present (warm session).
+        email_sel = 'input[placeholder="Email Address"]'
+        pass_sel = 'input[placeholder="Password"]'
+        form_ready = False
+        if not _biopolwifi_logged_in(page):
+            try:
+                page.wait_for_selector(email_sel, timeout=15000, state="visible")
+                form_ready = True
+            except PlaywrightError:
+                form_ready = False
+        if not form_ready:
+            # No login form — either already logged in (sentinel) or a stray page.
+            if _biopolwifi_logged_in(page):
+                print("✓ Already logged into the Cloudpath MDU portal (edificom).")
+                return 0
+            return _fail(
+                "Cloudpath portal showed neither the login form nor the logged-in "
+                f"sentinel — unexpected page ({page.url})."
+            )
+        email = _keychain_get(KEYCHAIN_SVC_BIOPOL_EMAIL)
+        password = _keychain_get(KEYCHAIN_SVC_BIOPOL_PASS)
+        if not (email and password):
+            return _fail(
+                "No Cloudpath portal credentials in the keychain. "
+                "Run: browser.py store-creds biopolwifi"
+            )
+        try:
+            page.fill(email_sel, email)
+            page.fill(pass_sel, password)
+            page.click('button:has-text("Login")')
+        except PlaywrightError as exc:
+            return _fail(f"Could not submit the Cloudpath login form: {exc}")
+        # Poll up to ~20s for the logged-in sentinel.
+        for _ in range(40):
+            if _biopolwifi_logged_in(page):
+                print("✓ Logged into the Cloudpath MDU portal (edificom).")
+                _record_login_event("biopolwifi", "keychain")
+                return 0
+            page.wait_for_timeout(500)
+        return _fail(
+            "Cloudpath login did not reach the properties page — wrong "
+            f"email/password, or an unexpected page ({page.url})."
+        )
+    finally:
+        browser.close()
+        pw.stop()
+
+
+def cmd_biopolwifi_logged_in(port: int) -> int:
+    """Exit 0 if the Cloudpath MDU portal is logged in, 2 if not (no login).
+
+    PASSIVE check: navigate to the portal, settle, and confirm the 'SDSC - Biopole'
+    / 'Properties' sentinel on the properties surface (never merely 'the URL isn't
+    the login form')."""
+    pw, browser = _connect(port)
+    try:
+        from playwright.sync_api import Error as PlaywrightError
+
+        _ctx, page = _pick_page(browser, "cloudpath.edificom.cloud")
+        try:
+            page.goto(BIOPOLWIFI_PORTAL_URL, wait_until="domcontentloaded")
+            page.wait_for_timeout(2500)
+        except PlaywrightError:
+            pass
+        if _biopolwifi_logged_in(page):
+            print("✓ Logged into the Cloudpath MDU portal (edificom).")
+            return 0
+        print("Not logged into the Cloudpath MDU portal (edificom).", file=sys.stderr)
+        return 2
+    finally:
+        browser.close()
+        pw.stop()
+
+
+def cmd_biopolwifi_store_creds() -> int:
+    """Store the Cloudpath MDU portal email+password in the macOS keychain.
+
+    Interactive one-time setup: prompt for the portal email (shown) and password
+    (hidden via getpass), then write the two items — SHARED with biopol-wifi.py —
+    so `browser.py login biopolwifi` runs unattended. No 1Password / TOTP for this
+    site; it's a plain email+password form."""
+    import getpass
+
+    print(
+        "Setting up unattended Cloudpath MDU portal (cloudpath.edificom.cloud) "
+        "login.\nCredentials are stored in your macOS login keychain (encrypted at "
+        "rest, read only by the `security` tool, no Touch ID on later reads).\n"
+    )
+    email = input("Cloudpath portal email (e.g. albert.glensk@epfl.ch): ").strip()
+    password = getpass.getpass("Cloudpath portal password: ")
+    if not (email and password):
+        return _fail("Missing email or password — nothing stored.")
+    if not (
+        _keychain_set(KEYCHAIN_SVC_BIOPOL_EMAIL, email)
+        and _keychain_set(KEYCHAIN_SVC_BIOPOL_PASS, password)
+    ):
+        return _fail("Failed to write one or more keychain items.")
+    print(
+        "✓ Stored the Cloudpath portal email and password in the macOS keychain.\n"
+        "  `browser.py login biopolwifi` now runs without a prompt.\n"
+        "  Verify with:  browser.py login biopolwifi\n"
+        "  Revoke with:  browser.py forget-creds biopolwifi"
+    )
+    return 0
+
+
+def cmd_biopolwifi_forget_creds() -> int:
+    """Delete the Cloudpath MDU portal credentials from the macOS keychain."""
+    for svc in (KEYCHAIN_SVC_BIOPOL_EMAIL, KEYCHAIN_SVC_BIOPOL_PASS):
+        _keychain_delete(svc)
+    print(
+        "✓ Removed the Cloudpath portal keychain credentials. "
+        "`browser.py login biopolwifi` needs `store-creds biopolwifi` again."
+    )
+    return 0
+
+
+# ---------------------------------------------------------------------------
 # Login-frequency log (how often a real login was actually needed)
 # ---------------------------------------------------------------------------
 
@@ -1879,6 +2069,15 @@ def _sites() -> list[Site]:
             blurb="app.slack.com (assisted login; `slack-session` prints xoxc+d creds)",
             login=cmd_slack_login,
             logged_in=cmd_slack_logged_in,
+        ),
+        Site(
+            name="biopolwifi",
+            aliases=("biopol", "cloudpath", "edificom"),
+            blurb="Cloudpath MDU WiFi portal (keychain email+password; SDSC Biopole units)",
+            login=cmd_biopolwifi_login,
+            logged_in=cmd_biopolwifi_logged_in,
+            store_creds=cmd_biopolwifi_store_creds,
+            forget_creds=cmd_biopolwifi_forget_creds,
         ),
     ]
 
