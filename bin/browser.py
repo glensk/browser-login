@@ -445,6 +445,35 @@ def _is_blank(url: str) -> bool:
     return not url or url == "about:blank" or url.startswith("chrome://")
 
 
+def _open_background_tab(port: int, browser, url: str) -> dict:
+    """Open URL in a NEW tab WITHOUT focusing it; return {url, title}.
+
+    Playwright's ``ctx.new_page()`` sends CDP ``Target.createTarget`` with
+    ``background: false``, which activates the tab and raises the Chrome
+    window on macOS — stealing OS focus from whatever the user is doing.
+    ``background: true`` avoids that, but Playwright never adopts targets
+    created externally mid-session (they only appear on the next connect),
+    so the tab is created and observed purely over CDP: creation through a
+    browser-level CDP session, load progress through the ``/json`` HTTP
+    target list.
+    """
+    session = browser.new_browser_cdp_session()
+    created = session.send("Target.createTarget", {"url": url, "background": True})
+    tid = created["targetId"]
+    info: dict = {}
+    deadline = time.time() + 15
+    while time.time() < deadline:
+        targets = _cdp_get(port, "/json")
+        for t in targets if isinstance(targets, list) else []:
+            if t.get("id") == tid:
+                info = t
+                break
+        if info.get("url") not in (None, "", "about:blank"):
+            break
+        time.sleep(0.25)
+    return {"url": info.get("url", url), "title": info.get("title", "")}
+
+
 def _pick_page(browser, url_substr: str | None):
     """Return a page (optionally matching url_substr), creating one if needed."""
     ctx = browser.contexts[0] if browser.contexts else browser.new_context()
@@ -459,6 +488,8 @@ def _pick_page(browser, url_substr: str | None):
         return ctx, content[-1]
     if pages:
         return ctx, pages[-1]
+    # Zero pages only happens right after launch, when Chrome is already
+    # frontmost anyway — the focusing new_page() is fine here.
     return ctx, ctx.new_page()
 
 
@@ -468,9 +499,13 @@ def cmd_open(port: int, url: str) -> int:
     try:
         ctx = browser.contexts[0] if browser.contexts else browser.new_context()
         blank = [pg for pg in ctx.pages if _is_blank(pg.url)]
-        page = blank[0] if blank else ctx.new_page()
-        page.goto(url, wait_until="domcontentloaded")
-        print(f"✓ Opened: {page.url}  (title: {page.title()!r})")
+        if blank:  # reuse a blank tab in place — navigation does not focus it
+            page = blank[0]
+            page.goto(url, wait_until="domcontentloaded")
+            print(f"✓ Opened: {page.url}  (title: {page.title()!r})")
+        else:  # new tab, created in the background so Chrome stays unfocused
+            info = _open_background_tab(port, browser, url)
+            print(f"✓ Opened: {info['url']}  (title: {info['title']!r})")
         return 0
     finally:
         browser.close()  # detaches CDP; the real browser keeps running

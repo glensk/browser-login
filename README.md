@@ -64,10 +64,15 @@ That's it — `browser.py` creates its own venv on first use.
 ```commands
 browser.py up                 # launch the shared Chromium (idempotent)
 browser.py status             # CDP health, browser version, open tabs
-browser.py open https://…     # navigate a tab
+browser.py open https://…     # navigate a tab (opens in the BACKGROUND — no focus steal)
 browser.py eval 'document.title' [--url SUBSTR]   # run JS in the active/matched tab → JSON
 browser.py down               # quit the shared browser
 ```
+
+`open` reuses a blank tab or creates the new tab via CDP `Target.createTarget`
+with `background: true`, so the shared Chromium never grabs macOS focus while
+you work. Only the assisted login flows intentionally raise the window
+(`bring_to_front`) because you must interact with them.
 
 ## Multi-site login
 
