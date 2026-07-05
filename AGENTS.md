@@ -28,8 +28,8 @@ framework. It is a **provider**: other repos depend on it, not the reverse. See
 ## Conventions
 
 - Every subcommand supports `-h/--help`; every CLI flag has a short and long form.
-- This repo declares **no** `_tooling/external_deps.py` — it is a provider, not a
-  consumer. Its own external tools (`op`, `himalaya`, `security`, Playwright) are
+- This repo declares **no** `EXTERNAL_DEPS` registry (extdeps package) — it is a
+  provider, not a consumer. Its own external tools (`op`, `himalaya`, `security`, Playwright) are
   **optional** and degrade gracefully (assisted fallback); they are documented in
   `README.md` (Requirements), not enforced with fail-loud checks.
 - The CDP endpoint is always `http://127.0.0.1:<port>` — never `localhost` (Chrome's
