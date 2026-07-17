@@ -62,17 +62,25 @@ That's it — `browser.py` creates its own venv on first use.
 ## Quick start
 
 ```commands
-browser.py up                 # launch the shared Chromium (idempotent)
+browser.py up                 # launch the shared Chromium (idempotent, BACKGROUND, clean tab)
 browser.py status             # CDP health, browser version, open tabs
 browser.py open https://…     # navigate a tab (opens in the BACKGROUND — no focus steal)
 browser.py eval 'document.title' [--url SUBSTR]   # run JS in the active/matched tab → JSON
 browser.py down               # quit the shared browser
 ```
 
-`open` reuses a blank tab or creates the new tab via CDP `Target.createTarget`
-with `background: true`, so the shared Chromium never grabs macOS focus while
-you work. Only the assisted login flows intentionally raise the window
-(`bring_to_front`) because you must interact with them.
+`up` launches in the background (via `open -g` on macOS) so Chrome for Testing
+never pops over what you're doing, and on a cold start it **wipes stale
+session-restore state** so it opens ONE clean tab instead of resurrecting every
+tab from last time (your logins persist — they live in Cookies/Local Storage,
+not the session files). `open` likewise reuses a blank tab or creates new tabs
+via CDP `Target.createTarget` with `background: true`. Only the assisted login
+flows intentionally raise the window (`bring_to_front`) because you must act.
+
+Env toggles: `CLAUDE_BROWSER_KEEP_TABS=1` keeps last session's tabs (skip the
+wipe); `CLAUDE_BROWSER_FOREGROUND=1` launches in the foreground (skip `open -g`).
+Separately, the Claude Code wrapper only auto-starts the browser when
+`CLAUDE_BROWSER_AUTOSTART=1` — by default it is lazy (started on first use).
 
 ## Multi-site login
 
