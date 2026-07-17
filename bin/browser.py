@@ -356,32 +356,130 @@ def _is_up(port: int) -> bool:
     return _cdp_get(port, "/json/version") is not None
 
 
+def _clear_session_restore() -> int:
+    """Delete Chrome's session-restore state so a cold launch opens ONE clean tab.
+
+    Chrome reopens the previous window's tabs from a handful of files under the
+    profile's ``Default/`` dir — the timestamped ``Sessions/`` records plus the
+    ``Current/Last Session`` and ``Current/Last Tabs`` blobs (which one it uses
+    depends on Chrome version and clean-vs-crash exit). Removing all of them
+    leaves nothing to restore, so the browser starts fresh. Logins are NOT here
+    (they live in ``Cookies`` / ``Local Storage`` / ``Login Data``), so they
+    persist. Opt out with ``CLAUDE_BROWSER_KEEP_TABS=1``. Fully guarded — a
+    failure here must never block ``up``. Returns the number of items removed.
+    """
+    if os.environ.get("CLAUDE_BROWSER_KEEP_TABS") == "1":
+        return 0
+    default_dir = PROFILE_DIR / "Default"
+    removed = 0
+    try:
+        sessions = default_dir / "Sessions"
+        if sessions.is_dir():
+            shutil.rmtree(sessions, ignore_errors=True)
+            removed += 1
+        for name in ("Current Session", "Current Tabs", "Last Session", "Last Tabs"):
+            f = default_dir / name
+            if f.exists():
+                f.unlink(missing_ok=True)
+                removed += 1
+    except OSError:
+        pass
+    return removed
+
+
+def _app_bundle(binary: str) -> Optional[Path]:
+    """The ``.app`` bundle enclosing a macOS executable, or None if not bundled.
+
+    e.g. ``…/Chromium.app/Contents/MacOS/Chromium`` → ``…/Chromium.app``.
+    """
+    for parent in Path(binary).parents:
+        if parent.suffix == ".app":
+            return parent
+    return None
+
+
+def _resolve_browser_pid(port: int) -> Optional[int]:
+    """Best-effort main browser PID, found via its unique debug-port flag.
+
+    Only the top-level browser process carries ``--remote-debugging-port``
+    (renderer/GPU helpers do not), so pgrep on it isolates the parent. Used when
+    the browser was launched via ``open`` (which doesn't return the child PID).
+    """
+    try:
+        res = subprocess.run(  # noqa: S603,S607
+            ["pgrep", "-f", f"remote-debugging-port={port}"],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        pids = sorted(int(x) for x in res.stdout.split() if x.strip().isdigit())
+        return pids[0] if pids else None
+    except (OSError, ValueError):
+        return None
+
+
+def _launch_browser(binary: str, flags: list[str]) -> Optional[int]:
+    """Start the browser detached and WITHOUT stealing window focus.
+
+    On macOS a subprocess-launched ``.app`` activates itself and grabs the
+    foreground — it pops over whatever you're working on. ``open -g`` launches it
+    in the background (its window opens *behind* the current app), and ``-n``
+    forces our profile instance instead of focusing an unrelated running one.
+    ``open`` doesn't return the browser's PID, so the caller resolves it after
+    CDP is up (``_resolve_browser_pid``). On other platforms a plain detached
+    ``Popen`` doesn't steal focus and yields the real PID. Returns the PID if
+    known immediately, else None. Opt out of background launch with
+    ``CLAUDE_BROWSER_FOREGROUND=1`` (falls back to a direct foreground launch).
+    """
+    foreground = os.environ.get("CLAUDE_BROWSER_FOREGROUND") == "1"
+    if sys.platform == "darwin" and not foreground:
+        app = _app_bundle(binary)
+        if app is not None:
+            subprocess.run(  # noqa: S603,S607
+                ["open", "-g", "-n", "-a", str(app), "--args", *flags],
+                check=False,
+            )
+            return None
+    proc = subprocess.Popen(  # noqa: S603 - launching a known browser binary
+        [binary, *flags],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        start_new_session=True,
+    )
+    return proc.pid
+
+
 def cmd_up(port: int) -> int:
     """Launch the shared browser if not already running (idempotent)."""
     if _is_up(port):
         print(f"✓ Shared browser already up (CDP http://localhost:{port}).")
         return 0
     PROFILE_DIR.mkdir(parents=True, exist_ok=True)
+    # Cold start (we're past the _is_up check): wipe stale tab-restore state so the
+    # window opens clean instead of resurrecting every tab from the last session.
+    _clear_session_restore()
     binary = _chromium_binary()
-    args = [
-        binary,
+    flags = [
         f"--user-data-dir={PROFILE_DIR}",
         f"--remote-debugging-port={port}",
         "--no-first-run",
         "--no-default-browser-check",
+        "--hide-crash-restore-bubble",
         "--remote-allow-origins=*",
     ]
-    proc = subprocess.Popen(  # noqa: S603 - launching a known browser binary
-        args,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-        start_new_session=True,
-    )
-    PID_FILE.write_text(str(proc.pid))
+    # Launch in the background so it never steals focus (see _launch_browser).
+    pid = _launch_browser(binary, flags)
+    if pid is not None:
+        PID_FILE.write_text(str(pid))
     for _ in range(50):  # up to ~10s
         if _is_up(port):
+            if pid is None:  # `open`-launched: resolve the real PID now it's up.
+                pid = _resolve_browser_pid(port)
+                if pid is not None:
+                    PID_FILE.write_text(str(pid))
             print(
-                f"✓ Shared browser launched (pid {proc.pid}, CDP http://localhost:{port}).\n"
+                f"✓ Shared browser launched in background "
+                f"(pid {pid or '?'}, CDP http://localhost:{port}).\n"
                 "  Log into your sites in that window ONCE; the session persists.\n"
                 f"  Profile: {PROFILE_DIR}"
             )
@@ -420,10 +518,15 @@ def cmd_down() -> int:
         except (ValueError, ProcessLookupError, PermissionError):
             pass
         PID_FILE.unlink(missing_ok=True)
-    # Fallback: match by profile dir.
-    subprocess.run(  # noqa: S603,S607
-        ["pkill", "-f", f"--user-data-dir={PROFILE_DIR}"], check=False
+    # Fallback: match by profile dir. The pattern must NOT start with '-', or BSD
+    # pkill (macOS) parses it as an option ("illegal option -- -"); the substring
+    # 'user-data-dir=<profile>' still uniquely matches our browser processes. This
+    # path matters now that `open`-launched cold starts may not capture a PID.
+    fallback = subprocess.run(  # noqa: S603,S607
+        ["pkill", "-f", f"user-data-dir={PROFILE_DIR}"], check=False
     )
+    if fallback.returncode == 0:  # pkill matched & signalled at least one process
+        killed = True
     print("✓ Shared browser stopped." if killed else "Stopped (or was not running).")
     return 0
 
