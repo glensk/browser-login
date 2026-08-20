@@ -76,10 +76,34 @@ human asked for it.
       request (exit 1) instead of silently ignoring it; `status` prints the
       mode. Headless remains useful for CSCS/Slack/biopolwifi + mechanical
       CDP work (screenshots, downloads, evals).
-- [ ] **Spike B (independent): hidden launch `open -g -j`.** Do NOT infer from
+- [x] **Spike B (independent): hidden launch `open -g -j`.** Do NOT infer from
       occluded-window results — a hidden window is a different macOS state.
       Own pass: rAF alive after `bring_to_front()`, click, screenshot, focus
       and z-order unchanged. Until it passes, keep `open -g`.
+
+      **Result 2026-08-20 — FAIL; `open -g` stays. No code change.**
+      Own pass on CfT 151, isolated step by step (System Events `visible`
+      probed between single CDP actions):
+
+      1. `open -g -j` itself is ineffective: Chrome un-hides at window
+         creation — end state identical to `open -g` (window on-screen,
+         z-behind frontmost, `visible=true`, no focus steal).
+      2. Post-launch hide (Cmd+H equivalent) establishes a true hidden state
+         (0 on-screen windows), and while hidden the browser IS fully
+         drivable: rAF alive on existing tabs (~16.5 ms frame delta — hidden
+         is NOT occlusion-paused, with the anti-throttling flags present),
+         click and bounded screenshot pass on a disposable `data:` tab.
+      3. But the hidden state cannot be HELD under automation: BOTH
+         `Target.createTarget` (even `background:true`) AND
+         `Page.bringToFront` un-hide the app (window returns on-screen
+         behind the frontmost app; focus still never stolen). Bare CDP
+         connects and `Runtime.evaluate` on existing tabs do NOT un-hide.
+
+      Net: every consumer workflow creates/navigates tabs and calls
+      tab-level `bring_to_front`, so a hidden launch degrades to today's
+      occluded `open -g` state on first action. Focus/z-order contract held
+      in every state tested. Useful side-fact: if the user manually hides
+      the window, read/eval-only automation keeps it hidden.
 - [ ] **Lifecycle record + transactional mode switching.** Atomic
       `.browser-lifecycle.json` `{state: starting|running|stopping|switching,
       mode, pid, process_start_time, nonce}`. Acceptance: at most ONE
