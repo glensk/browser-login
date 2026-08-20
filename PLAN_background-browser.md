@@ -104,7 +104,17 @@ human asked for it.
       occluded `open -g` state on first action. Focus/z-order contract held
       in every state tested. Useful side-fact: if the user manually hides
       the window, read/eval-only automation keeps it hidden.
-- [ ] **Lifecycle record + transactional mode switching.** Atomic
+- [x] **Lifecycle record + transactional mode switching.** *(done 2026-08-20:
+      `.browser-lifecycle.json` under `~/.cache/claude-browser/`, new
+      `browser.py switch headed|headless`; `up` heals the record of an
+      already-running browser; `status` prints the record + every invariant
+      violation. Verified live: 4-s transactional round-trip switch with
+      sessions intact; SIGKILL crash → status flags record/CDP/SingletonLock
+      violations and `up` self-recovers by removing the provably-stale lock;
+      clean `down` clears the record. The only direct signal target is a
+      `_validated_root_pid` (pid + ps lstart + root command line + Playwright
+      cache executable); pattern-scoped `pkill` is the final fallback. 53/53
+      helper unit checks.)* Atomic
       `.browser-lifecycle.json` `{state: starting|running|stopping|switching,
       mode, pid, process_start_time, nonce}`. Acceptance: at most ONE
       validated root browser process (executable + process start time + debug
