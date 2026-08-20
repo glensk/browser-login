@@ -63,10 +63,14 @@ That's it — `browser.py` creates its own venv on first use.
 
 ```commands
 browser.py up                 # launch the shared Chromium (idempotent, BACKGROUND, clean tab)
-browser.py status             # CDP health, browser version, open tabs
+browser.py up --headless      # opt-in windowless mode (same profile — see the headless note!)
+browser.py status             # CDP health, version, open tabs + the lifecycle record
+browser.py switch headless    # transactional mode switch (stop + relaunch, logins persist)
+browser.py clients            # who is attached over CDP (registered + unknown clients)
+browser.py doctor             # full health check on a disposable tab (never touches real tabs)
 browser.py open https://…     # navigate a tab (opens in the BACKGROUND — no focus steal)
 browser.py eval 'document.title' [--url SUBSTR]   # run JS in the active/matched tab → JSON
-browser.py down               # quit the shared browser
+browser.py down               # quit the shared browser (graceful CDP close → validated escalation)
 ```
 
 `up` launches in the background (via `open -g` on macOS) so Chrome for Testing
@@ -75,12 +79,89 @@ session-restore state** so it opens ONE clean tab instead of resurrecting every
 tab from last time (your logins persist — they live in Cookies/Local Storage,
 not the session files). `open` likewise reuses a blank tab or creates new tabs
 via CDP `Target.createTarget` with `background: true`. Only the assisted login
-flows intentionally raise the window (`bring_to_front`) because you must act.
+flows intentionally raise the window because you must act in it.
 
 Env toggles: `CLAUDE_BROWSER_KEEP_TABS=1` keeps last session's tabs (skip the
-wipe); `CLAUDE_BROWSER_FOREGROUND=1` launches in the foreground (skip `open -g`).
+wipe); `CLAUDE_BROWSER_FOREGROUND=1` launches in the foreground (skip `open -g`);
+`CLAUDE_BROWSER_HEADLESS=1` makes `up` default to headless.
 Separately, the Claude Code wrapper only auto-starts the browser when
 `CLAUDE_BROWSER_AUTOSTART=1` — by default it is lazy (started on first use).
+
+## Why you never see the window
+
+The whole design goal is that **driving the browser never interferes with your
+desktop**: no focus steal, no window raising, no z-order change. How that is
+achieved (and where the sharp edges are — all measured, see
+`PLAN_background-browser.md` for the evidence):
+
+- **Background launch.** `open -g -n` opens the window *behind* everything;
+  new tabs are created with `Target.createTarget {background: true}`, which
+  does not raise the window.
+- **Occlusion freezes rendering.** When the window is fully occluded, macOS
+  pauses rendering: `requestAnimationFrame` stops, and every Playwright click
+  times out on its "element is stable" wait (needs 2 rAF frames). The
+  `--disable-backgrounding-*` launch flags alone did NOT prevent this.
+- **`bring_to_front` unfreezes rendering but is NOT free.** On Chrome for
+  Testing 151 the tab-level CDP `Page.bringToFront` can raise the window to
+  the top of the z-order and even make Chrome the frontmost app (focus
+  steal) — it depends on macOS cooperative-activation state, so it
+  sometimes looks harmless. Treat it as an **escalation of last resort**:
+  probe rAF first, call `bring_to_front` only when rendering is actually
+  frozen (this is exactly what `browser.py doctor` does).
+- **Headless would solve all of this — but is a NO-GO for the admin sites.**
+  `--headless=new` advertises `HeadlessChrome` in the User-Agent and
+  Cloudflare hard-challenges it: claude.ai and chatgpt.com never load
+  ("Just a moment…" forever). CSCS/Slack/Cloudpath logins, screenshots,
+  downloads and evals all work headless. Hence headless stays **opt-in**
+  (`up -H`, `switch headless`) for non-Cloudflare work only.
+- **A hidden window is not an option either.** `open -g -j` is undone by
+  Chrome at window creation, and both `Target.createTarget` and
+  `Page.bringToFront` un-hide a manually hidden (Cmd+H) app.
+
+`status` prints the **lifecycle record** (`~/.cache/claude-browser/
+.browser-lifecycle.json`): state (`starting|running|stopping|switching`),
+mode, validated pid. Signals are only ever sent to a pid that still matches
+the record (start time + command line + executable) — never a bare number
+from a pid file. `doctor` certifies the whole stack: record vs live process,
+attached clients, and a bounded rAF/click/screenshot probe on a disposable
+`data:` tab, asserting the frontmost app and window z-order are unchanged
+afterwards.
+
+## Consumer contract (multi-client coordination)
+
+Any number of CDP clients may READ concurrently, but the browser is shared
+state — so two layers coordinate everyone (all under `~/.cache/claude-browser/`):
+
+1. **Registration (who is attached).** Every `browser.py` command that
+   connects registers itself in `clients/` (a shared flock on the registry
+   gate, held for the connection's lifetime). Long-lived clients — e.g. the
+   Playwright MCP server — wrap themselves in
+   `browser.py register-exec -t NAME -- CMD…` so their registration lives
+   exactly as long as the process. `switch`/`down` acquire the gate
+   exclusively (bounded wait, refusal names the holders), and `switch`
+   **fails closed** when an *unregistered* client is attached (or when it
+   cannot verify — no `lsof`); `-f/--force` overrides. `down` only warns.
+2. **Interaction lease (who is driving).** Anything that types, clicks for a
+   login, or otherwise owns the user-visible interaction takes the exclusive
+   `interaction.lock` flock (owner nonce + pid start time, 10 s heartbeat,
+   compare-before-release). The assisted/unattended `login` flows take it;
+   read-only probes (`logged-in`, `eval`, `open`, `token`, `slack-session`)
+   do not. A parent that already holds the lock and shells
+   `browser.py login …` exports `CLAUDE_BROWSER_LEASE_HELD=1` so the child
+   doesn't deadlock against it.
+
+Rules for anything that drives this browser:
+
+- **Never activate the app or raise the window.** Tab-level
+  `bring_to_front` only as an escalation when rAF is frozen (see above) —
+  never unconditionally, never AppleScript `activate`.
+- **`force=True` clicks never on final mutating controls.** Force-fallback is
+  acceptable for non-final controls only; the last click of a mutation must
+  pass normal actionability.
+- **Bound every screenshot and wait** (explicit timeouts) — an occluded
+  window can freeze rendering and an unbounded wait hangs forever.
+- **Hold the interaction lease** around interactive flows; register if you
+  hold a long-lived CDP connection.
 
 ## Multi-site login
 

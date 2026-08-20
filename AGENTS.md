@@ -24,6 +24,9 @@ framework. It is a **provider**: other repos depend on it, not the reverse. See
 - Shell: `shellcheck` (no shell scripts currently)
 - Pre-commit: `pre-commit run --all-files` (gitleaks secret scan)
 - Smoke test: `bin/browser.py -h` must exit 0; `browser.py up && browser.py status`.
+- Full health check: `browser.py doctor` (bounded probe on a disposable tab;
+  asserts the desktop is left untouched). Run it after changes to launch,
+  lifecycle, or coordination code.
 
 ## Conventions
 
@@ -36,6 +39,15 @@ framework. It is a **provider**: other repos depend on it, not the reverse. See
   debug port is IPv4-only; `localhost`→`::1` stalls on macOS).
 - A site's `logged_in` check must read a DOM sentinel on a stable post-login surface,
   not "the URL isn't `/login`".
+- **Never interfere with the user's desktop**: no app activation, no window
+  raising; tab-level `bring_to_front` only as an escalation when rendering is
+  frozen (on CfT 151 it can steal focus — README "Why you never see the
+  window"). Interactive flows hold the interaction lease; long-lived CDP
+  clients register via `register-exec`; `switch` fails closed on unregistered
+  clients. Full contract: README "Consumer contract".
+- The shared browser is LIVE infrastructure with the user's real sessions:
+  never `down`/`switch`/`login` it casually, and never edit `bin/browser.py`
+  in place from a subagent while consumers may exec it — use a worktree.
 - **No secrets, ever** — this is a public repo. Configuration is env vars + keychain
   *labels* only. gitleaks must stay clean.
 

@@ -192,6 +192,10 @@ human asked for it.
       rendering keep-alive that needs no window action at all (candidate:
       `Page.startScreencast` during interactions) — requires a
       fully-occluded test setup to validate, which needs a quiet desktop.
-- [ ] Docs: README "Why you never see the window" + the consumer contract
+- [x] Docs: README "Why you never see the window" + the consumer contract
       (tab-level bring_to_front only; no app activation; force-click never on
-      final mutating controls; bounded screenshots; lease usage).
+      final mutating controls; bounded screenshots; lease usage). *(done
+      2026-08-20 — with the btf rule updated to escalation-only per revised
+      fact 3. Also: quick start covers `switch`/`clients`/`doctor`/
+      `register-exec`/`-H`; AGENTS.md gains the non-interference conventions
+      and the doctor smoke step; the browser-login skill updated.)*
