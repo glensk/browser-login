@@ -15,6 +15,8 @@ the session persists in the profile dir across browser restarts.
 
 Generic lifecycle:
   up        Launch the shared browser (idempotent). Log into sites once here.
+            [-H|--headless] opts into a windowless browser (same profile, same
+            logins) — everything works except assisted (human) logins.
   status    Show CDP health, browser version, and open tabs.
   down      Quit the shared browser.
   open URL  Open/navigate a tab to URL in the shared browser.
@@ -165,6 +167,7 @@ def parse_args() -> argparse.Namespace:
         epilog=(
             "Examples:\n"
             "  ./browser.py up                 # start it, then log into sites once\n"
+            "  ./browser.py up --headless      # windowless (same profile/logins)\n"
             "  ./browser.py status             # CDP health + open tabs\n"
             "  ./browser.py open https://portal.cscs.ch/profile/\n"
             "  ./browser.py eval 'document.title'\n"
@@ -184,7 +187,15 @@ def parse_args() -> argparse.Namespace:
         "env CLAUDE_BROWSER_CDP_PORT).",
     )
     sub = p.add_subparsers(dest="cmd", required=True)
-    sub.add_parser("up", help="Launch the shared browser (idempotent).")
+    pup = sub.add_parser("up", help="Launch the shared browser (idempotent).")
+    pup.add_argument(
+        "-H",
+        "--headless",
+        action="store_true",
+        default=os.environ.get("CLAUDE_BROWSER_HEADLESS") == "1",
+        help="Opt-in headless mode (--headless=new): same profile, same logins, "
+        "no window at all (env default CLAUDE_BROWSER_HEADLESS=1).",
+    )
     sub.add_parser("status", help="Show CDP health, version, and open tabs.")
     sub.add_parser("down", help="Quit the shared browser.")
     po = sub.add_parser("open", help="Open/navigate a tab to URL.")
@@ -356,6 +367,43 @@ def _is_up(port: int) -> bool:
     return _cdp_get(port, "/json/version") is not None
 
 
+def _browser_mode(port: int) -> str | None:
+    """Mode of the RUNNING browser: ``"headless"``, ``"headed"``, or None if down.
+
+    ``/json/version`` names the flavour, but WHERE moved between Chrome versions:
+    older builds prefix the ``Browser`` field (``HeadlessChrome/<version>``), while
+    Chrome for Testing 151 reports a plain ``Browser`` and only the ``User-Agent``
+    says ``HeadlessChrome`` (verified 2026-08-20). Check both. The mode is read off
+    the live browser instead of remembered from launch — correct even for a
+    browser this process didn't start.
+    """
+    ver = _cdp_get(port, "/json/version")
+    if not isinstance(ver, dict):
+        return None
+    headless = str(ver.get("Browser", "")).startswith("Headless") or (
+        "HeadlessChrome" in str(ver.get("User-Agent", ""))
+    )
+    return "headless" if headless else "headed"
+
+
+def _require_headed_for_assisted(port: int, site: str) -> bool:
+    """True if a human could see the browser; else explain the fix and return False.
+
+    An ASSISTED login hands the window to the human (type an emailed code, finish
+    an SSO+2FA prompt), which is impossible with no window. Fail fast with the
+    remedy instead of blocking for 5–10 min on a wait nobody can satisfy.
+    """
+    if _browser_mode(port) != "headless":
+        return True
+    print(
+        f"❌ Assisted login for {site} needs a visible window, but the shared "
+        "browser is running HEADLESS.\n"
+        "   Run `browser.py down && browser.py up` (headed), then retry.",
+        file=sys.stderr,
+    )
+    return False
+
+
 def _clear_session_restore() -> int:
     """Delete Chrome's session-restore state so a cold launch opens ONE clean tab.
 
@@ -418,7 +466,9 @@ def _resolve_browser_pid(port: int) -> int | None:
         return None
 
 
-def _launch_browser(binary: str, flags: list[str]) -> int | None:
+def _launch_browser(
+    binary: str, flags: list[str], headless: bool = False
+) -> int | None:
     """Start the browser detached and WITHOUT stealing window focus.
 
     On macOS a subprocess-launched ``.app`` activates itself and grabs the
@@ -427,12 +477,14 @@ def _launch_browser(binary: str, flags: list[str]) -> int | None:
     forces our profile instance instead of focusing an unrelated running one.
     ``open`` doesn't return the browser's PID, so the caller resolves it after
     CDP is up (``_resolve_browser_pid``). On other platforms a plain detached
-    ``Popen`` doesn't steal focus and yields the real PID. Returns the PID if
+    ``Popen`` doesn't steal focus and yields the real PID. With ``headless`` there
+    is no window to hide, so the ``open`` dance is pointless — go straight to
+    ``Popen``, which also hands back the real PID immediately. Returns the PID if
     known immediately, else None. Opt out of background launch with
     ``CLAUDE_BROWSER_FOREGROUND=1`` (falls back to a direct foreground launch).
     """
     foreground = os.environ.get("CLAUDE_BROWSER_FOREGROUND") == "1"
-    if sys.platform == "darwin" and not foreground:
+    if sys.platform == "darwin" and not foreground and not headless:
         app = _app_bundle(binary)
         if app is not None:
             subprocess.run(
@@ -449,14 +501,36 @@ def _launch_browser(binary: str, flags: list[str]) -> int | None:
     return proc.pid
 
 
-def cmd_up(port: int) -> int:
-    """Launch the shared browser if not already running (idempotent)."""
-    if _is_up(port):
-        print(f"✓ Shared browser already up (CDP http://localhost:{port}).")
+def cmd_up(port: int, headless: bool = False) -> int:
+    """Launch the shared browser if not already running (idempotent).
+
+    ``headless`` opts into ``--headless=new``: same profile, same logins, no
+    window at all. The mode is fixed at launch, so a request that disagrees with
+    the browser already running is REFUSED (loudly) instead of silently ignored;
+    switching modes means quitting the browser, which is the caller's decision.
+    """
+    want = "headless" if headless else "headed"
+    running = _browser_mode(port)
+    if running is not None:
+        if running != want:
+            print(
+                f"❌ Mode mismatch: the shared browser is up in {running.upper()} "
+                f"mode, but {want.upper()} was requested.\n"
+                "   The mode is fixed at launch. To switch, quit it first:\n"
+                "     browser.py down && browser.py up"
+                f"{' --headless' if headless else ''}",
+                file=sys.stderr,
+            )
+            return 1
+        print(
+            f"✓ Shared browser already up, {running.upper()} "
+            f"(CDP http://localhost:{port})."
+        )
         return 0
     PROFILE_DIR.mkdir(parents=True, exist_ok=True)
-    # Cold start (we're past the _is_up check): wipe stale tab-restore state so the
-    # window opens clean instead of resurrecting every tab from the last session.
+    # Cold start (nothing was running, per _browser_mode): wipe stale tab-restore
+    # state so the window opens clean instead of resurrecting every tab from the
+    # last session.
     _clear_session_restore()
     binary = _chromium_binary()
     flags = [
@@ -476,8 +550,13 @@ def cmd_up(port: int) -> int:
         "--disable-renderer-backgrounding",
         "--disable-background-timer-throttling",
     ]
+    if headless:
+        # `--headless=new` is the real browser minus the window (full CDP, same
+        # profile, same logins). The anti-throttling flags above are kept — with
+        # no window they're moot, but harmless, and one mode difference less.
+        flags.append("--headless=new")
     # Launch in the background so it never steals focus (see _launch_browser).
-    pid = _launch_browser(binary, flags)
+    pid = _launch_browser(binary, flags, headless=headless)
     if pid is not None:
         PID_FILE.write_text(str(pid))
     for _ in range(50):  # up to ~10s
@@ -486,12 +565,21 @@ def cmd_up(port: int) -> int:
                 pid = _resolve_browser_pid(port)
                 if pid is not None:
                     PID_FILE.write_text(str(pid))
-            print(
-                f"✓ Shared browser launched in background "
-                f"(pid {pid or '?'}, CDP http://localhost:{port}).\n"
-                "  Log into your sites in that window ONCE; the session persists.\n"
-                f"  Profile: {PROFILE_DIR}"
-            )
+            if headless:
+                print(
+                    f"✓ Shared browser launched HEADLESS "
+                    f"(no window; pid {pid or '?'}, CDP http://localhost:{port}).\n"
+                    "  Logins from the profile still apply; assisted (human) "
+                    "logins need a window — `down` then plain `up` for those.\n"
+                    f"  Profile: {PROFILE_DIR}"
+                )
+            else:
+                print(
+                    f"✓ Shared browser launched in background "
+                    f"(pid {pid or '?'}, CDP http://localhost:{port}).\n"
+                    "  Log into your sites in that window ONCE; the session persists.\n"
+                    f"  Profile: {PROFILE_DIR}"
+                )
             return 0
         time.sleep(0.2)
     return _fail("Browser started but CDP endpoint never came up.")
@@ -506,7 +594,8 @@ def cmd_status(port: int) -> int:
         )
         return 1
     assert isinstance(ver, dict)
-    print(f"✓ Up — {ver.get('Browser')} | CDP http://localhost:{port}")
+    mode = _browser_mode(port) or "?"
+    print(f"✓ Up — {ver.get('Browser')} ({mode}) | CDP http://localhost:{port}")
     tabs = _cdp_get(port, "/json/list")
     tab_list = tabs if isinstance(tabs, list) else []
     pages = [t for t in tab_list if isinstance(t, dict) and t.get("type") == "page"]
@@ -1509,7 +1598,11 @@ def cmd_anthropic_login(port: int) -> int:
                 file=sys.stderr,
             )
 
-        # Assisted fallback. If auto already triggered the email, don't re-send.
+        # Assisted fallback — needs a human at a real window (the automatic
+        # magic-link path above works fine headless, so it is NOT gated).
+        if not _require_headed_for_assisted(port, "claude.ai"):
+            return 2
+        # If auto already triggered the email, don't re-send.
         if ANTHROPIC_LOGIN_EMAIL and not auto_attempted:
             _claude_fill_email_and_continue(page, ANTHROPIC_LOGIN_EMAIL)
         hint = (
@@ -1633,6 +1726,9 @@ def cmd_openai_login(port: int) -> int:
         if _chatgpt_logged_in(page):
             print("✓ Already logged into ChatGPT (chatgpt.com).")
             return 0
+        # A cold session is assisted-only — pointless without a window.
+        if not _require_headed_for_assisted(port, "chatgpt.com"):
+            return 2
         from playwright.sync_api import Error as PlaywrightError
 
         try:
@@ -1816,6 +1912,9 @@ def cmd_slack_login(port: int) -> int:
         if _slack_logged_in(page):
             print("✓ Already logged into Slack — session persists; nothing to do.")
             return 0
+        # A cold session is assisted-only — pointless without a window.
+        if not _require_headed_for_assisted(port, "Slack"):
+            return 2
         from playwright.sync_api import Error as PlaywrightError
 
         # Land straight on the SDSC workspace sign-in (skips the workspace picker).
@@ -2290,7 +2389,7 @@ def main() -> int:
     ensure_deps()
     port = args.cdp_port
     if args.cmd == "up":
-        return cmd_up(port)
+        return cmd_up(port, args.headless)
     if args.cmd == "status":
         return cmd_status(port)
     if args.cmd == "down":
