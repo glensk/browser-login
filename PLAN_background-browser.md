@@ -184,14 +184,14 @@ human asked for it.
       (⚠). 8/8 verdict unit checks.)*
 
 - [ ] **Follow-up (new 2026-08-20): stop calling `bring_to_front`
-      unconditionally in consumers.** anthropic-api.py:3353 and
-      openai-team.py:3068 call it on every flow; on CfT 151 that can raise
-      the window/steal focus (revised fact 3). Adopt doctor's pattern:
-      probe rAF first, escalate to tab-level `bring_to_front` ONLY when
-      rendering is frozen. Independently evaluate an occlusion-immune
-      rendering keep-alive that needs no window action at all (candidate:
-      `Page.startScreencast` during interactions) — requires a
-      fully-occluded test setup to validate, which needs a quiet desktop.
+      unconditionally in consumers.** ~~anthropic-api.py and openai-team.py
+      call it on every flow~~ — **consumer half DONE 2026-08-20**: both now
+      probe rAF first and escalate to tab-level `bring_to_front` only when
+      rendering is frozen (doctor's pattern); `-ta` dry-runs verified
+      end-to-end with zero window disturbance. REMAINING (this checkbox):
+      evaluate an occlusion-immune rendering keep-alive that needs no window
+      action at all (candidate: `Page.startScreencast` during interactions)
+      — requires a fully-occluded test setup, which needs a quiet desktop.
 - [x] Docs: README "Why you never see the window" + the consumer contract
       (tab-level bring_to_front only; no app activation; force-click never on
       final mutating controls; bounded screenshots; lease usage). *(done
