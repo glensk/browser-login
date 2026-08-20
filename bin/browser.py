@@ -982,15 +982,19 @@ def _lifecycle_transition(state: str, mode: str, rec: dict | None, port: int) ->
     Carrying the running browser's pid + start time into the transitional record
     keeps the shutdown ladder able to signal a *validated* PID after the record
     has already moved on; the nonce is fresh, one per transition. For
-    ``switching``, ``mode`` is the TARGET mode.
+    ``switching``, ``mode`` is the TARGET mode. When the previous record does not
+    (or does not any more) describe the live root — a browser started before
+    this mechanism existed, or by hand — the pid + start time are re-read from
+    the process table here, so the shutdown still gets a validated PID instead
+    of falling straight through to ``pkill``.
     """
-    return _lifecycle_write(
-        state,
-        mode,
-        pid=rec.get("pid") if rec else None,
-        process_start_time=rec.get("process_start_time") if rec else None,
-        port=port,
-    )
+    pid = _validated_root_pid(rec)
+    lstart = rec.get("process_start_time") if rec and pid is not None else None
+    if pid is None:
+        roots = _find_root_pids(port)
+        pid = roots[0] if len(roots) == 1 else None
+        lstart = _proc_lstart(pid) if pid is not None else None
+    return _lifecycle_write(state, mode, pid=pid, process_start_time=lstart, port=port)
 
 
 def _record_running(
@@ -1177,10 +1181,9 @@ def cmd_switch(port: int, target: str) -> int:
             + (" (lifecycle record refreshed)" if healed else "")
         )
         return 0
-    rec = _lifecycle_read()
-    _lifecycle_transition("switching", target, rec, port)
+    switching = _lifecycle_transition("switching", target, _lifecycle_read(), port)
     print(f"Switching {live.upper()} → {target.upper()} (stopping the browser)…")
-    if not _shutdown_browser(port, rec):
+    if not _shutdown_browser(port, switching):
         survivors = ", ".join(str(p) for p in _find_root_pids(port)) or "unknown"
         return _fail(
             f"Switch aborted: the browser did NOT stop (pid(s) {survivors} still "
@@ -1251,8 +1254,8 @@ def cmd_down(port: int) -> int:
         or (rec_mode if isinstance(rec_mode, str) else None)
         or "headed"
     )
-    _lifecycle_transition("stopping", mode, rec, port)
-    if not _shutdown_browser(port, rec):
+    stopping = _lifecycle_transition("stopping", mode, rec, port)
+    if not _shutdown_browser(port, stopping):
         survivors = ", ".join(str(p) for p in _find_root_pids(port)) or "unknown"
         return _fail(
             f"Shared browser did NOT stop — root process(es) {survivors} still "
