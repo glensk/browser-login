@@ -17,7 +17,10 @@ Generic lifecycle:
   up        Launch the shared browser (idempotent). Log into sites once here.
             [-H|--headless] opts into a windowless browser (same profile, same
             logins) — everything works except assisted (human) logins.
-  status    Show CDP health, browser version, and open tabs.
+  status    Show CDP health, browser version, open tabs, and the lifecycle record.
+  switch MODE
+            Transactionally switch to headed|headless: stop the browser and
+            relaunch it on the SAME profile (every login persists).
   down      Quit the shared browser.
   open URL  Open/navigate a tab to URL in the shared browser.
   eval JS   Run a JS expression in the active (or --url-matched) tab; print JSON.
@@ -55,18 +58,24 @@ import json
 import os
 import re
 import shutil
+import signal
 import subprocess
 import sys
 import time
 import urllib.error
 import urllib.request
+import uuid
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 
 DEFAULT_CDP_PORT = int(os.environ.get("CLAUDE_BROWSER_CDP_PORT", "9222"))
-PROFILE_DIR = Path.home() / ".cache" / "claude-browser" / "profile"
-PID_FILE = Path.home() / ".cache" / "claude-browser" / "browser.pid"
+CACHE_DIR = Path.home() / ".cache" / "claude-browser"
+PROFILE_DIR = CACHE_DIR / "profile"
+PID_FILE = CACHE_DIR / "browser.pid"
+# Single source of truth for "what is the shared browser doing right now" — see
+# the lifecycle section below. NO file means cleanly down.
+LIFECYCLE_FILE = CACHE_DIR / ".browser-lifecycle.json"
 PORTAL_PROFILE_URL = "https://portal.cscs.ch/profile/"
 PORTAL_API_ME = "https://portal.cscs.ch/api/users/me/"
 CSCS_TOKEN_CACHE = Path.home() / ".cache" / "cscs-api" / "portal_token"
@@ -152,7 +161,7 @@ KEYCHAIN_SVC_BIOPOL_PASS = "biopol-wifi: password"
 # Per-site log of REAL (cold) logins — one JSON object per line. Appended only
 # when `login <site>` actually had to sign in (never on a warm/already-logged-in
 # run), so `login-log <site>` shows how often you truly re-authenticated.
-LOGIN_LOG_DIR = Path.home() / ".cache" / "claude-browser" / "login-log"
+LOGIN_LOG_DIR = CACHE_DIR / "login-log"
 
 
 def parse_args() -> argparse.Namespace:
@@ -168,7 +177,8 @@ def parse_args() -> argparse.Namespace:
             "Examples:\n"
             "  ./browser.py up                 # start it, then log into sites once\n"
             "  ./browser.py up --headless      # windowless (same profile/logins)\n"
-            "  ./browser.py status             # CDP health + open tabs\n"
+            "  ./browser.py switch headless    # stop + relaunch windowless\n"
+            "  ./browser.py status             # CDP health + tabs + lifecycle\n"
             "  ./browser.py open https://portal.cscs.ch/profile/\n"
             "  ./browser.py eval 'document.title'\n"
             "  ./browser.py token              # cache the CSCS portal token\n"
@@ -196,7 +206,19 @@ def parse_args() -> argparse.Namespace:
         help="Opt-in headless mode (--headless=new): same profile, same logins, "
         "no window at all (env default CLAUDE_BROWSER_HEADLESS=1).",
     )
-    sub.add_parser("status", help="Show CDP health, version, and open tabs.")
+    sub.add_parser(
+        "status", help="Show CDP health, version, open tabs, and the lifecycle record."
+    )
+    psw = sub.add_parser(
+        "switch",
+        help="Transactional mode switch: stop the browser and relaunch it in MODE "
+        "on the SAME profile (every login persists).",
+    )
+    psw.add_argument(
+        "mode",
+        choices=("headed", "headless"),
+        help="Target mode to switch the shared browser to.",
+    )
     sub.add_parser("down", help="Quit the shared browser.")
     po = sub.add_parser("open", help="Open/navigate a tab to URL.")
     po.add_argument("url", help="URL to open.")
@@ -446,26 +468,6 @@ def _app_bundle(binary: str) -> Path | None:
     return None
 
 
-def _resolve_browser_pid(port: int) -> int | None:
-    """Best-effort main browser PID, found via its unique debug-port flag.
-
-    Only the top-level browser process carries ``--remote-debugging-port``
-    (renderer/GPU helpers do not), so pgrep on it isolates the parent. Used when
-    the browser was launched via ``open`` (which doesn't return the child PID).
-    """
-    try:
-        res = subprocess.run(
-            ["pgrep", "-f", f"remote-debugging-port={port}"],
-            capture_output=True,
-            text=True,
-            check=False,
-        )
-        pids = sorted(int(x) for x in res.stdout.split() if x.strip().isdigit())
-        return pids[0] if pids else None
-    except (OSError, ValueError):
-        return None
-
-
 def _launch_browser(
     binary: str, flags: list[str], headless: bool = False
 ) -> int | None:
@@ -476,8 +478,8 @@ def _launch_browser(
     in the background (its window opens *behind* the current app), and ``-n``
     forces our profile instance instead of focusing an unrelated running one.
     ``open`` doesn't return the browser's PID, so the caller resolves it after
-    CDP is up (``_resolve_browser_pid``). On other platforms a plain detached
-    ``Popen`` doesn't steal focus and yields the real PID. With ``headless`` there
+    CDP is up (``_record_running`` → ``_find_root_pids``). On other platforms a
+    plain detached ``Popen`` doesn't steal focus and yields the real PID. With ``headless`` there
     is no window to hide, so the ``open`` dance is pointless — go straight to
     ``Popen``, which also hands back the real PID immediately. Returns the PID if
     known immediately, else None. Opt out of background launch with
@@ -501,32 +503,566 @@ def _launch_browser(
     return proc.pid
 
 
-def cmd_up(port: int, headless: bool = False) -> int:
-    """Launch the shared browser if not already running (idempotent).
+# ---------------------------------------------------------------------------
+# Lifecycle record — at most ONE validated root browser, transactional switches
+# ---------------------------------------------------------------------------
+# The record (LIFECYCLE_FILE) answers "what is the shared browser doing right
+# now" for every client: {state, mode, pid, process_start_time, nonce, port,
+# iso}. NO file = cleanly down. A transitional state (starting/stopping/
+# switching) is the ONLY situation in which zero browser processes are
+# legitimate; in state `running` the record must agree with the live browser.
+# Nothing here trusts PID_FILE — a PID alone is forgeable by PID reuse, so the
+# (pid, ps start time, command line, executable path) tuple in the record is
+# what authorises a signal (see _validated_root_pid).
 
-    ``headless`` opts into ``--headless=new``: same profile, same logins, no
-    window at all. The mode is fixed at launch, so a request that disagrees with
-    the browser already running is REFUSED (loudly) instead of silently ignored;
-    switching modes means quitting the browser, which is the caller's decision.
+TRANSITIONAL_STATES = ("starting", "stopping", "switching")
+# A transition that has not finished within this long is a dead transition
+# (something crashed mid-flight) — reported, and overwritable by a new launch.
+TRANSITION_STALE_S = 120.0
+
+
+def _lifecycle_read() -> dict | None:
+    """The current lifecycle record, or None when absent or unreadable.
+
+    A missing file is the normal "cleanly down" state. A corrupt/truncated file
+    also reads as None rather than raising: the caller's job is to reconcile
+    with the live processes anyway, and `_lifecycle_problems` reports whatever
+    disagreement that causes.
     """
-    want = "headless" if headless else "headed"
-    running = _browser_mode(port)
-    if running is not None:
-        if running != want:
+    try:
+        data = json.loads(LIFECYCLE_FILE.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def _lifecycle_write(  # pylint: disable=too-many-arguments
+    state: str,
+    mode: str,
+    *,
+    pid: int | None = None,
+    process_start_time: str | None = None,
+    nonce: str | None = None,
+    port: int,
+) -> dict:
+    """Atomically write the lifecycle record; return the record written.
+
+    Written to a sibling ``.tmp`` and ``os.replace``d, so a concurrent reader
+    sees either the old or the new record but never a half-written one, and
+    chmod'ed 0600 (it names our profile's processes). A fresh ``nonce`` is
+    minted per transition unless the caller deliberately carries one over.
+    """
+    rec = {
+        "state": state,
+        "mode": mode,
+        "pid": pid,
+        "process_start_time": process_start_time,
+        "nonce": nonce or uuid.uuid4().hex,
+        "port": port,
+        "iso": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+    }
+    LIFECYCLE_FILE.parent.mkdir(parents=True, exist_ok=True)
+    tmp = LIFECYCLE_FILE.with_suffix(".tmp")
+    tmp.write_text(json.dumps(rec, indent=2) + "\n", encoding="utf-8")
+    tmp.chmod(0o600)
+    os.replace(tmp, LIFECYCLE_FILE)
+    return rec
+
+
+def _lifecycle_clear() -> None:
+    """Remove the record — i.e. declare the browser cleanly down. Idempotent."""
+    LIFECYCLE_FILE.unlink(missing_ok=True)
+
+
+def _ps_field(pid: int, fmt: str) -> str | None:
+    """One ``ps -o <fmt>`` field for PID, stripped; None if the process is gone.
+
+    ``LC_ALL=C`` pins the formatting (notably ``lstart``'s month/day names), so
+    a recorded start time stays comparable across locale changes.
+    """
+    try:
+        r = subprocess.run(
+            ["ps", "-p", str(pid), "-o", fmt],
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=False,
+            env={**os.environ, "LC_ALL": "C"},
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return r.stdout.strip() or None
+
+
+def _proc_lstart(pid: int) -> str | None:
+    """The process start time of PID (``ps -o lstart=``), or None if it's gone.
+
+    (pid, start time) is what makes a PID unforgeable: a recycled PID always
+    has a later start time than the one the record remembers.
+    """
+    return _ps_field(pid, "lstart=")
+
+
+def _proc_command(pid: int) -> str | None:
+    """The full command line of PID (``ps -o command=``), or None if it's gone."""
+    return _ps_field(pid, "command=")
+
+
+def _playwright_cache_root() -> Path:
+    """Playwright's browser cache dir — the only place our chromium may live."""
+    if sys.platform == "darwin":
+        return Path.home() / "Library" / "Caches" / "ms-playwright"
+    return Path.home() / ".cache" / "ms-playwright"
+
+
+def _is_root_command(cmd: str, port: int) -> bool:
+    """True if a ``ps`` command line is OUR ROOT browser process on `port`.
+
+    Renderer/GPU/utility children inherit the flags but every one of them
+    carries ``--type=<kind>``; only the top-level browser process has none. That
+    single negative check separates the one process we may signal from its dozen
+    helpers, and the profile-dir check keeps other people's Chromiums out.
+    """
+    return (
+        f"remote-debugging-port={port}" in cmd
+        and f"--user-data-dir={PROFILE_DIR}" in cmd
+        and "--type=" not in cmd
+    )
+
+
+def _find_root_pids(port: int) -> list[int]:
+    """PIDs of every root browser process for our profile on `port` (normally ≤1).
+
+    pgrep on the debug-port flag catches the whole process tree, so each
+    candidate is re-checked against its command line (`_is_root_command`). More
+    than one hit means two roots on one profile — the corrupted state
+    `_launch_guard` refuses to add to.
+    """
+    try:
+        res = subprocess.run(
+            ["pgrep", "-f", f"remote-debugging-port={port}"],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+    except OSError:
+        return []
+    pids: list[int] = []
+    for tok in res.stdout.split():
+        if not tok.strip().isdigit():
+            continue
+        pid = int(tok)
+        cmd = _proc_command(pid)
+        if cmd and _is_root_command(cmd, port):
+            pids.append(pid)
+    return sorted(pids)
+
+
+def _validated_root_pid(rec: dict | None) -> int | None:
+    """The record's PID iff it is STILL the exact process the record describes.
+
+    Every one of these must hold: an int PID; the process alive; its ``ps``
+    start time identical to the recorded one; a command line that is a root
+    browser for the recorded port and our profile; and an executable inside
+    Playwright's browser cache. This is the ONLY PID this script ever signals
+    directly — a recycled PID fails the start-time check, so we can never
+    SIGTERM some unrelated process that inherited the number.
+    """
+    if not isinstance(rec, dict):
+        return None
+    pid, want_start, port = (
+        rec.get("pid"),
+        rec.get("process_start_time"),
+        rec.get("port"),
+    )
+    if not (
+        isinstance(pid, int)
+        and isinstance(port, int)
+        and isinstance(want_start, str)
+        and want_start
+    ):
+        return None
+    if _proc_lstart(pid) != want_start:
+        return None
+    cmd = _proc_command(pid)
+    if not cmd or not _is_root_command(cmd, port):
+        return None
+    if not cmd.split()[0].startswith(str(_playwright_cache_root())):
+        return None
+    return pid
+
+
+def _singleton_lock() -> tuple[Path, str | None]:
+    """The profile's ``SingletonLock`` path plus its ``<host>-<pid>`` target.
+
+    Chrome creates it as a DANGLING symlink (the target names a host and PID,
+    not a real file), so presence must be probed with ``os.path.lexists`` —
+    ``Path.exists()`` follows the link and reports False for a lock that is very
+    much there. Second element is None when the lock is absent or unreadable.
+    """
+    lock = PROFILE_DIR / "SingletonLock"
+    if not os.path.lexists(lock):
+        return lock, None
+    try:
+        return lock, os.readlink(lock)
+    except OSError:
+        return lock, None
+
+
+def _singleton_lock_stale(target: str | None, port: int) -> bool:
+    """True if a present ``SingletonLock`` is crash debris, not a live lock.
+
+    Stale when the PID part of the target can't be parsed, the PID is gone, or
+    it belongs to something that is demonstrably not our browser. Deliberately
+    CONSERVATIVE: a live PID whose command line mentions our profile dir counts
+    as a real lock and is never removed — deleting a live lock invites two
+    browsers onto one profile, the exact corruption this step exists to prevent.
+    """
+    pid_part = (target or "").rsplit("-", 1)[-1]
+    if not pid_part.isdigit():
+        return True
+    pid = int(pid_part)
+    cmd = _proc_command(pid)
+    if cmd is None:
+        return True  # nothing alive is holding it
+    if str(PROFILE_DIR) in cmd:
+        return False  # a live process on our profile: real lock, hands off
+    return pid not in _find_root_pids(port)
+
+
+def _iso_age_s(iso: object) -> float | None:
+    """Seconds since a record's ``iso`` timestamp, or None if it won't parse."""
+    import datetime as _dt
+
+    if not isinstance(iso, str):
+        return None
+    try:
+        then = _dt.datetime.strptime(iso, "%Y-%m-%dT%H:%M:%S%z")
+    except (ValueError, TypeError):
+        return None
+    return (_dt.datetime.now(_dt.timezone.utc) - then).total_seconds()
+
+
+def _record_problems(rec: dict, port: int, *, up: bool) -> list[str]:
+    """Everything wrong with a PRESENT lifecycle record, relative to reality."""
+    problems: list[str] = []
+    state = str(rec.get("state", "?"))
+    rec_port = rec.get("port")
+    if isinstance(rec_port, int) and rec_port != port:
+        problems.append(f"record is for port {rec_port}, not the probed port {port}")
+    if state in TRANSITIONAL_STATES:
+        age = _iso_age_s(rec.get("iso"))
+        if age is None:
+            problems.append(
+                f"record is mid-transition ({state}) with an unparsable "
+                f"timestamp {rec.get('iso')!r}"
+            )
+        elif age > TRANSITION_STALE_S:
+            problems.append(
+                f"record stuck mid-transition ({state}) for {age / 60:.1f} min — "
+                "a transition died; `browser.py down` then `up` resets it"
+            )
+        return problems
+    if state != "running":
+        problems.append(f"record has an unknown state {state!r}")
+        return problems
+    if not up:
+        problems.append(
+            "record says 'running' but there is no CDP — the browser crashed "
+            "or was killed"
+        )
+    if _validated_root_pid(rec) is None:
+        problems.append(
+            f"recorded pid {rec.get('pid')} does not validate any more (gone, "
+            "restarted, or a different process)"
+        )
+    live_mode = _browser_mode(port)
+    if live_mode is not None and live_mode != rec.get("mode"):
+        problems.append(
+            f"live browser is {live_mode.upper()} but the record says "
+            f"{str(rec.get('mode')).upper()}"
+        )
+    return problems
+
+
+def _lifecycle_problems(port: int) -> list[str]:
+    """Human-readable list of lifecycle invariant violations; empty = healthy.
+
+    The invariants: at most ONE validated root browser process; zero processes
+    only while a transitional state is recorded; and, in state ``running``, a
+    record that agrees with the live browser (pid, mode, port, CDP up). Used by
+    ``status`` today and by ``doctor`` later.
+    """
+    rec = _lifecycle_read()
+    roots = _find_root_pids(port)
+    up = _is_up(port)
+    problems: list[str] = []
+    if len(roots) > 1:
+        pids = ", ".join(str(p) for p in roots)
+        problems.append(
+            f"{len(roots)} root browser processes on this profile (pids {pids}) — "
+            "expected at most one"
+        )
+    if rec is None:
+        if up or roots:
+            problems.append(
+                "browser is running but there is no lifecycle record (started "
+                "outside browser.py, or the record was lost)"
+            )
+    else:
+        problems.extend(_record_problems(rec, port, up=up))
+    lock, target = _singleton_lock()
+    if not up and os.path.lexists(lock) and _singleton_lock_stale(target, port):
+        problems.append(
+            f"stale SingletonLock in the profile ({target or 'unreadable'}) — "
+            "`browser.py up` clears it"
+        )
+    return problems
+
+
+def _cdp_browser_close(port: int) -> bool:
+    """Ask the browser to quit itself over CDP (``Browser.close``); True if sent.
+
+    The graceful path: Chrome flushes the profile (cookies, sessions) and
+    removes its own SingletonLock, neither of which a signal-based kill gets
+    right. A dropped connection while the command is in flight is the EXPECTED
+    success case (the browser died before answering), so that counts as sent.
+    Deliberately not routed through `_connect`, which ``sys.exit``s when the
+    browser is down.
+    """
+    try:
+        from playwright.sync_api import Error as PlaywrightError
+        from playwright.sync_api import sync_playwright
+    except ImportError:
+        return False
+    try:
+        pw = sync_playwright().start()
+    except (PlaywrightError, OSError):
+        return False
+    sent = False
+    try:
+        browser = pw.chromium.connect_over_cdp(f"http://127.0.0.1:{port}")
+        browser.new_browser_cdp_session().send("Browser.close")
+        sent = True
+    except PlaywrightError as exc:
+        # "Target closed"/"connection closed" == the browser went away while the
+        # command was in flight, which is exactly what we asked for.
+        sent = any(
+            m in str(exc).lower() for m in ("closed", "disconnected", "not connected")
+        )
+    except OSError:
+        sent = False
+    finally:
+        try:
+            pw.stop()
+        except (PlaywrightError, OSError):
+            pass
+    return sent
+
+
+def _wait_for_roots_gone(port: int, timeout_s: float) -> bool:
+    """Poll in 0.25 s steps until no root browser process is left; True if gone."""
+    deadline = time.monotonic() + timeout_s
+    while True:
+        if not _find_root_pids(port):
+            return True
+        if time.monotonic() >= deadline:
+            return False
+        time.sleep(0.25)
+
+
+def _clear_lock_after_shutdown(port: int) -> None:
+    """Drop a ``SingletonLock`` the stopped browser left behind (best-effort).
+
+    Chrome removes the lock only on a GRACEFUL exit; after a SIGTERM/pkill it
+    dangles and the next launch refuses to start ("profile appears to be in
+    use"). Give the browser up to 5 s to clean up after itself, then unlink the
+    lock ourselves — but only if it is provably stale — and say so on stderr.
+    """
+    deadline = time.monotonic() + 5
+    while time.monotonic() < deadline:
+        lock, _target = _singleton_lock()
+        if not os.path.lexists(lock):
+            return
+        time.sleep(0.25)
+    lock, target = _singleton_lock()
+    if not os.path.lexists(lock):
+        return
+    if not _singleton_lock_stale(target, port):
+        print(
+            f"⚠ SingletonLock ({target}) still looks live — left in place.",
+            file=sys.stderr,
+        )
+        return
+    try:
+        lock.unlink()
+        print("  removed the SingletonLock the killed browser left.", file=sys.stderr)
+    except OSError as exc:
+        print(f"⚠ could not remove {lock}: {exc}", file=sys.stderr)
+
+
+def _shutdown_browser(port: int, rec: dict | None = None) -> bool:
+    """Stop the shared browser, escalating only as far as needed. True if gone.
+
+    Assumes the caller ALREADY wrote a transitional record (``stopping`` /
+    ``switching``), so an observer that finds zero processes can tell a
+    transition from a crash. Ladder, every step polled instead of slept blindly:
+
+      1. CDP ``Browser.close`` — graceful, flushes the profile, drops the lock.
+      2. up to 5 s waiting for every root process to disappear.
+      3. ``SIGTERM`` to the ONE validated root PID (`_validated_root_pid` of the
+         pre-shutdown record — never a bare PID from a file), then wait until
+         10 s total have passed.
+      4. ``pkill -f user-data-dir=<profile>`` — pattern-scoped to our profile,
+         the fallback for `open`-launched roots whose PID we never captured.
+      5. a final ≤5 s poll, plus removal of a leftover SingletonLock.
+    """
+    rec = _lifecycle_read() if rec is None else rec
+    pid = _validated_root_pid(rec)
+    start = time.monotonic()
+    if _is_up(port):
+        _cdp_browser_close(port)
+    if not _wait_for_roots_gone(port, 5.0):
+        if pid is not None:
+            try:
+                os.kill(pid, signal.SIGTERM)
+            except (ProcessLookupError, PermissionError):
+                pass
+        remaining = max(0.5, 10.0 - (time.monotonic() - start))
+        if not _wait_for_roots_gone(port, remaining):
+            # Pattern must NOT start with '-', or BSD pkill parses it as an
+            # option ("illegal option -- -"); 'user-data-dir=<profile>' still
+            # matches only our browser's processes.
+            subprocess.run(["pkill", "-f", f"user-data-dir={PROFILE_DIR}"], check=False)
+            _wait_for_roots_gone(port, 5.0)
+    gone = not _find_root_pids(port)
+    if gone:
+        _clear_lock_after_shutdown(port)
+    return gone
+
+
+def _launch_guard(port: int) -> str | None:
+    """Reason a relaunch must ABORT, or None when launching is safe.
+
+    Blockers: a surviving root process (a second root on one profile is the
+    corruption this step exists to prevent) and a ``SingletonLock`` that is not
+    demonstrably stale. A provably stale lock is removed here (crash leftover);
+    a dead transitional record is NOT a blocker — it is reported and then
+    overwritten by the launch.
+    """
+    roots = _find_root_pids(port)
+    if roots:
+        pids = ", ".join(str(p) for p in roots)
+        return f"a root browser process for this profile is still alive (pid(s) {pids})"
+    lock, target = _singleton_lock()
+    if os.path.lexists(lock):
+        if not _singleton_lock_stale(target, port):
+            return f"the profile's SingletonLock is held by a live process ({target})"
+        try:
+            lock.unlink()
+            print("removed stale SingletonLock (crash leftover)", file=sys.stderr)
+        except OSError as exc:
+            return f"the stale SingletonLock {lock} could not be removed: {exc}"
+    rec = _lifecycle_read()
+    state = str(rec.get("state", "?")) if rec else ""
+    if state in TRANSITIONAL_STATES:
+        age = _iso_age_s(rec.get("iso") if rec else None)
+        if age is None or age > 60:
             print(
-                f"❌ Mode mismatch: the shared browser is up in {running.upper()} "
-                f"mode, but {want.upper()} was requested.\n"
-                "   The mode is fixed at launch. To switch, quit it first:\n"
-                "     browser.py down && browser.py up"
-                f"{' --headless' if headless else ''}",
+                f"overwriting a dead '{state}' lifecycle record "
+                "(no browser process is running)",
                 file=sys.stderr,
             )
-            return 1
+    return None
+
+
+def _lifecycle_transition(state: str, mode: str, rec: dict | None, port: int) -> dict:
+    """Record a ``stopping``/``switching`` transition over the OLD process.
+
+    Carrying the running browser's pid + start time into the transitional record
+    keeps the shutdown ladder able to signal a *validated* PID after the record
+    has already moved on; the nonce is fresh, one per transition. For
+    ``switching``, ``mode`` is the TARGET mode.
+    """
+    return _lifecycle_write(
+        state,
+        mode,
+        pid=rec.get("pid") if rec else None,
+        process_start_time=rec.get("process_start_time") if rec else None,
+        port=port,
+    )
+
+
+def _record_running(
+    port: int, mode: str, pid: int | None = None, nonce: str | None = None
+) -> int | None:
+    """Write the ``running`` record for the live browser; return its root PID.
+
+    The PID is resolved from the process table rather than trusted: an
+    `open`-launched browser never handed us one. The finished record is then
+    re-validated (`_validated_root_pid`) so a browser that does not match its
+    own record is flagged immediately instead of at the next `down`.
+    """
+    roots = _find_root_pids(port)
+    if pid not in roots:
+        pid = roots[0] if roots else None
+    lstart = _proc_lstart(pid) if pid is not None else None
+    rec = _lifecycle_write(
+        "running", mode, pid=pid, process_start_time=lstart, nonce=nonce, port=port
+    )
+    if pid is None:
         print(
-            f"✓ Shared browser already up, {running.upper()} "
-            f"(CDP http://localhost:{port})."
+            "⚠ browser is up but no root process matched our profile — "
+            "lifecycle record written without a pid.",
+            file=sys.stderr,
         )
-        return 0
+    elif _validated_root_pid(rec) is None:
+        print(
+            f"⚠ pid {pid} does not validate against its own lifecycle record; "
+            "`browser.py status` will keep reporting it.",
+            file=sys.stderr,
+        )
+    else:
+        PID_FILE.write_text(str(pid))  # legacy, for external observers only
+    return pid
+
+
+def _heal_running_record(port: int, mode: str) -> bool:
+    """Make the record match an already-running browser; True if it was rewritten.
+
+    Covers the honest cases where a perfectly good browser has a wrong record:
+    it predates this mechanism, was started by hand, or the record was lost.
+    """
+    rec = _lifecycle_read()
+    if (
+        _validated_root_pid(rec) is not None
+        and rec is not None
+        and rec.get("state") == "running"
+        and rec.get("mode") == mode
+        and rec.get("port") == port
+    ):
+        return False
+    _record_running(port, mode)
+    return True
+
+
+def _launch_and_record(port: int, headless: bool) -> int:
+    """Cold-launch the shared browser and record it. Shared by ``up``/``switch``.
+
+    Order matters: `_launch_guard` first (never a second root on one profile),
+    then a ``starting`` record BEFORE the launch (so the window in which zero
+    processes exist is an explicitly recorded transition), then a ``running``
+    record with the validated PID once CDP answers. If CDP never comes up the
+    ``starting`` record is deliberately left behind for `status`/`doctor`.
+    """
+    want = "headless" if headless else "headed"
+    reason = _launch_guard(port)
+    if reason is not None:
+        return _fail(
+            f"Refusing to launch a second browser on this profile: {reason}.\n"
+            "   Stop the old one first: browser.py down   "
+            "(then `browser.py status` should report no lifecycle problems)."
+        )
     PROFILE_DIR.mkdir(parents=True, exist_ok=True)
     # Cold start (nothing was running, per _browser_mode): wipe stale tab-restore
     # state so the window opens clean instead of resurrecting every tab from the
@@ -555,22 +1091,20 @@ def cmd_up(port: int, headless: bool = False) -> int:
         # profile, same logins). The anti-throttling flags above are kept — with
         # no window they're moot, but harmless, and one mode difference less.
         flags.append("--headless=new")
+    rec = _lifecycle_write("starting", want, port=port)
     # Launch in the background so it never steals focus (see _launch_browser).
     pid = _launch_browser(binary, flags, headless=headless)
     if pid is not None:
         PID_FILE.write_text(str(pid))
     for _ in range(50):  # up to ~10s
         if _is_up(port):
-            if pid is None:  # `open`-launched: resolve the real PID now it's up.
-                pid = _resolve_browser_pid(port)
-                if pid is not None:
-                    PID_FILE.write_text(str(pid))
+            pid = _record_running(port, want, pid, rec["nonce"])
             if headless:
                 print(
                     f"✓ Shared browser launched HEADLESS "
                     f"(no window; pid {pid or '?'}, CDP http://localhost:{port}).\n"
                     "  Logins from the profile still apply; assisted (human) "
-                    "logins need a window — `down` then plain `up` for those.\n"
+                    "logins need a window — `browser.py switch headed` for those.\n"
                     f"  Profile: {PROFILE_DIR}"
                 )
             else:
@@ -582,16 +1116,107 @@ def cmd_up(port: int, headless: bool = False) -> int:
                 )
             return 0
         time.sleep(0.2)
-    return _fail("Browser started but CDP endpoint never came up.")
+    return _fail(
+        "Browser started but CDP endpoint never came up — lifecycle record left "
+        "in state 'starting' (see `browser.py status`)."
+    )
+
+
+def cmd_up(port: int, headless: bool = False) -> int:
+    """Launch the shared browser if not already running (idempotent).
+
+    ``headless`` opts into ``--headless=new``: same profile, same logins, no
+    window at all. The mode is fixed at launch, so a request that disagrees with
+    the browser already running is REFUSED (loudly) instead of silently ignored —
+    ``browser.py switch MODE`` does that transactionally. When the running mode
+    DOES match, the lifecycle record is healed to describe the live process.
+    """
+    want = "headless" if headless else "headed"
+    running = _browser_mode(port)
+    if running is not None:
+        if running != want:
+            print(
+                f"❌ Mode mismatch: the shared browser is up in {running.upper()} "
+                f"mode, but {want.upper()} was requested.\n"
+                "   The mode is fixed at launch. Switch it in one transaction:\n"
+                f"     browser.py switch {want}",
+                file=sys.stderr,
+            )
+            return 1
+        healed = _heal_running_record(port, running)
+        print(
+            f"✓ Shared browser already up, {running.upper()} "
+            f"(CDP http://localhost:{port})."
+            + (" (lifecycle record refreshed)" if healed else "")
+        )
+        return 0
+    return _launch_and_record(port, headless)
+
+
+def cmd_switch(port: int, target: str) -> int:
+    """Switch the running browser between headed and headless, transactionally.
+
+    The mode is fixed at launch, so switching means stop + relaunch — on the
+    SAME profile, so every login survives (they live in the profile, not the
+    process). Each phase is recorded (``switching`` → ``starting`` → ``running``)
+    and the relaunch is refused while the old root process or its SingletonLock
+    is still around, so a failed switch leaves ONE state to inspect instead of
+    two browsers fighting over one profile.
+    """
+    live = _browser_mode(port)
+    if live is None:
+        return _fail(
+            "Nothing to switch — the shared browser is down. Run: browser.py up"
+            f"{' --headless' if target == 'headless' else ''}"
+        )
+    if live == target:
+        healed = _heal_running_record(port, live)
+        print(
+            f"✓ Shared browser already in {target.upper()} mode "
+            f"(CDP http://localhost:{port})."
+            + (" (lifecycle record refreshed)" if healed else "")
+        )
+        return 0
+    rec = _lifecycle_read()
+    _lifecycle_transition("switching", target, rec, port)
+    print(f"Switching {live.upper()} → {target.upper()} (stopping the browser)…")
+    if not _shutdown_browser(port, rec):
+        survivors = ", ".join(str(p) for p in _find_root_pids(port)) or "unknown"
+        return _fail(
+            f"Switch aborted: the browser did NOT stop (pid(s) {survivors} still "
+            "alive). The lifecycle record is left in state 'switching' — see "
+            "`browser.py status`."
+        )
+    rc = _launch_and_record(port, target == "headless")
+    if rc != 0:
+        return rc
+    print(f"✓ Switched to {target.upper()}.")
+    return 0
+
+
+def _print_lifecycle(port: int) -> None:
+    """Print the lifecycle record summary plus every invariant violation."""
+    rec = _lifecycle_read()
+    if rec is None:
+        print("Lifecycle: no record (cleanly down, or never started by browser.py)")
+    else:
+        pid = rec.get("pid")
+        print(
+            f"Lifecycle: {rec.get('state', '?')} / {rec.get('mode', '?')} / "
+            f"pid {pid if pid is not None else '-'} (since {rec.get('iso', '?')})"
+        )
+    for problem in _lifecycle_problems(port):
+        print(f"  ⚠ {problem}")
 
 
 def cmd_status(port: int) -> int:
-    """Print CDP health, browser version, and open tabs."""
+    """Print CDP health, browser version, open tabs, and the lifecycle state."""
     ver = _cdp_get(port, "/json/version")
     if ver is None:
         print(
             f"✗ Shared browser is DOWN (no CDP on http://localhost:{port}). Run: browser.py up"
         )
+        _print_lifecycle(port)
         return 1
     assert isinstance(ver, dict)
     mode = _browser_mode(port) or "?"
@@ -602,30 +1227,41 @@ def cmd_status(port: int) -> int:
     print(f"  {len(pages)} tab(s):")
     for t in pages:
         print(f"   - {t.get('title') or '(untitled)'}  →  {t.get('url')}")
+    _print_lifecycle(port)
     return 0
 
 
-def cmd_down() -> int:
-    """Quit the shared browser."""
-    killed = False
-    if PID_FILE.exists():
-        try:
-            pid = int(PID_FILE.read_text().strip())
-            os.kill(pid, 15)
-            killed = True
-        except (ValueError, ProcessLookupError, PermissionError):
-            pass
+def cmd_down(port: int) -> int:
+    """Quit the shared browser: record the stop, escalate as needed, verify.
+
+    A ``stopping`` record goes down FIRST, so a concurrent observer that finds
+    zero browser processes can tell an intentional shutdown from a crash. The
+    record is cleared only once no root process is left; otherwise it stays as
+    the breadcrumb for `status` and this command reports failure instead of the
+    old unconditional "✓ stopped".
+    """
+    rec = _lifecycle_read()
+    if rec is None and not _find_root_pids(port) and not _is_up(port):
         PID_FILE.unlink(missing_ok=True)
-    # Fallback: match by profile dir. The pattern must NOT start with '-', or BSD
-    # pkill (macOS) parses it as an option ("illegal option -- -"); the substring
-    # 'user-data-dir=<profile>' still uniquely matches our browser processes. This
-    # path matters now that `open`-launched cold starts may not capture a PID.
-    fallback = subprocess.run(
-        ["pkill", "-f", f"user-data-dir={PROFILE_DIR}"], check=False
+        print("Stopped (or was not running).")
+        return 0
+    rec_mode = rec.get("mode") if rec else None
+    mode = (
+        _browser_mode(port)
+        or (rec_mode if isinstance(rec_mode, str) else None)
+        or "headed"
     )
-    if fallback.returncode == 0:  # pkill matched & signalled at least one process
-        killed = True
-    print("✓ Shared browser stopped." if killed else "Stopped (or was not running).")
+    _lifecycle_transition("stopping", mode, rec, port)
+    if not _shutdown_browser(port, rec):
+        survivors = ", ".join(str(p) for p in _find_root_pids(port)) or "unknown"
+        return _fail(
+            f"Shared browser did NOT stop — root process(es) {survivors} still "
+            "alive. The lifecycle record is left in state 'stopping'; retry "
+            "`browser.py down`, or inspect with `browser.py status`."
+        )
+    _lifecycle_clear()
+    PID_FILE.unlink(missing_ok=True)  # legacy pid file, kept for external observers
+    print("✓ Shared browser stopped.")
     return 0
 
 
@@ -2392,8 +3028,10 @@ def main() -> int:
         return cmd_up(port, args.headless)
     if args.cmd == "status":
         return cmd_status(port)
+    if args.cmd == "switch":
+        return cmd_switch(port, args.mode)
     if args.cmd == "down":
-        return cmd_down()
+        return cmd_down(port)
     if args.cmd == "open":
         return cmd_open(port, args.url)
     if args.cmd == "eval":
