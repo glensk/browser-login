@@ -27,9 +27,15 @@ human asked for it.
 2. macOS pauses rendering of the occluded window: rAF freezes → Playwright
    actionability ("stable" needs 2 rAF frames) and screenshots stall. The
    `--disable-backgrounding-*` launch flags did NOT unfreeze rAF.
-3. `page.bring_to_front()` (CDP, tab-level) unfreezes rAF WITHOUT raising the
-   macOS window (verified via `CGWindowListCopyWindowInfo`: Chrome for Testing
-   stayed behind Brave/iTerm) and without focus change.
+3. `page.bring_to_front()` (CDP, tab-level) unfreezes rAF. ~~WITHOUT raising
+   the macOS window … and without focus change~~ — **REVISED 2026-08-20:
+   on CfT 151, `Page.bringToFront` CAN raise the window to the top of the
+   z-order and even make Chrome the frontmost app (focus steal), measured
+   reproducibly (2/2: z 6→0 with frontmost flipping to Chrome; caught first
+   by `doctor`'s before/after window assert). The effect appears to depend
+   on macOS cooperative-activation state, which is why 2026-08-19 saw no
+   raise. Consumers currently call it unconditionally → see the follow-up
+   step below.
 4. Consumers additionally use robust clicks (force-fallback on NON-final
    controls only) and bounded screenshot timeouts.
 5. Interim mitigation shipped with the invite-flow work: both team CLIs hold
@@ -155,11 +161,37 @@ human asked for it.
       compare-before-release; crash/stale-owner tests. Unknown/unregistered
       CDP clients (detected: established connections on :9222 vs
       registrations) make automatic mode switching FAIL CLOSED.
-- [ ] **`browser.py doctor`.** Uses a disposable `data:` page; acquires the
+- [x] **`browser.py doctor`.** Uses a disposable `data:` page; acquires the
       interaction lease; bounded rAF/click/screenshot checks; records
       frontmost app + window z-order before/after and asserts them unchanged;
       closes its target; non-macOS → explicit skip. Also validates the
       lifecycle record against the live process.
+
+      *(done 2026-08-20: 11-check run, all green in ~4.6 s on the live
+      browser. Checks: lifecycle-vs-live validation (invariant violations =
+      ❌), registered/unknown client report (⚠ only — refusal is switch's
+      job), frontmost + Quartz z-order snapshot (pyobjc self-installs into
+      the venv on first need; osascript/pyobjc unavailable → per-check ⚠
+      skip; non-macOS → skip), interaction lease (reports inherited vs
+      exclusive), background `data:` probe tab (recognised by
+      `doctor-probe` marker, closed in a finally incl. a CDP fallback for
+      unadopted targets), rAF race-bounded 5 s, unforced click verified via
+      page sentinel, in-memory bounded screenshot. `bring_to_front` is an
+      ESCALATION, not a default — probe rAF first, btf only if frozen, then
+      re-probe — because doctor's own first live run caught btf raising the
+      window (z 8→1): a true positive that revised fact 3. Window verdict
+      distinguishes browser-caused raises (❌) from user activity mid-probe
+      (⚠). 8/8 verdict unit checks.)*
+
+- [ ] **Follow-up (new 2026-08-20): stop calling `bring_to_front`
+      unconditionally in consumers.** anthropic-api.py:3353 and
+      openai-team.py:3068 call it on every flow; on CfT 151 that can raise
+      the window/steal focus (revised fact 3). Adopt doctor's pattern:
+      probe rAF first, escalate to tab-level `bring_to_front` ONLY when
+      rendering is frozen. Independently evaluate an occlusion-immune
+      rendering keep-alive that needs no window action at all (candidate:
+      `Page.startScreencast` during interactions) — requires a
+      fully-occluded test setup to validate, which needs a quiet desktop.
 - [ ] Docs: README "Why you never see the window" + the consumer contract
       (tab-level bring_to_front only; no app activation; force-click never on
       final mutating controls; bounded screenshots; lease usage).

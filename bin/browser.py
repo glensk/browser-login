@@ -25,6 +25,8 @@ Generic lifecycle:
             client is attached ([-f|--force] switches anyway).
   clients   Show who is attached over CDP: the registered clients (tool, pid,
             purpose) plus any unregistered ones a switch would refuse.
+  doctor    Full health check: the lifecycle record, client coordination, and a
+            drivability probe (rAF/click/screenshot) on a disposable tab.
   register-exec [-t NAME] -- CMD ARGS…
             Run a long-lived CDP client (e.g. the Playwright MCP server) as a
             REGISTERED client: the registration lives exactly as long as CMD.
@@ -79,6 +81,7 @@ import uuid
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 DEFAULT_CDP_PORT = int(os.environ.get("CLAUDE_BROWSER_CDP_PORT", "9222"))
 CACHE_DIR = Path.home() / ".cache" / "claude-browser"
@@ -191,6 +194,7 @@ def parse_args() -> argparse.Namespace:
             "  ./browser.py switch headless    # stop + relaunch windowless\n"
             "  ./browser.py status             # CDP health + tabs + lifecycle\n"
             "  ./browser.py clients            # who is attached over CDP\n"
+            "  ./browser.py doctor             # full health check (disposable tab)\n"
             "  ./browser.py open https://portal.cscs.ch/profile/\n"
             "  ./browser.py eval 'document.title'\n"
             "  ./browser.py token              # cache the CSCS portal token\n"
@@ -242,6 +246,12 @@ def parse_args() -> argparse.Namespace:
         "clients",
         help="Show the registered CDP clients plus any unregistered ones (a "
         "switch refuses while those are attached).",
+    )
+    sub.add_parser(
+        "doctor",
+        help="Full health check of the shared browser: lifecycle record, "
+        "coordination, and a drivability probe on a disposable page — never "
+        "touches real tabs.",
     )
     pre = sub.add_parser(
         "register-exec",
@@ -1110,7 +1120,7 @@ def _launch_and_record(port: int, headless: bool) -> int:
         return _fail(
             f"Refusing to launch a second browser on this profile: {reason}.\n"
             "   Stop the old one first: browser.py down   "
-            "(then `browser.py status` should report no lifecycle problems)."
+            "(then `browser.py doctor` should certify a clean state)."
         )
     PROFILE_DIR.mkdir(parents=True, exist_ok=True)
     # Cold start (nothing was running, per _browser_mode): wipe stale tab-restore
@@ -2004,6 +2014,640 @@ def cmd_eval(port: int, js: str, url_substr: str | None) -> int:
     finally:
         browser.close()
         pw.stop()
+
+
+# ---------------------------------------------------------------------------
+# doctor — certify a RUNNING browser without touching a single real tab
+# ---------------------------------------------------------------------------
+# `status` answers "does the browser reply?"; `doctor` answers "can it actually
+# be DRIVEN?" — and proves it the only way that is safe on a shared, logged-in
+# browser: on a disposable `data:` page of its own, under the interaction lease
+# (so no other driver is clicking meanwhile), with every step bounded by a
+# timeout or a JS sentinel. The frontmost app and the window z-order are
+# snapshotted before and after, because the whole point of the background launch
+# is that driving the browser NEVER steals focus: a probe that raised the window
+# is a regression to report, not a detail to shrug at.
+
+DOCTOR_MARKS = {"ok": "✅", "warn": "⚠", "fail": "❌"}
+# The probe page: a title to recognise it by, and one button whose handler sets
+# a sentinel — so a click is VERIFIED from the page instead of inferred from the
+# absence of an exception.
+DOCTOR_PROBE_URL = (
+    "data:text/html,<title>doctor-probe</title>"
+    '<button id="b" onclick="window.__clicked=1">go</button>'
+)
+# Chrome percent-encodes the quotes and spaces of that URL once it is loaded, so
+# a probe tab is recognised by this prefix plus the title word, never by the
+# full string — and that pair matches nothing but our own throwaway pages.
+DOCTOR_PROBE_PREFIX = "data:text/html"
+# Rendering liveness: 2 nested requestAnimationFrame callbacks (Playwright's own
+# "element is stable" criterion) RACED against a 5 s setTimeout sentinel. The
+# race is what bounds the evaluate — an occluded window whose rendering macOS
+# paused never fires a frame, and without the sentinel the evaluate would hang
+# forever instead of reporting the freeze.
+DOCTOR_RAF_JS = """() => {
+  const t0 = performance.now();
+  const frames = new Promise((res) =>
+    requestAnimationFrame(() => requestAnimationFrame(() => res(true))));
+  const sentinel = new Promise((res) => setTimeout(() => res(false), 5000));
+  return Promise.race([frames, sentinel]).then(
+    (alive) => ({ alive, delta: performance.now() - t0 }));
+}"""
+# How a Chrome-for-Testing window identifies itself as an app/window owner
+# (matched case-insensitively): "Google Chrome for Testing".
+CHROME_OWNER_MARK = "chrome for testing"
+# One-line AppleScript for `osascript -e`: the name of the active application.
+FRONTMOST_OSASCRIPT = (
+    'tell application "System Events" to get name of first process '
+    "whose frontmost is true"
+)
+
+
+def _doctor_add(log: list[str], level: str, check: str, detail: str) -> None:
+    """Print one ``✅/⚠/❌ <check>: <detail>`` line; record its level in `log`.
+
+    The log is nothing but the list of levels — the verdict counts them — and
+    printing as we go keeps a probe that takes seconds readable in real time.
+    """
+    print(f"{DOCTOR_MARKS[level]} {check}: {detail}")
+    log.append(level)
+
+
+def _exc_line(exc: BaseException) -> str:
+    """The first, clipped line of an exception message — enough to diagnose."""
+    lines = str(exc).strip().splitlines()
+    return lines[0][:160] if lines else type(exc).__name__
+
+
+def _is_probe_url(url: str) -> bool:
+    """True only for one of doctor's own disposable probe pages.
+
+    Deliberately narrow: a bare ``data:text/html`` test would also match a page
+    somebody else opened, and doctor closes what this matches.
+    """
+    return url.startswith(DOCTOR_PROBE_PREFIX) and "doctor-probe" in url
+
+
+def _frontmost_app() -> str | None:
+    """The name of the frontmost macOS application, or None if unreadable.
+
+    Read through System Events, which needs Automation permission for the
+    calling terminal; a refusal (or any other osascript failure) is reported as
+    a SKIPPED check, never as a violation — not knowing is not a regression.
+    """
+    try:
+        res = subprocess.run(
+            ["osascript", "-e", FRONTMOST_OSASCRIPT],
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return res.stdout.strip() or None
+
+
+def _quartz_module() -> Any:
+    """The ``Quartz`` module if it is importable right now, else None."""
+    try:
+        import Quartz
+
+        return Quartz
+    except ImportError:
+        return None
+
+
+def _import_quartz() -> Any:
+    """Quartz, self-healing ONE pyobjc install if missing; None if unavailable.
+
+    pyobjc is NOT one of this script's dependencies (`ensure_deps`) — the window
+    z-order check is the only thing that wants it — so it is installed on first
+    need, into the same isolated venv and the same way a dep added after that
+    venv was created is. If the install (no uv, no network) or the re-import
+    fails, the caller degrades to a frontmost-only comparison.
+    """
+    quartz = _quartz_module()
+    if quartz is not None:
+        return quartz
+    venv_python = CACHE_DIR / "venv" / "bin" / "python3"
+    print(
+        "doctor: installing pyobjc-framework-Quartz (window z-order check)…",
+        file=sys.stderr,
+    )
+    try:
+        subprocess.run(
+            [
+                "uv",
+                "pip",
+                "install",
+                "--python",
+                str(venv_python),
+                "pyobjc-framework-Quartz",
+            ],
+            check=True,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return _quartz_module()
+
+
+def _window_owners() -> list[str] | None:
+    """Owner app of every ordinary on-screen window, FRONT to BACK; None if unknown.
+
+    ``CGWindowListCopyWindowInfo`` lists windows in z-order, frontmost first.
+    Only layer 0 — the normal window layer — is kept: menu bars, the Dock,
+    tooltips and other overlays appear and vanish on their own and would make
+    the before/after comparison noisy without saying anything about who raised
+    whose window.
+    """
+    quartz = _import_quartz()
+    if quartz is None:
+        return None
+    owners: list[str] = []
+    try:
+        infos = quartz.CGWindowListCopyWindowInfo(
+            quartz.kCGWindowListOptionOnScreenOnly
+            | quartz.kCGWindowListExcludeDesktopElements,
+            quartz.kCGNullWindowID,
+        )
+        for info in infos or []:
+            if int(info.get("kCGWindowLayer") or 0) != 0:
+                continue
+            owners.append(str(info.get("kCGWindowOwnerName") or "?"))
+    except (AttributeError, OSError, TypeError, ValueError):
+        return None
+    return owners
+
+
+def _window_snapshot() -> dict | None:
+    """The desktop right now: ``{"frontmost", "owners"}``; None when not on macOS.
+
+    Either field is None when that particular reading is unavailable (no
+    Automation permission, no pyobjc), which the caller reports as a skipped
+    check and then leaves out of the comparison.
+    """
+    if sys.platform != "darwin":
+        return None
+    return {"frontmost": _frontmost_app(), "owners": _window_owners()}
+
+
+def _chrome_z_index(owners: list[str]) -> int:
+    """Front-most z-order index of a Chrome-for-Testing window in `owners`.
+
+    ``len(owners)`` — behind everything listed — when the shared browser has no
+    on-screen window at all, so "its window appeared" compares as a move UP
+    exactly like "its window was raised" does.
+    """
+    for i, name in enumerate(owners):
+        if CHROME_OWNER_MARK in name.lower():
+            return i
+    return len(owners)
+
+
+def _windows_verdict(before: dict, after: dict) -> tuple[str, str]:
+    """Compare two `_window_snapshot`s: ``(level, message)`` for one check line.
+
+    The invariant being certified is that DRIVING the browser never raises it: a
+    tab-level ``bring_to_front``, a click and a screenshot must leave the
+    desktop as they found it. Exactly two differences are real failures — the
+    browser became frontmost, or it climbed the z-order — because only the
+    browser can cause those. Every other difference is somebody using their Mac
+    while doctor ran, which is reported as a warning to rerun on a quiet desktop
+    rather than as a false accusation. Unknown readings are not compared at all.
+    """
+    fbefore, fafter = before.get("frontmost"), after.get("frontmost")
+    obefore, oafter = before.get("owners"), after.get("owners")
+    front_known = isinstance(fbefore, str) and isinstance(fafter, str)
+    owners_known = isinstance(obefore, list) and isinstance(oafter, list)
+    front_changed = front_known and fbefore != fafter
+    owners_changed = owners_known and obefore != oafter
+    if front_changed and CHROME_OWNER_MARK in str(fafter).lower():
+        return "fail", (
+            f"the browser RAISED ITSELF to the front ({fbefore!r} → {fafter!r}) "
+            "— driving it must never steal focus"
+        )
+    if owners_known:
+        zbefore = _chrome_z_index(list(obefore or []))
+        zafter = _chrome_z_index(list(oafter or []))
+        if zafter < zbefore:
+            return "fail", (
+                f"the browser moved UP the window z-order (index {zbefore} → "
+                f"{zafter}) — something raised its window"
+            )
+    if front_changed or owners_changed:
+        return "warn", (
+            "window order changed by user activity (not the browser) — rerun "
+            "doctor on a quiet desktop to confirm"
+        )
+    compared = (
+        " + ".join(
+            name
+            for name, known in (
+                ("frontmost app", front_known),
+                ("z-order", owners_known),
+            )
+            if known
+        )
+        or "nothing — both readings unavailable"
+    )
+    return "ok", f"unchanged by the probe ({compared})"
+
+
+def _doctor_lifecycle(log: list[str], port: int) -> bool:
+    """Validate the lifecycle record against reality; True if a browser is up.
+
+    Every entry `_lifecycle_problems` reports is an INVARIANT violation (two
+    roots on one profile, a record that disagrees with the live browser, crash
+    debris), so each becomes a ❌ here — where `status`, a pure report, only
+    lists them.
+    """
+    problems = _lifecycle_problems(port)
+    for problem in problems:
+        _doctor_add(log, "fail", "lifecycle", problem)
+    if not problems:
+        rec = _lifecycle_read()
+        if rec is None:
+            _doctor_add(
+                log, "ok", "lifecycle", "no record — nothing is recorded as running"
+            )
+        else:
+            _doctor_add(
+                log,
+                "ok",
+                "lifecycle",
+                f"record agrees with the live browser: {rec.get('state')}/"
+                f"{rec.get('mode')}, pid {rec.get('pid')} (since {rec.get('iso')})",
+            )
+    return _is_up(port)
+
+
+def _doctor_coordination(log: list[str], port: int) -> None:
+    """Report who else is attached over CDP — informational, never a failure.
+
+    Turning an unregistered client into a refusal is `switch`'s job: it has to
+    fail closed BEFORE it kills a browser somebody else is driving. Doctor only
+    certifies, so an unknown (or unverifiable) client is a ⚠ that leaves the
+    exit code alone. Listing the registrations also reaps dead ones.
+    """
+    live = _registry_live_clients()
+    if live:
+        listing = "; ".join(_describe_client(rec) for rec in live)
+        _doctor_add(log, "ok", "registered clients", f"{len(live)} attached: {listing}")
+    else:
+        _doctor_add(log, "ok", "registered clients", "none attached")
+    unknown = _unknown_cdp_clients(port)
+    if unknown is None:
+        _doctor_add(
+            log,
+            "warn",
+            "unregistered clients",
+            "cannot verify (no lsof on PATH) — `switch` fails closed in this state",
+        )
+    elif unknown:
+        listing = "; ".join(f"pid {pid}: {cmd[:60]}" for pid, cmd in unknown)
+        _doctor_add(
+            log,
+            "warn",
+            "unregistered clients",
+            f"{len(unknown)} nobody registered ({listing}) — `switch` would refuse",
+        )
+    else:
+        _doctor_add(log, "ok", "unregistered clients", f"none on port {port}")
+
+
+def _doctor_windows_before(log: list[str]) -> dict | None:
+    """Snapshot the desktop BEFORE the probe; None when there is nothing to compare."""
+    before = _window_snapshot()
+    if before is None:
+        _doctor_add(log, "warn", "window checks", "skipped (not macOS)")
+        return None
+    if before.get("frontmost") is None:
+        _doctor_add(
+            log,
+            "warn",
+            "frontmost check",
+            "skipped (osascript could not name the frontmost app — Automation "
+            "permission?)",
+        )
+    if before.get("owners") is None:
+        _doctor_add(
+            log,
+            "warn",
+            "z-order check",
+            "skipped (pyobjc-framework-Quartz unavailable)",
+        )
+    if before.get("frontmost") is None and before.get("owners") is None:
+        return None
+    owners = before.get("owners")
+    _doctor_add(
+        log,
+        "ok",
+        "window snapshot",
+        f"frontmost {before.get('frontmost')!r}, "
+        + (
+            f"{len(owners)} on-screen window(s)"
+            if owners is not None
+            else "z-order unknown"
+        ),
+    )
+    return before
+
+
+def _doctor_windows_after(log: list[str], before: dict) -> None:
+    """Re-snapshot the desktop and judge whether the probe disturbed it."""
+    after = _window_snapshot()
+    if after is None:
+        _doctor_add(
+            log, "warn", "window order", "could not re-read the desktop after the probe"
+        )
+        return
+    level, message = _windows_verdict(before, after)
+    _doctor_add(log, level, "window order", message)
+
+
+def _doctor_raf(log: list[str], page, *, escalated: bool) -> bool:
+    """rAF liveness: does the (usually occluded) window still paint frames?
+
+    The check that would have caught the 2026-08-19 regression, where macOS
+    paused rendering for the occluded background window and EVERY driver's
+    clicks timed out on Playwright's "element is stable" wait — 2 consecutive
+    animation frames, exactly what is measured here. Returns True when alive.
+    With ``escalated=False`` a frozen result is only a ⚠ — the caller retries
+    after ``bring_to_front``; the second attempt (``escalated=True``) is the
+    real verdict. (The 5 s setTimeout sentinel that bounds the evaluate relies
+    on ``--disable-background-timer-throttling``, which ``up`` always sets.)
+    """
+    from playwright.sync_api import Error as PlaywrightError
+
+    label = "rendering (rAF, after bring_to_front)" if escalated else "rendering (rAF)"
+    try:
+        result = page.evaluate(DOCTOR_RAF_JS)
+    except PlaywrightError as exc:
+        _doctor_add(log, "fail", label, f"evaluate failed: {_exc_line(exc)}")
+        return False
+    if not isinstance(result, dict):
+        _doctor_add(log, "fail", label, f"unexpected probe result {result!r}")
+        return False
+    delta = result.get("delta")
+    took = f"{float(delta):.0f} ms" if isinstance(delta, int | float) else "? ms"
+    if result.get("alive"):
+        _doctor_add(
+            log,
+            "ok",
+            label,
+            f"2 animation frames in {took} — the window paints while occluded",
+        )
+        return True
+    if not escalated:
+        _doctor_add(
+            log,
+            "warn",
+            label,
+            f"no animation frame within 5000 ms ({took}) — rendering is frozen; "
+            "escalating to tab-level bring_to_front (the consumer fallback)",
+        )
+        return False
+    _doctor_add(
+        log,
+        "fail",
+        label,
+        f"no animation frame within 5000 ms ({took}) even after bring_to_front "
+        "— rendering is frozen, so every click will time out",
+    )
+    return False
+
+
+def _doctor_click(log: list[str], page) -> None:
+    """A REAL click on the probe button — normal actionability, never forced.
+
+    ``force=True`` would skip precisely the hit-testing and stability waits that
+    a frozen or occluded window breaks, i.e. it would make this check pass while
+    every consumer's click still failed. The button's handler sets
+    ``window.__clicked``, so success is read back from the page.
+    """
+    from playwright.sync_api import Error as PlaywrightError
+
+    try:
+        page.click("#b", timeout=8000)
+        clicked = page.evaluate("() => window.__clicked === 1")
+    except PlaywrightError as exc:
+        _doctor_add(log, "fail", "click", f"page.click('#b') failed: {_exc_line(exc)}")
+        return
+    if clicked:
+        _doctor_add(
+            log, "ok", "click", "the button was clicked and its handler ran (no force)"
+        )
+    else:
+        _doctor_add(
+            log, "fail", "click", "click() returned but the handler set no sentinel"
+        )
+
+
+def _doctor_screenshot(log: list[str], page) -> None:
+    """A bounded screenshot, kept in memory — the capture path consumers rely on."""
+    from playwright.sync_api import Error as PlaywrightError
+
+    try:
+        shot = page.screenshot(timeout=10000)
+    except PlaywrightError as exc:
+        _doctor_add(
+            log, "fail", "screenshot", f"page.screenshot() failed: {_exc_line(exc)}"
+        )
+        return
+    if len(shot) < 1000:
+        _doctor_add(
+            log,
+            "warn",
+            "screenshot",
+            f"only {len(shot)} bytes — suspiciously small for a real capture",
+        )
+    else:
+        _doctor_add(
+            log,
+            "ok",
+            "screenshot",
+            f"{len(shot)} bytes captured in memory (no file written)",
+        )
+
+
+def _doctor_drivability(log: list[str], page) -> None:
+    """The bounded drivability checks on the probe page, in consumer order.
+
+    ``bring_to_front`` is an ESCALATION, not a default: on Chrome for Testing
+    151 ``Page.bringToFront`` can raise the window and even steal macOS focus
+    (measured 2026-08-20, reproducible), so the probe only reaches for it when
+    rendering is actually frozen — exactly the situation in which a consumer
+    would need it — and flags the escalation so the window checks that follow
+    are read in that light.
+    """
+    from playwright.sync_api import Error as PlaywrightError
+
+    if _doctor_raf(log, page, escalated=False):
+        _doctor_add(
+            log,
+            "ok",
+            "bring_to_front",
+            "not needed — rendering is alive without it (and on CfT 151 it can "
+            "raise the window / steal focus)",
+        )
+    else:
+        try:
+            page.bring_to_front()
+            _doctor_add(
+                log,
+                "warn",
+                "bring_to_front",
+                "escalated: rendering was frozen without it — NOTE: on CfT 151 "
+                "this can raise the window / steal focus",
+            )
+        except PlaywrightError as exc:
+            _doctor_add(
+                log,
+                "fail",
+                "bring_to_front",
+                f"bring_to_front() failed: {_exc_line(exc)}",
+            )
+        _doctor_raf(log, page, escalated=True)
+    _doctor_click(log, page)
+    _doctor_screenshot(log, page)
+
+
+def _doctor_open_probe(log: list[str], port: int) -> bool:
+    """Create the disposable probe tab in the BACKGROUND; True if it loaded.
+
+    Created over CDP with ``background: true`` (see `_open_background_tab`) so
+    it cannot raise the window, and this connection is then dropped again:
+    Playwright only adopts targets that already existed when it attached, so the
+    page object has to come from a FRESH connection.
+    """
+    pw, browser = _connect(port)
+    try:
+        info = _open_background_tab(port, browser, DOCTOR_PROBE_URL)
+    finally:
+        browser.close()
+        pw.stop()
+    url = str(info.get("url") or "")
+    if not _is_probe_url(url):
+        _doctor_add(
+            log,
+            "fail",
+            "probe setup",
+            f"the background probe tab never loaded (target url {url!r})",
+        )
+        return False
+    _doctor_add(
+        log,
+        "ok",
+        "probe page",
+        f"disposable data: tab created in the background (title {info.get('title')!r})",
+    )
+    return True
+
+
+def _close_probe_targets(port: int, browser) -> int:
+    """Close every leftover probe target over CDP; return how many were closed.
+
+    The fallback for the one case ``page.close()`` cannot cover: a probe tab
+    Playwright never adopted. Scoped by `_is_probe_url`, so it can only ever
+    close doctor's own throwaway pages.
+    """
+    session = browser.new_browser_cdp_session()
+    targets = _cdp_get(port, "/json")
+    closed = 0
+    for t in targets if isinstance(targets, list) else []:
+        tid = t.get("id") if isinstance(t, dict) else None
+        if tid and _is_probe_url(str(t.get("url") or "")):
+            session.send("Target.closeTarget", {"targetId": tid})
+            closed += 1
+    return closed
+
+
+def _doctor_probe(log: list[str], port: int) -> None:
+    """Drive a disposable probe page and report every drivability check.
+
+    Nothing here touches a real tab: the page is created by
+    `_doctor_open_probe`, driven, and closed again in a ``finally`` — including
+    the path where Playwright cannot see it, which is cleaned up over CDP. A
+    failed check therefore costs a throwaway tab at worst, never a login.
+    """
+    from playwright.sync_api import Error as PlaywrightError
+
+    if not _doctor_open_probe(log, port):
+        return
+    pw, browser = _connect(port)
+    page = None
+    try:
+        pages = [pg for ctx in browser.contexts for pg in ctx.pages]
+        for candidate in pages:
+            if _is_probe_url(candidate.url):
+                page = candidate
+                break
+        if page is None:
+            _doctor_add(
+                log,
+                "fail",
+                "probe setup",
+                f"the probe tab is invisible to Playwright after reconnecting "
+                f"({len(pages)} tab(s) seen)",
+            )
+            return
+        _doctor_drivability(log, page)
+    finally:
+        if page is not None:
+            with contextlib.suppress(PlaywrightError):
+                page.close()
+        else:
+            with contextlib.suppress(PlaywrightError):
+                _close_probe_targets(port, browser)
+        browser.close()
+        pw.stop()
+
+
+def cmd_doctor(port: int) -> int:
+    """Certify a RUNNING shared browser end to end; 0 only if nothing FAILED.
+
+    The order is deliberate: the lifecycle record is validated against the live
+    process first (a browser that disagrees with its own record is not worth
+    probing, and a cleanly DOWN one is not certifiable at all — doctor's job is
+    certifying a running browser, so that exits 1), then who else is attached,
+    then the desktop snapshot, then the probe itself.
+
+    LOCKS: a client registration is held for the WHOLE probe before the
+    interaction lease is taken — the documented gate-then-lease order — which
+    also keeps a `switch`/`down` from stealing the browser between the probe's
+    two CDP connections. ⚠ lines never change the exit code: "somebody else is
+    attached" and "you moved a window mid-probe" are facts to report, not
+    verdicts to fail on.
+    """
+    log: list[str] = []
+    if not _doctor_lifecycle(log, port):
+        _doctor_add(log, "fail", "doctor", "browser is down — nothing to probe")
+        return 1
+    _doctor_coordination(log, port)
+    before = _doctor_windows_before(log)
+    release = _registry_register("browser.py", _purpose(), port)
+    try:
+        with _interaction_lease("doctor") as owner:
+            _doctor_add(
+                log,
+                "ok",
+                "interaction lease",
+                "inherited from the parent (CLAUDE_BROWSER_LEASE_HELD=1)"
+                if owner == "inherited"
+                else f"held exclusively for the probe (owner {owner[:8]})",
+            )
+            _doctor_probe(log, port)
+            if before is not None:
+                _doctor_windows_after(log, before)
+    finally:
+        release()
+    failed = log.count("fail")
+    if failed:
+        print(f"❌ doctor: {failed} check(s) failed")
+        return 1
+    print(f"✅ doctor: all checks passed ({log.count('ok')} ✅, {log.count('warn')} ⚠)")
+    return 0
 
 
 def _scan_token(ctx, page) -> str | None:
@@ -3703,6 +4347,8 @@ def main() -> int:
         return cmd_switch(port, args.mode, args.force)
     if args.cmd == "clients":
         return cmd_clients(port)
+    if args.cmd == "doctor":
+        return cmd_doctor(port)
     if args.cmd == "register-exec":
         return cmd_register_exec(port, args.tool, args.cmd_)
     if args.cmd == "down":
