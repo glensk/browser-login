@@ -58,9 +58,9 @@ import sys
 import time
 import urllib.error
 import urllib.request
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable, Optional
 
 DEFAULT_CDP_PORT = int(os.environ.get("CLAUDE_BROWSER_CDP_PORT", "9222"))
 PROFILE_DIR = Path.home() / ".cache" / "claude-browser" / "profile"
@@ -251,7 +251,7 @@ def parse_args() -> argparse.Namespace:
     return p.parse_args()
 
 
-def ensure_deps():  # noqa: ANN201  # literal "def ensure_deps():" required by pre-commit hook
+def ensure_deps():  # literal "def ensure_deps():" required by pre-commit hook
     """Auto-create an isolated venv (NOT cscs-api's) and re-exec into it.
 
     Browser deps (playwright) are heavy, so they live in a dedicated venv under
@@ -387,7 +387,7 @@ def _clear_session_restore() -> int:
     return removed
 
 
-def _app_bundle(binary: str) -> Optional[Path]:
+def _app_bundle(binary: str) -> Path | None:
     """The ``.app`` bundle enclosing a macOS executable, or None if not bundled.
 
     e.g. ``…/Chromium.app/Contents/MacOS/Chromium`` → ``…/Chromium.app``.
@@ -398,7 +398,7 @@ def _app_bundle(binary: str) -> Optional[Path]:
     return None
 
 
-def _resolve_browser_pid(port: int) -> Optional[int]:
+def _resolve_browser_pid(port: int) -> int | None:
     """Best-effort main browser PID, found via its unique debug-port flag.
 
     Only the top-level browser process carries ``--remote-debugging-port``
@@ -406,7 +406,7 @@ def _resolve_browser_pid(port: int) -> Optional[int]:
     the browser was launched via ``open`` (which doesn't return the child PID).
     """
     try:
-        res = subprocess.run(  # noqa: S603,S607
+        res = subprocess.run(
             ["pgrep", "-f", f"remote-debugging-port={port}"],
             capture_output=True,
             text=True,
@@ -418,7 +418,7 @@ def _resolve_browser_pid(port: int) -> Optional[int]:
         return None
 
 
-def _launch_browser(binary: str, flags: list[str]) -> Optional[int]:
+def _launch_browser(binary: str, flags: list[str]) -> int | None:
     """Start the browser detached and WITHOUT stealing window focus.
 
     On macOS a subprocess-launched ``.app`` activates itself and grabs the
@@ -435,12 +435,12 @@ def _launch_browser(binary: str, flags: list[str]) -> Optional[int]:
     if sys.platform == "darwin" and not foreground:
         app = _app_bundle(binary)
         if app is not None:
-            subprocess.run(  # noqa: S603,S607
+            subprocess.run(
                 ["open", "-g", "-n", "-a", str(app), "--args", *flags],
                 check=False,
             )
             return None
-    proc = subprocess.Popen(  # noqa: S603 - launching a known browser binary
+    proc = subprocess.Popen(
         [binary, *flags],
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
@@ -466,6 +466,15 @@ def cmd_up(port: int) -> int:
         "--no-default-browser-check",
         "--hide-crash-restore-bubble",
         "--remote-allow-origins=*",
+        # The window deliberately opens in the background (open -g) and is
+        # therefore usually OCCLUDED — macOS then pauses rendering, freezing
+        # requestAnimationFrame, which makes Playwright's click actionability
+        # wait ("stable" = 2 consecutive rAF frames) time out for EVERY driver
+        # (observed 2026-08-19: anthropic-api.py --team-* clicks all timing
+        # out). Keep rendering + timers alive while occluded/backgrounded:
+        "--disable-backgrounding-occluded-windows",
+        "--disable-renderer-backgrounding",
+        "--disable-background-timer-throttling",
     ]
     # Launch in the background so it never steals focus (see _launch_browser).
     pid = _launch_browser(binary, flags)
@@ -522,7 +531,7 @@ def cmd_down() -> int:
     # pkill (macOS) parses it as an option ("illegal option -- -"); the substring
     # 'user-data-dir=<profile>' still uniquely matches our browser processes. This
     # path matters now that `open`-launched cold starts may not capture a PID.
-    fallback = subprocess.run(  # noqa: S603,S607
+    fallback = subprocess.run(
         ["pkill", "-f", f"user-data-dir={PROFILE_DIR}"], check=False
     )
     if fallback.returncode == 0:  # pkill matched & signalled at least one process
@@ -789,7 +798,7 @@ def _keychain_get(service: str) -> str | None:
     needs NO Touch ID — that is the whole point versus the ``op`` path.
     """
     try:
-        r = subprocess.run(  # noqa: S603
+        r = subprocess.run(
             [
                 "security",
                 "find-generic-password",
@@ -821,7 +830,7 @@ def _keychain_set(service: str, value: str) -> bool:
     silent (no-prompt) access to the ``security`` binary that our reads use.
     """
     try:
-        r = subprocess.run(  # noqa: S603
+        r = subprocess.run(
             [
                 "security",
                 "add-generic-password",
@@ -850,7 +859,7 @@ def _keychain_set(service: str, value: str) -> bool:
 def _keychain_delete(service: str) -> bool:
     """Delete a login-keychain item; ``True`` if it was deleted or already gone."""
     try:
-        subprocess.run(  # noqa: S603
+        subprocess.run(
             [
                 "security",
                 "delete-generic-password",
@@ -912,7 +921,7 @@ def _op_totp_uri(item: str, account: str) -> str | None:
     items expose only a live code, not the seed). Never printed/logged.
     """
     try:
-        r = subprocess.run(  # noqa: S603
+        r = subprocess.run(
             [
                 "op",
                 "item",
@@ -959,7 +968,7 @@ def _op_creds(item: str, account: str) -> tuple[str, str, str] | None:
     """
     base = ["op", "item", "get", item, "--account", account]
     try:
-        creds = subprocess.run(  # noqa: S603
+        creds = subprocess.run(
             [
                 *base,
                 "--fields",
@@ -973,7 +982,7 @@ def _op_creds(item: str, account: str) -> tuple[str, str, str] | None:
             timeout=60,
             check=False,
         )
-        otp_r = subprocess.run(  # noqa: S603
+        otp_r = subprocess.run(
             [*base, "--otp"], capture_output=True, text=True, timeout=60, check=False
         )
     except (OSError, subprocess.SubprocessError):
@@ -1224,21 +1233,32 @@ def _claude_billing_sentinel(page) -> bool:
 def _claude_logged_in(page) -> bool:
     """ACTIVE check: navigate to the billing admin page and confirm we land there
     logged in (per O3 — reaching the SDSC admin/billing surface, not just "not
-    /login"). A redirect to /login or /logout, or bouncing off the billing route,
-    means not logged in (or no admin rights in this org)."""
+    /login"). A redirect to /login or /logout means not logged in; never reaching
+    the billing route + sentinel within ~15 s means not confirmed (wrong org /
+    no admin rights / SPA never settled).
+
+    POLLED, not a one-shot: the billing SPA renders its invoice rows well after
+    domcontentloaded, and the old fixed 2.5 s wait raced that render — a cold
+    SPA load intermittently produced FALSE NEGATIVES ("Not logged into Claude"
+    while the profile session was fine, observed 2026-08-19 blocking
+    anthropic-api.py --team-remove)."""
     from playwright.sync_api import Error as PlaywrightError
 
     try:
         page.goto(CLAUDE_BILLING_URL, wait_until="domcontentloaded")
-        page.wait_for_timeout(2500)
     except PlaywrightError:
         return False
-    url = page.url
-    if "/login" in url or "/logout" in url:
-        return False
-    if "/admin-settings/billing" not in url:
-        return False  # bounced elsewhere — wrong org / not an admin
-    return _claude_billing_sentinel(page)
+    for _ in range(30):  # up to ~15 s
+        try:
+            page.wait_for_timeout(500)
+            url = page.url
+        except PlaywrightError:
+            return False
+        if "/login" in url or "/logout" in url:
+            return False  # definitive: bounced to the login surface
+        if "/admin-settings/billing" in url and _claude_billing_sentinel(page):
+            return True
+    return False  # never confirmed — treat as not logged in (fail closed)
 
 
 def _claude_fill_email_and_continue(page, email: str) -> bool:
@@ -1316,7 +1336,7 @@ def _himalaya_latest_login_mail(
     best_ts = -1.0
     for folder in ("INBOX", "Archive"):
         try:
-            res = subprocess.run(  # noqa: S603
+            res = subprocess.run(
                 [
                     himalaya,
                     "envelope",
@@ -1361,7 +1381,7 @@ def _himalaya_extract_magic_link(himalaya: str, folder: str, msg_id: str) -> str
     """Read the mail body and pull out the claude.ai/magic-link#… URL (a bearer
     credential — never printed/logged)."""
     try:
-        res = subprocess.run(  # noqa: S603
+        res = subprocess.run(
             [himalaya, "message", "read", msg_id, "--folder", folder],
             capture_output=True,
             text=True,
@@ -2147,7 +2167,7 @@ def cmd_login_log(site_name: str | None) -> int:
     print("  recent (all sites):")
     for e in sorted(events, key=lambda e: e.get("ts", 0))[-12:]:
         print(
-            f"    {e.get('iso', '?')}  {str(e.get('site', '?')):<11} "
+            f"    {e.get('iso', '?')}  {e.get('site', '?')!s:<11} "
             f"({e.get('mode', '?')})"
         )
     return 0
@@ -2170,8 +2190,8 @@ class Site:
     blurb: str
     login: Callable[[int], int]
     logged_in: Callable[[int], int]
-    store_creds: Optional[Callable[[], int]] = None
-    forget_creds: Optional[Callable[[], int]] = None
+    store_creds: Callable[[], int] | None = None
+    forget_creds: Callable[[], int] | None = None
 
 
 def _sites() -> list[Site]:

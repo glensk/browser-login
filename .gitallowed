@@ -1,0 +1,3 @@
+# git-secrets false-positive allowlist (regexes; see `git secrets --list`)
+# getpass PROMPT lines contain the word "password" but never a secret value.
+password = getpass\.getpass\(
