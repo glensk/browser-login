@@ -1,5 +1,8 @@
 # PLAN: fully non-interfering background browser for automation
 
+Reconciled through a judged Claude↔Codex debate (gpt-5.6-sol, 3 rounds,
+2026-08-20). Future work — not implemented in that session.
+
 ## Session
 
 Resume: `c --resume 44e9d484-4ec0-4ce4-8635-b8ee209fb5a2`
@@ -8,49 +11,71 @@ Resume: `c --resume 44e9d484-4ec0-4ce4-8635-b8ee209fb5a2`
 
 The shared automation Chromium (browser.py, CDP :9222) must never interfere
 with Albert's desktop work: no focus steal, no window raising, ideally no
-visible window at all — while remaining fully drivable (clicks, keystrokes,
+visible window — while remaining fully drivable (clicks, keystrokes,
 screenshots) by anthropic-api.py / openai-team.py / MCP browser tools.
 
-## Facts established 2026-08-19/20 (this session)
+## Contract (define first)
 
-1. The window launches behind everything (`open -g -n`) and never takes focus.
-2. An occluded/background window has **rendering paused by macOS**:
-   `requestAnimationFrame` freezes → Playwright's actionability wait ("stable"
-   = 2 consecutive rAF frames) times out on every normal click; screenshots
-   stall. The launch flags `--disable-backgrounding-occluded-windows`,
-   `--disable-renderer-backgrounding`, `--disable-background-timer-throttling`
-   did NOT unfreeze rAF on macOS.
-3. `page.bring_to_front()` (CDP, tab-level) unfreezes rAF **without raising the
-   macOS window**: verified via the window-server z-order
-   (`CGWindowListCopyWindowInfo` — Chrome for Testing stayed behind Brave and
-   iTerm after the call) and without focus change. So the current mechanism is
-   already non-interfering; the window is merely present on the desktop /
-   in Mission Control.
-4. Downstream flows additionally use robust clicks (normal → `force=True`
-   fallback) and bounded screenshot timeouts, so they survive even a frozen
-   window.
+Normal automation must never activate the app, raise the window, or change
+macOS focus/z-order. The ONE exception: an explicitly requested assisted login
+(`browser.py login SITE` / `--headed`), which may raise the window because a
+human asked for it.
 
-## Plan (future work, in order)
+## Facts established 2026-08-19/20
 
-- [ ] **Spike: headless-by-default.** Add `browser.py up --headless` (new
-      headless mode, `--headless=new`), same profile dir. Validate the two
-      critical sessions survive: `logged-in anthropic` + a claude.ai
-      admin-page DOM read, `logged-in openai` + a chatgpt.com admin read.
-      Risk to test: Cloudflare/anti-bot heuristics on claude.ai and
-      chatgpt.com may treat headless differently; sessions may be flagged.
-- [ ] **Dual-mode lifecycle.** If the spike passes: make headless the default
-      for `up`; `browser.py up --headed` (and `login SITE`, which needs a human)
-      auto-restarts the browser in headed mode and back. Guard: refuse
-      mode-switch while another CDP client is connected.
-- [ ] **Fallback if headless is flagged:** keep today's headed-behind-windows
-      launch and codify the non-interference contract instead:
-      `open -g -j` (launch hidden), never call app-level activation,
-      tab-level `bring_to_front()` only (documented as z-order-safe), robust
-      click + bounded screenshot patterns in every consumer (already done for
-      anthropic-api.py; port to openai-team.py).
-- [ ] **Regression check script.** `browser.py doctor`: asserts (a) CDP up,
-      (b) rAF alive on the active tab after `bring_to_front()`, (c) frontmost
-      app unchanged and Chromium window not top-of-z-order after a full
-      open→click→screenshot cycle (via CGWindowList), so interference
-      regressions are caught mechanically.
-- [ ] Docs: README section "Why you never see the window" + consumer contract.
+1. Window launches behind everything (`open -g -n`), never takes focus.
+2. macOS pauses rendering of the occluded window: rAF freezes → Playwright
+   actionability ("stable" needs 2 rAF frames) and screenshots stall. The
+   `--disable-backgrounding-*` launch flags did NOT unfreeze rAF.
+3. `page.bring_to_front()` (CDP, tab-level) unfreezes rAF WITHOUT raising the
+   macOS window (verified via `CGWindowListCopyWindowInfo`: Chrome for Testing
+   stayed behind Brave/iTerm) and without focus change.
+4. Consumers additionally use robust clicks (force-fallback on NON-final
+   controls only) and bounded screenshot timeouts.
+5. Interim mitigation shipped with the invite-flow work: both team CLIs hold
+   an exclusive advisory flock (`~/.cache/claude-browser/interaction.lock`)
+   around their browser-driving sections (bounded wait, loud failure naming
+   the holder).
+
+## Steps (in order)
+
+- [ ] **Spike A: headless-by-default.** `browser.py up --headless`
+      (`--headless=new`, same profile). Validation matrix = FULL workflows
+      across ALL consumers, not just login sentinels: claude.ai admin DOM read
+      + `-ta` dry-run; chatgpt.com admin read + `-ta` dry-run; CSCS login +
+      token read; Slack session extraction; biopolwifi; file downloads;
+      screenshots; assisted-login handoff. Anti-bot risk (Cloudflare) is the
+      thing being tested. Headless stays opt-in behind a soak period before
+      any default flip.
+- [ ] **Spike B (independent): hidden launch `open -g -j`.** Do NOT infer from
+      occluded-window results — a hidden window is a different macOS state.
+      Own pass: rAF alive after `bring_to_front()`, click, screenshot, focus
+      and z-order unchanged. Until it passes, keep `open -g`.
+- [ ] **Lifecycle record + transactional mode switching.** Atomic
+      `.browser-lifecycle.json` `{state: starting|running|stopping|switching,
+      mode, pid, process_start_time, nonce}`. Acceptance: at most ONE
+      validated root browser process (executable + process start time + debug
+      port + profile dir all match the record); zero processes allowed only
+      while a recorded transition state is active; exactly one healthy CDP
+      root afterwards. Signals go only to a validated PID (never bare-PID
+      kill — PID reuse). Shutdown = CDP `Browser.close` → SIGTERM after 5 s →
+      pkill after 10 s; relaunch aborts while the old root or the profile
+      `SingletonLock` persists. Record agreement is required only in state
+      `running`; `doctor` flags stale transitional/crash states.
+- [ ] **Two-layer client coordination.** Layer 1: shared lifecycle
+      REGISTRATION for every supported CDP connection (read-only evals and our
+      MCP tools included); mode switch/down requires exclusive acquisition
+      over the registration set. Layer 2: exclusive INTERACTION lease for
+      focus/input/screenshot flows (supersedes the interim interaction.lock).
+      Both via flock/O_EXCL, owner nonce + PID start time, bounded heartbeat,
+      compare-before-release; crash/stale-owner tests. Unknown/unregistered
+      CDP clients (detected: established connections on :9222 vs
+      registrations) make automatic mode switching FAIL CLOSED.
+- [ ] **`browser.py doctor`.** Uses a disposable `data:` page; acquires the
+      interaction lease; bounded rAF/click/screenshot checks; records
+      frontmost app + window z-order before/after and asserts them unchanged;
+      closes its target; non-macOS → explicit skip. Also validates the
+      lifecycle record against the live process.
+- [ ] Docs: README "Why you never see the window" + the consumer contract
+      (tab-level bring_to_front only; no app activation; force-click never on
+      final mutating controls; bounded screenshots; lease usage).
