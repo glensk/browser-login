@@ -20,7 +20,14 @@ Generic lifecycle:
   status    Show CDP health, browser version, open tabs, and the lifecycle record.
   switch MODE
             Transactionally switch to headed|headless: stop the browser and
-            relaunch it on the SAME profile (every login persists).
+            relaunch it on the SAME profile (every login persists). Waits for
+            registered CDP clients to drain and REFUSES while an unregistered
+            client is attached ([-f|--force] switches anyway).
+  clients   Show who is attached over CDP: the registered clients (tool, pid,
+            purpose) plus any unregistered ones a switch would refuse.
+  register-exec [-t NAME] -- CMD ARGS…
+            Run a long-lived CDP client (e.g. the Playwright MCP server) as a
+            REGISTERED client: the registration lives exactly as long as CMD.
   down      Quit the shared browser.
   open URL  Open/navigate a tab to URL in the shared browser.
   eval JS   Run a JS expression in the active (or --url-matched) tab; print JSON.
@@ -53,6 +60,9 @@ disk). No system browser is touched, so this never collides with your daily Brav
 """
 
 import argparse
+import atexit
+import contextlib
+import fcntl
 import glob
 import json
 import os
@@ -61,11 +71,12 @@ import shutil
 import signal
 import subprocess
 import sys
+import threading
 import time
 import urllib.error
 import urllib.request
 import uuid
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -179,6 +190,7 @@ def parse_args() -> argparse.Namespace:
             "  ./browser.py up --headless      # windowless (same profile/logins)\n"
             "  ./browser.py switch headless    # stop + relaunch windowless\n"
             "  ./browser.py status             # CDP health + tabs + lifecycle\n"
+            "  ./browser.py clients            # who is attached over CDP\n"
             "  ./browser.py open https://portal.cscs.ch/profile/\n"
             "  ./browser.py eval 'document.title'\n"
             "  ./browser.py token              # cache the CSCS portal token\n"
@@ -218,6 +230,36 @@ def parse_args() -> argparse.Namespace:
         "mode",
         choices=("headed", "headless"),
         help="Target mode to switch the shared browser to.",
+    )
+    psw.add_argument(
+        "-f",
+        "--force",
+        action="store_true",
+        help="Switch even with unknown (unregistered) or unverifiable CDP "
+        "clients attached — they lose their connection.",
+    )
+    sub.add_parser(
+        "clients",
+        help="Show the registered CDP clients plus any unregistered ones (a "
+        "switch refuses while those are attached).",
+    )
+    pre = sub.add_parser(
+        "register-exec",
+        help="Run CMD as a REGISTERED CDP client: hold a registry registration "
+        "for exactly as long as CMD runs (for long-lived clients like the "
+        "Playwright MCP server). Usage: register-exec [-t NAME] -- CMD ARGS…",
+    )
+    pre.add_argument(
+        "-t",
+        "--tool",
+        default="wrapped",
+        help="Tool name recorded in the registration (default: wrapped).",
+    )
+    pre.add_argument(
+        "cmd_",  # NOT "cmd" — that would clobber the subparsers' dest="cmd"
+        metavar="cmd",
+        nargs=argparse.REMAINDER,
+        help="Command to run (prefix with -- to stop flag parsing).",
     )
     sub.add_parser("down", help="Quit the shared browser.")
     po = sub.add_parser("open", help="Open/navigate a tab to URL.")
@@ -828,7 +870,10 @@ def _cdp_browser_close(port: int) -> bool:
     right. A dropped connection while the command is in flight is the EXPECTED
     success case (the browser died before answering), so that counts as sent.
     Deliberately not routed through `_connect`, which ``sys.exit``s when the
-    browser is down.
+    browser is down — and, since `switch`/`down` call this while they hold the
+    client gate EXCLUSIVELY, must NOT register a client here either: a second fd
+    asking for the same gate shared would deadlock against our own hold (see the
+    deadlock rule in the client-coordination section). Keep it CDP-only.
     """
     try:
         from playwright.sync_api import Error as PlaywrightError
@@ -1126,6 +1171,464 @@ def _launch_and_record(port: int, headless: bool) -> int:
     )
 
 
+# ---------------------------------------------------------------------------
+# Client coordination — layer 1: CDP-client registry, layer 2: interaction lease
+# ---------------------------------------------------------------------------
+# One browser, many drivers (this script, Playwright MCP, anthropic-api.py,
+# openai-team.py). Two advisory flocks under CACHE_DIR keep them out of each
+# other's way; because they are flocks, the kernel releases them even when a
+# holder is SIGKILLed, so there is no stale-lock class of bug to clean up.
+#
+#   Layer 1 — the GATE (REGISTRY_GATE). Every attached CDP client holds it
+#   SHARED for the whole connection; `switch`/`down` take it EXCLUSIVELY, which
+#   by construction waits for every registered client to drain before the
+#   browser is touched. The per-client metadata file (CLIENTS_DIR/<nonce>.json,
+#   LOCK_EX'd by its owner) turns that anonymous shared lock into a NAMED set:
+#   the gate says somebody is attached, the files say who — and a file whose own
+#   lock is free belongs to a client that died, i.e. it is debris to reap.
+#
+#   Layer 2 — the LEASE (INTERACTION_LOCK). Exclusive "I am the one driving
+#   focus/input/screenshots right now", taken only around interactive sections.
+#   It is the SAME file the consumer CLIs already flock, so they and we
+#   serialise against each other.
+#
+# DEADLOCK RULE: an flock belongs to the open file DESCRIPTION, so a second fd
+# in the SAME process conflicts with our own exclusive hold exactly as another
+# process would. Any code path that already holds the gate exclusively must
+# therefore NEVER register and never take the gate shared — which is why
+# `_cdp_browser_close` (called from `switch`/`down` while the gate is held)
+# deliberately bypasses `_connect`.
+
+CLIENTS_DIR = CACHE_DIR / "clients"
+REGISTRY_GATE = CLIENTS_DIR / ".registry.lock"
+# How long a client waits for the gate to become shareable (i.e. for a mode
+# switch or a shutdown to finish) before it fails loud instead of attaching.
+REGISTRY_SH_WAIT_S = 15.0
+# How long `switch`/`down` wait for every registered client to drain.
+REGISTRY_EX_WAIT_S = 20.0
+# `up` only needs to know that no switch/shutdown is mid-flight — a short wait.
+REGISTRY_UP_WAIT_S = 5.0
+
+INTERACTION_LOCK = CACHE_DIR / "interaction.lock"
+INTERACTION_WAIT_S = 30.0
+INTERACTION_HEARTBEAT_S = 10.0
+
+# What this process is doing, for its registry entry — filled in by main() from
+# the chosen subcommand. A one-element list (not a rebindable str) so main can
+# set it without a `global` statement.
+_PURPOSE: list[str] = []
+
+
+def _set_purpose(text: str) -> None:
+    """Record WHAT this process is doing; reported in its registry entry."""
+    _PURPOSE[:] = [text]
+
+
+def _purpose() -> str:
+    """This process's purpose string, or a neutral default if never set."""
+    return _PURPOSE[0] if _PURPOSE else "(unspecified)"
+
+
+def _flock_wait(fd: int, kind: int, wait_s: float) -> bool:
+    """Poll for `kind` (LOCK_SH/LOCK_EX) on `fd` in 0.25 s steps; True if held.
+
+    Non-blocking polling rather than a blocking ``flock``: a blocking wait would
+    hang a CLI forever behind a wedged holder, while a bounded poll lets every
+    caller report WHO is in the way and exit.
+    """
+    deadline = time.monotonic() + wait_s
+    while True:
+        try:
+            fcntl.flock(fd, kind | fcntl.LOCK_NB)
+            return True
+        except OSError:
+            if time.monotonic() >= deadline:
+                return False
+            time.sleep(0.25)
+
+
+def _read_json_dict(path: Path) -> dict | None:
+    """Parse a JSON object from `path`, or None if absent/garbage/not an object."""
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def _registry_live_clients() -> list[dict]:
+    """Every LIVE client registration; reaps the files of dead ones on the way.
+
+    Liveness is the file's own flock, not its content: a registrant holds
+    LOCK_EX on its metadata file for as long as it is attached, so a file we
+    CAN lock shared belongs to a process that is gone (crashed, SIGKILLed, or
+    exited without releasing) and is unlinked here. That makes the listing
+    self-healing — no reaper daemon, no timeout heuristics.
+    """
+    live: list[dict] = []
+    try:
+        paths = sorted(CLIENTS_DIR.glob("*.json"))
+    except OSError:
+        return live
+    for path in paths:
+        try:
+            fd = os.open(str(path), os.O_RDONLY)
+        except OSError:
+            continue
+        try:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_SH | fcntl.LOCK_NB)
+            except OSError:
+                rec = _read_json_dict(path)  # locked → a live client
+                if rec is not None:
+                    live.append(rec)
+                continue
+            fcntl.flock(fd, fcntl.LOCK_UN)
+            path.unlink(missing_ok=True)  # lockable → dead client's debris
+        finally:
+            os.close(fd)
+    return live
+
+
+def _describe_client(rec: dict) -> str:
+    """One human line for a registration: tool, pid, purpose, when, age."""
+    age = _iso_age_s(rec.get("heartbeat_iso") or rec.get("iso"))
+    return (
+        f"{rec.get('tool') or '?'} pid {rec.get('pid') or '?'} — "
+        f"{rec.get('purpose') or '(unspecified)'} "
+        f"(since {rec.get('iso') or '?'}"
+        + (f", {age:.0f}s ago)" if age is not None else ")")
+    )
+
+
+def _registry_register(tool: str, purpose: str, port: int) -> Callable[[], None]:
+    """Register this process as an attached CDP client; return its ``release()``.
+
+    Two locks are taken and held until release: the gate SHARED (so `switch`
+    and `down` — which need it exclusively — cannot pull the browser out from
+    under a live connection) and LOCK_EX on our own metadata file (which is
+    both the liveness signal other readers test and the record of who we are).
+    The file is created ``O_EXCL`` and locked BEFORE it is written, so the
+    window in which a concurrent reaper could mistake it for debris is as small
+    as an open() syscall.
+
+    Fails loud (exit) when the gate cannot be shared within
+    REGISTRY_SH_WAIT_S: that means a mode switch or a shutdown is mid-flight,
+    and attaching anyway is exactly the race this layer exists to prevent.
+    """
+    CLIENTS_DIR.mkdir(parents=True, exist_ok=True)
+    gate_fd = os.open(str(REGISTRY_GATE), os.O_RDWR | os.O_CREAT, 0o600)
+    if not _flock_wait(gate_fd, fcntl.LOCK_SH, REGISTRY_SH_WAIT_S):
+        os.close(gate_fd)
+        sys.exit(
+            "❌ Cannot attach to the shared browser: it is being switched or "
+            f"stopped right now (waited {REGISTRY_SH_WAIT_S:.0f}s for the client "
+            "gate).\n   Retry in a moment; `browser.py status` shows the "
+            "lifecycle state."
+        )
+    nonce = uuid.uuid4().hex
+    while True:
+        path = CLIENTS_DIR / f"{nonce}.json"
+        try:
+            own_fd = os.open(str(path), os.O_CREAT | os.O_EXCL | os.O_RDWR, 0o600)
+            break
+        except FileExistsError:
+            nonce = uuid.uuid4().hex  # a 128-bit collision, humoured anyway
+        except OSError as exc:
+            fcntl.flock(gate_fd, fcntl.LOCK_UN)
+            os.close(gate_fd)
+            sys.exit(f"❌ Cannot register a CDP client in {CLIENTS_DIR}: {exc}")
+    fcntl.flock(own_fd, fcntl.LOCK_EX)  # uncontended by construction
+    now = time.strftime("%Y-%m-%dT%H:%M:%S%z")
+    rec = {
+        "nonce": nonce,
+        "pid": os.getpid(),
+        "pid_start_time": _proc_lstart(os.getpid()),
+        "tool": tool,
+        "purpose": purpose,
+        "port": port,
+        "iso": now,
+        "heartbeat_iso": now,
+    }
+    os.pwrite(own_fd, (json.dumps(rec) + "\n").encode(), 0)
+    released = False
+
+    def release() -> None:
+        """Drop the registration: unlink our file, then both locks. Idempotent."""
+        nonlocal released
+        if released:
+            return
+        released = True
+        current = _read_json_dict(path)
+        if current is not None and current.get("nonce") not in (None, nonce):
+            print(
+                f"⚠ registration {path.name} was overwritten by nonce "
+                f"{current.get('nonce')} — leaving it alone (not ours to remove).",
+                file=sys.stderr,
+            )
+        else:
+            path.unlink(missing_ok=True)
+        for fd in (own_fd, gate_fd):
+            with contextlib.suppress(OSError):
+                fcntl.flock(fd, fcntl.LOCK_UN)
+            with contextlib.suppress(OSError):
+                os.close(fd)
+
+    return release
+
+
+def _gate_acquire(kind: int, wait_s: float) -> int | None:
+    """Hold the registry gate (`kind` = LOCK_SH/LOCK_EX); its fd, or None.
+
+    NEVER call this from a path that already holds the gate exclusively — see
+    the deadlock rule above. Silent on failure: the caller words the refusal,
+    which differs per command (`switch` aborts, `down` warns and proceeds).
+    """
+    CLIENTS_DIR.mkdir(parents=True, exist_ok=True)
+    fd = os.open(str(REGISTRY_GATE), os.O_RDWR | os.O_CREAT, 0o600)
+    if _flock_wait(fd, kind, wait_s):
+        return fd
+    os.close(fd)
+    return None
+
+
+def _gate_release(fd: int) -> None:
+    """Drop a gate hold: unlock, then close. Fully guarded."""
+    with contextlib.suppress(OSError):
+        fcntl.flock(fd, fcntl.LOCK_UN)
+    with contextlib.suppress(OSError):
+        os.close(fd)
+
+
+def _gate_busy(action: str) -> str:
+    """The "clients are still attached" refusal for `action`, naming them."""
+    lines = [
+        f"   still attached: {_describe_client(r)}" for r in _registry_live_clients()
+    ]
+    return (
+        f"Cannot {action}: registered CDP client(s) did not drain within "
+        f"{REGISTRY_EX_WAIT_S:.0f}s.\n"
+        + (
+            "\n".join(lines)
+            or "   (no registration file left — see `browser.py clients`)"
+        )
+        + "\n   Let them finish, then retry."
+    )
+
+
+def _established_cdp_clients(port: int) -> list[tuple[int, str]]:
+    """(pid, command) for every process with an ESTABLISHED connection to `port`.
+
+    ``lsof -F`` prints one field per line, letter-prefixed (``p<pid>``,
+    ``c<command>``), grouped per process — which is why the parse is a tiny
+    state machine. Both ends of each loopback pair show up, so the browser side
+    is filtered out by its ``--user-data-dir=<our profile>`` command line, as is
+    this process. Returns [] when lsof is missing or fails; callers MUST treat
+    "no lsof" as CANNOT VERIFY (see `_unknown_cdp_clients`) rather than as
+    "nobody is attached".
+    """
+    try:
+        res = subprocess.run(
+            ["lsof", "-nP", f"-iTCP:{port}", "-sTCP:ESTABLISHED", "-Fpc"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return []
+    found: list[tuple[int, str]] = []
+    seen: set[int] = set()
+    pid: int | None = None
+    for line in res.stdout.splitlines():
+        if line[:1] == "p" and line[1:].strip().isdigit():
+            pid = int(line[1:])
+        elif line[:1] == "c" and pid is not None:
+            if pid in seen or pid == os.getpid():
+                continue
+            seen.add(pid)
+            cmd = _proc_command(pid) or line[1:].strip()
+            if f"--user-data-dir={PROFILE_DIR}" not in cmd:
+                found.append((pid, cmd))
+    return sorted(found)
+
+
+def _proc_ppid(pid: int) -> int | None:
+    """The parent PID of `pid`, or None when the process is gone."""
+    out = _ps_field(pid, "ppid=")
+    return int(out) if out and out.isdigit() else None
+
+
+def _pid_or_ancestor_registered(pid: int, known: set[object]) -> bool:
+    """True if `pid` or any ancestor (≤15 hops) is a registered client PID.
+
+    A ``register-exec`` wrapper records the pid of the child it spawned, but
+    the actual CDP socket may belong to a GRANDchild (npx → node for the
+    Playwright MCP server), so a connection counts as registered when any
+    process on its ancestry chain is.
+    """
+    for _ in range(15):
+        if pid in known:
+            return True
+        parent = _proc_ppid(pid)
+        if parent is None or parent <= 1:
+            return False
+        pid = parent
+    return False
+
+
+def _unknown_cdp_clients(port: int) -> list[tuple[int, str]] | None:
+    """Attached CDP clients that are NOT registered; None if unverifiable.
+
+    Compares the kernel's view (lsof) with the registry. ``None`` means the
+    comparison could not be MADE at all (no lsof on PATH) — fail-closed callers
+    must treat that like "unknown clients present", never like "none". A
+    connection is "known" when its pid OR an ancestor is registered (see
+    `_pid_or_ancestor_registered`).
+    """
+    if shutil.which("lsof") is None:
+        return None
+    known = {rec.get("pid") for rec in _registry_live_clients()}
+    return [
+        (pid, cmd)
+        for pid, cmd in _established_cdp_clients(port)
+        if not _pid_or_ancestor_registered(pid, known)
+    ]
+
+
+def _unknown_clients_verdict(port: int) -> str | None:
+    """Why stopping/switching the browser is unsafe, or None when it is safe.
+
+    Fail-closed by design: an unregistered established CDP connection means
+    somebody we cannot coordinate with is driving the browser — and so does
+    being unable to LOOK. Both are reported; what to do about it is the
+    caller's call (`switch` refuses, `down` only warns).
+    """
+    unknown = _unknown_cdp_clients(port)
+    if unknown is None:
+        return "cannot verify who is attached to the CDP port (no lsof on PATH)"
+    if unknown:
+        listing = "\n".join(f"     pid {pid}: {cmd}" for pid, cmd in unknown)
+        return f"{len(unknown)} unregistered CDP client(s) attached:\n{listing}"
+    return None
+
+
+def _lease_record(base: dict) -> bytes:
+    """The lease's one-line JSON record: `base` plus a FRESH ``heartbeat_iso``."""
+    stamped = {**base, "heartbeat_iso": time.strftime("%Y-%m-%dT%H:%M:%S%z")}
+    return (json.dumps(stamped) + "\n").encode()
+
+
+def _lease_write(fd: int, base: dict) -> None:
+    """Replace the lease file's content with a freshly stamped record."""
+    os.ftruncate(fd, 0)
+    os.pwrite(fd, _lease_record(base), 0)
+
+
+def _lease_heartbeat(fd: int, base: dict, stop: threading.Event) -> None:
+    """Refresh the lease's ``heartbeat_iso`` until `stop` is set (daemon thread).
+
+    A heartbeat proves the holder is not merely *alive* but still working — the
+    flock alone cannot say that. The interval is read from
+    INTERACTION_HEARTBEAT_S on every pass (so a test can shrink it), and any
+    write error ends the thread quietly: the lock, not the file content, is the
+    actual mutex.
+    """
+    while not stop.wait(INTERACTION_HEARTBEAT_S):
+        try:
+            _lease_write(fd, base)
+        except OSError:
+            return
+
+
+def _lease_holder(fd: int) -> str:
+    """Whatever the lease file says about its holder, for diagnostics only."""
+    try:
+        return os.pread(fd, 4096, 0).decode("utf-8", "replace").strip()
+    except OSError:
+        return ""
+
+
+@contextlib.contextmanager
+def _interaction_lease(
+    purpose: str, wait_s: float = INTERACTION_WAIT_S
+) -> Iterator[str]:
+    """Hold the exclusive INTERACTION lease for the block; yield the owner nonce.
+
+    Layer 2 of the coordination: the gate only says "somebody is attached",
+    this says "I am the one driving focus, input and screenshots right now".
+    It locks the SAME file the consumer CLIs (anthropic-api.py, openai-team.py)
+    already lock, so all of them serialise; they write a plain
+    ``pid purpose timestamp`` line and we write JSON, and NEITHER side parses
+    the other's — the flock is the contract, the content is diagnostics, so any
+    format is tolerated when reporting a holder.
+
+    LOCK ORDERING (never invert): the gate is taken FIRST (in `_connect`, via
+    the registration) and the lease SECOND. `switch`/`down` take the gate
+    exclusively and never take the lease, so no cycle can form.
+
+    On timeout: fail loud naming the holder — never proceed into a browser
+    somebody else is clicking. On release: stop the heartbeat, then
+    compare-before-release (a foreign nonce means somebody wrote the file
+    WITHOUT the lock, which flock should make impossible — so it is reported,
+    loudly, instead of silently overwritten).
+
+    REENTRANCY: a parent that already holds this lock and then shells
+    ``browser.py login <site>`` (anthropic-api.py's --download-csv does) would
+    deadlock the child against its own parent. Such a parent exports
+    ``CLAUDE_BROWSER_LEASE_HELD=1``; the child then yields without locking —
+    the parent's flock is the exclusion, exactly as before this lease existed.
+    """
+    if os.environ.get("CLAUDE_BROWSER_LEASE_HELD") == "1":
+        yield "inherited"  # parent's flock is the real exclusion
+        return
+    INTERACTION_LOCK.parent.mkdir(parents=True, exist_ok=True)
+    fd = os.open(str(INTERACTION_LOCK), os.O_RDWR | os.O_CREAT, 0o600)
+    if not _flock_wait(fd, fcntl.LOCK_EX, wait_s):
+        holder = _lease_holder(fd) or "<unknown holder>"
+        os.close(fd)
+        sys.exit(
+            f"❌ Another browser interaction holds the lease: {holder}\n"
+            f"   Waited {wait_s:.0f}s. Retry later (lease: {INTERACTION_LOCK})."
+        )
+    nonce = uuid.uuid4().hex
+    base = {
+        "pid": os.getpid(),
+        "pid_start_time": _proc_lstart(os.getpid()),
+        "nonce": nonce,
+        "purpose": purpose,
+        "iso": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+    }
+    _lease_write(fd, base)
+    stop = threading.Event()
+    beat = threading.Thread(
+        target=_lease_heartbeat,
+        args=(fd, base, stop),
+        name="browser-lease-heartbeat",
+        daemon=True,
+    )
+    beat.start()
+    try:
+        yield nonce
+    finally:
+        stop.set()
+        beat.join(timeout=2.0)
+        current = _read_json_dict(INTERACTION_LOCK)
+        if current is not None and current.get("nonce") not in (None, nonce):
+            print(
+                f"⚠ the interaction lease was rewritten by nonce "
+                f"{current.get('nonce')} while we held it — somebody is writing "
+                f"{INTERACTION_LOCK} without taking the lock.",
+                file=sys.stderr,
+            )
+        with contextlib.suppress(OSError):
+            os.ftruncate(fd, 0)
+        with contextlib.suppress(OSError):
+            fcntl.flock(fd, fcntl.LOCK_UN)
+        with contextlib.suppress(OSError):
+            os.close(fd)
+
+
 def cmd_up(port: int, headless: bool = False) -> int:
     """Launch the shared browser if not already running (idempotent).
 
@@ -1134,6 +1637,11 @@ def cmd_up(port: int, headless: bool = False) -> int:
     the browser already running is REFUSED (loudly) instead of silently ignored —
     ``browser.py switch MODE`` does that transactionally. When the running mode
     DOES match, the lifecycle record is healed to describe the live process.
+
+    A COLD launch takes the client gate shared for its duration, so it cannot
+    slip into the middle of a `switch`/`down` window and race the relaunch that
+    switch is about to do itself. The already-up branch needs no gate — it
+    touches no process.
     """
     want = "headless" if headless else "headed"
     running = _browser_mode(port)
@@ -1154,10 +1662,20 @@ def cmd_up(port: int, headless: bool = False) -> int:
             + (" (lifecycle record refreshed)" if healed else "")
         )
         return 0
-    return _launch_and_record(port, headless)
+    gate = _gate_acquire(fcntl.LOCK_SH, REGISTRY_UP_WAIT_S)
+    if gate is None:
+        return _fail(
+            "Not launching: a mode switch or shutdown is in progress (waited "
+            f"{REGISTRY_UP_WAIT_S:.0f}s for the client gate). Retry in a moment; "
+            "`browser.py status` shows the lifecycle state."
+        )
+    try:
+        return _launch_and_record(port, headless)
+    finally:
+        _gate_release(gate)
 
 
-def cmd_switch(port: int, target: str) -> int:
+def cmd_switch(port: int, target: str, force: bool = False) -> int:
     """Switch the running browser between headed and headless, transactionally.
 
     The mode is fixed at launch, so switching means stop + relaunch — on the
@@ -1166,6 +1684,15 @@ def cmd_switch(port: int, target: str) -> int:
     and the relaunch is refused while the old root process or its SingletonLock
     is still around, so a failed switch leaves ONE state to inspect instead of
     two browsers fighting over one profile.
+
+    Before ANY of that, the client gate is taken exclusively — which waits for
+    every registered CDP client to drain — and the port is checked for clients
+    nobody registered. An unknown client (or the inability to look, i.e. no
+    lsof) makes an automatic switch FAIL CLOSED: killing a browser out from
+    under a driver we cannot coordinate with is the interference this layer
+    exists to prevent. ``--force`` is the deliberate override; the relaunch
+    itself must NOT re-acquire the gate (deadlock rule), so `_launch_and_record`
+    is called directly here while we still hold it.
     """
     live = _browser_mode(port)
     if live is None:
@@ -1181,18 +1708,34 @@ def cmd_switch(port: int, target: str) -> int:
             + (" (lifecycle record refreshed)" if healed else "")
         )
         return 0
-    switching = _lifecycle_transition("switching", target, _lifecycle_read(), port)
-    print(f"Switching {live.upper()} → {target.upper()} (stopping the browser)…")
-    if not _shutdown_browser(port, switching):
-        survivors = ", ".join(str(p) for p in _find_root_pids(port)) or "unknown"
-        return _fail(
-            f"Switch aborted: the browser did NOT stop (pid(s) {survivors} still "
-            "alive). The lifecycle record is left in state 'switching' — see "
-            "`browser.py status`."
-        )
-    rc = _launch_and_record(port, target == "headless")
-    if rc != 0:
-        return rc
+    gate = _gate_acquire(fcntl.LOCK_EX, REGISTRY_EX_WAIT_S)
+    if gate is None:
+        return _fail(_gate_busy(f"switch to {target.upper()}"))
+    try:
+        verdict = _unknown_clients_verdict(port)
+        if verdict is not None and not force:
+            return _fail(
+                f"Switch aborted — {verdict}\n"
+                "   Stop the attached client(s) (or install lsof so they can be "
+                "identified), then retry — or re-run with --force to switch anyway "
+                "(any attached client WILL lose its connection)."
+            )
+        if verdict is not None:
+            print(f"⚠ --force: switching anyway — {verdict}", file=sys.stderr)
+        switching = _lifecycle_transition("switching", target, _lifecycle_read(), port)
+        print(f"Switching {live.upper()} → {target.upper()} (stopping the browser)…")
+        if not _shutdown_browser(port, switching):
+            survivors = ", ".join(str(p) for p in _find_root_pids(port)) or "unknown"
+            return _fail(
+                f"Switch aborted: the browser did NOT stop (pid(s) {survivors} "
+                "still alive). The lifecycle record is left in state 'switching' "
+                "— see `browser.py status`."
+            )
+        rc = _launch_and_record(port, target == "headless")
+        if rc != 0:
+            return rc
+    finally:
+        _gate_release(gate)
     print(f"✓ Switched to {target.upper()}.")
     return 0
 
@@ -1234,6 +1777,75 @@ def cmd_status(port: int) -> int:
     return 0
 
 
+def cmd_clients(port: int) -> int:
+    """Show who is attached over CDP: the registered clients and the unknown ones.
+
+    Purely diagnostic — it reports, it never judges, so it always exits 0;
+    turning an unknown client into a refusal is `switch`'s job. Listing the
+    registrations also REAPS the files of clients that died holding one, so
+    running this is the cheapest way to clean up after a crash.
+    """
+    live = _registry_live_clients()
+    if live:
+        print(f"{len(live)} registered CDP client(s):")
+        for rec in live:
+            print(f"  - {_describe_client(rec)}")
+    else:
+        print("No registered CDP clients.")
+    unknown = _unknown_cdp_clients(port)
+    if unknown is None:
+        print(
+            "Unregistered clients: CANNOT VERIFY (no lsof on PATH) — "
+            "`switch` fails closed in this state; --force overrides."
+        )
+    elif unknown:
+        print(f"{len(unknown)} UNREGISTERED client(s) on port {port}:")
+        for pid, cmd in unknown:
+            print(f"  - pid {pid}: {cmd}")
+    else:
+        print(f"No unregistered clients on port {port}.")
+    return 0
+
+
+def cmd_register_exec(port: int, tool: str, cmd: list[str]) -> int:
+    """Run CMD as a registered CDP client; exit with CMD's exit code.
+
+    For long-lived clients this script cannot instrument from the inside —
+    above all the Playwright MCP server, which otherwise shows up as an
+    UNKNOWN client and fails every `switch` closed. The wrapper registers the
+    CHILD's pid (the socket may even belong to a grandchild — npx → node —
+    which the ancestry walk in `_unknown_cdp_clients` resolves), stays alive
+    as its parent with stdio inherited (transparent for MCP's stdio protocol),
+    forwards SIGTERM/SIGINT, and releases the registration when CMD exits.
+    """
+    if cmd and cmd[0] == "--":
+        cmd = cmd[1:]  # argparse.REMAINDER keeps the separator; drop it
+    if not cmd:
+        return _fail("register-exec: no command given (usage: … -t NAME -- CMD ARGS…)")
+    # Register FIRST (fails loud while a switch holds the gate), THEN spawn:
+    # a child must never run unregistered. The record carries the WRAPPER's
+    # pid; the child's/grandchild's sockets resolve to it via the ancestry
+    # walk in _unknown_cdp_clients.
+    release = _registry_register(tool, " ".join(cmd)[:160], port)
+    try:
+        proc = subprocess.Popen(cmd)
+    except OSError as exc:
+        release()
+        return _fail(f"register-exec: cannot start {cmd[0]!r}: {exc}")
+
+    def _forward(signum: int, _frame: object) -> None:
+        with contextlib.suppress(OSError):
+            proc.send_signal(signum)
+
+    signal.signal(signal.SIGTERM, _forward)
+    signal.signal(signal.SIGINT, _forward)
+    try:
+        rc = proc.wait()
+    finally:
+        release()
+    return rc
+
+
 def cmd_down(port: int) -> int:
     """Quit the shared browser: record the stop, escalate as needed, verify.
 
@@ -1242,6 +1854,12 @@ def cmd_down(port: int) -> int:
     record is cleared only once no root process is left; otherwise it stays as
     the breadcrumb for `status` and this command reports failure instead of the
     old unconditional "✓ stopped".
+
+    Like `switch` this waits (exclusively, on the client gate) for every
+    registered CDP client to drain — but unknown clients only earn a WARNING
+    here: a human asking for the browser to stop must not be blocked by
+    something they can see in the message. Fail-closed is for the AUTOMATIC
+    decision (`switch`), not for an explicit human one.
     """
     rec = _lifecycle_read()
     if rec is None and not _find_root_pids(port) and not _is_up(port):
@@ -1254,26 +1872,49 @@ def cmd_down(port: int) -> int:
         or (rec_mode if isinstance(rec_mode, str) else None)
         or "headed"
     )
-    stopping = _lifecycle_transition("stopping", mode, rec, port)
-    if not _shutdown_browser(port, stopping):
-        survivors = ", ".join(str(p) for p in _find_root_pids(port)) or "unknown"
-        return _fail(
-            f"Shared browser did NOT stop — root process(es) {survivors} still "
-            "alive. The lifecycle record is left in state 'stopping'; retry "
-            "`browser.py down`, or inspect with `browser.py status`."
-        )
-    _lifecycle_clear()
-    PID_FILE.unlink(missing_ok=True)  # legacy pid file, kept for external observers
+    gate = _gate_acquire(fcntl.LOCK_EX, REGISTRY_EX_WAIT_S)
+    if gate is None:
+        return _fail(_gate_busy("stop the shared browser"))
+    try:
+        verdict = _unknown_clients_verdict(port)
+        if verdict is not None:
+            print(f"⚠ stopping anyway — {verdict}", file=sys.stderr)
+        stopping = _lifecycle_transition("stopping", mode, rec, port)
+        if not _shutdown_browser(port, stopping):
+            survivors = ", ".join(str(p) for p in _find_root_pids(port)) or "unknown"
+            return _fail(
+                f"Shared browser did NOT stop — root process(es) {survivors} still "
+                "alive. The lifecycle record is left in state 'stopping'; retry "
+                "`browser.py down`, or inspect with `browser.py status`."
+            )
+        _lifecycle_clear()
+        PID_FILE.unlink(missing_ok=True)  # legacy, kept for external observers
+    finally:
+        _gate_release(gate)
     print("✓ Shared browser stopped.")
     return 0
 
 
-def _connect(port: int):
-    """Connect Playwright to the shared browser over CDP. Returns (pw, browser)."""
+def _connect(port: int, purpose: str = ""):
+    """Connect Playwright to the shared browser over CDP. Returns (pw, browser).
+
+    Registers this process in the client registry FIRST (see
+    `_registry_register`): the shared gate lock that registration holds is what
+    makes `switch`/`down` wait for us instead of yanking the browser away
+    mid-action. `purpose` defaults to the running subcommand (`_purpose`, set
+    once in main) so no call site has to pass anything.
+
+    The registration is dropped by an ``atexit`` handler rather than by the ~20
+    callers: each already closes the browser in a ``finally`` and then returns
+    straight into process exit, so releasing at exit is precise enough for the
+    gate and leaves every call site untouched. NEVER call this from a path that
+    already holds the gate exclusively — see the deadlock rule above.
+    """
     from playwright.sync_api import sync_playwright
 
     if not _is_up(port):
         sys.exit("Shared browser is down. Run: browser.py up")
+    atexit.register(_registry_register("browser.py", purpose or _purpose(), port))
     pw = sync_playwright().start()
     # 127.0.0.1, not localhost — see _cdp_get (avoids the IPv6 ::1 stall).
     browser = pw.chromium.connect_over_cdp(f"http://127.0.0.1:{port}")
@@ -1770,74 +2411,81 @@ def cmd_cscs_login(port: int) -> int:
     (Touch-ID-gated; vault never exposed to the browser). Captures the API token
     from the SAME connection (no second ``connect_over_cdp``). Idempotent: if
     already logged in, it skips the login form and just refreshes the token.
+
+    Everything that drives the page happens under the INTERACTION lease, so it
+    can never interleave with another tool's clicks (it waits, then fails loud
+    naming the holder).
     """
     pw, browser = _connect(port)
     try:
-        # Prefer a settled portal app tab (already logged in) so we skip a full
-        # SPA reload — the slow part of a repeated `cscs-login`. _pick_portal_page
-        # ignores transient OAuth-callback tabs; only navigate when there is no
-        # settled app tab yet (cold session / Keycloak tab).
-        ctx, page = _pick_portal_page(browser)
-        if not _on_portal(page):
-            page.goto(PORTAL_PROFILE_URL, wait_until="domcontentloaded")
-            page.wait_for_timeout(1500)
-        if _on_portal(page):
-            print("✓ Already logged into CSCS.")
-        elif "auth.cscs.ch" not in page.url:
-            return _fail(f"Unexpected page (not portal, not Keycloak): {page.url}")
-        else:
-            creds = _keychain_creds()
-            cscs_login_mode = "keychain"
-            if creds is not None:
-                print("Using CSCS credentials from the macOS keychain (no Touch ID).")
-            else:
-                print(
-                    "No keychain credentials yet — falling back to 1Password "
-                    "(approve Touch ID). Run `browser.py cscs-store-creds` once to "
-                    "make future logins fingerprint-free."
-                )
-                creds = _op_creds(CSCS_OP_ITEM, CSCS_OP_ACCOUNT)
-                cscs_login_mode = "1password"
-            if creds is None:
-                return _fail(
-                    "No CSCS credentials available. Either run "
-                    "`browser.py cscs-store-creds` (keychain, no fingerprint), or "
-                    f"make 1Password item '{CSCS_OP_ITEM}' (account "
-                    f"{CSCS_OP_ACCOUNT}) readable via op (desktop 'Integrate with "
-                    "1Password CLI' on, Touch ID approved)."
-                )
-            user, password, otp = creds
-            page.fill("#username", user)
-            page.fill("#password", password)
-            _click_keycloak_submit(page)
-            # Wait for EITHER the OTP step or a direct landing on the portal.
-            otp_filled = False
-            for _ in range(40):  # ~20s
-                if _on_portal(page):
-                    break
-                if not otp_filled:
-                    otp_el = (
-                        page.query_selector("#otp")
-                        or page.query_selector("input[name=otp]")
-                        or page.query_selector("input[autocomplete=one-time-code]")
-                    )
-                    if otp_el:
-                        otp_el.fill(otp)
-                        _click_keycloak_submit(page)
-                        otp_filled = True
-                page.wait_for_timeout(500)
+        with _interaction_lease("login cscs"):
+            # Prefer a settled portal app tab (already logged in) so we skip a full
+            # SPA reload — the slow part of a repeated `cscs-login`. _pick_portal_page
+            # ignores transient OAuth-callback tabs; only navigate when there is no
+            # settled app tab yet (cold session / Keycloak tab).
+            ctx, page = _pick_portal_page(browser)
             if not _on_portal(page):
-                return _fail(
-                    "Login did not reach the portal — wrong username/password/OTP, "
-                    f"or an unexpected page ({page.url})."
-                )
-            print("✓ Logged into CSCS.")
-            _record_login_event("cscs", cscs_login_mode)
-        # Capture the token from THIS connection — no second connect_over_cdp
-        # (cmd_token would re-attach to every open tab again, costing seconds).
-        rc = _capture_and_cache_token(ctx, page)
-        _close_stale_cscs_tabs(ctx, keep=page)  # clear dead OAuth/login stubs
-        return rc
+                page.goto(PORTAL_PROFILE_URL, wait_until="domcontentloaded")
+                page.wait_for_timeout(1500)
+            if _on_portal(page):
+                print("✓ Already logged into CSCS.")
+            elif "auth.cscs.ch" not in page.url:
+                return _fail(f"Unexpected page (not portal, not Keycloak): {page.url}")
+            else:
+                creds = _keychain_creds()
+                cscs_login_mode = "keychain"
+                if creds is not None:
+                    print(
+                        "Using CSCS credentials from the macOS keychain (no Touch ID)."
+                    )
+                else:
+                    print(
+                        "No keychain credentials yet — falling back to 1Password "
+                        "(approve Touch ID). Run `browser.py cscs-store-creds` once to "
+                        "make future logins fingerprint-free."
+                    )
+                    creds = _op_creds(CSCS_OP_ITEM, CSCS_OP_ACCOUNT)
+                    cscs_login_mode = "1password"
+                if creds is None:
+                    return _fail(
+                        "No CSCS credentials available. Either run "
+                        "`browser.py cscs-store-creds` (keychain, no fingerprint), or "
+                        f"make 1Password item '{CSCS_OP_ITEM}' (account "
+                        f"{CSCS_OP_ACCOUNT}) readable via op (desktop 'Integrate with "
+                        "1Password CLI' on, Touch ID approved)."
+                    )
+                user, password, otp = creds
+                page.fill("#username", user)
+                page.fill("#password", password)
+                _click_keycloak_submit(page)
+                # Wait for EITHER the OTP step or a direct landing on the portal.
+                otp_filled = False
+                for _ in range(40):  # ~20s
+                    if _on_portal(page):
+                        break
+                    if not otp_filled:
+                        otp_el = (
+                            page.query_selector("#otp")
+                            or page.query_selector("input[name=otp]")
+                            or page.query_selector("input[autocomplete=one-time-code]")
+                        )
+                        if otp_el:
+                            otp_el.fill(otp)
+                            _click_keycloak_submit(page)
+                            otp_filled = True
+                    page.wait_for_timeout(500)
+                if not _on_portal(page):
+                    return _fail(
+                        "Login did not reach the portal — wrong username/password/OTP, "
+                        f"or an unexpected page ({page.url})."
+                    )
+                print("✓ Logged into CSCS.")
+                _record_login_event("cscs", cscs_login_mode)
+            # Capture the token from THIS connection — no second connect_over_cdp
+            # (cmd_token would re-attach to every open tab again, costing seconds).
+            rc = _capture_and_cache_token(ctx, page)
+            _close_stale_cscs_tabs(ctx, keep=page)  # clear dead OAuth/login stubs
+            return rc
     finally:
         browser.close()
         pw.stop()
@@ -2205,73 +2853,78 @@ def cmd_anthropic_login(port: int) -> int:
     If $ANTHROPIC_LOGIN_EMAIL is set AND himalaya is available, logs in FULLY
     AUTOMATICALLY: triggers the magic-link email, reads it via himalaya, opens the
     link — no password, no manual code. Otherwise (or if that fails) falls back to
-    ASSISTED: you complete the email login in the shared window; it auto-detects."""
+    ASSISTED: you complete the email login in the shared window; it auto-detects.
+    Held under the INTERACTION lease — no other tool clicks in the meantime."""
     pw, browser = _connect(port)
     try:
+        # Warm probe FIRST, outside the lease — the same read-only check
+        # `logged-in` does lease-free, so an ensure-login call with a warm
+        # session never waits behind another tool's interaction.
         _ctx, page = _pick_page(browser, "claude.ai")
         if _claude_logged_in(page):
             print("✓ Already logged into Claude (claude.ai).")
             return 0
-        from playwright.sync_api import Error as PlaywrightError
+        with _interaction_lease("login anthropic"):
+            from playwright.sync_api import Error as PlaywrightError
 
-        try:
-            page.goto(CLAUDE_LOGIN_URL, wait_until="domcontentloaded")
-            page.bring_to_front()
-        except PlaywrightError:
-            pass
+            try:
+                page.goto(CLAUDE_LOGIN_URL, wait_until="domcontentloaded")
+                page.bring_to_front()
+            except PlaywrightError:
+                pass
 
-        himalaya = _himalaya_bin()
-        auto_attempted = False
-        if ANTHROPIC_LOGIN_EMAIL and himalaya:
-            auto_attempted = True
+            himalaya = _himalaya_bin()
+            auto_attempted = False
+            if ANTHROPIC_LOGIN_EMAIL and himalaya:
+                auto_attempted = True
+                print(
+                    f"Automatic login for {ANTHROPIC_LOGIN_EMAIL} (magic-link via himalaya)…",
+                    file=sys.stderr,
+                )
+                if _claude_auto_login(page, ANTHROPIC_LOGIN_EMAIL, himalaya):
+                    print("✓ Logged into Claude (claude.ai).")
+                    _record_login_event("anthropic", "auto")
+                    return 0
+                print(
+                    "  Automatic login didn't complete — falling back to assisted.",
+                    file=sys.stderr,
+                )
+
+            # Assisted fallback — needs a human at a real window (the automatic
+            # magic-link path above works fine headless, so it is NOT gated).
+            if not _require_headed_for_assisted(port, "claude.ai"):
+                return 2
+            # If auto already triggered the email, don't re-send.
+            if ANTHROPIC_LOGIN_EMAIL and not auto_attempted:
+                _claude_fill_email_and_continue(page, ANTHROPIC_LOGIN_EMAIL)
+            hint = (
+                "set $ANTHROPIC_LOGIN_EMAIL and install himalaya to fully automate this"
+                if not (ANTHROPIC_LOGIN_EMAIL and himalaya)
+                else "open the login link Anthropic just emailed you"
+            )
             print(
-                f"Automatic login for {ANTHROPIC_LOGIN_EMAIL} (magic-link via himalaya)…",
+                "\n🔐 Claude (claude.ai) needs a login.\n"
+                "   In the shared Chrome window (now in front):\n"
+                "     1. Continue with email"
+                + (
+                    f" (pre-filled: {ANTHROPIC_LOGIN_EMAIL})"
+                    if ANTHROPIC_LOGIN_EMAIL
+                    else ""
+                )
+                + ".\n"
+                "     2. Open the login link Anthropic emails you (or enter the code).\n"
+                "     3. Make sure the org switcher shows 'SDSC · Team plan'.\n"
+                f"   I'll detect success automatically. Tip: {hint}.\n",
                 file=sys.stderr,
             )
-            if _claude_auto_login(page, ANTHROPIC_LOGIN_EMAIL, himalaya):
-                print("✓ Logged into Claude (claude.ai).")
-                _record_login_event("anthropic", "auto")
-                return 0
-            print(
-                "  Automatic login didn't complete — falling back to assisted.",
-                file=sys.stderr,
-            )
-
-        # Assisted fallback — needs a human at a real window (the automatic
-        # magic-link path above works fine headless, so it is NOT gated).
-        if not _require_headed_for_assisted(port, "claude.ai"):
-            return 2
-        # If auto already triggered the email, don't re-send.
-        if ANTHROPIC_LOGIN_EMAIL and not auto_attempted:
-            _claude_fill_email_and_continue(page, ANTHROPIC_LOGIN_EMAIL)
-        hint = (
-            "set $ANTHROPIC_LOGIN_EMAIL and install himalaya to fully automate this"
-            if not (ANTHROPIC_LOGIN_EMAIL and himalaya)
-            else "open the login link Anthropic just emailed you"
-        )
-        print(
-            "\n🔐 Claude (claude.ai) needs a login.\n"
-            "   In the shared Chrome window (now in front):\n"
-            "     1. Continue with email"
-            + (
-                f" (pre-filled: {ANTHROPIC_LOGIN_EMAIL})"
-                if ANTHROPIC_LOGIN_EMAIL
-                else ""
-            )
-            + ".\n"
-            "     2. Open the login link Anthropic emails you (or enter the code).\n"
-            "     3. Make sure the org switcher shows 'SDSC · Team plan'.\n"
-            f"   I'll detect success automatically. Tip: {hint}.\n",
-            file=sys.stderr,
-        )
-        if not _claude_wait_for_login(page, timeout_s=300):
-            return _fail(
-                "Claude login not detected within 5 min. Finish the email login in "
-                "the shared browser, then re-run: browser.py login anthropic"
-            )
-        print("✓ Logged into Claude (claude.ai).")
-        _record_login_event("anthropic", "assisted")
-        return 0
+            if not _claude_wait_for_login(page, timeout_s=300):
+                return _fail(
+                    "Claude login not detected within 5 min. Finish the email login in "
+                    "the shared browser, then re-run: browser.py login anthropic"
+                )
+            print("✓ Logged into Claude (claude.ai).")
+            _record_login_event("anthropic", "assisted")
+            return 0
     finally:
         browser.close()
         pw.stop()
@@ -2358,9 +3011,13 @@ def cmd_openai_login(port: int) -> int:
     """Ensure chatgpt.com (ChatGPT Business admin) is logged in. Idempotent (a
     warm session just returns 0). ChatGPT logs in via Google SSO + 2FA, which
     can't be replayed from stored credentials — a cold session is ASSISTED: you
-    complete the SSO once in the shared window; the session then persists."""
+    complete the SSO once in the shared window; the session then persists. Held
+    under the INTERACTION lease — no other tool clicks in the meantime."""
     pw, browser = _connect(port)
     try:
+        # Warm probe + headless guard FIRST, outside the lease (both are the
+        # read-only checks `logged-in` does lease-free); only the assisted
+        # interaction below needs the exclusive lease.
         _ctx, page = _pick_page(browser, "chatgpt.com")
         if _chatgpt_logged_in(page):
             print("✓ Already logged into ChatGPT (chatgpt.com).")
@@ -2368,30 +3025,31 @@ def cmd_openai_login(port: int) -> int:
         # A cold session is assisted-only — pointless without a window.
         if not _require_headed_for_assisted(port, "chatgpt.com"):
             return 2
-        from playwright.sync_api import Error as PlaywrightError
+        with _interaction_lease("login openai"):
+            from playwright.sync_api import Error as PlaywrightError
 
-        try:
-            page.bring_to_front()
-        except PlaywrightError:
-            pass
-        print(
-            "\n🔐 ChatGPT (chatgpt.com) needs a login.\n"
-            "   In the shared Chrome window (now in front):\n"
-            "     1. Log in on the page that opened (Google SSO + 2FA).\n"
-            "        If Google refuses ('this browser may not be secure'), use\n"
-            "        the account's email+password login instead of the SSO button.\n"
-            "     2. Land anywhere on chatgpt.com — success is auto-detected and\n"
-            "        admin access confirmed on chatgpt.com/admin/members.\n",
-            file=sys.stderr,
-        )
-        if not _chatgpt_wait_for_login(page, timeout_s=300):
-            return _fail(
-                "ChatGPT login not detected within 5 min. Finish the SSO login in "
-                "the shared browser, then re-run: browser.py login openai"
+            try:
+                page.bring_to_front()
+            except PlaywrightError:
+                pass
+            print(
+                "\n🔐 ChatGPT (chatgpt.com) needs a login.\n"
+                "   In the shared Chrome window (now in front):\n"
+                "     1. Log in on the page that opened (Google SSO + 2FA).\n"
+                "        If Google refuses ('this browser may not be secure'), use\n"
+                "        the account's email+password login instead of the SSO button.\n"
+                "     2. Land anywhere on chatgpt.com — success is auto-detected and\n"
+                "        admin access confirmed on chatgpt.com/admin/members.\n",
+                file=sys.stderr,
             )
-        print("✓ Logged into ChatGPT (chatgpt.com).")
-        _record_login_event("openai", "assisted")
-        return 0
+            if not _chatgpt_wait_for_login(page, timeout_s=300):
+                return _fail(
+                    "ChatGPT login not detected within 5 min. Finish the SSO login in "
+                    "the shared browser, then re-run: browser.py login openai"
+                )
+            print("✓ Logged into ChatGPT (chatgpt.com).")
+            _record_login_event("openai", "assisted")
+            return 0
     finally:
         browser.close()
         pw.stop()
@@ -2544,9 +3202,12 @@ def cmd_slack_login(port: int) -> int:
     the session then persists in the profile (so this is a ONE-TIME step).
     `slack_api.py` reuses it via `browser.py slack-session`. The wait is PASSIVE
     (10 min) — the page is NOT reloaded while you type, and $SLACK_LOGIN_EMAIL is
-    pre-filled when set."""
+    pre-filled when set. Held under the INTERACTION lease throughout, so no other
+    tool clicks in the shared window while you sign in."""
     pw, browser = _connect(port)
     try:
+        # Warm probe + headless guard FIRST, outside the lease (read-only, the
+        # same checks `logged-in` does lease-free).
         _ctx, page = _pick_page(browser, "slack.com")
         if _slack_logged_in(page):
             print("✓ Already logged into Slack — session persists; nothing to do.")
@@ -2554,38 +3215,39 @@ def cmd_slack_login(port: int) -> int:
         # A cold session is assisted-only — pointless without a window.
         if not _require_headed_for_assisted(port, "Slack"):
             return 2
-        from playwright.sync_api import Error as PlaywrightError
+        with _interaction_lease("login slack"):
+            from playwright.sync_api import Error as PlaywrightError
 
-        # Land straight on the SDSC workspace sign-in (skips the workspace picker).
-        try:
-            page.goto(SLACK_WORKSPACE_URL, wait_until="domcontentloaded")
-            page.bring_to_front()
-            page.wait_for_timeout(1500)
-            _slack_prefill_email(page)
-        except PlaywrightError:
-            pass
-        email_note = (
-            f" (email pre-filled: {SLACK_LOGIN_EMAIL})"
-            if SLACK_LOGIN_EMAIL
-            else " (tip: export SLACK_LOGIN_EMAIL=albert.glensk@epfl.ch to pre-fill it)"
-        )
-        print(
-            "\n🔐 Slack needs a ONE-TIME login (the session then persists).\n"
-            f"   In the shared Chrome window (now in front){email_note}:\n"
-            f"     1. Workspace: swiss-data-science ({SLACK_WORKSPACE_URL}).\n"
-            "     2. Sign in (email code or SSO) as an Owner/Admin.\n"
-            "     3. Land in the workspace — I detect success automatically.\n"
-            "   Take your time — the page is NOT reloaded while you type.\n",
-            file=sys.stderr,
-        )
-        if not _slack_wait_for_login(page, timeout_s=600):
-            return _fail(
-                "Slack login not detected within 10 min. Finish it in the shared "
-                "browser, then re-run: browser.py login slack"
+            # Land straight on the SDSC workspace sign-in (skips the workspace picker).
+            try:
+                page.goto(SLACK_WORKSPACE_URL, wait_until="domcontentloaded")
+                page.bring_to_front()
+                page.wait_for_timeout(1500)
+                _slack_prefill_email(page)
+            except PlaywrightError:
+                pass
+            email_note = (
+                f" (email pre-filled: {SLACK_LOGIN_EMAIL})"
+                if SLACK_LOGIN_EMAIL
+                else " (tip: export SLACK_LOGIN_EMAIL=albert.glensk@epfl.ch to pre-fill it)"
             )
-        print("✓ Logged into Slack — session saved in the shared profile.")
-        _record_login_event("slack", "assisted")
-        return 0
+            print(
+                "\n🔐 Slack needs a ONE-TIME login (the session then persists).\n"
+                f"   In the shared Chrome window (now in front){email_note}:\n"
+                f"     1. Workspace: swiss-data-science ({SLACK_WORKSPACE_URL}).\n"
+                "     2. Sign in (email code or SSO) as an Owner/Admin.\n"
+                "     3. Land in the workspace — I detect success automatically.\n"
+                "   Take your time — the page is NOT reloaded while you type.\n",
+                file=sys.stderr,
+            )
+            if not _slack_wait_for_login(page, timeout_s=600):
+                return _fail(
+                    "Slack login not detected within 10 min. Finish it in the shared "
+                    "browser, then re-run: browser.py login slack"
+                )
+            print("✓ Logged into Slack — session saved in the shared profile.")
+            _record_login_event("slack", "assisted")
+            return 0
     finally:
         browser.close()
         pw.stop()
@@ -2666,66 +3328,68 @@ def cmd_biopolwifi_login(port: int) -> int:
     we fill it from the two macOS-keychain items (shared with biopol-wifi.py) and
     submit — no SSO, no 1Password fallback for this site. Idempotent: a warm
     session (the 'SDSC - Biopole' / 'Properties' sentinel already present) just
-    returns 0. No token is extracted; this only keeps the GUI logged in."""
+    returns 0. No token is extracted; this only keeps the GUI logged in. Held
+    under the INTERACTION lease — no other tool clicks in the meantime."""
     pw, browser = _connect(port)
     try:
-        from playwright.sync_api import Error as PlaywrightError
+        with _interaction_lease("login biopolwifi"):
+            from playwright.sync_api import Error as PlaywrightError
 
-        _ctx, page = _pick_page(browser, "cloudpath.edificom.cloud")
-        # If the picked tab isn't already on the portal (cold session reuses
-        # whatever content tab _pick_page returned), navigate there and settle.
-        if "cloudpath.edificom.cloud" not in page.url:
+            _ctx, page = _pick_page(browser, "cloudpath.edificom.cloud")
+            # If the picked tab isn't already on the portal (cold session reuses
+            # whatever content tab _pick_page returned), navigate there and settle.
+            if "cloudpath.edificom.cloud" not in page.url:
+                try:
+                    page.goto(BIOPOLWIFI_PORTAL_URL, wait_until="domcontentloaded")
+                    page.wait_for_timeout(2000)  # let the Vue SPA render
+                except PlaywrightError:
+                    pass
+            # The Vue login form can render a beat after domcontentloaded — WAIT for
+            # the email field before deciding which state we're in (query_selector
+            # right away races the render and returns None). Skip the wait entirely
+            # when the logged-in sentinel is already present (warm session).
+            email_sel = 'input[placeholder="Email Address"]'
+            pass_sel = 'input[placeholder="Password"]'
+            form_ready = False
+            if not _biopolwifi_logged_in(page):
+                try:
+                    page.wait_for_selector(email_sel, timeout=15000, state="visible")
+                    form_ready = True
+                except PlaywrightError:
+                    form_ready = False
+            if not form_ready:
+                # No login form — either already logged in (sentinel) or a stray page.
+                if _biopolwifi_logged_in(page):
+                    print("✓ Already logged into the Cloudpath MDU portal (edificom).")
+                    return 0
+                return _fail(
+                    "Cloudpath portal showed neither the login form nor the logged-in "
+                    f"sentinel — unexpected page ({page.url})."
+                )
+            email = _keychain_get(KEYCHAIN_SVC_BIOPOL_EMAIL)
+            password = _keychain_get(KEYCHAIN_SVC_BIOPOL_PASS)
+            if not (email and password):
+                return _fail(
+                    "No Cloudpath portal credentials in the keychain. "
+                    "Run: browser.py store-creds biopolwifi"
+                )
             try:
-                page.goto(BIOPOLWIFI_PORTAL_URL, wait_until="domcontentloaded")
-                page.wait_for_timeout(2000)  # let the Vue SPA render
-            except PlaywrightError:
-                pass
-        # The Vue login form can render a beat after domcontentloaded — WAIT for
-        # the email field before deciding which state we're in (query_selector
-        # right away races the render and returns None). Skip the wait entirely
-        # when the logged-in sentinel is already present (warm session).
-        email_sel = 'input[placeholder="Email Address"]'
-        pass_sel = 'input[placeholder="Password"]'
-        form_ready = False
-        if not _biopolwifi_logged_in(page):
-            try:
-                page.wait_for_selector(email_sel, timeout=15000, state="visible")
-                form_ready = True
-            except PlaywrightError:
-                form_ready = False
-        if not form_ready:
-            # No login form — either already logged in (sentinel) or a stray page.
-            if _biopolwifi_logged_in(page):
-                print("✓ Already logged into the Cloudpath MDU portal (edificom).")
-                return 0
+                page.fill(email_sel, email)
+                page.fill(pass_sel, password)
+                page.click('button:has-text("Login")')
+            except PlaywrightError as exc:
+                return _fail(f"Could not submit the Cloudpath login form: {exc}")
+            # Poll up to ~20s for the logged-in sentinel.
+            for _ in range(40):
+                if _biopolwifi_logged_in(page):
+                    print("✓ Logged into the Cloudpath MDU portal (edificom).")
+                    _record_login_event("biopolwifi", "keychain")
+                    return 0
+                page.wait_for_timeout(500)
             return _fail(
-                "Cloudpath portal showed neither the login form nor the logged-in "
-                f"sentinel — unexpected page ({page.url})."
+                "Cloudpath login did not reach the properties page — wrong "
+                f"email/password, or an unexpected page ({page.url})."
             )
-        email = _keychain_get(KEYCHAIN_SVC_BIOPOL_EMAIL)
-        password = _keychain_get(KEYCHAIN_SVC_BIOPOL_PASS)
-        if not (email and password):
-            return _fail(
-                "No Cloudpath portal credentials in the keychain. "
-                "Run: browser.py store-creds biopolwifi"
-            )
-        try:
-            page.fill(email_sel, email)
-            page.fill(pass_sel, password)
-            page.click('button:has-text("Login")')
-        except PlaywrightError as exc:
-            return _fail(f"Could not submit the Cloudpath login form: {exc}")
-        # Poll up to ~20s for the logged-in sentinel.
-        for _ in range(40):
-            if _biopolwifi_logged_in(page):
-                print("✓ Logged into the Cloudpath MDU portal (edificom).")
-                _record_login_event("biopolwifi", "keychain")
-                return 0
-            page.wait_for_timeout(500)
-        return _fail(
-            "Cloudpath login did not reach the properties page — wrong "
-            f"email/password, or an unexpected page ({page.url})."
-        )
     finally:
         browser.close()
         pw.stop()
@@ -3027,12 +3691,20 @@ def main() -> int:
     args = parse_args()
     ensure_deps()
     port = args.cdp_port
+    # Say what we are doing BEFORE anything attaches over CDP: this is the
+    # `purpose` every client registration reports to whoever waits on the gate.
+    site = getattr(args, "site", None)
+    _set_purpose(f"{args.cmd} {site}" if site else str(args.cmd))
     if args.cmd == "up":
         return cmd_up(port, args.headless)
     if args.cmd == "status":
         return cmd_status(port)
     if args.cmd == "switch":
-        return cmd_switch(port, args.mode)
+        return cmd_switch(port, args.mode, args.force)
+    if args.cmd == "clients":
+        return cmd_clients(port)
+    if args.cmd == "register-exec":
+        return cmd_register_exec(port, args.tool, args.cmd_)
     if args.cmd == "down":
         return cmd_down(port)
     if args.cmd == "open":

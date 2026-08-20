@@ -125,7 +125,28 @@ human asked for it.
       pkill after 10 s; relaunch aborts while the old root or the profile
       `SingletonLock` persists. Record agreement is required only in state
       `running`; `doctor` flags stale transitional/crash states.
-- [ ] **Two-layer client coordination.** Layer 1: shared lifecycle
+- [x] **Two-layer client coordination.** *(done 2026-08-20. Layer 1:
+      `~/.cache/claude-browser/clients/` — every `_connect` holds gate-SH +
+      an flock'd metadata file for its lifetime; `switch`/`down` acquire
+      gate-EX (bounded 20 s, refusal names live holders); `clients`
+      subcommand reports + reaps; `register-exec [-t NAME] -- CMD` wraps
+      long-lived clients (Playwright MCP re-registered through it in
+      mydotfiles — which also revived the MCP: its old top-level
+      `mcpServers` entry in ~/.claude.json was dead config the CLI no longer
+      reads). Unknown-client detection via lsof with pid-ancestry matching;
+      `switch` FAILS CLOSED on unknown/unverifiable (`-f/--force`
+      overrides), `down` warns and proceeds. Layer 2: `_interaction_lease`
+      on the same `interaction.lock` consumers flock — owner nonce + pid
+      start time, 10 s heartbeat thread, compare-before-release,
+      `CLAUDE_BROWSER_LEASE_HELD=1` reentrancy for parents that already
+      hold it (anthropic-api.py -dl patched to export it; its warm path is
+      also lease-free now: warm probes + headless guards hoisted out of the
+      lease in the three assisted logins). Verified live: registration
+      blocks switch and is named in the refusal; kill -9 → reap → switch
+      proceeds; bare-TCP unknown client refused in 0.4 s with pid+command;
+      warm `login anthropic` returns in ~6 s under a held lease;
+      `anthropic-api.py -dl` end-to-end in 6.8 s; 39/39 lock unit checks.)*
+      Layer 1: shared lifecycle
       REGISTRATION for every supported CDP connection (read-only evals and our
       MCP tools included); mode switch/down requires exclusive acquisition
       over the registration set. Layer 2: exclusive INTERACTION lease for
