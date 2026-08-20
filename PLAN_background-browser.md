@@ -39,7 +39,7 @@ human asked for it.
 
 ## Steps (in order)
 
-- [ ] **Spike A: headless-by-default.** `browser.py up --headless`
+- [x] **Spike A: headless-by-default.** `browser.py up --headless`
       (`--headless=new`, same profile). Validation matrix = FULL workflows
       across ALL consumers, not just login sentinels: claude.ai admin DOM read
       + `-ta` dry-run; chatgpt.com admin read + `-ta` dry-run; CSCS login +
@@ -47,6 +47,35 @@ human asked for it.
       screenshots; assisted-login handoff. Anti-bot risk (Cloudflare) is the
       thing being tested. Headless stays opt-in behind a soak period before
       any default flip.
+
+      **Result 2026-08-20 — headless is a NO-GO for the admin surfaces;
+      stays opt-in permanently (`up -H/--headless`, env
+      `CLAUDE_BROWSER_HEADLESS=1`); default flip is off the table.**
+      Matrix (Chrome for Testing 151, `--headless=new`, shared profile):
+
+      | Workflow                          | Headless result |
+      | :-------------------------------- | :--------------- |
+      | claude.ai DOM read (`logged-in`)  | ❌ Cloudflare "Just a moment…" interstitial persists >20 s, sentinel never appears |
+      | `anthropic-api.py -ta` dry-run    | ❌ clean gate abort (exit 1, correct remedy message) |
+      | chatgpt.com admin read            | ❌ same Cloudflare interstitial |
+      | `openai-team.py -ta` dry-run      | ❌ gate fails; full run NOT executed headless — its legacy own-profile fallback would spawn a second uncoordinated browser |
+      | CSCS Keycloak login + token       | ✅ full unattended login, token cached + API-validated, 17 s |
+      | Slack session extraction          | ✅ xoxc + d cookie + team_domain |
+      | biopolwifi unattended login       | ✅ 6 s (also restored the cold session) |
+      | rAF / screenshot / download       | ✅ 2 rAF frames in 28 ms (no occlusion throttling), shot 0.1 s, download OK |
+      | assisted-login handoff            | ✅ new guard: exit 2 + remedy before any human-wait; himalaya auto path stays allowed |
+
+      Root cause: `--headless=new` advertises `HeadlessChrome/151.0.0.0` in the
+      User-Agent; Cloudflare (fronting claude.ai AND chatgpt.com — the two
+      primary consumers) hard-challenges it. Sessions were NOT damaged: after
+      restoring headed mode all five sites verified logged in, and both `-ta`
+      dry-runs pass headed end-to-end (dialog filled, stopped before mutation).
+      Detection gotcha shipped: CfT 151 reports a plain `Browser` field in
+      `/json/version` — only the User-Agent carries the `HeadlessChrome`
+      marker; `_browser_mode()` checks both. `up` now refuses a mode-mismatched
+      request (exit 1) instead of silently ignoring it; `status` prints the
+      mode. Headless remains useful for CSCS/Slack/biopolwifi + mechanical
+      CDP work (screenshots, downloads, evals).
 - [ ] **Spike B (independent): hidden launch `open -g -j`.** Do NOT infer from
       occluded-window results — a hidden window is a different macOS state.
       Own pass: rAF alive after `bring_to_front()`, click, screenshot, focus
