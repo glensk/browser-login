@@ -274,6 +274,16 @@ def parse_args() -> argparse.Namespace:
     sub.add_parser("down", help="Quit the shared browser.")
     po = sub.add_parser("open", help="Open/navigate a tab to URL.")
     po.add_argument("url", help="URL to open.")
+    po.add_argument(
+        "-r",
+        "--reuse",
+        action="store_true",
+        help=(
+            "Navigate an existing tab already on this URL (compared without "
+            "query/fragment) instead of opening a new tab. Picks the oldest "
+            "match — the same tab `eval --url` targets."
+        ),
+    )
     pe = sub.add_parser("eval", help="Eval a JS expression in a tab; print JSON.")
     pe.add_argument("js", help="JavaScript expression to evaluate.")
     pe.add_argument(
@@ -1984,11 +1994,24 @@ def _pick_page(browser, url_substr: str | None):
     return ctx, ctx.new_page()
 
 
-def cmd_open(port: int, url: str) -> int:
+def _strip_query(url: str) -> str:
+    """URL without query/fragment or trailing slash — for tab-reuse matching."""
+    return url.split("#", 1)[0].split("?", 1)[0].rstrip("/")
+
+
+def cmd_open(port: int, url: str, reuse: bool = False) -> int:
     """Open/navigate a tab to URL."""
     pw, browser = _connect(port)
     try:
         ctx = browser.contexts[0] if browser.contexts else browser.new_context()
+        if reuse:
+            base = _strip_query(url)
+            same = [pg for pg in ctx.pages if _strip_query(pg.url) == base]
+            if same:  # oldest match = the tab `eval --url` would pick
+                page = same[0]
+                page.goto(url, wait_until="domcontentloaded")
+                print(f"✓ Reused tab: {page.url}  (title: {page.title()!r})")
+                return 0
         blank = [pg for pg in ctx.pages if _is_blank(pg.url)]
         if blank:  # reuse a blank tab in place — navigation does not focus it
             page = blank[0]
@@ -4354,7 +4377,7 @@ def main() -> int:
     if args.cmd == "down":
         return cmd_down(port)
     if args.cmd == "open":
-        return cmd_open(port, args.url)
+        return cmd_open(port, args.url, reuse=args.reuse)
     if args.cmd == "eval":
         return cmd_eval(port, args.js, args.url)
     if args.cmd == "token":
