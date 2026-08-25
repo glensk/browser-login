@@ -69,6 +69,8 @@ browser.py switch headless    # transactional mode switch (stop + relaunch, logi
 browser.py clients            # who is attached over CDP (registered + unknown clients)
 browser.py doctor             # full health check on a disposable tab (never touches real tabs)
 browser.py open https://…     # navigate a tab (opens in the BACKGROUND — no focus steal)
+browser.py open -r https://…  # --reuse: navigate an existing same-URL tab (no duplicate tabs;
+                              #   matches sans query/fragment, oldest first = eval's pick)
 browser.py eval 'document.title' [--url SUBSTR]   # run JS in the active/matched tab → JSON
 browser.py down               # quit the shared browser (graceful CDP close → validated escalation)
 ```
