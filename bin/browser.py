@@ -3368,54 +3368,126 @@ def _himalaya_date_epoch(s: str) -> float:
         return 0.0
 
 
+# Anthropic has renamed the magic-link subject at least once, so sender is the
+# primary signal and the subject is only a fallback hint. Observed subjects:
+#   2026-08  "Your secure link to Claude.ai is here | <timestamp>"
+# The original filter demanded "log in to Claude.ai", which never matched.
+_ANTHROPIC_MAIL_DOMAIN = "mail.anthropic.com"
+_CLAUDE_SUBJECT_HINTS = ("secure link to Claude.ai", "log in to Claude.ai")
+
+
+def _diag(sink: list[str] | None, msg: str) -> None:
+    """Record a one-line reason for a silent skip, de-duplicated."""
+    if sink is not None and msg not in sink:
+        sink.append(msg)
+
+
+def _is_claude_login_mail(env: dict) -> bool:
+    """True for an Anthropic magic-link mail.
+
+    A known subject wins outright. Otherwise fall back to the sender — the
+    localpart is randomised per message (`no-reply-<random>@mail.anthropic.com`)
+    but the domain is stable — AND require the subject to look like a link mail:
+    ordinary product mail ("You have new requests from your team") ships from
+    that same domain, and selecting it would starve the real login mail.
+    """
+    subject = (env.get("subject") or "").lower()
+    if any(h.lower() in subject for h in _CLAUDE_SUBJECT_HINTS):
+        return True
+    sender = ((env.get("from") or {}).get("addr") or "").lower()
+    if not sender.endswith("@" + _ANTHROPIC_MAIL_DOMAIN):
+        return False
+    return "claude" in subject and "link" in subject
+
+
 def _himalaya_latest_login_mail(
-    himalaya: str, email: str, since_ts: float
+    himalaya: str,
+    email: str,
+    since_ts: float,
+    account: str | None = None,
+    diag: list[str] | None = None,
 ) -> tuple[str, str] | None:
-    """Newest 'log in to Claude.ai' mail to `email`, not clearly older than
+    """Newest Anthropic magic-link mail to `email`, not clearly older than
     `since_ts`. Searches INBOX + Archive (a server rule auto-archives them).
+
+    Matching is on SENDER first (`*@mail.anthropic.com`) and only then on a
+    subject substring, because Anthropic has changed the subject at least once:
+    the real 2026 subject is "Your secure link to Claude.ai is here | <ts>",
+    while this function used to require "log in to Claude.ai" — a string that
+    has never appeared in either folder, so auto-login silently never engaged.
+
+    `diag`, if given, collects one-line reasons explaining why nothing matched;
+    the caller prints them, because every failure path here is otherwise silent.
+
     Returns (folder, id) or None."""
     best_folder: str | None = None
     best_id: str | None = None
-    best_ts = -1.0
+    best_key = (-1, -1.0)  # (has_parsable_date, ts) — a dated mail always wins
+    seen = matched = 0
     for folder in ("INBOX", "Archive"):
+        argv = [himalaya, "envelope", "list", "--folder", folder]
+        if account:
+            argv += ["-a", account]
+        argv += ["--page-size", "30", "-o", "json"]
         try:
             res = subprocess.run(
-                [
-                    himalaya,
-                    "envelope",
-                    "list",
-                    "--folder",
-                    folder,
-                    "--page-size",
-                    "30",
-                    "-o",
-                    "json",
-                ],
+                argv,
                 capture_output=True,
                 text=True,
                 timeout=30,
                 check=False,
             )
-        except (OSError, subprocess.SubprocessError):
+        except (OSError, subprocess.SubprocessError) as exc:
+            _diag(diag, f"{folder}: himalaya could not be run ({exc})")
             continue
         if res.returncode != 0:
+            _diag(
+                diag,
+                f"{folder}: himalaya exited {res.returncode} "
+                f"({(res.stderr or '').strip()[:160] or 'no stderr'})",
+            )
             continue
         try:
             envs = json.loads(res.stdout)
-        except (ValueError, TypeError):
+        except (ValueError, TypeError) as exc:
+            _diag(diag, f"{folder}: himalaya output was not JSON ({exc})")
             continue
-        for env in envs if isinstance(envs, list) else []:
-            if "log in to Claude.ai" not in (env.get("subject") or ""):
+        if not isinstance(envs, list):
+            _diag(diag, f"{folder}: himalaya JSON was not a list")
+            continue
+        for env in envs:
+            seen += 1
+            if not _is_claude_login_mail(env):
                 continue
+            matched += 1
             to = ((env.get("to") or {}).get("addr") or "").lower()
             if email and to and to != email.lower():
+                _diag(
+                    diag,
+                    f"{folder}: a Claude login mail was addressed to {to}, not {email}",
+                )
                 continue
-            ts = _himalaya_date_epoch(env.get("date") or "")
+            raw_date = env.get("date") or ""
+            ts = _himalaya_date_epoch(raw_date)
             if ts and ts + 180 < since_ts:  # clearly older than our trigger → skip
                 continue
-            if ts > best_ts:
-                best_ts, best_folder, best_id = ts, folder, str(env.get("id"))
+            if not ts:
+                # Unparsable date: still eligible, but ranked BELOW any dated
+                # candidate. Previously ts==0.0 was falsy, so it skipped the
+                # freshness guard above AND beat best_ts=-1.0 — i.e. a date-format
+                # change would make this silently consume an arbitrary old mail.
+                _diag(diag, f"{folder}: could not parse mail date {raw_date!r}")
+            key = (1 if ts else 0, ts)
+            if key > best_key:
+                best_key, best_folder, best_id = key, folder, str(env.get("id"))
     if best_folder is None or best_id is None:
+        if matched == 0:
+            _diag(
+                diag,
+                f"no Anthropic login mail among the {seen} newest envelopes "
+                f"(looked for sender *@{_ANTHROPIC_MAIL_DOMAIN} or subject ~ "
+                f"{_CLAUDE_SUBJECT_HINTS[0]!r})",
+            )
         return None
     return (best_folder, best_id)
 
@@ -3447,19 +3519,44 @@ def _claude_auto_login(page, email: str, himalaya: str) -> bool:
 
     trigger_ts = time.time()
     if not _claude_fill_email_and_continue(page, email):
+        print(
+            "  Could not submit the email on the login form — no link was requested.",
+            file=sys.stderr,
+        )
         return False
-    print(f"  Sent a login link to {email}; reading it via himalaya…", file=sys.stderr)
+    account = os.environ.get("ANTHROPIC_LOGIN_HIMALAYA_ACCOUNT")
+    print(
+        f"  Sent a login link to {email}; reading it via himalaya"
+        f"{f' (account {account})' if account else ' (default account)'}…",
+        file=sys.stderr,
+    )
     link = None
-    deadline = time.monotonic() + 90
+    diag: list[str] = []
+    # EPFL Exchange delivery can lag well past a minute; overridable because the
+    # right value is a property of the mail path, not of this code.
+    try:
+        wait_s = max(10, int(os.environ.get("ANTHROPIC_LOGIN_MAIL_TIMEOUT", "180")))
+    except ValueError:
+        wait_s = 180
+    deadline = time.monotonic() + wait_s
     while time.monotonic() < deadline:
-        hit = _himalaya_latest_login_mail(himalaya, email, trigger_ts)
+        diag.clear()  # keep only the last round's reasons
+        hit = _himalaya_latest_login_mail(
+            himalaya, email, trigger_ts, account=account, diag=diag
+        )
         if hit:
             link = _himalaya_extract_magic_link(himalaya, hit[0], hit[1])
             if link:
                 break
+            _diag(
+                diag,
+                f"found the mail ({hit[0]} id {hit[1]}) but no magic link in its body",
+            )
         time.sleep(3)
     if not link:
-        print("  No magic-link email arrived within 90s.", file=sys.stderr)
+        print(f"  No magic-link email arrived within {wait_s}s.", file=sys.stderr)
+        for reason in diag:
+            print(f"    · {reason}", file=sys.stderr)
         return False
     try:
         page.goto(link, wait_until="domcontentloaded")  # SPA consumes #token → signs in
