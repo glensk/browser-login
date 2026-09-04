@@ -1,10 +1,9 @@
-# PLAN — take the CSCS password + TOTP seed out of agent reach
+# PLAN — `credlogind`: keep login credentials out of agent reach
 
-> Reconciled after a judged Claude↔Codex debate (round 1, `converged: true`, 14/14
-> objections accepted). The original "root launchd daemon" plan survives only as Phase 2B:
-> Codex's first objection — investigate supported automation credentials before building a
-> personal-credential oracle — was confirmed by live probing and demotes the daemon to a
-> fallback.
+> Reconciled after two judged Claude↔Codex debates (round 1: 14/14 accepted, converged;
+> round 2 on the build: 12/12 accepted, converged). Round 2 pivoted the architecture from
+> "daemon returns a token" to **a broker that never hands the token out**, and cut
+> biopolwifi from v1.
 
 ## Session
 
@@ -13,192 +12,132 @@ Ticket: tp#144 (priority high)
 
 ## Goal
 
-No process running as uid 501 (`albert`) — Claude Code, its subagents, any script — can
-read the CSCS password or TOTP seed. `cscs-api.py` keeps working unattended, with no
-Touch ID. An agent obtaining a *bounded* API credential is acceptable; an agent obtaining
-the *account* is not.
+No process running as uid 501 (`albert`) can read a stored login credential, and no agent
+can obtain more authority at CSCS than the specific operations `cscs-api.py` needs.
 
 ## Why (measured, 2026-09-04)
 
 `browser.py` stores the CSCS username/password/TOTP seed in the login keychain with
-`-T /usr/bin/security` — silent access for anything running as albert. Verified this
-session: a keychain lookup of the seed with its secret-printing flag returns 40 bytes with
-no prompt. Those two values are the whole CSCS account, `sshservice.cscs.ch` SSH-certificate
-signing included — not merely portal access. `browser.py login-log cscs` shows the keychain
-path has been in use since 2026-07-05, so **every agent session since then could have read
-them**.
+`-T /usr/bin/security`: silent access for anything running as albert, verified this session
+(a keychain lookup with the secret-printing flag returns 40 bytes, no prompt). `login-log`
+shows that path in use since 2026-07-05, so **every agent session since then could have read
+them**. The pair is the whole CSCS account — portal *and* `sshservice.cscs.ch` certificate
+signing.
 
 ## Threat model
 
 - **In scope**: arbitrary code running as uid 501 with a full shell and network.
 - **Out of scope**: Albert typing his password at a real sudo prompt; CSCS-side compromise.
-- **Accepted**: an agent may hold a *scoped, expiring, revocable* API credential.
+- **Accepted**: an agent may invoke bounded, named operations against CSCS.
 - **Unfixable residual**: an agent running as albert can install a user LaunchAgent that
-  keylogs or screen-records and capture a sudo password later. No design here closes that;
-  it is the general "an agent with your uid is you" limit. Recorded, not solved.
+  keylogs or screen-records and capture a sudo password later. Recorded, not solved.
 
-## Verified environment facts (2026-09-04, this Mac)
+## Settled by evidence (do not re-litigate without new measurements)
 
-| Fact                                    | Value                                          | Consequence                                        |
-| :-------------------------------------- | :--------------------------------------------- | :------------------------------------------------- |
-| `sudo -n true`                          | `a password is required`                       | root is a real boundary                            |
-| `pam_tid` for sudo                      | absent (only `sudo_local.template`)            | no biometric path to root                          |
-| SIP                                     | enabled                                        | but see the interpreter row                        |
-| `id albert`                             | includes `80(admin)`                           | admin is not root here, but see `/Applications`    |
-| `/usr/local`, `/opt`, `/Library/LaunchDaemons`, `/Library`, `/Library/Developer` | `root:wheel`, not writable | safe install targets                 |
-| **`/Applications`**                     | **`drwxrwxr-x root:admin` — albert-writable**  | **`/usr/bin/python3` is NOT safe (see D3)**        |
-| `/usr/bin/python3`                      | shim to `/Applications/Xcode.app/…/python3` 3.9 | outside SIP, reachable via an admin-writable dir   |
-| `/var/root`                             | `drwxr-x--- root:wheel`                        | unreadable as albert                               |
-| FileVault                               | **Off**                                        | enable before provisioning rotated secrets         |
+| Question | Finding | Date |
+| :--- | :--- | :--- |
+| Waldur PAT instead of a daemon? | **No** — `POST /api/personal-access-tokens/` → `400 "You are not allowed to create personal access tokens."` Account lacks the permission; request drafted for CSCS, who are historically unresponsive | 2026-09-04 |
+| CSCS service account instead? | **No, on merit** — real endpoints are `marketplace-{project,customer}-service-accounts`; a service account is an HPC credential (API key → JWT → signed SSH cert), so minting one puts a durable SSH-capable secret where an agent can read it | 2026-09-04 |
+| Browserless Keycloak flow? | **No** — SPNEGO → password → OTP all accepted, then the callback returns `{"detail":"keycloak error: Invalid auth state."}`. The portal validates a `state` its SPA registers server-side: not a cookie, not in the 285-endpoint API root, no initiation URL | 2026-09-04 |
+| Is root a real boundary here? | **Yes** — `sudo -n` refused, no `pam_tid`, SIP on, `/usr/local`, `/opt`, `/Library/LaunchDaemons`, `/var/db`, `/var/run` all root-owned and not albert-writable | 2026-09-04 |
+| Safe interpreter? | **Not `/usr/bin/python3`** — it resolves via `xcode-select` through `/Applications` (`drwxrwxr-x root:admin`, albert-writable) into Xcode.app → root code execution | 2026-09-04 |
+| FileVault | **Off** — must be enabled before provisioning rotated secrets | 2026-09-04 |
 
-## Live API discovery (2026-09-04, read-only probes against portal.cscs.ch)
+## Architecture — a broker, not a token dispenser
 
-| Probe                                          | Result                                                               |
-| :--------------------------------------------- | :------------------------------------------------------------------- |
-| `GET /api/personal-access-tokens/`             | **200** `[]` — PATs supported, none exist yet                        |
-| `OPTIONS /api/personal-access-tokens/` (POST)  | accepts `name`, `scopes`, **`allowed_networks`**, **`expires_at`**   |
-| `GET /api/personal-access-tokens/available_scopes/` | 20 scopes                                                       |
-| `GET /api/service-accounts/`                   | 404 — not at this API root                                           |
-| `GET /api/auth-tokens/`                        | 403                                                                  |
+`cscs-api.py` today fetches a Waldur DRF **session** token and calls the API with it. That
+token is not scoped: `OPTIONS /api/marketplace-project-service-accounts/` advertises `POST`
+for it, so it may be able to mint SSH-capable service accounts. Handing it to an agent grants
+far more than the portal reads the tool needs.
 
-Scope coverage for what `cscs-api.py` actually does:
-
-| Operation                        | Scope                                          | Covered |
-| :------------------------------- | :--------------------------------------------- | :------ |
-| `-l projects`                    | `PROJECT.LIST`                                 | yes     |
-| `-lu` (all users)                | `CUSTOMER.LIST_USERS`, `SERVICE_PROVIDER.LIST_USERS` | yes |
-| `--list-users PROJECT` (team)    | `SERVICE_PROVIDER.LIST_PROJECT_PERMISSIONS`    | yes     |
-| `--user-projects EMAIL`          | the above combined                             | yes     |
-| `-a/--add-user` (email invite)   | only `INVITATION.LIST` exists, no create scope | **open** — `PROJECT.CREATE_PERMISSION` may substitute |
-
-**No available scope can mint service accounts, sign SSH certificates, or change the
-account password.** That is what bounds the credential an agent may hold.
-
-## Phases
-
-### Phase 0 — PAT go/no-go spike — **RUN 2026-09-04, RESULT: BLOCKED**
-
-Authorised by Albert and executed: `POST /api/personal-access-tokens/` with the nine read
-scopes, `allowed_networks` = egress `/32`, `expires_at` = +24 h.
+So the daemon **keeps the token** and exposes named operations:
 
 ```
-HTTP 400  {"non_field_errors":["You are not allowed to create personal access tokens."]}
+LIST_PROJECTS · LIST_USERS · LIST_PROJECT_TEAM <uuid> · LIST_INVITATIONS · INVITE_USER <project> <email> <role>
 ```
 
-The account can *list* PATs (`GET` → 200 `[]`) but not create them — the `200 []` was not
-sufficient evidence, which is why the spike was worth running. No PAT was created and none
-exists (`GET` still returns `[]`).
+`INVITE_USER` is the sole mutation. Arguments are validated against the site's schema; no URL,
+path or header ever crosses the socket. The token never leaves the daemon.
 
-Service accounts were checked as the alternative and **rejected on merit, not availability**.
-The real endpoints are `marketplace-project-service-accounts` / `-customer-` (not
-`/api/service-accounts/`, which 404s) and their `OPTIONS` advertises `POST`. But a CSCS
-service account is an HPC access credential — API key → JWT → **signed SSH certificate** —
-scoped to one project. Minting one would create a *durable SSH-capable* credential sitting
-where an agent can read it: strictly worse for this threat model than the 1-hour portal
-token, and it would not grant the cross-project portal reads `cscs-api.py` needs. Not created.
+- **A1 — Site identity is a compile-time enum.** The verb carries a site *name* that must match
+  an entry in the daemon's own registry; every URL, selector and credential key is a constant in
+  root-owned code. Unknown names are rejected before any credential is read.
+- **A2 — One service UID per site.** Per-site launchd worker, socket, credential store, state
+  directory and browser profile. Shared root-owned code is read-only. No privileged dispatcher
+  holds every secret.
+- **A3 — Exact-origin checks before every secret entry.** Not substring tests: `browser.py`
+  currently uses `"auth.cscs.ch" in page.url` (`bin/browser.py:3056`) and `"portal.cscs.ch" in
+  url` (`:3129`), which `https://evil.example/?auth.cscs.ch` satisfies. The adapter parses the
+  URL, requires HTTPS and exact host equality, revalidates immediately before every
+  username/password/TOTP fill and submit, rejects foreign form actions, and blocks off-allowlist
+  requests with a route interceptor.
+- **A4 — Private headless Chromium, hardened and asserted.** Pinned Playwright + Chromium
+  installed root-owned. Launch with `chromium_sandbox=True`; a test reads the live process argv
+  and **fails** if `--no-sandbox` is present or a TCP debugging port appears (Playwright defaults
+  to `--no-sandbox` and always speaks CDP over a pipe, so "no listener" is not "no CDP").
+  Dedicated `HOME`/`TMPDIR`/profile/cache per worker, downloads and crash artifacts disabled,
+  browser closed the moment the token is minted.
+- **A5 — Filesystem split.** Code `/usr/local/libexec/credlogind/`; secrets
+  `/var/db/credlogind/<site>/` in a **root-owned** directory as `root:<site-group>` `0440` (the
+  worker reads, cannot rewrite — a service-user-owned `0400` file can be chmodded by that user);
+  sockets `/var/run/`; a separate service-owned state directory for cache and limiter data.
+- **A6 — One source of truth.** Automated login logic is **removed** from `browser.py`, not
+  duplicated. The adapter lives only in the daemon package, installed from a reviewed versioned
+  bundle whose digest is recorded independently of this writable checkout. No auto-update.
+- **A7 — Limiter.** Hard minimum interval and hourly cap regardless of failure classification;
+  state persisted across crash and reboot; only the one proven stale-auth retry; every unknown
+  outcome means no automatic retry; operator reset requires root.
+- **A8 — Contract.** `cscs-api.py` calls the broker directly. `browser.py login cscs` remains an
+  explicitly human-only shared-browser flow. No silent redefinition of the existing markers, and
+  no session injection into the shared browser in v1.
+- **A9 — Eligibility.** A site qualifies only with a stored credential AND a proven consumer AND
+  defined transfer semantics AND an accepted privilege ceiling. **CSCS only in v1.** biopolwifi is
+  excluded: `biopol-wifi.py` already has a browserless `BiopolClient` with a 5-minute JWT, and
+  `browser.py`'s biopol login extracts no token, so a private headless session transfers nothing.
 
-**Consequence**: Phase 2A is blocked pending CSCS enabling PAT creation for `aglensk`.
-The decision returns to Albert — request that from CSCS, build Phase 2B, or both in parallel.
+## Build sequence (single ordered list — earlier versions contradicted themselves)
 
-### Phase 1 — Rotation (mandatory whatever Phase 0 decides; needs Albert) — **now due**
+- [x] 1. Debate round 1 (14/14 accepted, converged)
+- [x] 2. tp#144 filed (high), plan linked
+- [x] 3. PAT spike — creation refused; service accounts rejected on merit
+- [x] 4. D9 spike — browserless flow disproven with evidence
+- [x] 5. Stdlib RFC 6238 TOTP + `verify_token()` landed with conformance tests
+- [x] 6. Debate round 2 on the build (12/12 accepted, converged) — broker pivot
+- [ ] 7. Measure the DRF token's authorisation ceiling; record it. Decides whether any
+      token-hand-back mode may ever exist
+- [ ] 8. `credlogind` package: CSCS adapter (A3/A4), broker operations, socket server with
+      `getpeereid()`, limiter (A7), structured logging that cannot emit a secret
+- [ ] 9. launchd plist, per-site UID/group creation, `/var/db` + `/var/run` layout (A2/A5)
+- [ ] 10. Reviewed bundle + root-owned provisioning tool with the runtime-closure audit (A6)
+- [ ] 11. `cscs-api.py` refactored onto the broker; automated login removed from `browser.py` (A6/A8)
+- [ ] 12. Acceptance suite — every row below with fixture, command and required result
+- [ ] 13. Build and test on **synthetic** credentials only
+- [ ] 14. Enable FileVault, reboot
+- [ ] 15. Rotate the CSCS password and TOTP seed from a trusted environment, agents stopped
+- [ ] 16. Provision through the verified root-owned tool
+- [ ] 17. Remove the keychain copies and every automated fallback; verify absence
+- [ ] 18. Production verification, including the real 401 refresh path
+- [ ] 19. README + repo_scope updates; `_DONE` rename + `plans-done/` archive
 
-Albert chose to defer rotation until the spike proved out. The spike is done and blocked,
-so this is the next thing owed regardless of which design lands.
+## Acceptance suite (step 12 — each needs fixture, command, required result)
 
-The password and TOTP seed have been agent-readable since 2026-07-05 and must be treated as
-compromised. Rotate both at CSCS **with all agents stopped**, from a terminal no agent is
-attached to. Deletion is not remediation. Enable FileVault **before** provisioning any new
-secret store.
+| # | Check | Required result |
+| :- | :--- | :--- |
+| 1 | Read `/var/db/credlogind/cscs/*` as albert | Permission denied |
+| 2 | Keychain lookup of the CSCS items after step 17 | item not found |
+| 3 | Overwrite the installed adapter / plist as albert | Permission denied |
+| 4 | `lldb -p <worker pid>` as albert | denied |
+| 5 | Live Chromium argv | no `--no-sandbox`, no TCP debug port |
+| 6 | Adapter navigated to `https://evil.example/?auth.cscs.ch` | refuses before any fill |
+| 7 | `LIST_PROJECTS https://evil/` and unknown site name | `FAIL bad-request`, no credential read |
+| 8 | Burst + sequential floods | hard cap trips; account never locked |
+| 9 | Limiter state after kill -9 and after reboot | preserved |
+| 10 | Per-site UID isolation | worker cannot read another site's store |
+| 11 | Oversized / partial / stalled socket requests | bounded, closed, no hang |
+| 12 | Crash artifacts and unified log | no secret-bearing content |
+| 13 | Runtime closure audit (python, node driver, Chromium helpers, dylibs, config) | nothing uid-501-writable |
+| 14 | `cscs-api.py` full 401 refresh path against the broker | works unattended |
 
-### Phase 2A — PAT-backed `cscs-api.py` (preferred; no daemon at all)
-
-- [ ] `cscs-api.py` accepts a PAT (env `CSCS_PAT` or its own 0600 cache) and prefers it over the 1-hour DRF token
-- [ ] On PAT expiry: a clear, actionable error telling Albert to mint a new one — no silent fallback to a credentialled login
-- [ ] Delete the keychain username/password/seed items; remove `cscs-store-creds` and the keychain path from `browser.py` for CSCS
-- [ ] The shared-browser CSCS login becomes human-only (1Password + Touch ID), never agent-triggerable with stored secrets
-- [ ] Document the mint/rotate procedure; calendar the PAT expiry
-
-### Phase 2B — Root-boundary login daemon (only if Phase 0 fails)
-
-Redesigned per the debate:
-
-- **D1** credentials never touch the CDP browser on port 9222 — the agent can read the form field
-- **D2** the daemon takes no parameters; every endpoint is a compile-time constant
-- **D3** **not** `/usr/bin/python3`: it resolves through `/Applications` (albert-writable) into
-  Xcode.app, so an agent could substitute the bundle and get **root code execution**. The
-  runtime must be pinned wholly inside a root-only-writable chain (`/usr/local/libexec/…`,
-  audited `/` to `/usr` to `/usr/local` to `/usr/local/libexec`, all `root:wheel`), invoked
-  with `-I -B`, or the daemon written as a compiled binary
-- **D4** runs as a dedicated non-login `_cscslogin` user, **not root** — root is the boundary,
-  not the runtime; a TLS client and HTML parser running as root turns any flaw into full compromise
-- **D5** creds in a `_cscslogin`-owned `0400` file inside a root-owned directory; not the
-  System keychain (its unlock material sits on the same machine). Apple Silicon storage is
-  hardware-encrypted regardless of FileVault; FileVault's real contribution is binding volume
-  access to user credentials
-- **D6** returns `OK <token>` over the socket after a `getpeereid()` peer-uid check — no token
-  file (`root:staff 0640` would widen exposure and invent atomicity/staleness work), and no
-  fabricated expiry (a 40-hex DRF token encodes none)
-- **D7** socket activation needs `launch_activate_socket` (no Python stdlib wrapper) and
-  `SockPathMode` as decimal `384`; **decision: avoid it** — a `KeepAlive` daemon binding its
-  own socket is more auditable
-- **D8** limiter: coalesce concurrent callers into one in-flight login, serve a still-valid
-  cached token without authenticating, persist atomically, trip an operator-resettable lock on
-  the first definite credential rejection, return a uniform failure with secret-free logs
-- **D9 — SETTLED 2026-09-04: the browserless flow does NOT work; use a private headless
-  browser owned by the service account.** The prototype (`daemon/cscs_login_flow.py`, since
-  trimmed) drove the whole HTTP flow: Kerberos-SPNEGO auto-submit → username/password →
-  OTP, **all three accepted** by Keycloak, reaching the portal's OIDC callback, which answers
-
-  ```
-  {"detail":"keycloak error: Invalid auth state."}
-  ```
-
-  The portal validates a `state` its SPA registers server-side. That registration is not a
-  cookie (six candidate names tested, portal sets no cookies on a plain visit), is not among
-  the 285 endpoints in the API root, and has no server-side initiation URL
-  (`/api-auth/keycloak/{login,start,begin,authorize}/`, `/api-auth/login/keycloak/` all 404;
-  `/api-auth/keycloak/complete/` is GET-only "O Auth View Complete"). Driving it would mean
-  reverse-engineering an undocumented, changeable mechanism — the brittleness Codex's O7
-  warned about. Its sanctioned fallback applies: a headless browser owned by `_cscslogin`,
-  launched with **no `--remote-debugging-port`**, so no agent can attach and read the
-  password field. **Cost, accepted knowingly**: Playwright + Chromium become third-party code
-  in a privileged runtime, pinned and installed root-owned under `/usr/local/libexec/`.
-  What survives from the prototype is what the daemon still needs — the stdlib TOTP generator
-  (RFC 6238 vectors in `tests/test_cscs_totp.py`) and `verify_token()`, the post-condition
-  that the daemon never returns a token it has not seen work
-- **D10** install ceremony: agents stopped, separate trusted terminal, audited artifact staged
-  root-owned first, install from there, then `sudo -K` and assert `sudo -n true` still fails —
-  `sudo ./install.sh` from this agent-writable checkout is itself an escalation
-- **D11** a distinct command for daemon-backed refresh; `cscs-api.py` parses `browser.py`'s exact
-  warm/cold markers and `needs_login` exit code (`cscs-api.py:597`), so the meaning of
-  `cscs-login` / `logged-in cscs` must not silently change
-
-### Phase 3 — Verification (all must fail closed, run as albert, no sudo)
-
-Read the creds file · keychain lookup of the CSCS items · overwrite the daemon program ·
-edit the plist · `lldb -p <pid>` · parameterised `LOGIN` · burst requests · inherited
-descriptors · peer credentials · dependency-path writability · malicious redirect/form
-action · proxy and CA injection · oversized/partial/stalled requests · concurrency · crash
-and core artifacts · unified-log visibility · stale socket · reboot · update/rollback ·
-rotation · the real 401-retry path in `cscs-api.py`.
-
-**Never grep for the real secret** — argv and shell history are themselves a disclosure path.
-Use synthetic canaries in an isolated test install; verify production only by absence,
-ownership and behaviour.
-
-## Steps
-
-- [x] 1. Debate the plan with Codex; reconcile (round 1, converged, 14/14 accepted)
-- [x] 2. File tp#144 (high) and link this plan
-- [x] 3. Read-only API discovery — PAT endpoint, POST schema, 20 available scopes
-- [x] 4. Albert authorised the PAT mint; rotation deferred until the spike proved out
-- [x] 5. Phase 0 spike run — **PAT creation refused by CSCS policy**; service accounts rejected on merit
-- [x] 5a. Albert: PAT was never required — it was the shortcut; build Phase 2B on the current credentials
-- [x] 6. D9 spike: browserless flow disproven with evidence; TOTP + token verifier landed with RFC 6238 tests
-- [ ] 7. Daemon: headless browser under `_cscslogin`, socket server, limiter, install ceremony
-- [ ] 8. `browser.py` integration + the distinct refresh command (D11)
-- [ ] 9. Phase 3 verification matrix, then rotation + FileVault
-- [ ] 6. Phase 1 rotation + FileVault
-- [ ] 7. Phase 2A (or 2B if the spike fails)
-- [ ] 8. Phase 3 verification matrix
-- [ ] 9. README + repo_scope updates; `_DONE` rename + `plans-done/` archive
+Secrets are never passed on a command line (argv and shell history are a disclosure path);
+tests use synthetic canaries, and production is verified only by absence, ownership and
+behaviour.
