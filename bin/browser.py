@@ -3070,6 +3070,92 @@ def _on_portal(page) -> bool:
     )
 
 
+def _cscs_creds(*, announce: bool = True) -> tuple[tuple[str, str, str] | None, str]:
+    """Resolve ``(user, password, otp)`` for CSCS plus the source that produced it.
+
+    Keychain first (prompt-free; the 6-digit code is generated locally from the
+    stored seed), else the single 1Password item (Touch-ID-gated). Called once
+    per login ATTEMPT so a retry gets a FRESH code — a TOTP is valid ~30s and a
+    retried attempt lands well past that.
+    """
+    creds = _keychain_creds()
+    if creds is not None:
+        if announce:
+            print("Using CSCS credentials from the macOS keychain (no Touch ID).")
+        return creds, "keychain"
+    if announce:
+        print(
+            "No keychain credentials yet — falling back to 1Password "
+            "(approve Touch ID). Run `browser.py cscs-store-creds` once to "
+            "make future logins fingerprint-free."
+        )
+    return _op_creds(CSCS_OP_ITEM, CSCS_OP_ACCOUNT), "1password"
+
+
+def _keycloak_flow_expired(page) -> bool:
+    """True when Keycloak aborted the flow because ITS auth session went stale.
+
+    Symptom (seen 2026-09-03): submitting a Keycloak login page that has been
+    sitting open for hours carries a dead ``session_code``, so instead of the
+    portal we land on ``/api-auth/keycloak/complete/`` with
+    ``error=temporarily_unavailable`` +
+    ``error_description=authentication_expired``
+    — nothing is wrong with the credentials. A fresh navigation to the portal
+    starts a new authorization request and succeeds, so this is worth exactly
+    one retry (see ``cmd_cscs_login``).
+    """
+    # URL check first, so the common case needs no playwright import at all.
+    if any(
+        marker in page.url
+        for marker in ("authentication_expired", "temporarily_unavailable")
+    ):
+        return True
+    from playwright.sync_api import Error as PlaywrightError
+
+    try:
+        body = page.inner_text("body", timeout=2000).lower()
+    except PlaywrightError:
+        return False
+    return any(
+        phrase in body
+        for phrase in (
+            "your login attempt timed out",
+            "action expired",
+            "you took too long to login",
+        )
+    )
+
+
+def _submit_keycloak_login(page, creds: tuple[str, str, str]) -> bool:
+    """Fill the Keycloak form (+ the OTP step) and wait for the portal to settle.
+
+    Returns ``True`` once ``_on_portal`` holds, ``False`` after ~20s without it
+    (the caller decides whether that is a stale flow worth retrying or a real
+    credential failure).
+    """
+    user, password, otp = creds
+    page.fill("#username", user)
+    page.fill("#password", password)
+    _click_keycloak_submit(page)
+    # Wait for EITHER the OTP step or a direct landing on the portal.
+    otp_filled = False
+    for _ in range(40):  # ~20s
+        if _on_portal(page):
+            return True
+        if not otp_filled:
+            otp_el = (
+                page.query_selector("#otp")
+                or page.query_selector("input[name=otp]")
+                or page.query_selector("input[autocomplete=one-time-code]")
+            )
+            if otp_el:
+                otp_el.fill(otp)
+                _click_keycloak_submit(page)
+                otp_filled = True
+        page.wait_for_timeout(500)
+    return _on_portal(page)
+
+
 def cmd_cscs_login(port: int) -> int:
     """Log into CSCS in the shared browser using stored credentials, then cache.
 
@@ -3092,6 +3178,10 @@ def cmd_cscs_login(port: int) -> int:
             # settled app tab yet (cold session / Keycloak tab).
             ctx, page = _pick_portal_page(browser)
             if not _on_portal(page):
+                # Prune dead OAuth/Keycloak stubs (e.g. an `authentication_expired`
+                # callback left over from a failed run) BEFORE navigating: they
+                # slow every connect_over_cdp and confuse a later tab pick.
+                _close_stale_cscs_tabs(ctx, keep=page)
                 page.goto(PORTAL_PROFILE_URL, wait_until="domcontentloaded")
                 page.wait_for_timeout(1500)
             if _on_portal(page):
@@ -3099,53 +3189,41 @@ def cmd_cscs_login(port: int) -> int:
             elif "auth.cscs.ch" not in page.url:
                 return _fail(f"Unexpected page (not portal, not Keycloak): {page.url}")
             else:
-                creds = _keychain_creds()
                 cscs_login_mode = "keychain"
-                if creds is not None:
-                    print(
-                        "Using CSCS credentials from the macOS keychain (no Touch ID)."
-                    )
-                else:
-                    print(
-                        "No keychain credentials yet — falling back to 1Password "
-                        "(approve Touch ID). Run `browser.py cscs-store-creds` once to "
-                        "make future logins fingerprint-free."
-                    )
-                    creds = _op_creds(CSCS_OP_ITEM, CSCS_OP_ACCOUNT)
-                    cscs_login_mode = "1password"
-                if creds is None:
-                    return _fail(
-                        "No CSCS credentials available. Either run "
-                        "`browser.py cscs-store-creds` (keychain, no fingerprint), or "
-                        f"make 1Password item '{CSCS_OP_ITEM}' (account "
-                        f"{CSCS_OP_ACCOUNT}) readable via op (desktop 'Integrate with "
-                        "1Password CLI' on, Touch ID approved)."
-                    )
-                user, password, otp = creds
-                page.fill("#username", user)
-                page.fill("#password", password)
-                _click_keycloak_submit(page)
-                # Wait for EITHER the OTP step or a direct landing on the portal.
-                otp_filled = False
-                for _ in range(40):  # ~20s
-                    if _on_portal(page):
-                        break
-                    if not otp_filled:
-                        otp_el = (
-                            page.query_selector("#otp")
-                            or page.query_selector("input[name=otp]")
-                            or page.query_selector("input[autocomplete=one-time-code]")
+                for attempt in (1, 2):
+                    creds, cscs_login_mode = _cscs_creds(announce=attempt == 1)
+                    if creds is None:
+                        return _fail(
+                            "No CSCS credentials available. Either run "
+                            "`browser.py cscs-store-creds` (keychain, no fingerprint), "
+                            f"or make 1Password item '{CSCS_OP_ITEM}' (account "
+                            f"{CSCS_OP_ACCOUNT}) readable via op (desktop 'Integrate "
+                            "with 1Password CLI' on, Touch ID approved)."
                         )
-                        if otp_el:
-                            otp_el.fill(otp)
-                            _click_keycloak_submit(page)
-                            otp_filled = True
-                    page.wait_for_timeout(500)
-                if not _on_portal(page):
-                    return _fail(
-                        "Login did not reach the portal — wrong username/password/OTP, "
-                        f"or an unexpected page ({page.url})."
+                    if _submit_keycloak_login(page, creds):
+                        break
+                    # Only a stale Keycloak auth session earns a retry; a wrong
+                    # password must still fail on the first attempt (retrying it
+                    # would burn a second try toward the account lockout).
+                    if attempt == 2 or not _keycloak_flow_expired(page):
+                        return _fail(
+                            "Login did not reach the portal — wrong "
+                            "username/password/OTP, or an unexpected page "
+                            f"({page.url})."
+                        )
+                    print(
+                        "Keycloak aborted the flow (authentication_expired) — "
+                        "restarting the login once from a fresh page."
                     )
+                    _close_stale_cscs_tabs(ctx, keep=page)
+                    page.goto(PORTAL_PROFILE_URL, wait_until="domcontentloaded")
+                    page.wait_for_timeout(1500)
+                    if _on_portal(page):
+                        break  # the fresh authorization request re-used the SSO session
+                    if "auth.cscs.ch" not in page.url:
+                        return _fail(
+                            f"Retry did not reach the Keycloak form ({page.url})."
+                        )
                 print("✓ Logged into CSCS.")
                 _record_login_event("cscs", cscs_login_mode)
             # Capture the token from THIS connection — no second connect_over_cdp
