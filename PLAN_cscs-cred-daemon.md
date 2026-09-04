@@ -1,170 +1,161 @@
-# PLAN — root credential daemon for CSCS login
+# PLAN — take the CSCS password + TOTP seed out of agent reach
+
+> Reconciled after a judged Claude↔Codex debate (round 1, `converged: true`, 14/14
+> objections accepted). The original "root launchd daemon" plan survives only as Phase 2B:
+> Codex's first objection — investigate supported automation credentials before building a
+> personal-credential oracle — was confirmed by live probing and demotes the daemon to a
+> fallback.
 
 ## Session
 
 Resume: `c --resume 5c9dba96-a144-4335-bef3-45a9f7e792ff`
+Ticket: tp#144 (priority high)
 
 ## Goal
 
-Put the CSCS password and TOTP seed out of reach of any process running as uid 501
-(`albert`) — Claude Code, its subagents, any script — while keeping `cscs-api.py`
-fingerprint-free and unattended. An agent may still *obtain a portal session*; it must
-never be able to *read the credentials*.
+No process running as uid 501 (`albert`) — Claude Code, its subagents, any script — can
+read the CSCS password or TOTP seed. `cscs-api.py` keeps working unattended, with no
+Touch ID. An agent obtaining a *bounded* API credential is acceptable; an agent obtaining
+the *account* is not.
 
-## Why now (measured exposure, 2026-09-04)
+## Why (measured, 2026-09-04)
 
-`browser.py` stores its keychain items with `-T /usr/bin/security`, i.e. silent access for
-any process running as albert. Verified in this session: `security find-generic-password`
-with the account/service of the TOTP seed and its secret-printing flag returns 40 bytes
-with no prompt and no Touch ID.
-
-Password + TOTP seed is not "portal access" — it is the whole CSCS account, including
-`sshservice.cscs.ch` SSH-certificate signing. That is the asset worth isolating.
+`browser.py` stores the CSCS username/password/TOTP seed in the login keychain with
+`-T /usr/bin/security` — silent access for anything running as albert. Verified this
+session: a keychain lookup of the seed with its secret-printing flag returns 40 bytes with
+no prompt. Those two values are the whole CSCS account, `sshservice.cscs.ch` SSH-certificate
+signing included — not merely portal access. `browser.py login-log cscs` shows the keychain
+path has been in use since 2026-07-05, so **every agent session since then could have read
+them**.
 
 ## Threat model
 
-- **In scope**: arbitrary code running as uid 501 with a full shell and network access.
-- **Out of scope**: Albert typing his account password at a real sudo prompt; physical
-  theft of the machine (see the FileVault decision); compromise at CSCS.
-- **Accepted by design**: the daemon is an *oracle*. An agent can always ask it to log in
-  and will then hold a portal token. Albert has explicitly accepted this ("after it's
-  logged in the agent can do whatever").
+- **In scope**: arbitrary code running as uid 501 with a full shell and network.
+- **Out of scope**: Albert typing his password at a real sudo prompt; CSCS-side compromise.
+- **Accepted**: an agent may hold a *scoped, expiring, revocable* API credential.
 - **Unfixable residual**: an agent running as albert can install a user LaunchAgent that
-  keylogs or screen-records, and could capture the sudo password the next time Albert
-  types one. No daemon design closes this; it is the general "an agent with your uid is
-  you" limit. Recorded, not solved.
+  keylogs or screen-records and capture a sudo password later. No design here closes that;
+  it is the general "an agent with your uid is you" limit. Recorded, not solved.
 
 ## Verified environment facts (2026-09-04, this Mac)
 
-| Fact                                   | Value                                    | Consequence                                     |
-| :------------------------------------- | :--------------------------------------- | :---------------------------------------------- |
-| `sudo -n true`                         | `sudo: a password is required`           | root is a real boundary                         |
-| `pam_tid` in `/etc/pam.d/sudo*`        | absent (only `sudo_local.template`)      | no Touch-ID path to root either                 |
-| SIP                                    | enabled                                  | system binaries not replaceable                 |
-| `id albert`                            | includes `80(admin)`                     | admin alone is not root here                    |
-| `/usr/local`, `/opt`                   | `drwxr-xr-x root:wheel`, not writable    | safe install targets                            |
-| `/Library/LaunchDaemons`               | `drwxr-xr-x root:wheel`, not writable    | safe plist target                               |
-| `/var/root`                            | `drwxr-x--- root:wheel`                  | unreadable as albert                            |
-| `/opt/homebrew`                        | `drwxr-xr-x albert:admin`                | **must not be on the daemon's path** — root RCE |
-| `/usr/bin/python3`                     | `3.9.6`, `root:wheel`, SIP-protected     | usable interpreter, stdlib only, 3.9 syntax     |
-| FileVault                              | **Off**                                  | drives the storage decision (D4)                |
+| Fact                                    | Value                                          | Consequence                                        |
+| :-------------------------------------- | :--------------------------------------------- | :------------------------------------------------- |
+| `sudo -n true`                          | `a password is required`                       | root is a real boundary                            |
+| `pam_tid` for sudo                      | absent (only `sudo_local.template`)            | no biometric path to root                          |
+| SIP                                     | enabled                                        | but see the interpreter row                        |
+| `id albert`                             | includes `80(admin)`                           | admin is not root here, but see `/Applications`    |
+| `/usr/local`, `/opt`, `/Library/LaunchDaemons`, `/Library`, `/Library/Developer` | `root:wheel`, not writable | safe install targets                 |
+| **`/Applications`**                     | **`drwxrwxr-x root:admin` — albert-writable**  | **`/usr/bin/python3` is NOT safe (see D3)**        |
+| `/usr/bin/python3`                      | shim to `/Applications/Xcode.app/…/python3` 3.9 | outside SIP, reachable via an admin-writable dir   |
+| `/var/root`                             | `drwxr-x--- root:wheel`                        | unreadable as albert                               |
+| FileVault                               | **Off**                                        | enable before provisioning rotated secrets         |
 
-## Design decisions
+## Live API discovery (2026-09-04, read-only probes against portal.cscs.ch)
 
-### D1 — No browser anywhere in the credential path
+| Probe                                          | Result                                                               |
+| :--------------------------------------------- | :------------------------------------------------------------------- |
+| `GET /api/personal-access-tokens/`             | **200** `[]` — PATs supported, none exist yet                        |
+| `OPTIONS /api/personal-access-tokens/` (POST)  | accepts `name`, `scopes`, **`allowed_networks`**, **`expires_at`**   |
+| `GET /api/personal-access-tokens/available_scopes/` | 20 scopes                                                       |
+| `GET /api/service-accounts/`                   | 404 — not at this API root                                           |
+| `GET /api/auth-tokens/`                        | 403                                                                  |
 
-Credentials must never be typed into the shared Chromium on CDP port 9222: the agent
-controls that browser and can read the password field's value mid-login via CDP. The
-daemon performs the Keycloak flow in its own process and hands back only the result.
+Scope coverage for what `cscs-api.py` actually does:
 
-### D2 — The daemon takes no parameters
+| Operation                        | Scope                                          | Covered |
+| :------------------------------- | :--------------------------------------------- | :------ |
+| `-l projects`                    | `PROJECT.LIST`                                 | yes     |
+| `-lu` (all users)                | `CUSTOMER.LIST_USERS`, `SERVICE_PROVIDER.LIST_USERS` | yes |
+| `--list-users PROJECT` (team)    | `SERVICE_PROVIDER.LIST_PROJECT_PERMISSIONS`    | yes     |
+| `--user-projects EMAIL`          | the above combined                             | yes     |
+| `-a/--add-user` (email invite)   | only `INVITATION.LIST` exists, no create scope | **open** — `PROJECT.CREATE_PERMISSION` may substitute |
 
-No target URL, no realm, no output path. Every endpoint is a compile-time constant
-(`auth.cscs.ch`, `portal.cscs.ch`). A parameterised daemon lets the agent point the login
-at a server it controls and harvest the password. The request protocol is a bare verb.
+**No available scope can mint service accounts, sign SSH certificates, or change the
+account password.** That is what bounds the credential an agent may hold.
 
-### D3 — Root-only runtime, stdlib only
+## Phases
 
-Interpreter `/usr/bin/python3` (SIP-protected). **Zero third-party imports**: cookie
-handling via `urllib.request` + `http.cookiejar`, form parsing via `html.parser`, TOTP via
-a ~15-line RFC 6238 `hmac`/`base64` implementation instead of `pyotp`. This removes both
-the root-owned venv and its supply chain. Code lives in `/usr/local/libexec/cscs-logind/`
-(`root:wheel`, dirs 0755, files 0644, entrypoint 0755). Nothing under `/opt/homebrew`,
-`~/.local`, or the repo working tree may be reachable from the daemon.
-Python 3.9 constraint: `from __future__ import annotations` (same lesson as cscs-api tp#109).
+### Phase 0 — PAT go/no-go spike (needs Albert's authorisation: it mints a credential)
 
-### D4 — Credential storage, given FileVault is OFF
+Mint one PAT with the narrowest scope set above, a short `expires_at`, and `allowed_networks`
+restricted to Albert's egress, then exercise every `cscs-api.py` path against it. Decides
+Phase 2A vs 2B. If `-a/--add-user` cannot be covered, the invite path stays a portal/GUI
+action rather than justifying a whole daemon for one occasional write.
 
-A plaintext `/var/root/cscs.creds` (0600) is root-proof but is a *regression* at rest: the
-current login keychain is encrypted with Albert's login password, whereas a plaintext file
-falls to an external boot or a pulled SSD. Options, to be settled in the debate:
+### Phase 1 — Rotation (mandatory whatever Phase 0 decides; needs Albert)
 
-- **(a)** System keychain (`/Library/Keychains/System.keychain`) — root-only, encrypted
-  blob, but its unlock key in `/var/db/SystemKey` is also root-only-at-rest, so the same
-  physical-access exposure with more moving parts.
-- **(b)** `/var/root/cscs.creds`, 0600 root:wheel, plus **turn FileVault on** — simplest,
-  and FileVault is the honest fix for the physical-access dimension.
-- **(c)** File encrypted with an `age` key that itself lives in `/var/root` — theatre; the
-  key sits next to the ciphertext.
+The password and TOTP seed have been agent-readable since 2026-07-05 and must be treated as
+compromised. Rotate both at CSCS **with all agents stopped**, from a terminal no agent is
+attached to. Deletion is not remediation. Enable FileVault **before** provisioning any new
+secret store.
 
-Leaning **(b) + FileVault on**, and saying so plainly rather than pretending (a) solves
-physical access.
+### Phase 2A — PAT-backed `cscs-api.py` (preferred; no daemon at all)
 
-### D5 — Trigger: launchd on-demand socket, no sudo
+- [ ] `cscs-api.py` accepts a PAT (env `CSCS_PAT` or its own 0600 cache) and prefers it over the 1-hour DRF token
+- [ ] On PAT expiry: a clear, actionable error telling Albert to mint a new one — no silent fallback to a credentialled login
+- [ ] Delete the keychain username/password/seed items; remove `cscs-store-creds` and the keychain path from `browser.py` for CSCS
+- [ ] The shared-browser CSCS login becomes human-only (1Password + Touch ID), never agent-triggerable with stored secrets
+- [ ] Document the mint/rotate procedure; calendar the PAT expiry
 
-`/Library/LaunchDaemons/ch.cscs.logind.plist` with a `Sockets` entry at
-`/var/run/cscs-login.sock`, `SockPathOwner` 501 / `SockPathMode` 0600, `RunAtLoad false`.
-Connecting wakes the daemon **as root**; the caller needs no sudo. Protocol: client sends
-`LOGIN\n`, daemon replies `OK <expires-in-seconds>\n` or `FAIL <machine-readable-reason>\n`.
+### Phase 2B — Root-boundary login daemon (only if Phase 0 fails)
 
-### D6 — Rate limit and lockout protection
+Redesigned per the debate:
 
-A hostile or looping agent must not be able to hammer Keycloak into locking the account.
-Cap: one real login attempt per 60 s, max 10 per hour, tracked in a root-only state file;
-over the cap the daemon replies `FAIL rate-limited` without touching CSCS. Consecutive
-Keycloak auth failures (as opposed to transient errors) trip a longer cooldown.
+- **D1** credentials never touch the CDP browser on port 9222 — the agent can read the form field
+- **D2** the daemon takes no parameters; every endpoint is a compile-time constant
+- **D3** **not** `/usr/bin/python3`: it resolves through `/Applications` (albert-writable) into
+  Xcode.app, so an agent could substitute the bundle and get **root code execution**. The
+  runtime must be pinned wholly inside a root-only-writable chain (`/usr/local/libexec/…`,
+  audited `/` to `/usr` to `/usr/local` to `/usr/local/libexec`, all `root:wheel`), invoked
+  with `-I -B`, or the daemon written as a compiled binary
+- **D4** runs as a dedicated non-login `_cscslogin` user, **not root** — root is the boundary,
+  not the runtime; a TLS client and HTML parser running as root turns any flaw into full compromise
+- **D5** creds in a `_cscslogin`-owned `0400` file inside a root-owned directory; not the
+  System keychain (its unlock material sits on the same machine). Apple Silicon storage is
+  hardware-encrypted regardless of FileVault; FileVault's real contribution is binding volume
+  access to user credentials
+- **D6** returns `OK <token>` over the socket after a `getpeereid()` peer-uid check — no token
+  file (`root:staff 0640` would widen exposure and invent atomicity/staleness work), and no
+  fabricated expiry (a 40-hex DRF token encodes none)
+- **D7** socket activation needs `launch_activate_socket` (no Python stdlib wrapper) and
+  `SockPathMode` as decimal `384`; **decision: avoid it** — a `KeepAlive` daemon binding its
+  own socket is more auditable
+- **D8** limiter: coalesce concurrent callers into one in-flight login, serve a still-valid
+  cached token without authenticating, persist atomically, trip an operator-resettable lock on
+  the first definite credential rejection, return a uniform failure with secret-free logs
+- **D9** the browserless Keycloak flow is **unproven** — today's token comes from browser
+  localStorage (`_scan_token`, `bin/browser.py:2677`). Prototype and prove it first, with every
+  redirect and form action HTTPS plus host/path allowlisted, proxy/CA env disabled, sizes and
+  timeouts bounded, result verified via `/users/me`
+- **D10** install ceremony: agents stopped, separate trusted terminal, audited artifact staged
+  root-owned first, install from there, then `sudo -K` and assert `sudo -n true` still fails —
+  `sudo ./install.sh` from this agent-writable checkout is itself an escalation
+- **D11** a distinct command for daemon-backed refresh; `cscs-api.py` parses `browser.py`'s exact
+  warm/cold markers and `needs_login` exit code (`cscs-api.py:597`), so the meaning of
+  `cscs-login` / `logged-in cscs` must not silently change
 
-### D7 — Token hand-off without a symlink hazard
+### Phase 3 — Verification (all must fail closed, run as albert, no sudo)
 
-The daemon must **not** write into `~/.cache/cscs-api/` — that directory is agent-writable,
-so a symlink planted there would have root clobber an arbitrary path. Instead the daemon
-writes `/var/run/cscs-login/portal_token` (dir `root:wheel` 0755, file `root:staff` 0640);
-`cscs-api.py` and `browser.py` read it and copy it into their own cache. The token itself is
-not a secret we are hiding from the agent — portal access is granted by design.
+Read the creds file · keychain lookup of the CSCS items · overwrite the daemon program ·
+edit the plist · `lldb -p <pid>` · parameterised `LOGIN` · burst requests · inherited
+descriptors · peer credentials · dependency-path writability · malicious redirect/form
+action · proxy and CA injection · oversized/partial/stalled requests · concurrency · crash
+and core artifacts · unified-log visibility · stale socket · reboot · update/rollback ·
+rotation · the real 401-retry path in `cscs-api.py`.
 
-### D8 — Retire the user-side credential copies
-
-The daemon is pointless while the same secrets stay readable in the login keychain. The
-landing sequence ends with `browser.py cscs-forget-creds` and a verification that a
-keychain lookup for the CSCS items reports *item not found*. The remaining fallback is the
-1Password item behind Touch ID (interactive, and Albert-approved per use) — acceptable,
-because it is not silently readable.
-
-### D9 — Home for the code
-
-`browser-login` already owns CSCS credential storage and login (`cscs-store-creds`,
-`cscs-login`, the keychain helpers), so the daemon lands here under `daemon/`, with
-`browser.py cscs-login` gaining a "daemon first, then fall back" path. Alternative
-considered: a separate repo — rejected as splitting one concern across two.
+**Never grep for the real secret** — argv and shell history are themselves a disclosure path.
+Use synthetic canaries in an isolated test install; verify production only by absence,
+ownership and behaviour.
 
 ## Steps
 
-- [ ] 1. Debate this plan with Codex (`codex-debate`, mode=plan); reconcile through the judged loop
-- [ ] 2. File the tp ticket (priority high) and link this plan
-- [ ] 3. Settle D4 (storage) and D3 (stdlib-only vs root venv) from the debate outcome
-- [ ] 4. `daemon/cscs_logind.py` — stdlib-only Keycloak flow: username/password page → OTP page → portal OIDC callback → extract the 40-hex Waldur DRF token
-- [ ] 5. `daemon/cscs_logind.py` — socket server, `LOGIN` verb, rate limit (D6), token write (D7), structured logging that never logs a secret
-- [ ] 6. `daemon/ch.cscs.logind.plist` — launchd socket-activated daemon spec
-- [ ] 7. `daemon/install.sh` — one-time `sudo` install: copy files root-owned, import creds from the existing keychain, write the store per D4, `launchctl bootstrap system`; plus `uninstall.sh`
-- [ ] 8. `browser.py`: `_daemon_login()` tried before the keychain path in `cmd_cscs_login`; `login-log` records mode `daemon`
-- [ ] 9. Tests: TOTP vector check (RFC 6238), form-parse fixtures, rate-limiter, protocol contract, and a negative test asserting the daemon rejects any argument
-- [ ] 10. Adversarial verification as albert (see below) — every item must fail closed
-- [ ] 11. `browser.py cscs-forget-creds`, confirm the keychain items are gone, confirm `cscs-api.py -l` still works unattended
-- [ ] 12. Turn FileVault on (if D4 lands on (b)); README + repo_scope updates; `_DONE` rename + `plans-done/` archive
-
-## Adversarial verification (step 10 — all must fail)
-
-Run as `albert`, no sudo:
-
-| Attack                                                        | Required result       |
-| :------------------------------------------------------------ | :-------------------- |
-| read `/var/root/cscs.creds`                                    | Permission denied     |
-| keychain lookup of the CSCS username/password/seed items       | item not found        |
-| overwrite `/usr/local/libexec/cscs-logind/cscs_logind.py`      | Permission denied     |
-| edit `/Library/LaunchDaemons/ch.cscs.logind.plist`             | Permission denied     |
-| `lldb -p <daemon pid>` / read its memory                       | denied (not root)     |
-| send `LOGIN https://evil.example/` on the socket               | `FAIL bad-request`    |
-| 50 rapid `LOGIN` requests                                      | `FAIL rate-limited`   |
-| grep the daemon log for the password or the seed               | no match              |
-
-## Open questions for the Codex debate
-
-1. D4: System keychain vs `/var/root` file + FileVault — which is honestly better here?
-2. D3: is a stdlib-only Keycloak client too brittle against theme/flow changes, and is a
-   root-owned Playwright worth its supply-chain surface as the alternative?
-3. Is socket activation with `SockPathMode` 0600 the right trigger, or is there a macOS
-   idiom (XPC, `SMAppService`) with a better authorisation story for a non-GUI tool?
-4. Any escalation path missed — launchd env inheritance, `PATH`/`PYTHONPATH` injection,
-   `DYLD_*`, core dumps, `sudo` timestamp reuse, Time Machine copies of `/var/root`?
-5. Does the daemon-as-oracle design leak anything beyond the portal token (e.g. can a
-   caller distinguish "wrong password" from "rate-limited" in a way that helps an attacker)?
+- [x] 1. Debate the plan with Codex; reconcile (round 1, converged, 14/14 accepted)
+- [x] 2. File tp#144 (high) and link this plan
+- [x] 3. Read-only API discovery — PAT endpoint, POST schema, 20 available scopes
+- [ ] 4. **Albert decides**: authorise the Phase 0 PAT mint, and schedule the Phase 1 rotation
+- [ ] 5. Phase 0 spike, then decide 2A vs 2B
+- [ ] 6. Phase 1 rotation + FileVault
+- [ ] 7. Phase 2A (or 2B if the spike fails)
+- [ ] 8. Phase 3 verification matrix
+- [ ] 9. README + repo_scope updates; `_DONE` rename + `plans-done/` archive
