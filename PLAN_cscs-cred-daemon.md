@@ -144,10 +144,28 @@ Redesigned per the debate:
 - **D8** limiter: coalesce concurrent callers into one in-flight login, serve a still-valid
   cached token without authenticating, persist atomically, trip an operator-resettable lock on
   the first definite credential rejection, return a uniform failure with secret-free logs
-- **D9** the browserless Keycloak flow is **unproven** — today's token comes from browser
-  localStorage (`_scan_token`, `bin/browser.py:2677`). Prototype and prove it first, with every
-  redirect and form action HTTPS plus host/path allowlisted, proxy/CA env disabled, sizes and
-  timeouts bounded, result verified via `/users/me`
+- **D9 — SETTLED 2026-09-04: the browserless flow does NOT work; use a private headless
+  browser owned by the service account.** The prototype (`daemon/cscs_login_flow.py`, since
+  trimmed) drove the whole HTTP flow: Kerberos-SPNEGO auto-submit → username/password →
+  OTP, **all three accepted** by Keycloak, reaching the portal's OIDC callback, which answers
+
+  ```
+  {"detail":"keycloak error: Invalid auth state."}
+  ```
+
+  The portal validates a `state` its SPA registers server-side. That registration is not a
+  cookie (six candidate names tested, portal sets no cookies on a plain visit), is not among
+  the 285 endpoints in the API root, and has no server-side initiation URL
+  (`/api-auth/keycloak/{login,start,begin,authorize}/`, `/api-auth/login/keycloak/` all 404;
+  `/api-auth/keycloak/complete/` is GET-only "O Auth View Complete"). Driving it would mean
+  reverse-engineering an undocumented, changeable mechanism — the brittleness Codex's O7
+  warned about. Its sanctioned fallback applies: a headless browser owned by `_cscslogin`,
+  launched with **no `--remote-debugging-port`**, so no agent can attach and read the
+  password field. **Cost, accepted knowingly**: Playwright + Chromium become third-party code
+  in a privileged runtime, pinned and installed root-owned under `/usr/local/libexec/`.
+  What survives from the prototype is what the daemon still needs — the stdlib TOTP generator
+  (RFC 6238 vectors in `tests/test_cscs_totp.py`) and `verify_token()`, the post-condition
+  that the daemon never returns a token it has not seen work
 - **D10** install ceremony: agents stopped, separate trusted terminal, audited artifact staged
   root-owned first, install from there, then `sudo -K` and assert `sudo -n true` still fails —
   `sudo ./install.sh` from this agent-writable checkout is itself an escalation
@@ -175,7 +193,11 @@ ownership and behaviour.
 - [x] 3. Read-only API discovery — PAT endpoint, POST schema, 20 available scopes
 - [x] 4. Albert authorised the PAT mint; rotation deferred until the spike proved out
 - [x] 5. Phase 0 spike run — **PAT creation refused by CSCS policy**; service accounts rejected on merit
-- [ ] 5a. **Albert decides**: ask CSCS to enable PAT creation for `aglensk`, build Phase 2B, or both
+- [x] 5a. Albert: PAT was never required — it was the shortcut; build Phase 2B on the current credentials
+- [x] 6. D9 spike: browserless flow disproven with evidence; TOTP + token verifier landed with RFC 6238 tests
+- [ ] 7. Daemon: headless browser under `_cscslogin`, socket server, limiter, install ceremony
+- [ ] 8. `browser.py` integration + the distinct refresh command (D11)
+- [ ] 9. Phase 3 verification matrix, then rotation + FileVault
 - [ ] 6. Phase 1 rotation + FileVault
 - [ ] 7. Phase 2A (or 2B if the spike fails)
 - [ ] 8. Phase 3 verification matrix
