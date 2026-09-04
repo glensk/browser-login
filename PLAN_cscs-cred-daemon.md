@@ -76,14 +76,34 @@ account password.** That is what bounds the credential an agent may hold.
 
 ## Phases
 
-### Phase 0 — PAT go/no-go spike (needs Albert's authorisation: it mints a credential)
+### Phase 0 — PAT go/no-go spike — **RUN 2026-09-04, RESULT: BLOCKED**
 
-Mint one PAT with the narrowest scope set above, a short `expires_at`, and `allowed_networks`
-restricted to Albert's egress, then exercise every `cscs-api.py` path against it. Decides
-Phase 2A vs 2B. If `-a/--add-user` cannot be covered, the invite path stays a portal/GUI
-action rather than justifying a whole daemon for one occasional write.
+Authorised by Albert and executed: `POST /api/personal-access-tokens/` with the nine read
+scopes, `allowed_networks` = egress `/32`, `expires_at` = +24 h.
 
-### Phase 1 — Rotation (mandatory whatever Phase 0 decides; needs Albert)
+```
+HTTP 400  {"non_field_errors":["You are not allowed to create personal access tokens."]}
+```
+
+The account can *list* PATs (`GET` → 200 `[]`) but not create them — the `200 []` was not
+sufficient evidence, which is why the spike was worth running. No PAT was created and none
+exists (`GET` still returns `[]`).
+
+Service accounts were checked as the alternative and **rejected on merit, not availability**.
+The real endpoints are `marketplace-project-service-accounts` / `-customer-` (not
+`/api/service-accounts/`, which 404s) and their `OPTIONS` advertises `POST`. But a CSCS
+service account is an HPC access credential — API key → JWT → **signed SSH certificate** —
+scoped to one project. Minting one would create a *durable SSH-capable* credential sitting
+where an agent can read it: strictly worse for this threat model than the 1-hour portal
+token, and it would not grant the cross-project portal reads `cscs-api.py` needs. Not created.
+
+**Consequence**: Phase 2A is blocked pending CSCS enabling PAT creation for `aglensk`.
+The decision returns to Albert — request that from CSCS, build Phase 2B, or both in parallel.
+
+### Phase 1 — Rotation (mandatory whatever Phase 0 decides; needs Albert) — **now due**
+
+Albert chose to defer rotation until the spike proved out. The spike is done and blocked,
+so this is the next thing owed regardless of which design lands.
 
 The password and TOTP seed have been agent-readable since 2026-07-05 and must be treated as
 compromised. Rotate both at CSCS **with all agents stopped**, from a terminal no agent is
@@ -153,8 +173,9 @@ ownership and behaviour.
 - [x] 1. Debate the plan with Codex; reconcile (round 1, converged, 14/14 accepted)
 - [x] 2. File tp#144 (high) and link this plan
 - [x] 3. Read-only API discovery — PAT endpoint, POST schema, 20 available scopes
-- [ ] 4. **Albert decides**: authorise the Phase 0 PAT mint, and schedule the Phase 1 rotation
-- [ ] 5. Phase 0 spike, then decide 2A vs 2B
+- [x] 4. Albert authorised the PAT mint; rotation deferred until the spike proved out
+- [x] 5. Phase 0 spike run — **PAT creation refused by CSCS policy**; service accounts rejected on merit
+- [ ] 5a. **Albert decides**: ask CSCS to enable PAT creation for `aglensk`, build Phase 2B, or both
 - [ ] 6. Phase 1 rotation + FileVault
 - [ ] 7. Phase 2A (or 2B if the spike fails)
 - [ ] 8. Phase 3 verification matrix
