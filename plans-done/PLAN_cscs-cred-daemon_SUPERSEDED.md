@@ -1,3 +1,16 @@
+> **SUPERSEDED 2026-09-05** by
+> `42-Git/home/tp/plans/PLAN_credential-plane.md` (the plan for tp#97).
+>
+> Why: this plan built a bespoke `credlogind` socket daemon for ONE credential. The
+> successor adopts a shipped credential proxy for the ~46 brokerable credentials in tp#97,
+> keeps a hand-written minter only for CSCS, and removes the non-HTTP credentials instead
+> of brokering them.
+>
+> **Kept here on purpose**: the O13 capability-closure matrix (three-valued
+> GREEN/RED/UNKNOWN gate, 403-vs-405 semantics, greedy-glob closure, method-override
+> surfaces, operation equivalence) is the documented fallback if Phase 0 of the successor
+> returns NO-GO. Do not delete.
+
 # PLAN — `credlogind`: keep login credentials out of agent reach
 
 > Reconciled after two judged Claude↔Codex debates (round 1: 14/14 accepted, converged;
