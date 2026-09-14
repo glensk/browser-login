@@ -185,7 +185,8 @@ cached — xoxc rotates).
 
 Every time a site performs a **real (cold) login** — not a warm "already logged in"
 — one record is appended to `~/.cache/claude-browser/login-log/<site>.jsonl` (with a
-`mode`: `assisted` = you had to act, vs `auto`/`keychain`/… automated). Read it with
+`mode`: `assisted` = you had to act, vs `auto`/`keychain`/`sso`/… automated — `sso`
+is an SSO button click that completed with no password). Read it with
 `browser.py login-log` — **no arg = a live aggregate across every tool** (total real
 logins, how many you had to sign in for, per-site breakdown, recent events); add a
 SITE for just one. That's how you measure how often re-auth — and specifically a
@@ -200,6 +201,7 @@ manual sign-in — actually happens.
 | `openai` (`chatgpt`)   | **Assisted.** ChatGPT Business logs in via Google SSO + 2FA, which can't be replayed from a stored secret — you complete the SSO once in the shared window; the session persists. Logged-in sentinel: the 'Invite member' button on `chatgpt.com/admin/members`. |
 | `slack`                | **Assisted.** app.slack.com logs in via email-code / SSO; you sign in once and the session persists. Logged-in sentinel: a team with an `xoxc-` token in `localConfig_v2`. `browser.py slack-session` then prints `{token,cookie,team_domain}` (xoxc + httpOnly `d` cookie via CDP) so `slack-api` can call `users.admin.setInactive` on the Pro plan — where the API token is scope-blocked. Bearer creds → stdout only, never cached. |
 | `biopolwifi`           | **Keychain email+password, unattended.** SDSC Biopole WiFi units are managed via a Ruckus Cloudpath MDU portal (`cloudpath.edificom.cloud`, a plain Vue SPA). `store-creds biopolwifi` caches the portal email+password in the macOS keychain (the same items `sdsc/biopol-wifi/biopol-wifi.py` reads); login fills the form and confirms the `SDSC - Biopole` / `Properties` sentinel. No SSO, no TOTP, no token extracted. Aliases: `biopol`, `cloudpath`, `edificom`. |
+| `switch`               | **SSO click, assisted fallback.** `login switch` opens `/auth/login` and clicks the single SWITCH edu-ID button — passwordless while the browser's edu-ID IdP session lives; otherwise you finish the edu-ID login once in the window. Logged-in sentinel: on `cloud.switch.ch` outside `/auth/` with NO `/auth/openid_connect_eduid_ch` sign-in form — the anonymous root renders that form with HTTP 200, so the URL alone proves nothing. `logged-in switch` probes a background tab it closes again (never focuses the window) and exits 2 when logged out OR when it cannot tell — the `infra/status` check `switch-portal-login` runs it every 30 min. No stored credential by design: edu-ID is Albert's primary federated identity. Aliases: `switch-cloud`, `cloud.switch.ch`, `scp`. |
 
 CSCS back-compat aliases (`token`, `cscs-login`, `cscs-store-creds`,
 `cscs-forget-creds`) are kept because downstream tools depend on their exact stdout

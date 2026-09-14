@@ -35,8 +35,8 @@ Generic lifecycle:
   eval JS   Run a JS expression in the active (or --url-matched) tab; print JSON.
 
 Generic multi-site login (a SITE is one of the entries in the SITES registry —
-currently ``cscs``, ``anthropic``/``claude``, ``openai``/``chatgpt``, ``slack``
-and ``biopolwifi``; add more by registering a Site):
+currently ``cscs``, ``anthropic``/``claude``, ``openai``/``chatgpt``, ``slack``,
+``biopolwifi`` and ``switch``; add more by registering a Site):
   login SITE        Ensure SITE is logged in in the shared browser. Automated for
                     sites with stored credentials (CSCS Keycloak). For claude.ai:
                     FULLY automatic when $ANTHROPIC_LOGIN_EMAIL is set and himalaya
@@ -44,7 +44,9 @@ and ``biopolwifi``; add more by registering a Site):
                     the link — no password, no code); otherwise ASSISTED (you
                     complete the email login in the window). For chatgpt.com:
                     ASSISTED (Google SSO + 2FA once in the shared window; the
-                    session persists). Records a login event.
+                    session persists). For the Switch Cloud Portal: clicks the
+                    edu-ID sign-in button (no password while the edu-ID session
+                    is alive), otherwise ASSISTED. Records a login event.
   logged-in SITE    Exit 0 if SITE is logged in, 2 if not (no login attempted).
   login-log SITE    Show how often a *real* login was actually needed for SITE
                     (count, first/last, average interval) — read from the log.
@@ -320,7 +322,7 @@ def parse_args() -> argparse.Namespace:
     pl.add_argument(
         "site",
         help="Site to log into (e.g. cscs, anthropic/claude, openai/chatgpt, "
-        "slack, biopolwifi).",
+        "slack, biopolwifi, switch).",
     )
     pli = sub.add_parser(
         "logged-in", help="Exit 0 if SITE is logged in, 2 if not (no login)."
@@ -4307,6 +4309,297 @@ def cmd_biopolwifi_forget_creds() -> int:
 
 
 # ---------------------------------------------------------------------------
+# Switch Cloud Portal (cloud.switch.ch) — edu-ID SSO click, assisted fallback, no token
+# ---------------------------------------------------------------------------
+# SDSC's tenant of the SWITCH Cloud Portal authenticates through SWITCH edu-ID
+# (OpenID Connect). Its /auth/login page carries exactly ONE control: a button
+# that POSTs to /auth/openid_connect_eduid_ch. While the browser's edu-ID IdP
+# session is alive, that click IS the whole login (no password, no 2-step code);
+# otherwise it lands on login.eduid.ch and a human finishes it once (ASSISTED).
+# No token is extracted — the consumer (switch-cloud's `-P` saga) drives the
+# portal itself and only needs the session to exist.
+#
+# The portal's session cookie is a BROWSER-SESSION cookie, so every restart of
+# the shared Chromium logs it out again; `logged-in switch` is therefore polled
+# (every 30 min by the infra/status check `switch-portal-login`) and must stay
+# strictly read-only: no interaction lease, no focus, no navigating a tab the
+# user owns.
+SWITCH_ORIGIN = "https://cloud.switch.ch"
+SWITCH_LOGIN_PATH = "/auth/login"
+SWITCH_SIGN_IN_FORM_ACTION = "/auth/openid_connect_eduid_ch"
+SWITCH_SIGN_IN_FORM_SELECTOR = f'form[action="{SWITCH_SIGN_IN_FORM_ACTION}"]'
+SWITCH_SIGN_IN_BUTTON_SELECTOR = SWITCH_SIGN_IN_FORM_SELECTOR + " button[type=submit]"
+
+
+def _switch_verdict(url: str, has_sign_in_form: bool) -> str:
+    """Classify a portal page as ``login`` / ``logged-in`` / ``unknown`` (pure).
+
+    The FORM is the primary evidence, the URL only secondary: an anonymous
+    ``GET /`` answers 200 **at** ``/`` and renders the edu-ID sign-in page right
+    there (verified 2026-09-14 with curl), so "the tab is on cloud.switch.ch" is
+    never evidence of a session — the absence of that form is.
+
+    Everything that is not positively one of the two — an off-origin IdP page
+    (login.eduid.ch), ``about:blank``, a ``chrome-error://`` page, an empty URL,
+    an OIDC callback still under ``/auth/`` — is ``unknown``. This fails CLOSED:
+    callers treat ``unknown`` exactly as "not logged in".
+    """
+    if has_sign_in_form or SWITCH_LOGIN_PATH in url:
+        return "login"
+    if url == SWITCH_ORIGIN or url.startswith(SWITCH_ORIGIN + "/"):
+        if not url[len(SWITCH_ORIGIN) :].startswith("/auth/"):
+            return "logged-in"
+    return "unknown"
+
+
+def _switch_has_sign_in_form(page) -> bool | None:
+    """True/False whether the edu-ID sign-in form is in the DOM; None if unknown.
+
+    None (the page navigated away mid-query, the target died, CDP hiccuped) is
+    deliberately NOT False: "we could not read the DOM" must never be promoted
+    into "there is no login form", i.e. into evidence of a session.
+    """
+    try:
+        return page.query_selector(SWITCH_SIGN_IN_FORM_SELECTOR) is not None
+    except Exception:  # pylint: disable=broad-exception-caught
+        return None
+
+
+def _switch_page_verdict(page) -> str:
+    """`_switch_verdict` for a live page, with the fail-closed rule applied: a
+    DOM we could not read never yields ``logged-in``."""
+    try:
+        url = page.url
+    except Exception:  # pylint: disable=broad-exception-caught
+        return "unknown"
+    has_form = _switch_has_sign_in_form(page)
+    verdict = _switch_verdict(url, bool(has_form))
+    if has_form is None and verdict == "logged-in":
+        return "unknown"
+    return verdict
+
+
+def _switch_page_by_target(browser, tid: str):
+    """The Playwright page whose CDP target id is `tid`, or None.
+
+    `doctor` finds its probe tab by URL; that is NOT acceptable here — a stale,
+    logged-out portal tab the user left open would answer for our probe and be
+    read as the session's state. The target id is the only identity a real tab
+    cannot accidentally impersonate.
+    """
+    from playwright.sync_api import Error as PlaywrightError
+
+    for ctx in browser.contexts:
+        for pg in ctx.pages:
+            session = None
+            try:
+                session = ctx.new_cdp_session(pg)
+                info = session.send("Target.getTargetInfo")
+                if str(info.get("targetInfo", {}).get("targetId") or "") == tid:
+                    return pg
+            except PlaywrightError:
+                continue
+            finally:
+                if session is not None:
+                    with contextlib.suppress(PlaywrightError):
+                        session.detach()
+    return None
+
+
+def _switch_close_target(browser, tid: str) -> None:
+    """Close the probe target over CDP — the path for a tab Playwright never
+    adopted, which `page.close()` cannot reach (it would else stay open)."""
+    session = browser.new_browser_cdp_session()
+    session.send("Target.closeTarget", {"targetId": tid})
+
+
+def _switch_probe(port: int) -> tuple[str, str]:
+    """READ-ONLY portal probe; returns (verdict, observed url). Never focuses.
+
+    Takes NO interaction lease and touches no tab of the user's: the probe page
+    is created in the BACKGROUND over CDP (``background: true`` cannot raise the
+    window), read, and closed again in the ``finally``. Playwright never adopts
+    a target created mid-session, so the connection is dropped and re-made —
+    the same dance as `_doctor_probe`, except that the page is identified by its
+    TARGET ID (see `_switch_page_by_target`).
+
+    Anything that goes wrong is ``unknown``, never ``logged-in``.
+    """
+    from playwright.sync_api import Error as PlaywrightError
+
+    pw, browser = _connect(port)
+    tid = ""
+    try:
+        session = browser.new_browser_cdp_session()
+        created = session.send(
+            "Target.createTarget",
+            {"url": SWITCH_ORIGIN + "/", "background": True},
+        )
+        tid = str(created.get("targetId") or "")
+    except PlaywrightError:  # TimeoutError subclasses this
+        return ("unknown", "")
+    finally:
+        browser.close()
+        pw.stop()
+    if not tid:
+        return ("unknown", "")
+
+    pw, browser = _connect(port)
+    page = None
+    url = ""
+    try:
+        page = _switch_page_by_target(browser, tid)
+        if page is None:
+            return ("unknown", "")
+        page.wait_for_load_state("domcontentloaded", timeout=10_000)
+        deadline = time.monotonic() + 10.0
+        while time.monotonic() < deadline:
+            url = page.url
+            if not _is_blank(url):
+                break
+            time.sleep(0.25)
+        page.wait_for_timeout(500)  # let a Turbo redirect land
+        url = page.url
+        return (_switch_page_verdict(page), url)
+    except PlaywrightError:  # TimeoutError subclasses this
+        return ("unknown", url)
+    finally:
+        if page is not None:
+            with contextlib.suppress(PlaywrightError):
+                page.close()
+        else:
+            with contextlib.suppress(PlaywrightError):
+                _switch_close_target(browser, tid)
+        browser.close()
+        pw.stop()
+
+
+def _switch_wait_for_login(
+    page, timeout_s: float, poll_s: float = 0.5, heartbeat: bool = False
+) -> bool:
+    """PASSIVE poll of the login tab: True as soon as it settles logged in.
+
+    Never navigates the tab — a `goto` mid-flight would abort the edu-ID
+    redirect chain the human is completing. `heartbeat` prints a progress line
+    to stderr every 30 s (the long assisted wait), exactly like
+    `_chatgpt_wait_for_login`.
+    """
+    start = time.monotonic()
+    last_beat = 0.0
+    while time.monotonic() - start < timeout_s:
+        if _switch_page_verdict(page) == "logged-in":
+            return True
+        elapsed = time.monotonic() - start
+        if heartbeat and elapsed - last_beat >= 30:
+            print(
+                f"  …waiting for you to finish the SWITCH edu-ID login in the "
+                f"shared browser window ({int(elapsed)}s elapsed)…",
+                file=sys.stderr,
+            )
+            last_beat = elapsed
+        try:
+            page.wait_for_timeout(poll_s * 1000)
+        except Exception:  # pylint: disable=broad-exception-caught
+            time.sleep(poll_s)
+    return False
+
+
+def cmd_switch_logged_in(port: int) -> int:
+    """Exit 0 if the Switch Cloud Portal is logged in, 2 if not — and 2 when it
+    cannot be told (fail CLOSED; a monitoring check treats 2 as red).
+
+    READ-ONLY by contract: no interaction lease, no `bring_to_front`, no
+    `new_page` — it opens one background tab and closes it again.
+    """
+    verdict, url = _switch_probe(port)
+    if verdict == "logged-in":
+        print("✓ Logged into Switch Cloud Portal (cloud.switch.ch).")
+        return 0
+    if verdict == "login":
+        print("Not logged into Switch Cloud Portal (cloud.switch.ch).", file=sys.stderr)
+        return 2
+    print(
+        f"Cannot tell whether Switch Cloud Portal is logged in — the probe "
+        f"landed on {url!r}.",
+        file=sys.stderr,
+    )
+    return 2
+
+
+def cmd_switch_login(port: int) -> int:
+    """Ensure the Switch Cloud Portal is logged in. Idempotent (a warm session
+    just returns 0).
+
+    A cold session is one click: the /auth/login page's single edu-ID button
+    completes the login with NO password while the browser's edu-ID IdP session
+    is alive (mode ``sso``). Otherwise the click lands on login.eduid.ch and the
+    run becomes ASSISTED — you finish the edu-ID login once in the shared
+    window. The interactive part is held under the INTERACTION lease, so no
+    other tool clicks in the meantime.
+    """
+    from playwright.sync_api import Error as PlaywrightError
+
+    # Warm probe + headless guard FIRST, outside the lease (both are read-only,
+    # exactly what `logged-in` does lease-free).
+    if _switch_probe(port)[0] == "logged-in":
+        print("✓ Already logged into Switch Cloud Portal (cloud.switch.ch).")
+        return 0
+    if not _require_headed_for_assisted(port, "Switch Cloud Portal"):
+        return 2
+    pw, browser = _connect(port)
+    try:
+        with _interaction_lease("login switch"):
+            ctx = browser.contexts[0] if browser.contexts else browser.new_context()
+            page = next((pg for pg in ctx.pages if "cloud.switch.ch" in pg.url), None)
+            if page is None:
+                # Allowed here and nowhere else in this site: the flow is
+                # interactive and the window is headed by the guard above.
+                page = ctx.new_page()
+            try:
+                page.goto(
+                    SWITCH_ORIGIN + SWITCH_LOGIN_PATH, wait_until="domcontentloaded"
+                )
+            except PlaywrightError as exc:
+                return _fail(
+                    f"could not open {SWITCH_ORIGIN}{SWITCH_LOGIN_PATH} in the shared "
+                    f"browser: {exc}"
+                )
+            with contextlib.suppress(PlaywrightError):
+                page.bring_to_front()
+            # A failed click is not fatal: it just means no sign-in form was
+            # there (already mid-flow, or already logged in) — fall through to
+            # the wait, which decides on evidence.
+            with contextlib.suppress(PlaywrightError):
+                page.click(SWITCH_SIGN_IN_BUTTON_SELECTOR, timeout=10_000)
+            if _switch_wait_for_login(page, timeout_s=15):
+                print("✓ Logged into Switch Cloud Portal (SSO, no password needed).")
+                _record_login_event("switch", "sso")
+                return 0
+            print(
+                "\n🔐 Switch Cloud Portal (cloud.switch.ch) needs a login.\n"
+                "   In the shared Chrome window (now in front):\n"
+                "     1. Sign in with your SWITCH edu-ID on the page that opened (email,\n"
+                "        password, and the 2-step code unless this browser is remembered).\n"
+                "     2. Land back on cloud.switch.ch — success is auto-detected.\n",
+                file=sys.stderr,
+            )
+            if not _switch_wait_for_login(
+                page, timeout_s=300, poll_s=2.0, heartbeat=True
+            ):
+                return _fail(
+                    "Switch Cloud Portal login not detected within 5 min. Finish the "
+                    "edu-ID login in the shared browser, then re-run: "
+                    "browser.py login switch"
+                )
+            print("✓ Logged into Switch Cloud Portal (cloud.switch.ch).")
+            _record_login_event("switch", "assisted")
+            return 0
+    finally:
+        browser.close()
+        pw.stop()
+
+
+# ---------------------------------------------------------------------------
 # Login-frequency log (how often a real login was actually needed)
 # ---------------------------------------------------------------------------
 
@@ -4329,6 +4622,7 @@ def _record_login_event(site_name: str, mode: str) -> None:
 
 # Modes where a HUMAN had to act (vs. fully unattended re-auth). The aggregate
 # view highlights the assisted count — that's "how often we had to sign in".
+# `sso` (an edu-ID click that completed without a password) is AUTOMATED.
 ASSISTED_MODES = {"assisted", "1password"}
 
 
@@ -4480,6 +4774,13 @@ def _sites() -> list[Site]:
             logged_in=cmd_biopolwifi_logged_in,
             store_creds=cmd_biopolwifi_store_creds,
             forget_creds=cmd_biopolwifi_forget_creds,
+        ),
+        Site(
+            name="switch",
+            aliases=("switch-cloud", "cloud.switch.ch", "scp"),
+            blurb="Switch Cloud Portal (edu-ID SSO click, assisted fallback; no token)",
+            login=cmd_switch_login,
+            logged_in=cmd_switch_logged_in,
         ),
     ]
 
