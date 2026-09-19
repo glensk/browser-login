@@ -291,7 +291,8 @@ def parse_args() -> argparse.Namespace:
     pe.add_argument(
         "--url",
         default=None,
-        help="Substring to pick the target tab (default: first/active tab).",
+        help="Substring to pick the target tab (default: first/active tab). "
+        "Exits 1 when no tab matches — never evaluates in another tab.",
     )
     sub.add_parser("token", help="Cache the CSCS portal token from the portal tab.")
     sub.add_parser(
@@ -447,6 +448,53 @@ def _cdp_get(port: int, path: str, timeout: float = 2.0) -> object | None:
             return parsed
     except (urllib.error.URLError, OSError, ValueError):
         return None
+
+
+def _cdp_new_tab(port: int, url: str = "about:blank", timeout: float = 5.0) -> bool:
+    """Create a tab over the CDP HTTP endpoint; True if Chrome created one.
+
+    ``PUT /json/new`` is the ONLY way to get a page into a browser that has
+    none — every Playwright API needs a browser context, and a Chromium with
+    zero page targets exposes none (see `_ensure_page_target`). PUT, not GET:
+    Chrome rejects the GET form of /json/new since 111.
+    """
+    req = urllib.request.Request(
+        f"http://127.0.0.1:{port}/json/new?{url}", method="PUT"
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            return 200 <= int(r.status) < 300
+    except (urllib.error.URLError, OSError, ValueError):
+        return False
+
+
+def _page_targets(port: int) -> list[dict]:
+    """The browser's page targets (tabs) as reported by ``/json/list``."""
+    targets = _cdp_get(port, "/json/list")
+    if not isinstance(targets, list):
+        return []
+    return [t for t in targets if isinstance(t, dict) and t.get("type") == "page"]
+
+
+def _ensure_page_target(port: int, timeout: float = 5.0) -> None:
+    """Guarantee the browser has >=1 tab before Playwright attaches to it.
+
+    A Chromium whose last tab was closed keeps running with zero page targets,
+    and ``connect_over_cdp`` then fails for EVERY consumer with "Protocol error
+    (Browser.setDownloadBehavior): Browser context management is not supported"
+    — Playwright finds no browser context to adopt. One blank tab restores it
+    (tp#317). It is not litter: `cmd_open` and `_pick_page` prefer reusing a
+    blank tab (`_is_blank`) over creating another one. Best effort — if the tab
+    cannot be created we fall through and let `connect_over_cdp` raise the real
+    error rather than masking it with one of our own.
+    """
+    if _page_targets(port):
+        return
+    if not _cdp_new_tab(port):
+        return
+    deadline = time.time() + timeout
+    while not _page_targets(port) and time.time() < deadline:
+        time.sleep(0.1)
 
 
 def _is_up(port: int) -> bool:
@@ -1936,6 +1984,7 @@ def _connect(port: int, purpose: str = ""):
 
     if not _is_up(port):
         sys.exit("Shared browser is down. Run: browser.py up")
+    _ensure_page_target(port)  # zero tabs => connect_over_cdp dies (tp#317)
     atexit.register(_registry_register("browser.py", purpose or _purpose(), port))
     pw = sync_playwright().start()
     # 127.0.0.1, not localhost — see _cdp_get (avoids the IPv6 ::1 stall).
@@ -1977,14 +2026,24 @@ def _open_background_tab(port: int, browser, url: str) -> dict:
     return {"url": info.get("url", url), "title": info.get("title", "")}
 
 
-def _pick_page(browser, url_substr: str | None):
-    """Return a page (optionally matching url_substr), creating one if needed."""
+def _pick_page(browser, url_substr: str | None, *, require_match: bool = False):
+    """Return ``(ctx, page)`` (optionally matching url_substr), creating one if needed.
+
+    With ``require_match`` the caller gets ``(ctx, None)`` when no tab matches,
+    instead of an arbitrary other tab. That is what `eval --url` needs: falling
+    back silently ran a SharePoint query inside a Slack tab and returned Slack's
+    HTML, which reads like an API error rather than a wrong-tab result (tp#317).
+    The in-repo site flows keep the default fallback on purpose — they pick a
+    reusable tab and then NAVIGATE it to their own URL.
+    """
     ctx = browser.contexts[0] if browser.contexts else browser.new_context()
     pages = list(ctx.pages)
     if url_substr:
         for pg in pages:
             if url_substr in pg.url:
                 return ctx, pg
+        if require_match:
+            return ctx, None
     # Default: prefer a real content tab over an empty new-tab/chrome:// page.
     content = [pg for pg in pages if not _is_blank(pg.url)]
     if content:
@@ -2032,7 +2091,18 @@ def cmd_eval(port: int, js: str, url_substr: str | None) -> int:
     """Eval a JS expression in a tab and print the JSON result."""
     pw, browser = _connect(port)
     try:
-        _ctx, page = _pick_page(browser, url_substr)
+        ctx, page = _pick_page(browser, url_substr, require_match=True)
+        if page is None:
+            # Listed without query/fragment: an OAuth-callback tab carries a
+            # live code/token there, and this line lands in logs and transcripts.
+            urls = [_strip_query(pg.url) for pg in ctx.pages]
+            open_urls = ", ".join(urls[:8]) or "none"
+            if len(urls) > 8:
+                open_urls += f", … (+{len(urls) - 8} more)"
+            return _fail(
+                f"No tab matching {url_substr!r} — nothing evaluated. Open one "
+                f"first: browser.py open <url>. Open tabs: {open_urls}"
+            )
         result = page.evaluate(f"() => ({js})")
         print(json.dumps(result, indent=2, default=str))
         return 0
