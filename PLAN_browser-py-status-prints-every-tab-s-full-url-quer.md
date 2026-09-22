@@ -177,3 +177,7 @@ bin/browser.py doctor                                     # lifecycle/desktop in
 
 (`status --full-urls` is deliberately NOT run live — it is exercised by the stubbed
 `full_urls=True` test with known query/fragment/magic-link/`data:` fixtures.)
+
+## Review 2026-09-22
+
+- [ ] Plan's own Verification chain (PLAN line 168: ruff format/check + mypy + pylint bin/browser.py) is red: pylint bin/browser.py exits 26 (bare) / uv run pylint bin/browser.py exits 24 (canonicalized form f1439e0 made authoritative in AGENTS.md) — 47 pre-existing findings, first line 'bin/browser.py:1:0: C0302: Too many lines in module (5059/1000) (too-many-lines)', incl. import-outside-toplevel x~30, R0911/R0912 x5. Step 8 ('Lint + verify + commit') is checked [x] though this literal Verification command fails. Full root-cause/fix detail in -D.
