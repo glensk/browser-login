@@ -64,6 +64,18 @@ The chromium binary is Playwright's bundled "Chrome for Testing" (already on
 disk). No system browser is touched, so this never collides with your daily Brave.
 """
 
+# Two pylint messages are properties of this tool's documented architecture, not
+# defects (canonical lint command: `uv run pylint bin/browser.py`, AGENTS.md):
+#   * too-many-lines — browser.py is deliberately ONE self-contained file so any
+#     consumer repo (and any agent) can exec it straight off PATH with nothing to
+#     install; splitting it into a package would break that contract.
+#   * import-outside-toplevel — playwright/pyotp/requests (and Quartz, getpass,
+#     binascii, datetime) are imported inside the functions that use them so
+#     `-h`, `status` and `ensure_deps` itself run BEFORE those packages exist;
+#     the self-bootstrapping venv in `ensure_deps` is impossible otherwise.
+# Every other pylint exemption in this file is per-line, with its own reason.
+# pylint: disable=too-many-lines,import-outside-toplevel
+
 import argparse
 import atexit
 import contextlib
@@ -1776,6 +1788,10 @@ def cmd_switch(port: int, target: str, force: bool = False) -> int:
     itself must NOT re-acquire the gate (deadlock rule), so `_launch_and_record`
     is called directly here while we still hold it.
     """
+    # Each of the 7 exits is a distinct, named refusal (down / already in that
+    # mode / unknown CDP client / stale lock / …) that callers read off stdout;
+    # funnelling them through one return would hide which invariant refused.
+    # pylint: disable=too-many-return-statements
     live = _browser_mode(port)
     if live is None:
         return _fail(
@@ -3672,6 +3688,10 @@ def _himalaya_latest_login_mail(
     the caller prints them, because every failure path here is otherwise silent.
 
     Returns (folder, id) or None."""
+    # The branches ARE the diagnostics: every `diag` reason (folder missing,
+    # unparsable envelope, wrong sender, wrong subject, too old) is its own
+    # named case, and collapsing them is what made auto-login silently fail.
+    # pylint: disable=too-many-branches
     best_folder: str | None = None
     best_id: str | None = None
     best_key = (-1, -1.0)  # (has_parsable_date, ts) — a dated mail always wins
@@ -3767,6 +3787,11 @@ def _claude_auto_login(page, email: str, himalaya: str) -> bool:
     """Fully automatic login: trigger the magic-link email, read it via himalaya,
     open the link in the shared browser (the SPA reads the #token and signs in).
     No password, no manual code. Returns True on success, False (→ assisted)."""
+    # One branch per step of the magic-link handshake (submit email → poll the
+    # mailbox → open the link → confirm the session), each with its own operator
+    # message before falling back to assisted login; splitting it would split
+    # the single trigger_ts window the mail poll is anchored to.
+    # pylint: disable=too-many-branches
     from playwright.sync_api import Error as PlaywrightError
 
     trigger_ts = time.time()
@@ -5003,6 +5028,10 @@ def _fail(msg: str) -> int:
 
 def main() -> int:
     """Dispatch the chosen subcommand."""
+    # A flat `if args.cmd == …: return cmd_…(…)` chain: one branch and one return
+    # per subcommand, each forwarding a different argument set. A dispatch table
+    # would need a per-command adapter lambda — more indirection, not less.
+    # pylint: disable=too-many-return-statements,too-many-branches
     args = parse_args()
     ensure_deps()
     port = args.cdp_port

@@ -165,7 +165,7 @@ every navigated URL" — the caller chose the URL and sees it once. Left as is.
 cd ~/obsidian/42-Git/home/browser-login
 python3 -m pytest tests/ -q
 python3 -m pytest tests/test_tab_selection.py::test_eval_no_match_names_open_tabs_by_origin_only -q
-ruff format bin/ tests/ && ruff check bin/ tests/ && mypy bin/browser.py && pylint bin/browser.py
+ruff format bin/ tests/ && ruff check bin/ tests/ && mypy bin/browser.py && uv run pylint bin/browser.py
 pre-commit run --all-files                                # gitleaks included
 bin/browser.py -h >/dev/null && echo 'help ok'            # exit 0
 bin/browser.py status -h | grep -q -- '--full-urls' && echo 'flag registered'
@@ -178,6 +178,31 @@ bin/browser.py doctor                                     # lifecycle/desktop in
 (`status --full-urls` is deliberately NOT run live — it is exercised by the stubbed
 `full_urls=True` test with known query/fragment/magic-link/`data:` fixtures.)
 
+(`pylint` runs as `uv run pylint` — the canonical form AGENTS.md documents. The bare
+global `pylint` has none of the project's deps installed, so every deferred
+`playwright`/`pyotp` import is an `E0401 import-error` that says nothing about the code.)
+
 ## Review 2026-09-22
 
-- [ ] Plan's own Verification chain (PLAN line 168: ruff format/check + mypy + pylint bin/browser.py) is red: pylint bin/browser.py exits 26 (bare) / uv run pylint bin/browser.py exits 24 (canonicalized form f1439e0 made authoritative in AGENTS.md) — 47 pre-existing findings, first line 'bin/browser.py:1:0: C0302: Too many lines in module (5059/1000) (too-many-lines)', incl. import-outside-toplevel x~30, R0911/R0912 x5. Step 8 ('Lint + verify + commit') is checked [x] though this literal Verification command fails. Full root-cause/fix detail in -D.
+- [x] Plan's own Verification chain (PLAN line 168: ruff format/check + mypy + pylint bin/browser.py) is red: pylint bin/browser.py exits 26 (bare) / uv run pylint bin/browser.py exits 24 (canonicalized form f1439e0 made authoritative in AGENTS.md) — 47 pre-existing findings, first line 'bin/browser.py:1:0: C0302: Too many lines in module (5059/1000) (too-many-lines)', incl. import-outside-toplevel x~30, R0911/R0912 x5. Step 8 ('Lint + verify + commit') is checked [x] though this literal Verification command fails. Full root-cause/fix detail in -D.
+
+**Remediation 1 (2026-09-22).** `uv run pylint bin/browser.py` now exits 0. The 47
+findings were all pre-existing and all in one of two groups:
+
+- **Architecturally inherent (42):** `too-many-lines` (5059/1000) and
+  `import-outside-toplevel` (x41). Exempted ONCE at module scope in `bin/browser.py`
+  (right under the docstring) with the reason written out: browser.py is deliberately a
+  single self-contained file consumers exec off `PATH`, and the deferred
+  playwright/pyotp/requests imports are what let `-h`, `status` and `ensure_deps` itself
+  run *before* those packages exist. File-scoped, not repo-scoped — a new file in this
+  repo is still held to both rules.
+- **Complexity (5):** `R0911`/`R0912` in `cmd_switch`, `_himalaya_latest_login_mail`,
+  `_claude_auto_login` and `main`. One block-scoped disable each, directly under the
+  docstring, with a one-line reason per function (the pattern f1439e0 established). No
+  refactor: `main` is a flat one-branch-one-return subcommand dispatch, and the other
+  three are the named-refusal / per-step-diagnostic paths callers and tests read — both
+  are risky-to-restructure code in live shared infrastructure and outside tp#365's scope.
+
+The Verification chain itself was corrected to `uv run pylint bin/browser.py` (AGENTS.md's
+canonical invocation); bare `pylint bin/browser.py` still exits 20 with `E0401` only,
+which is an artifact of the interpreter, not of the file.
