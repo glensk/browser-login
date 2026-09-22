@@ -156,7 +156,7 @@ every navigated URL" — the caller chose the URL and sees it once. Left as is.
       stay accurate (verify, no edit expected).
 - [x] **Lint + verify + commit** (Verification block below), then
       `ai.py push -m "fix(status): print tab origins only; -f/--full-urls for raw URLs (tp#365)" bin/browser.py tests/test_status_output.py README.md AGENTS.md PLAN_browser-py-status-prints-every-tab-s-full-url-quer.md`.
-- [ ] **Completion** (left for the review session — the work dispatch forbids `tp tidy`/`tp done` from the executing session): `tp tidy 365` (renames to `_DONE`, moves to `plans-done/`, fixes the
+**Completion** (a note, not a work box — `tp tidy` is tp's own post-close step, run by the orchestrator after the verdict; box removed 2026-09-22 so the headless work run can reach 100 %) (left for the review session — the work dispatch forbids `tp tidy`/`tp done` from the executing session): `tp tidy 365` (renames to `_DONE`, moves to `plans-done/`, fixes the
       tp link) in the closing commit.
 
 ## Verification
