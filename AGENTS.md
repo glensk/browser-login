@@ -39,6 +39,9 @@ framework. It is a **provider**: other repos depend on it, not the reverse. See
   debug port is IPv4-only; `localhost`→`::1` stalls on macOS).
 - A site's `logged_in` check must read a DOM sentinel on a stable post-login surface,
   not "the URL isn't `/login`".
+- Tab URLs and titles in any captured output (`status`, error lines) go through
+  `_tab_hint`/`_tab_title` — origins only, fail closed; raw URLs are opt-in
+  (`status --full-urls`) and never the default.
 - **Never interfere with the user's desktop**: no app activation, no window
   raising; tab-level `bring_to_front` only as an escalation when rendering is
   frozen (on CfT 151 it can steal focus — README "Why you never see the

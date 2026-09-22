@@ -64,7 +64,7 @@ That's it — `browser.py` creates its own venv on first use.
 ```commands
 browser.py up                 # launch the shared Chromium (idempotent, BACKGROUND, clean tab)
 browser.py up --headless      # opt-in windowless mode (same profile — see the headless note!)
-browser.py status             # CDP health, version, open tabs + the lifecycle record
+browser.py status             # CDP health, version, open tabs (origins only; -f full URLs) + the lifecycle record
 browser.py switch headless    # transactional mode switch (stop + relaunch, logins persist)
 browser.py clients            # who is attached over CDP (registered + unknown clients)
 browser.py doctor             # full health check on a disposable tab (never touches real tabs)
@@ -127,7 +127,12 @@ achieved (and where the sharp edges are — all measured, see
 .browser-lifecycle.json`): state (`starting|running|stopping|switching`),
 mode, validated pid. Signals are only ever sent to a pid that still matches
 the record (start time + command line + executable) — never a bare number
-from a pid file. `doctor` certifies the whole stack: record vs live process,
+from a pid file. Its tab lines show **origins only** and fail-closed titles
+(a title that is just the URL, a blank, a non-string or a multiline one renders
+as `(untitled)`), because `status` output lands in logs and LLM transcripts and
+an in-flight OAuth or magic-link tab carries its code/token in the path and
+query; `-f/--full-urls` is the human opt-in for raw URLs (`status -f | pbcopy`)
+and is unsafe from an agent session. `doctor` certifies the whole stack: record vs live process,
 attached clients, and a bounded rAF/click/screenshot probe on a disposable
 `data:` tab, asserting the frontmost app and window z-order are unchanged
 afterwards.

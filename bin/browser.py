@@ -17,7 +17,8 @@ Generic lifecycle:
   up        Launch the shared browser (idempotent). Log into sites once here.
             [-H|--headless] opts into a windowless browser (same profile, same
             logins) — everything works except assisted (human) logins.
-  status    Show CDP health, browser version, open tabs, and the lifecycle record.
+  status    Show CDP health, browser version, open tabs (origins only; -f full
+            URLs), and the lifecycle record.
   switch MODE
             Transactionally switch to headed|headless: stop the browser and
             relaunch it on the SAME profile (every login persists). Waits for
@@ -195,7 +196,7 @@ def parse_args() -> argparse.Namespace:
             "  ./browser.py up                 # start it, then log into sites once\n"
             "  ./browser.py up --headless      # windowless (same profile/logins)\n"
             "  ./browser.py switch headless    # stop + relaunch windowless\n"
-            "  ./browser.py status             # CDP health + tabs + lifecycle\n"
+            "  ./browser.py status             # CDP health + tabs (origins only) + lifecycle\n"
             "  ./browser.py clients            # who is attached over CDP\n"
             "  ./browser.py doctor             # full health check (disposable tab)\n"
             "  ./browser.py open https://portal.cscs.ch/profile/\n"
@@ -225,8 +226,18 @@ def parse_args() -> argparse.Namespace:
         help="Opt-in headless mode (--headless=new): same profile, same logins, "
         "no window at all (env default CLAUDE_BROWSER_HEADLESS=1).",
     )
-    sub.add_parser(
-        "status", help="Show CDP health, version, open tabs, and the lifecycle record."
+    pst = sub.add_parser(
+        "status",
+        help="Show CDP health, version, open tabs (origins only), and the lifecycle "
+        "record.",
+    )
+    pst.add_argument(
+        "-f",
+        "--full-urls",
+        action="store_true",
+        help="print each tab's full URL — path, query and fragment. UNSAFE from an "
+        "agent session: in-flight auth tabs carry codes/tokens and status output "
+        "lands in logs and LLM transcripts. Default: origin only.",
     )
     psw = sub.add_parser(
         "switch",
@@ -1826,8 +1837,13 @@ def _print_lifecycle(port: int) -> None:
         print(f"  ⚠ {problem}")
 
 
-def cmd_status(port: int) -> int:
-    """Print CDP health, browser version, open tabs, and the lifecycle state."""
+def cmd_status(port: int, full_urls: bool = False) -> int:
+    """Print CDP health, browser version, open tabs, and the lifecycle state.
+
+    Tab lines show origins only (`_tab_line`): this output lands in logs and
+    LLM transcripts, and an in-flight OAuth/magic-link tab carries its code or
+    token in the path/query (tp#365). ``full_urls`` is the human opt-in.
+    """
     ver = _cdp_get(port, "/json/version")
     if ver is None:
         print(
@@ -1843,7 +1859,7 @@ def cmd_status(port: int) -> int:
     pages = [t for t in tab_list if isinstance(t, dict) and t.get("type") == "page"]
     print(f"  {len(pages)} tab(s):")
     for t in pages:
-        print(f"   - {t.get('title') or '(untitled)'}  →  {t.get('url')}")
+        print(_tab_line(t, full_urls))
     _print_lifecycle(port)
     return 0
 
@@ -2062,7 +2078,8 @@ def _strip_query(url: str) -> str:
 
 
 def _tab_hint(url: str) -> str:
-    """Origin-only rendering of a tab URL for the `eval --url` no-match error.
+    """Origin-only rendering of a tab URL for `status` and the `eval --url`
+    no-match error.
 
     Only ``scheme://host[:port]`` survives: the path, query, fragment and
     userinfo are withheld because a password-reset tab, a magic-link tab or a
@@ -2090,6 +2107,51 @@ def _tab_hint(url: str) -> str:
     if ":" in host:  # IPv6 literal — urlsplit strips the brackets
         host = f"[{host}]"
     return f"{parts.scheme}://{host}" + (f":{port}" if port is not None else "")
+
+
+def _tab_title(title: object, url: object) -> str:
+    """Fail-closed rendering of a tab title for `status`.
+
+    Chrome titles a page that has no ``<title>`` with its own URL minus the
+    scheme — path and query included — so a title-less OAuth callback or
+    magic-link hop would print its token through the title column even once
+    the URL column is origin-only (tp#365). A title contained in the raw or
+    the percent-decoded URL therefore renders as ``(untitled)``, as does a
+    non-string, blank or non-printable one (a newline in ``document.title``
+    would forge output lines). Long titles are cut at 100 characters. A site
+    that deliberately writes a secret into its own ``<title>`` is site
+    content — the same bytes every CDP client reads — and outside this guard.
+    """
+    if not isinstance(title, str) or not title.strip():
+        return "(untitled)"
+    if isinstance(url, str) and url:
+        if title in url or title in urllib.parse.unquote(url):
+            return "(untitled)"
+    if not title.isprintable():
+        return "(untitled)"
+    if len(title) > 100:
+        return title[:97] + "…"
+    return title
+
+
+def _tab_line(target: dict[str, object], full_urls: bool = False) -> str:
+    """One `status` tab line: fail-closed title, origin-only URL.
+
+    ``full_urls`` puts the raw URL in the URL column — the title column still
+    goes through `_tab_title` (the flag opts into raw URLs, not raw bytes on
+    stdout). A ``url`` that is not a string never reaches `_tab_hint`.
+    """
+    url = target.get("url")
+    title = _tab_title(target.get("title"), url)
+    if url is None:
+        hint = "(empty)"
+    elif not isinstance(url, str):
+        hint = "<unparseable url>"
+    elif full_urls:
+        hint = url or "(empty)"
+    else:
+        hint = _tab_hint(url)
+    return f"   - {title}  →  {hint}"
 
 
 def cmd_open(port: int, url: str, reuse: bool = False) -> int:
@@ -4950,7 +5012,7 @@ def main() -> int:
     if args.cmd == "up":
         return cmd_up(port, args.headless)
     if args.cmd == "status":
-        return cmd_status(port)
+        return cmd_status(port, args.full_urls)
     if args.cmd == "switch":
         return cmd_switch(port, args.mode, args.force)
     if args.cmd == "clients":

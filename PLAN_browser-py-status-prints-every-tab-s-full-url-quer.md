@@ -94,29 +94,29 @@ every navigated URL" — the caller chose the URL and sees it once. Left as is.
 
 ## Steps
 
-- [ ] **`_tab_title(title: object, url: object) -> str`** (new helper next to `_tab_hint`,
+- [x] **`_tab_title(title: object, url: object) -> str`** (new helper next to `_tab_hint`,
       `bin/browser.py:2064`): the fail-closed title renderer from decision 2 — `(untitled)`
       for non-string/blank, for a title contained in the raw or `unquote`d URL string, and
       for a non-`isprintable()` title; cut at 100 characters (97 + `…`). Docstring names the
       Chrome untitled-default channel and the line-forgery case.
-- [ ] **`_tab_line(target: dict) -> str`** (same place): returns
+- [x] **`_tab_line(target: dict) -> str`** (same place): returns
       `- {_tab_title(t.get('title'), t.get('url'))}  →  {hint}` where `hint` is
       `_tab_hint(url)` when `url` is a `str`, else `<unparseable url>`; with
       `full_urls=True` the URL column is the raw `url` and the title column is unchanged
       (still `_tab_title` — the flag opts into raw URLs, not raw bytes on stdout).
-- [ ] **`cmd_status(port, full_urls=False)`** (`bin/browser.py:1829`): the loop at `:1845`
+- [x] **`cmd_status(port, full_urls=False)`** (`bin/browser.py:1829`): the loop at `:1845`
       prints `_tab_line(t, full_urls)`. No trailer line. `✓ Up …`, `N tab(s):`,
       `Lifecycle:` lines, the page-type filter and both exit codes unchanged.
-- [ ] **argparse + dispatch** (`bin/browser.py:228-230`, `:4952`): `status` gains
+- [x] **argparse + dispatch** (`bin/browser.py:228-230`, `:4952`): `status` gains
       `-f/--full-urls` (`store_true`; help: "print each tab's full URL — path, query and
       fragment. UNSAFE from an agent session: in-flight auth tabs carry codes/tokens and
       status output lands in logs and LLM transcripts. Default: origin only."); dispatch
       `cmd_status(port, args.full_urls)`. Epilog example (`:198`) →
       `# CDP health + tabs (origins only) + lifecycle`; module docstring summary (`:20`) →
       `status    Show CDP health, browser version, open tabs (origins only; -f full URLs), and the lifecycle record.`
-- [ ] **`_tab_hint` docstring** (`bin/browser.py:2064-2077`): "for `status` and the
+- [x] **`_tab_hint` docstring** (`bin/browser.py:2064-2077`): "for `status` and the
       `eval --url` no-match error"; rendering rules unchanged (tp#337 tests untouched).
-- [ ] **Tests** — new `tests/test_status_output.py` (module-loading shim from
+- [x] **Tests** — new `tests/test_status_output.py` (module-loading shim from
       `tests/test_tab_selection.py`; monkeypatch `_cdp_get`, `_browser_mode`,
       `_print_lifecycle` with a call recorder; `capsys`). Fixture targets: a Keycloak
       authorize URL with `state=`/`nonce=`/`redirect_uri=`, a magic-link path
@@ -145,7 +145,7 @@ every navigated URL" — the caller chose the URL and sees it once. Left as is.
     `full_urls=True` for `-f`, `False` without it.
   - `tests/test_tab_selection.py::test_eval_no_match_names_open_tabs_by_origin_only`
     still passes — the eval error must not start advertising `status`.
-- [ ] **Docs**: `README.md:67` → `# CDP health, version, open tabs (origins only; -f full
+- [x] **Docs**: `README.md:67` → `# CDP health, version, open tabs (origins only; -f full
       URLs) + the lifecycle record`; the `status` paragraph at `README.md:126-129` gains
       one sentence (tab URLs are origins and titles are fail-closed because status output
       lands in transcripts; `-f/--full-urls` is the human opt-in, unsafe from an agent);
@@ -154,9 +154,9 @@ every navigated URL" — the caller chose the URL and sees it once. Left as is.
       closed; raw URLs are opt-in (`status --full-urls`) and never the default";
       `sdsc/cscs-api/README.md:309` and `~/.claude/skills/anthropic-api/SKILL.md:80`
       stay accurate (verify, no edit expected).
-- [ ] **Lint + verify + commit** (Verification block below), then
+- [x] **Lint + verify + commit** (Verification block below), then
       `ai.py push -m "fix(status): print tab origins only; -f/--full-urls for raw URLs (tp#365)" bin/browser.py tests/test_status_output.py README.md AGENTS.md PLAN_browser-py-status-prints-every-tab-s-full-url-quer.md`.
-- [ ] **Completion**: `tp tidy 365` (renames to `_DONE`, moves to `plans-done/`, fixes the
+- [ ] **Completion** (left for the review session — the work dispatch forbids `tp tidy`/`tp done` from the executing session): `tp tidy 365` (renames to `_DONE`, moves to `plans-done/`, fixes the
       tp link) in the closing commit.
 
 ## Verification
