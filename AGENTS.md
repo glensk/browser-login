@@ -20,7 +20,9 @@ framework. It is a **provider**: other repos depend on it, not the reverse. See
 
 ## Build / test / lint
 
-- Python: `ruff format bin/ && ruff check bin/ && mypy bin/browser.py && pylint bin/browser.py`
+- Python: `ruff format bin/ && ruff check bin/ && mypy bin/browser.py && uv run pylint bin/browser.py`
+  (`uv sync` first — pylint has to run inside the project venv so the deferred
+  playwright/pyotp/requests imports resolve).
 - Shell: `shellcheck` (no shell scripts currently)
 - Pre-commit: `pre-commit run --all-files` (gitleaks secret scan)
 - Smoke test: `bin/browser.py -h` must exit 0; `browser.py up && browser.py status`.

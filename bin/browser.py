@@ -368,9 +368,9 @@ def ensure_deps():  # literal "def ensure_deps():" required by pre-commit hook
     ~/.cache to avoid bloating the cscs-api client's .venv.
     """
     try:
-        import playwright  # noqa: F401
-        import pyotp  # noqa: F401
-        import requests  # noqa: F401
+        import playwright  # noqa: F401  # pylint: disable=unused-import
+        import pyotp  # noqa: F401  # pylint: disable=unused-import
+        import requests  # noqa: F401  # pylint: disable=unused-import
 
         return
     except ImportError:
@@ -618,7 +618,7 @@ def _launch_browser(
                 check=False,
             )
             return None
-    proc = subprocess.Popen(
+    proc = subprocess.Popen(  # pylint: disable=consider-using-with
         [binary, *flags],
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
@@ -1915,7 +1915,7 @@ def cmd_register_exec(port: int, tool: str, cmd: list[str]) -> int:
     # walk in _unknown_cdp_clients.
     release = _registry_register(tool, " ".join(cmd)[:160], port)
     try:
-        proc = subprocess.Popen(cmd)
+        proc = subprocess.Popen(cmd)  # pylint: disable=consider-using-with
     except OSError as exc:
         release()
         return _fail(f"register-exec: cannot start {cmd[0]!r}: {exc}")
@@ -2860,7 +2860,8 @@ def _scan_token(ctx, page) -> str | None:
     try:
         token = page.evaluate(
             "() => { const re=/\\b[0-9a-f]{40}\\b/;"
-            "for (let i=0;i<localStorage.length;i++){const v=localStorage.getItem(localStorage.key(i));"
+            "for (let i=0;i<localStorage.length;i++)"
+            "{const v=localStorage.getItem(localStorage.key(i));"
             "const m=v&&v.match(re); if(m) return m[0];} return null; }"
         )
         if token:

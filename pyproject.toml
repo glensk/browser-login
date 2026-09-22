@@ -23,3 +23,8 @@ package = false
 # Note: browser.py ALSO self-bootstraps an isolated venv at
 # ~/.cache/claude-browser/venv on first run (it installs playwright/pyotp/requests
 # via uv), so `uv sync` here is optional — it just gives you a project-local .venv.
+
+[dependency-groups]
+# pylint must run inside this venv: browser.py's deferred imports (playwright, pyotp,
+# requests) resolve only here, otherwise every one is an E0401 import-error.
+dev = ["pylint>=4"]
