@@ -78,6 +78,7 @@ import sys
 import threading
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 import uuid
 from collections.abc import Callable, Iterator
@@ -2060,6 +2061,37 @@ def _strip_query(url: str) -> str:
     return url.split("#", 1)[0].split("?", 1)[0].rstrip("/")
 
 
+def _tab_hint(url: str) -> str:
+    """Origin-only rendering of a tab URL for the `eval --url` no-match error.
+
+    Only ``scheme://host[:port]`` survives: the path, query, fragment and
+    userinfo are withheld because a password-reset tab, a magic-link tab or a
+    ``data:`` page carries its secret there, and the error line lands in logs
+    and LLM transcripts (tp#337). A URL without a hostname collapses to
+    ``<scheme>:…``, except the literal ``about:blank`` (the "only a blank tab —
+    use `open`" signal). Fails closed: a malformed URL renders as a placeholder
+    and none of its bytes reach the output. Hostnames are NOT promised secret —
+    they are the ``--url`` selector's own vocabulary, and `open` already prints
+    every navigated URL.
+    """
+    if not url:
+        return "(empty)"
+    if url == "about:blank":
+        return url
+    try:
+        parts = urllib.parse.urlsplit(url)
+        host, port = parts.hostname, parts.port  # both raise on malformed input
+    except ValueError:
+        return "<unparseable url>"
+    if not host:
+        return f"{parts.scheme}:…" if parts.scheme else "<unparseable url>"
+    if not host.isprintable():  # urlsplit lets control characters through
+        return "<unparseable url>"
+    if ":" in host:  # IPv6 literal — urlsplit strips the brackets
+        host = f"[{host}]"
+    return f"{parts.scheme}://{host}" + (f":{port}" if port is not None else "")
+
+
 def cmd_open(port: int, url: str, reuse: bool = False) -> int:
     """Open/navigate a tab to URL."""
     pw, browser = _connect(port)
@@ -2093,15 +2125,22 @@ def cmd_eval(port: int, js: str, url_substr: str | None) -> int:
     try:
         ctx, page = _pick_page(browser, url_substr, require_match=True)
         if page is None:
-            # Listed without query/fragment: an OAuth-callback tab carries a
-            # live code/token there, and this line lands in logs and transcripts.
-            urls = [_strip_query(pg.url) for pg in ctx.pages]
-            open_urls = ", ".join(urls[:8]) or "none"
-            if len(urls) > 8:
-                open_urls += f", … (+{len(urls) - 8} more)"
+            # Tabs are named by origin only (tp#337): the path, query, fragment
+            # and userinfo of a reset/magic-link/data: tab are secrets, and this
+            # line lands in logs and transcripts. Deduplicate ALL hints first
+            # (first-appearance order, ×N per repeated origin), THEN cap at 8 —
+            # the "+N more" unit is origins, not tabs.
+            counts: dict[str, int] = {}
+            for pg in ctx.pages:
+                hint = _tab_hint(pg.url)
+                counts[hint] = counts.get(hint, 0) + 1
+            hints = [h if n == 1 else f"{h} ×{n}" for h, n in counts.items()]
+            open_tabs = ", ".join(hints[:8]) or "none"
+            if len(hints) > 8:
+                open_tabs += f", … (+{len(hints) - 8} more origins)"
             return _fail(
                 f"No tab matching {url_substr!r} — nothing evaluated. Open one "
-                f"first: browser.py open <url>. Open tabs: {open_urls}"
+                f"first: browser.py open <url>. Open tabs: {open_tabs}"
             )
         result = page.evaluate(f"() => ({js})")
         print(json.dumps(result, indent=2, default=str))

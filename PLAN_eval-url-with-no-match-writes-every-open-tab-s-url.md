@@ -86,20 +86,20 @@ below are recorded as non-blocking assumptions (`tp question 337 …`).
 
 ## Steps
 
-- [ ] Add `_tab_hint(url: str) -> str` next to `_strip_query` (`bin/browser.py:~2058`)
+- [x] Add `_tab_hint(url: str) -> str` next to `_strip_query` (`bin/browser.py:~2058`)
       implementing the origin-only rules above (`urllib.parse.urlsplit`; the module already
       imports `urllib.error`/`urllib.request`): hostname present → `scheme://host[:port]`
       (IPv6 re-bracketed); empty → `(empty)`; literal `about:blank` → as-is; no hostname →
       `<scheme>:…`; `ValueError` from `urlsplit`/`.port` → `<unparseable url>`. Docstring
       names tp#337, says why the path is withheld and that hostnames are not promised secret.
-- [ ] Rewrite the no-match branch of `cmd_eval` (`bin/browser.py:2096-2105`): hints from
+- [x] Rewrite the no-match branch of `cmd_eval` (`bin/browser.py:2096-2105`): hints from
       `_tab_hint`; deduplicate all hints in first-appearance order with a `×N` suffix where
       N > 1; then cap at 8 unique hints and append `… (+N more origins)` for the omitted
       unique ones; keep the `No tab matching … — nothing evaluated. Open one first:
       browser.py open <url>. Open tabs: …` wording; NO pointer to `status`. Replace the
       "Listed without query/fragment" comment with one stating the origin-only rule and the
       dedup-then-cap order.
-- [ ] Tests in `tests/test_tab_selection.py` (module docstring: add the third pinned failure
+- [x] Tests in `tests/test_tab_selection.py` (module docstring: add the third pinned failure
       mode): a `_tab_hint` table — path+query+fragment, `user:pw@host:8443`,
       `http://[::1]:8080/p`, `data:`, `blob:`, `file:`, `javascript:`, `about:blank`,
       `chrome://newtab/`, empty string, scheme-only (`https:`), malformed IPv6
@@ -113,9 +113,9 @@ below are recorded as non-blocking assumptions (`tp question 337 …`).
       is absent, and that the exit code is 1 with no traceback; a dedup/cap test — 12 tabs
       over 10 origins with repeats at positions 1, 9 and 11 → 8 listed with the right `×N`
       counts and `(+2 more origins)`.
-- [ ] `README.md:75-76`: one clause — the error names the open tabs by origin only (no
+- [x] `README.md:75-76`: one clause — the error names the open tabs by origin only (no
       path, query or fragment). No mention of `status`.
-- [ ] Lint, tests and gates green: `ruff format bin/ tests/ && ruff check bin/ tests/ &&
+- [x] Lint, tests and gates green: `ruff format bin/ tests/ && ruff check bin/ tests/ &&
       mypy bin/browser.py && pylint bin/browser.py`, `python3 -m pytest tests/ -q`,
       `pre-commit run --all-files` (gitleaks — if a fixture trips it, rename the fixture,
       never allowlist), `bin/browser.py -h` and `bin/browser.py eval -h` exit 0; commit with

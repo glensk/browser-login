@@ -73,7 +73,8 @@ browser.py open -r https://…  # --reuse: navigate an existing same-URL tab (no
                               #   matches sans query/fragment, oldest first = eval's pick)
 browser.py eval 'document.title' [--url SUBSTR]   # run JS in the active/matched tab → JSON
                               #   --url with no matching tab exits 1 (it never falls back to
-                              #   another tab); a browser with zero tabs gets a blank one first
+                              #   another tab; the error names the open tabs by origin only —
+                              #   no path, query or fragment); zero tabs → a blank one is created
 browser.py down               # quit the shared browser (graceful CDP close → validated escalation)
 ```
 
