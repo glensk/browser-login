@@ -65,9 +65,20 @@ recorded with `tp question`).
   behaviour change for scripts); the refusal text for `down` gains
   `— or re-run with -f/--force to stop anyway`.
 
+## Implementation notes (2026-09-23)
+
+- The stale path lives in `_down_clear_stale`; it re-reads the record right
+  before the unlink and clears only if the nonce is unchanged, so a concurrent
+  `up` that just wrote `starting` keeps its record (added beyond the plan —
+  narrows the no-gate clear's race window).
+- `_registry_client_lines()` factored out of `_gate_busy` so the `--force`
+  warning names the same clients the refusal does.
+- `tests/test_down.py` adds two cases beyond the seven: live browser with no
+  clients stops normally, and the `down -f` parser flag.
+
 ## Steps
 
-- [ ] `cmd_down`: add the stale-record early path — `not _is_up(port) and not
+- [x] `cmd_down`: add the stale-record early path — `not _is_up(port) and not
       _find_root_pids(port)` and record is absent or not a fresh transitional
       state → `_lifecycle_clear()`, `PID_FILE.unlink(missing_ok=True)`, print
       `Stopped (stale lifecycle record cleared).` (or the existing `Stopped (or
@@ -75,21 +86,21 @@ recorded with `tp question`).
       "fresh transitional" test into a small helper
       (`_fresh_transition(rec) -> str | None`) reusing `_iso_age_s` +
       `TRANSITIONAL_STATES` + `TRANSITION_STALE_S`.
-- [ ] Add `-f/--force` to the `down` subparser (help: stop even while registered
+- [x] Add `-f/--force` to the `down` subparser (help: stop even while registered
       CDP clients are attached — they lose their connection); wire
       `cmd_down(port, args.force)` in `main` (`bin/browser.py:5055`).
-- [ ] `cmd_down(port, force=False)`: with `force`, refuse on a fresh transitional
+- [x] `cmd_down(port, force=False)`: with `force`, refuse on a fresh transitional
       record; else `_gate_acquire(LOCK_EX, REGISTRY_UP_WAIT_S)`; on `None`
       print `⚠ --force: stopping without draining — <_describe_client lines>`
       to stderr and run the unchanged stopping/shutdown/clear sequence with
       `gate=None` (release guarded by `if gate is not None`).
-- [ ] `_gate_busy(action, hint="")`: append the optional override hint; `down`
+- [x] `_gate_busy(action, hint="")`: append the optional override hint; `down`
       passes the `-f/--force` hint, `switch` keeps its current text.
-- [ ] Update the module docstring (`down` line, `bin/browser.py:34`) and the
+- [x] Update the module docstring (`down` line, `bin/browser.py:34`) and the
       `cmd_down` docstring (fail-closed-for-registered + force semantics + stale
       path); README `browser.py down` line (`README.md:78`) and the
       "Consumer contract" section (`README.md:140`) with `down -f`.
-- [ ] New `tests/test_down.py` (same import pattern as
+- [x] New `tests/test_down.py` (same import pattern as
       `tests/test_switch_site.py`; monkeypatch `CACHE_DIR`, `PROFILE_DIR`,
       `PID_FILE`, `LIFECYCLE_FILE`, `CLIENTS_DIR`, `REGISTRY_GATE` to `tmp_path`,
       shrink `REGISTRY_EX_WAIT_S`/`REGISTRY_UP_WAIT_S`, stub `_is_up`,
@@ -105,8 +116,8 @@ recorded with `tp question`).
          called, record cleared, stderr names the client.
       6. `force=True` + fresh `switching` record → rc 1, nothing shut down.
       7. no record, nothing running → unchanged `Stopped (or was not running).`
-- [ ] Lint + tests (Verification below), `bin/browser.py down -h` shows `-f`.
-- [ ] Commit via `ai.py push` (subagents never commit); tick boxes; on completion
+- [x] Lint + tests (Verification below), `bin/browser.py down -h` shows `-f`.
+- [x] Commit via `ai.py push` (subagents never commit); tick boxes; on completion
       `tp tidy` archives this plan.
 
 NOTE (Albert, optional): a live check on the real shared browser — `browser.py

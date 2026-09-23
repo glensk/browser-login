@@ -75,7 +75,9 @@ browser.py eval 'document.title' [--url SUBSTR]   # run JS in the active/matched
                               #   --url with no matching tab exits 1 (it never falls back to
                               #   another tab; the error names the open tabs by origin only —
                               #   no path, query or fragment); zero tabs → a blank one is created
-browser.py down               # quit the shared browser (graceful CDP close → validated escalation)
+browser.py down [-f]          # quit the shared browser (graceful CDP close → validated escalation);
+                              #   refuses while a registered client (MCP server) stays attached —
+                              #   -f/--force stops anyway; a stale record with no browser is cleared
 ```
 
 `up` launches in the background (via `open -g` on macOS) so Chrome for Testing
@@ -150,7 +152,14 @@ state — so two layers coordinate everyone (all under `~/.cache/claude-browser/
    exactly as long as the process. `switch`/`down` acquire the gate
    exclusively (bounded wait, refusal names the holders), and `switch`
    **fails closed** when an *unregistered* client is attached (or when it
-   cannot verify — no `lsof`); `-f/--force` overrides. `down` only warns.
+   cannot verify — no `lsof`); `-f/--force` overrides. `down` only warns
+   about unregistered clients; a registered one that does not drain makes it
+   refuse, and `down -f/--force` stops after a 5 s grace without draining
+   (the registered wrappers keep running, only their CDP connection drops —
+   the MCP server reconnects after the next `up`). Neither `--force` overrides
+   a fresh `starting`/`stopping`/`switching` record (a transition in flight).
+   A lifecycle record with no browser behind it (no CDP, no root process) is
+   cleared by a plain `down` without waiting for the gate.
 2. **Interaction lease (who is driving).** Anything that types, clicks for a
    login, or otherwise owns the user-visible interaction takes the exclusive
    `interaction.lock` flock (owner nonce + pid start time, 10 s heartbeat,

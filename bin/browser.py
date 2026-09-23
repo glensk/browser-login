@@ -31,7 +31,11 @@ Generic lifecycle:
   register-exec [-t NAME] -- CMD ARGS…
             Run a long-lived CDP client (e.g. the Playwright MCP server) as a
             REGISTERED client: the registration lives exactly as long as CMD.
-  down      Quit the shared browser.
+  down [-f|--force]
+            Quit the shared browser. Waits for registered CDP clients to drain
+            and refuses while one stays attached (-f/--force stops anyway —
+            they lose their connection); a stale lifecycle record with no
+            browser behind it is cleared without waiting.
   open URL  Open/navigate a tab to URL in the shared browser.
   eval JS   Run a JS expression in the active (or --url-matched) tab; print JSON.
 
@@ -297,7 +301,14 @@ def parse_args() -> argparse.Namespace:
         nargs=argparse.REMAINDER,
         help="Command to run (prefix with -- to stop flag parsing).",
     )
-    sub.add_parser("down", help="Quit the shared browser.")
+    pdn = sub.add_parser("down", help="Quit the shared browser.")
+    pdn.add_argument(
+        "-f",
+        "--force",
+        action="store_true",
+        help="Stop even while registered CDP clients (e.g. the Playwright MCP "
+        "server) are attached — they lose their connection.",
+    )
     po = sub.add_parser("open", help="Open/navigate a tab to URL.")
     po.add_argument("url", help="URL to open.")
     po.add_argument(
@@ -1494,11 +1505,13 @@ def _gate_release(fd: int) -> None:
         os.close(fd)
 
 
-def _gate_busy(action: str) -> str:
-    """The "clients are still attached" refusal for `action`, naming them."""
-    lines = [
-        f"   still attached: {_describe_client(r)}" for r in _registry_live_clients()
-    ]
+def _gate_busy(action: str, hint: str = "") -> str:
+    """The "clients are still attached" refusal for `action`, naming them.
+
+    `hint` is appended to the closing "Let them finish, then retry" line — the
+    command's override, when it has one (`down` passes its `-f/--force`).
+    """
+    lines = [f"   still attached: {line}" for line in _registry_client_lines()]
     return (
         f"Cannot {action}: registered CDP client(s) did not drain within "
         f"{REGISTRY_EX_WAIT_S:.0f}s.\n"
@@ -1506,8 +1519,13 @@ def _gate_busy(action: str) -> str:
             "\n".join(lines)
             or "   (no registration file left — see `browser.py clients`)"
         )
-        + "\n   Let them finish, then retry."
+        + f"\n   Let them finish, then retry{hint}."
     )
+
+
+def _registry_client_lines() -> list[str]:
+    """One `_describe_client` line per live registration."""
+    return [_describe_client(r) for r in _registry_live_clients()]
 
 
 def _established_cdp_clients(port: int) -> list[tuple[int, str]]:
@@ -1949,7 +1967,55 @@ def cmd_register_exec(port: int, tool: str, cmd: list[str]) -> int:
     return rc
 
 
-def cmd_down(port: int) -> int:
+def _fresh_transition(rec: dict | None) -> str | None:
+    """The record's transitional state if it is still FRESH, else None.
+
+    Fresh = ``starting``/``stopping``/``switching`` no older than
+    TRANSITION_STALE_S, or with an unparsable timestamp (fail safe: another
+    process may be mid-launch/mid-switch with no CDP answer yet). A stuck,
+    older transition is a dead one and reads as None.
+    """
+    if not rec:
+        return None
+    state = str(rec.get("state", ""))
+    if state not in TRANSITIONAL_STATES:
+        return None
+    age = _iso_age_s(rec.get("iso"))
+    return state if age is None or age <= TRANSITION_STALE_S else None
+
+
+def _down_clear_stale(port: int, rec: dict | None) -> bool:
+    """Clear a record no browser stands behind, WITHOUT the gate; True if done.
+
+    With no CDP answer and no root process on our profile there is nothing a
+    registered client could lose, so waiting for the gate would only let a
+    long-lived client (the Playwright MCP server) keep a stale record alive
+    forever. A FRESH transitional record is left alone — another process may be
+    launching or switching and simply has no CDP yet. The record is re-read
+    right before the unlink and cleared only if it is still the one judged
+    here (same nonce), so a concurrent `up` that just wrote ``starting`` keeps
+    its record.
+    """
+    if _fresh_transition(rec) is not None or _is_up(port) or _find_root_pids(port):
+        return False
+    current = _lifecycle_read()
+    if rec is not None and (
+        current is None or current.get("nonce") != rec.get("nonce")
+    ):
+        return False  # changed under us — let the gated path decide
+    if rec is None and current is not None:
+        return False
+    _lifecycle_clear()
+    PID_FILE.unlink(missing_ok=True)  # legacy, kept for external observers
+    print(
+        "Stopped (stale lifecycle record cleared)."
+        if rec is not None
+        else "Stopped (or was not running)."
+    )
+    return True
+
+
+def cmd_down(port: int, force: bool = False) -> int:
     """Quit the shared browser: record the stop, escalate as needed, verify.
 
     A ``stopping`` record goes down FIRST, so a concurrent observer that finds
@@ -1963,21 +2029,51 @@ def cmd_down(port: int) -> int:
     here: a human asking for the browser to stop must not be blocked by
     something they can see in the message. Fail-closed is for the AUTOMATIC
     decision (`switch`), not for an explicit human one.
+
+    Registered clients, by contrast, keep the default fail-closed: a client
+    that does not drain within REGISTRY_EX_WAIT_S makes `down` refuse, naming
+    it. ``force`` gives the gate a short grace (REGISTRY_UP_WAIT_S, enough for
+    one-shot `open`/`eval` clients) and then stops WITHOUT it — the registered
+    wrappers are not killed, only their CDP connection drops. Even ``force``
+    refuses on a FRESH transitional record: a live `up`/`switch` is mid-flight.
+
+    A record with no browser behind it (no CDP, no root process) is cleared
+    straight away, without the gate — see `_down_clear_stale`.
     """
     rec = _lifecycle_read()
-    if rec is None and not _find_root_pids(port) and not _is_up(port):
-        PID_FILE.unlink(missing_ok=True)
-        print("Stopped (or was not running).")
+    if _down_clear_stale(port, rec):
         return 0
+    if force and (busy := _fresh_transition(rec)) is not None:
+        return _fail(
+            f"Cannot force-stop the shared browser: a '{busy}' transition is in "
+            "flight (another `up`/`switch`/`down`). Retry once it has finished; "
+            "`browser.py status` shows the lifecycle state."
+        )
     rec_mode = rec.get("mode") if rec else None
     mode = (
         _browser_mode(port)
         or (rec_mode if isinstance(rec_mode, str) else None)
         or "headed"
     )
-    gate = _gate_acquire(fcntl.LOCK_EX, REGISTRY_EX_WAIT_S)
+    gate = _gate_acquire(
+        fcntl.LOCK_EX, REGISTRY_UP_WAIT_S if force else REGISTRY_EX_WAIT_S
+    )
+    if gate is None and not force:
+        return _fail(
+            _gate_busy(
+                "stop the shared browser", " — or re-run with -f/--force to stop anyway"
+            )
+        )
     if gate is None:
-        return _fail(_gate_busy("stop the shared browser"))
+        print(
+            "⚠ --force: stopping without draining — these registered CDP "
+            "client(s) lose their connection:\n"
+            + (
+                "\n".join(f"   {line}" for line in _registry_client_lines())
+                or "   (no registration file left — see `browser.py clients`)"
+            ),
+            file=sys.stderr,
+        )
     try:
         verdict = _unknown_clients_verdict(port)
         if verdict is not None:
@@ -1993,7 +2089,8 @@ def cmd_down(port: int) -> int:
         _lifecycle_clear()
         PID_FILE.unlink(missing_ok=True)  # legacy, kept for external observers
     finally:
-        _gate_release(gate)
+        if gate is not None:
+            _gate_release(gate)
     print("✓ Shared browser stopped.")
     return 0
 
@@ -5052,7 +5149,7 @@ def main() -> int:
     if args.cmd == "register-exec":
         return cmd_register_exec(port, args.tool, args.cmd_)
     if args.cmd == "down":
-        return cmd_down(port)
+        return cmd_down(port, args.force)
     if args.cmd == "open":
         return cmd_open(port, args.url, reuse=args.reuse)
     if args.cmd == "eval":
