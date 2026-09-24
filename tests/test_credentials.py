@@ -232,9 +232,12 @@ def _store_creds_env(monkeypatch, seed: str):
     monkeypatch.setattr(browser.shutil, "which", lambda name: "/usr/bin/op")
     monkeypatch.setattr(browser, "_op_creds", lambda item, acct: ("user", "pw", "1"))
     monkeypatch.setattr(browser, "_op_totp_uri", lambda item, acct: seed)
-    monkeypatch.setattr(
-        browser, "_keychain_set", lambda svc, v: stored.__setitem__(svc, v) or True
-    )
+
+    def fake_set(svc, v):
+        stored[svc] = v
+        return True
+
+    monkeypatch.setattr(browser, "_keychain_set", fake_set)
     return stored
 
 
@@ -334,10 +337,10 @@ def test_click_keycloak_submit_is_a_noop_without_a_button():
 )
 def test_on_portal(url, on_portal):
     class _P:
-        pass
+        def __init__(self, url):
+            self.url = url
 
-    p = _P()
-    p.url = url
+    p = _P(url)
     assert browser._on_portal(p) is on_portal
 
 
@@ -484,9 +487,12 @@ def test_forget_creds_fails_loud_when_an_item_survives(monkeypatch, capsys, cmd)
 )
 def test_forget_creds_succeeds_when_all_items_are_gone(monkeypatch, capsys, cmd):
     deleted: list[str] = []
-    monkeypatch.setattr(
-        browser, "_keychain_delete", lambda svc: not deleted.append(svc)
-    )
+
+    def fake_delete(svc):
+        deleted.append(svc)
+        return True
+
+    monkeypatch.setattr(browser, "_keychain_delete", fake_delete)
     assert getattr(browser, cmd)() == 0
     assert len(deleted) == (3 if "cscs" in cmd else 2)
     assert "✓ Removed" in capsys.readouterr().out
