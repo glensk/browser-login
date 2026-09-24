@@ -3024,8 +3024,13 @@ def _capture_and_cache_token(ctx, page) -> int:
             "request → Authorization header to find it."
         )
     CSCS_TOKEN_CACHE.parent.mkdir(parents=True, exist_ok=True)
-    CSCS_TOKEN_CACHE.write_text(token)
-    CSCS_TOKEN_CACHE.chmod(0o600)
+    # Created 0600 and tightened BEFORE the write (a pre-existing file keeps its
+    # old mode through O_CREAT) — never write-then-chmod, which leaves the token
+    # readable by other users in between.
+    fd = os.open(CSCS_TOKEN_CACHE, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as fh:
+        os.fchmod(fh.fileno(), 0o600)
+        fh.write(token)
     print(f"✓ Token cached at {CSCS_TOKEN_CACHE} (mode 0600).")
     resp = requests.get(
         PORTAL_API_ME, headers={"Authorization": f"Token {token}"}, timeout=15
