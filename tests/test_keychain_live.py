@@ -99,6 +99,9 @@ def test_keychain_set_round_trips_through_security_stdin(monkeypatch):
             got = browser._keychain_get(services[case])
             expected = value if value.isascii() else value.encode().hex()
             assert got == expected, f"read-back mismatch for case {case}"
+        # No -U UPDATE case on purpose: updating an existing item opened a
+        # SecurityAgent prompt on 2026-09-24, and the 15 s timeout killing the
+        # client mid-prompt made securityd abort (see PLAN execution notes).
         # an invalid value must not reach the keychain at all
         assert not browser._keychain_set(f"{account}-newline", "a\nb", "tp489")
         found = _items_matching(account, account)
