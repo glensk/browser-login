@@ -3216,10 +3216,13 @@ def _kc_add_line(service: str, value: str, description: str) -> bytes | None:
     return data + b"\n"
 
 
-def _keychain_set(
-    service: str, value: str, description: str = "cscs-api credential"
-) -> bool:
-    """Create/replace a login-keychain item; return ``True`` on success.
+def _keychain_write(service: str, value: str, description: str) -> str:
+    """Create/replace a login-keychain item; return the outcome as a word.
+
+    ``"ok"``; ``"invalid"`` (``_kc_add_line`` refused it — nothing was run);
+    ``"rejected"`` (``security`` exited non-zero — nothing written);
+    ``"uncertain"`` (``security`` could not be run or timed out — it may have
+    written anyway); ``"mismatch"`` (exit 0, but the read-back differs).
 
     The secret goes to ``security -i`` on stdin, never on argv (argv is readable
     by every same-user process via ``ps``). ``-U`` updates in place if the item
@@ -3233,7 +3236,7 @@ def _keychain_set(
     """
     line = _kc_add_line(service, value, description)
     if line is None:
-        return False
+        return "invalid"
     try:
         r = subprocess.run(
             ["security", "-i"],
@@ -3243,23 +3246,86 @@ def _keychain_set(
             check=False,
         )
     except (OSError, subprocess.SubprocessError):
-        return False
+        return "uncertain"
     if r.returncode != 0:
-        return False
+        return "rejected"
     printable_ascii = all(0x20 <= ord(c) < 0x7F for c in value)
     expected = value if printable_ascii else value.encode("utf-8").hex()
-    return _keychain_get(service) == expected
+    return "ok" if _keychain_get(service) == expected else "mismatch"
 
 
-def _keychain_set_all(items: Sequence[tuple[str, str]], description: str) -> bool:
-    """Write several ``(service, value)`` items; ``True`` only if all succeed.
+def _keychain_set(
+    service: str, value: str, description: str = "cscs-api credential"
+) -> bool:
+    """Create/replace a login-keychain item; ``True`` on success (see
+    ``_keychain_write`` for the write and the read-back check)."""
+    return _keychain_write(service, value, description) == "ok"
+
+
+@dataclass
+class KeychainBatchResult:
+    """Outcome of ``_keychain_set_all``.
+
+    ``ok``: every item written and read back. ``changed``: the keychain may
+    differ from before (a write ran, or its outcome is unknown). ``removed`` /
+    ``surviving``: the batch's services the cleanup deleted / could NOT delete.
+    """
+
+    ok: bool
+    changed: bool = False
+    removed: tuple[str, ...] = ()
+    surviving: tuple[str, ...] = ()
+
+
+def _keychain_set_all(
+    items: Sequence[tuple[str, str]], description: str
+) -> KeychainBatchResult:
+    """Write several ``(service, value)`` items as one credential set.
 
     Every item is validated before the first write, so an invalid last field
-    leaves the keychain untouched. Writes stop at the first failure.
+    leaves the keychain untouched. Writes stop at the first failure; unless
+    nothing can have changed (the FIRST write was refused outright), every item
+    of the batch is then deleted — a mixed old/new set would make a login submit
+    a wrong pair (lockout risk), a missing one makes it fall back to 1Password.
+
+    Best effort, NOT atomic: a login running concurrently can still read a
+    mixed set in the window, and a delete can fail (``surviving``).
     """
     if any(_kc_add_line(svc, v, description) is None for svc, v in items):
-        return False
-    return all(_keychain_set(svc, v, description) for svc, v in items)
+        return KeychainBatchResult(ok=False)
+    for i, (svc, v) in enumerate(items):
+        outcome = _keychain_write(svc, v, description)
+        if outcome == "ok":
+            continue
+        if i == 0 and outcome in ("rejected", "invalid"):
+            return KeychainBatchResult(ok=False)
+        removed: list[str] = []
+        surviving: list[str] = []
+        for other, _ in items:  # every item: an earlier one may hold OLD bytes
+            (removed if _keychain_delete(other) else surviving).append(other)
+        return KeychainBatchResult(False, True, tuple(removed), tuple(surviving))
+    return KeychainBatchResult(ok=True, changed=True)
+
+
+def _report_keychain_batch_failure(
+    result: KeychainBatchResult, store_cmd: str, forget_cmd: str
+) -> int:
+    """The one failure line for a ``_keychain_set_all`` that did not succeed.
+
+    Names service labels only, never values; claims the set is gone only when
+    every delete succeeded.
+    """
+    if not result.changed:
+        return _fail("Failed to write the keychain items — nothing changed.")
+    if not result.surviving:
+        return _fail(
+            "Failed to write the keychain items; the partially written items were "
+            f"removed — no stored set remains. Re-run `browser.py {store_cmd}`."
+        )
+    return _fail(
+        "Failed to write the keychain items, and cleanup FAILED for "
+        f"{', '.join(result.surviving)} — run `browser.py {forget_cmd}`."
+    )
 
 
 def _keychain_delete(service: str) -> bool:
@@ -3599,11 +3665,11 @@ def _fill_keycloak_otp(page, otp: Callable[[], str | None]) -> bool:
         if _on_portal(page) or "auth.cscs.ch" not in page.url:
             print("⚠ The Keycloak page moved on before the OTP could be filled.")
             return False
-        field = _keycloak_otp_field(page)
-        if field is None:
+        otp_input = _keycloak_otp_field(page)
+        if otp_input is None:
             print("⚠ The Keycloak OTP field disappeared before it could be filled.")
             return False
-        field.fill(code)
+        otp_input.fill(code)
         _click_keycloak_submit(page)
     except PlaywrightError:
         print("⚠ The Keycloak OTP step changed while filling it — not submitted.")
@@ -3776,15 +3842,18 @@ def cmd_cscs_store_creds() -> int:
             "Nothing stored — re-run and paste the correct seed."
         )
 
-    if not _keychain_set_all(
+    result = _keychain_set_all(
         [
             (KEYCHAIN_SVC_USER, user),
             (KEYCHAIN_SVC_PASS, password),
             (KEYCHAIN_SVC_TOTP, seed),
         ],
         "cscs-api credential",
-    ):
-        return _fail("Failed to write one or more keychain items.")
+    )
+    if not result.ok:
+        return _report_keychain_batch_failure(
+            result, "store-creds cscs", "forget-creds cscs"
+        )
 
     print(
         "✓ Stored CSCS username, password and TOTP seed in the macOS keychain.\n"
@@ -5059,14 +5128,17 @@ def cmd_biopolwifi_store_creds() -> int:
     password = getpass.getpass("Cloudpath portal password: ")
     if not (email and password):
         return _fail("Missing email or password — nothing stored.")
-    if not _keychain_set_all(
+    result = _keychain_set_all(
         [
             (KEYCHAIN_SVC_BIOPOL_EMAIL, email),
             (KEYCHAIN_SVC_BIOPOL_PASS, password),
         ],
         "biopol-wifi credential",
-    ):
-        return _fail("Failed to write one or more keychain items.")
+    )
+    if not result.ok:
+        return _report_keychain_batch_failure(
+            result, "store-creds biopolwifi", "forget-creds biopolwifi"
+        )
     print(
         "✓ Stored the Cloudpath portal email and password in the macOS keychain.\n"
         "  `browser.py login biopolwifi` now runs without a prompt.\n"

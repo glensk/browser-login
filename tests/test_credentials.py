@@ -219,19 +219,20 @@ def test_keychain_set_non_ascii_expects_the_hex_read_back(run):
 
 def test_keychain_set_all_validates_the_whole_batch_first(run):
     rec = run(_Res(0))
-    ok = browser._keychain_set_all([("a", "fine"), ("b", "bad\n")], "d")
-    assert ok is False and not rec.calls
+    res = browser._keychain_set_all([("a", "fine"), ("b", "bad\n")], "d")
+    assert res.ok is False and res.changed is False and not rec.calls
 
 
 def test_keychain_set_all_stops_at_the_first_failure(run):
     rec = run(_Res(1))
-    assert browser._keychain_set_all([("a", "x"), ("b", "y")], "d") is False
-    assert len(rec.calls) == 1
+    res = browser._keychain_set_all([("a", "x"), ("b", "y")], "d")
+    assert res.ok is False and res.changed is False
+    assert len(rec.calls) == 1  # first write refused: nothing to clean up
 
 
 def test_keychain_set_all_writes_every_item_with_the_description(run):
     rec = run(_Res(0), _Res(0, "x\n"), _Res(0), _Res(0, "y\n"))
-    assert browser._keychain_set_all([("a", "x"), ("b", "y")], "my desc") is True
+    assert browser._keychain_set_all([("a", "x"), ("b", "y")], "my desc").ok is True
     writes = [kw["input"] for argv, kw in rec.calls if argv == ["security", "-i"]]
     assert len(writes) == 2
     assert all(b'-D "my desc"' in w for w in writes)
@@ -363,12 +364,17 @@ def _store_creds_env(monkeypatch, seed: str, password: str = "pw"):
     )
     monkeypatch.setattr(browser, "_op_totp_uri", lambda item, acct: seed)
 
-    def fake_set(svc, v, description="cscs-api credential"):
+    def fake_write(svc, v, description):
         assert description == "cscs-api credential"
         stored[svc] = v
+        return "ok"
+
+    def fake_delete(svc):
+        stored.pop(svc, None)
         return True
 
-    monkeypatch.setattr(browser, "_keychain_set", fake_set)
+    monkeypatch.setattr(browser, "_keychain_write", fake_write)
+    monkeypatch.setattr(browser, "_keychain_delete", fake_delete)
     return stored
 
 
@@ -392,9 +398,10 @@ def test_store_creds_refuses_a_seed_that_makes_no_code(monkeypatch):
 
 def test_store_creds_invalid_last_field_writes_nothing(monkeypatch, run):
     rec = run(_Res(0))
-    real_set = browser._keychain_set
+    real_write, real_delete = browser._keychain_write, browser._keychain_delete
     _store_creds_env(monkeypatch, SEED + "\n")  # still makes a code (stripped)
-    monkeypatch.setattr(browser, "_keychain_set", real_set)
+    monkeypatch.setattr(browser, "_keychain_write", real_write)
+    monkeypatch.setattr(browser, "_keychain_delete", real_delete)
     assert browser.cmd_cscs_store_creds() == 1
     assert not rec.calls
 
@@ -411,11 +418,11 @@ def test_biopolwifi_store_creds_labels_and_validates(monkeypatch, run):
 
     seen: list[tuple[str, str, str]] = []
 
-    def fake_set(svc, v, description="cscs-api credential"):
+    def fake_write(svc, v, description):
         seen.append((svc, v, description))
-        return True
+        return "ok"
 
-    monkeypatch.setattr(browser, "_keychain_set", fake_set)
+    monkeypatch.setattr(browser, "_keychain_write", fake_write)
     answers = iter(["me@example.org"])
     monkeypatch.setattr(getpass, "getpass", lambda _prompt="": "pw")
     assert browser.cmd_biopolwifi_store_creds() == 0

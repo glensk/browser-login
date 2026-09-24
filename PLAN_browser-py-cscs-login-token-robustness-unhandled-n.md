@@ -88,7 +88,7 @@ make the verification run touch the real login keychain (Codex O5).
 
 ## Steps
 
-- [ ] **Guard first (O1).** Add `tests/conftest.py` with an autouse fixture that replaces
+- [x] **Guard first (O1).** Add `tests/conftest.py` with an autouse fixture that replaces
       `subprocess.run` / `subprocess.Popen` with a default-deny wrapper: any call whose argv[0]
       basename is `security`, `op` or `himalaya` raises before executing; `tests/test_keychain_live.py`
       opts out via a marker. Update the `_store_creds_env` fixture (`tests/test_credentials.py:353`)
@@ -133,7 +133,7 @@ make the verification run touch the real login keychain (Codex O5).
       remaining → no sleep (strict `<`); fractional boundary; an `otpauth://` URI with
       `period=60`; malformed URI → `None`. `_op_creds` no longer calls `--otp`; `_op_otp` does.
       Update existing tests that pass `(user, pw, "123456")` tuples to the new shape.
-- [ ] **D3 (+O2, O3).** Split `_keychain_set` into an internal `_keychain_write(service, value,
+- [x] **D3 (+O2, O3).** Split `_keychain_set` into an internal `_keychain_write(service, value,
       description) -> str` returning `"invalid"` (validation failed, no call), `"rejected"`
       (`security` exited non-zero), `"uncertain"` (`OSError`/`TimeoutExpired`/`SubprocessError`
       after launch), `"mismatch"` (rc 0 but read-back differs) or `"ok"`; `_keychain_set` stays a
@@ -143,12 +143,12 @@ make the verification run touch the real login keychain (Codex O5).
       `"rejected"` or `"invalid"`). Cleanup attempts `_keychain_delete` for EVERY item of the batch,
       even after one fails, and records which were removed and which survive. Docstring states the
       best-effort, non-atomic contract (O4).
-- [ ] **D3 callers.** `cmd_cscs_store_creds` and the biopolwifi store print exactly one of:
+- [x] **D3 callers.** `cmd_cscs_store_creds` and the biopolwifi store print exactly one of:
       "nothing changed"; "partially written items removed — no stored set remains, re-run
       `<store command>`"; or "cleanup FAILED for <service labels> — run `browser.py forget-creds
       <site>`" (all exit 1). Never claim the old set is gone unless every delete returned `True`.
       Messages name service labels only, never values.
-- [ ] **D3 tests.** Stateful fake keychain behind the mocked `subprocess.run`: item 1 rc 0, item 2
+- [x] **D3 tests.** Stateful fake keychain behind the mocked `subprocess.run`: item 1 rc 0, item 2
       rc 1 → both deleted, `changed=True`, `surviving=[]`; item 1 rc 1 → no delete; item 1 rc 0 +
       read-back mismatch → cleanup; item 1 writes then raises `TimeoutExpired` → cleanup; one and
       all deletes failing → `surviving` lists them and every delete was still attempted; caller
