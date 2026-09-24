@@ -3142,12 +3142,54 @@ def _kc_account() -> str:
     return getpass.getuser()
 
 
+_KC_PW_PREFIX = "password:"
+_KC_HEX_RE = re.compile(r"0x([0-9A-Fa-f]*)(?: .*)?")
+
+
+def _kc_parse_password(stderr: str) -> str | None:
+    """Decode the secret from ``find-generic-password -g`` stderr, or ``None``.
+
+    ``-g`` labels its encoding (tp#498): a quoted value is the stored text
+    verbatim (inner ``"`` unescaped, so it is everything between the first and
+    the last quote); otherwise ``0x<HEX>`` holds the UTF-8 bytes, optionally
+    followed by a space and a rendering that is ignored. The last
+    ``password:`` line wins. Empty, unparsable or non-UTF-8 values give
+    ``None``. Never logs.
+    """
+    line = None
+    for raw in stderr.split("\n"):
+        if raw.startswith(_KC_PW_PREFIX):
+            line = raw
+    if line is None:
+        return None
+    text = line.rstrip("\r")[len(_KC_PW_PREFIX) :]
+    if text.startswith(" "):
+        text = text[1:]
+    if text.startswith("0x"):
+        m = _KC_HEX_RE.fullmatch(text)
+        if m is None or not m.group(1) or len(m.group(1)) % 2:
+            return None
+        try:
+            return bytes.fromhex(m.group(1)).decode("utf-8")
+        except UnicodeDecodeError:
+            return None
+    if len(text) >= 2 and text.startswith('"') and text.endswith('"'):
+        return text[1:-1] or None
+    return None
+
+
 def _keychain_get(service: str) -> str | None:
     """Read a generic-password item from the login keychain (prompt-free).
 
-    Returns the secret string, or ``None`` if the item is absent. Reading an
-    already-unlocked login keychain via the Apple-signed ``security`` binary
-    needs NO Touch ID — that is the whole point versus the ``op`` path.
+    Returns the secret string, or ``None`` if the item is absent or its value
+    cannot be decoded. Reading an already-unlocked login keychain via the
+    Apple-signed ``security`` binary needs NO Touch ID — that is the whole
+    point versus the ``op`` path.
+
+    Uses ``-g`` (labelled dump on stderr), not ``-w``: ``-w`` prints
+    non-printable values as bare hex with no marker, so ``cafe`` and the hex
+    of a UTF-8 password are indistinguishable (tp#498). The captured output is
+    never printed; a decode failure warns naming the service label only.
     """
     try:
         r = subprocess.run(
@@ -3158,10 +3200,11 @@ def _keychain_get(service: str) -> str | None:
                 _kc_account(),
                 "-s",
                 service,
-                "-w",
+                "-g",
             ],
             capture_output=True,
             text=True,
+            errors="replace",
             timeout=15,
             check=False,
         )
@@ -3169,10 +3212,14 @@ def _keychain_get(service: str) -> str | None:
         return None
     if r.returncode != 0:
         return None
-    # `-w` prints the secret + a trailing newline; strip only that newline so a
-    # password ending in spaces is preserved verbatim.
-    value = r.stdout.rstrip("\n")
-    return value or None
+    # stdout holds only the attribute dump (account, service, description).
+    value = _kc_parse_password(r.stderr)
+    if value is None:
+        print(
+            f"Keychain item {service} has an unreadable value — ignoring it.",
+            file=sys.stderr,
+        )
+    return value
 
 
 # `security -i` reads one command per line into a 4096-byte buffer; a longer
@@ -3229,10 +3276,9 @@ def _keychain_write(service: str, value: str, description: str) -> str:
     exists. ``-T /usr/bin/security`` scopes silent (no-prompt) access to the
     ``security`` binary that our reads use.
 
-    After the write the item is read back and must equal the one form
-    ``find-generic-password -w`` prints: the value itself when it is printable
-    ASCII, else its UTF-8 bytes as hex. That is a consistency check against a
-    tokenizer divergence, not proof of byte-exact storage (tp#498).
+    After the write the item is read back through ``_keychain_get`` and must
+    equal ``value`` exactly — a byte-exact round-trip check that also catches
+    a tokenizer divergence (tp#498).
     """
     line = _kc_add_line(service, value, description)
     if line is None:
@@ -3249,9 +3295,7 @@ def _keychain_write(service: str, value: str, description: str) -> str:
         return "uncertain"
     if r.returncode != 0:
         return "rejected"
-    printable_ascii = all(0x20 <= ord(c) < 0x7F for c in value)
-    expected = value if printable_ascii else value.encode("utf-8").hex()
-    return "ok" if _keychain_get(service) == expected else "mismatch"
+    return "ok" if _keychain_get(service) == value else "mismatch"
 
 
 def _keychain_set(

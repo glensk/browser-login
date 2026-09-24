@@ -23,6 +23,7 @@ import sys
 from pathlib import Path
 
 import pytest
+from conftest import _security_g
 
 _BROWSER_PY = Path(__file__).resolve().parent.parent / "bin" / "browser.py"
 
@@ -44,10 +45,10 @@ OLD = {"svc.a": "OLD-VALUE-A", "svc.b": "OLD-VALUE-B", "svc.c": "OLD-VALUE-C"}
 
 
 class _Res:
-    def __init__(self, returncode: int = 0, stdout: str = ""):
+    def __init__(self, returncode: int = 0, stdout: str = "", stderr: str = ""):
         self.returncode = returncode
         self.stdout = stdout
-        self.stderr = ""
+        self.stderr = stderr
 
 
 def _token(line: str, flag: str) -> str:
@@ -57,7 +58,7 @@ def _token(line: str, flag: str) -> str:
 
 
 class FakeKeychain:
-    """`security` stand-in: add (via -i stdin), find -w, delete; per-service faults."""
+    """`security` stand-in: add (via -i stdin), find -g, delete; per-service faults."""
 
     def __init__(self, items: dict[str, str] | None = None):
         self.items: dict[str, str] = dict(items or {})
@@ -83,7 +84,7 @@ class FakeKeychain:
         if argv[1] == "find-generic-password":
             if svc not in self.items:
                 return _Res(44)
-            return _Res(0, self.items[svc] + "\n")
+            return _Res(0, "", _security_g(self.items[svc]))
         if argv[1] == "delete-generic-password":
             self.deletes.append(svc)
             if svc in self.delete_fail:

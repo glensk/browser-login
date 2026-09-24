@@ -35,7 +35,7 @@ import tempfile
 from pathlib import Path
 
 import pytest
-from conftest import DeniedSubprocess, _executable
+from conftest import DeniedSubprocess, _executable, _security_g
 
 # Captured at import, before conftest's guard wraps ``subprocess.Popen`` for a
 # test: ``subprocess.run`` looks ``Popen`` up at call time, so the real run
@@ -64,6 +64,14 @@ CASES = {
     "trailing": "dummy-trailing\\",
     "shell": "dummy$;|&#`",
     "utf8": "dümmy-✓",
+    "hexlike": "cafe",
+    "hexutf8": "c3a4",
+    "hexprefix": "0x41",
+    "quote_end": 'ab"',
+    "utf8_quote": 'ä"x',
+    "only_utf8": "ä",
+    "emoji": "😀",
+    "lone_backslash": "\\",
 }
 
 
@@ -207,7 +215,7 @@ _ADD_LINE = re.compile(
 
 
 _ROUTABLE_ARGV = (
-    ["find-generic-password", "-a", None, "-s", None, "-w"],
+    ["find-generic-password", "-a", None, "-s", None, "-g"],
     ["delete-generic-password", "-a", None, "-s", None],
 )
 
@@ -247,7 +255,7 @@ def _route_security(args, kw, keychain: Path):
         routed = dict(kw)
         routed["input"] = _route_add_line(kw.get("input"), keychain)
         return head + rest, routed
-    # the only argv shapes: <sub> -a A -s S [-w]; the operands A and S are free
+    # the only argv shapes: <sub> -a A -s S [-g]; the operands A and S are free
     shape = [None if i in (2, 4) else arg for i, arg in enumerate(rest)]
     if shape in _ROUTABLE_ARGV:
         return head + rest + [str(keychain)], dict(kw)
@@ -312,7 +320,7 @@ class _Recorder:
 
     def __call__(self, argv, **kw):
         self.calls.append((list(argv), dict(kw)))
-        out, rc = "", 0
+        out, err, rc = "", "", 0
         if argv[1:] == ["-i"]:
             fields = re.findall(rb'"((?:[^"\\]|\\.)*)"', kw["input"])
             acct, svc, value = (
@@ -321,10 +329,10 @@ class _Recorder:
             self.items[(acct, svc)] = value
         elif argv[1] == "find-generic-password":
             value = self.items.get((argv[3], argv[5]))
-            out, rc = (value + "\n", 0) if value is not None else ("", 44)
+            err, rc = (_security_g(value), 0) if value is not None else ("", 44)
         elif argv[1] == "delete-generic-password":
             rc = 0 if self.items.pop((argv[3], argv[5]), None) is not None else 44
-        return subprocess.CompletedProcess(argv, rc, out, "")
+        return subprocess.CompletedProcess(argv, rc, out, err)
 
 
 @pytest.fixture
@@ -391,7 +399,7 @@ def test_bad_add_input_is_refused(routed, data):
 
 def test_find_and_delete_get_keychain_as_last_argument(routed):
     keychain, recorder, router = routed
-    router(["security", "find-generic-password", "-a", "A", "-s", "S", "-w"])
+    router(["security", "find-generic-password", "-a", "A", "-s", "S", "-g"])
     router(["/usr/bin/security", "delete-generic-password", "-a", "A", "-s", "S"])
     assert [argv[-1] for argv, _ in recorder.calls] == [str(keychain)] * 2
     assert recorder.calls[1][0][0] == "/usr/bin/security"
@@ -400,14 +408,15 @@ def test_find_and_delete_get_keychain_as_last_argument(routed):
 @pytest.mark.parametrize(
     "argv",
     [
-        ["security", "find-generic-password", "-a", "A", "-s", "S", "-w", "/k"],
+        ["security", "find-generic-password", "-a", "A", "-s", "S", "-g", "/k"],
         ["security", "find-generic-password", "-a", "A", "-s", "S"],
         ["security", "delete-generic-password", "-a", "A", "-s", "S", "/k"],
         ["security", "dump-keychain"],
         ["security", "list-keychains"],
         ["security", "default-keychain"],
         ["security", "delete-keychain", "/k"],
-        "security find-generic-password -a A -s S -w",
+        "security find-generic-password -a A -s S -g",
+        ["security", "find-generic-password", "-a", "A", "-s", "S", "-w"],
     ],
 )
 def test_other_security_shapes_are_refused(routed, argv):
@@ -419,7 +428,7 @@ def test_other_security_shapes_are_refused(routed, argv):
 
 def test_executable_override_is_refused(routed):
     _, recorder, router = routed
-    argv = ["find", "find-generic-password", "-a", "A", "-s", "S", "-w"]
+    argv = ["find", "find-generic-password", "-a", "A", "-s", "S", "-g"]
     with pytest.raises(RoutingRefused):
         router(argv, executable="/usr/bin/security")
     with pytest.raises(RoutingRefused):
@@ -430,7 +439,7 @@ def test_executable_override_is_refused(routed):
 def test_router_never_passes_timeout(routed):
     _, recorder, router = routed
     router(
-        ["security", "find-generic-password", "-a", "A", "-s", "S", "-w"], timeout=15
+        ["security", "find-generic-password", "-a", "A", "-s", "S", "-g"], timeout=15
     )
     assert "timeout" not in recorder.calls[0][1]
 
@@ -446,7 +455,7 @@ def test_other_credential_tools_still_hit_the_guard(routed, argv):
 
 
 def _find(router):
-    router(["security", "find-generic-password", "-a", "A", "-s", "S", "-w"])
+    router(["security", "find-generic-password", "-a", "A", "-s", "S", "-g"])
 
 
 def test_replaced_keychain_file_is_refused(routed):
@@ -640,8 +649,7 @@ def test_keychain_set_round_trips_through_security_stdin(temp_keychain, monkeypa
         for case, value in CASES.items():
             assert browser._keychain_set(services[case], value, "tp506 live test"), case
             got = browser._keychain_get(services[case])
-            expected = value if value.isascii() else value.encode().hex()
-            assert got == expected, f"read-back mismatch for case {case}"
+            assert got == value, f"read-back mismatch for case {case}"
         # No -U UPDATE case on purpose: the router strips -U (insert-only),
         # and an update opened a SecurityAgent prompt on 2026-09-24.
         # an invalid value must not reach the keychain at all

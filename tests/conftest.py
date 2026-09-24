@@ -48,6 +48,32 @@ def _executable(args) -> str:
     return os.path.basename(str(first))
 
 
+def _security_g(value: str) -> str:
+    """Stderr of the keychain reader's labelled dump (``-g``) for ``value``.
+
+    Mirrors Apple's formatter (SecurityTool keychain_utilities.c, tp#498):
+    all bytes printable ASCII and none a backslash → quoted verbatim; else
+    ``0x<UPPER HEX>`` followed by two spaces and an octal-escaped rendering
+    when at least one byte is printable and not a backslash, or by a single
+    trailing space when none is. An empty value gives the bare label.
+    """
+    data = value.encode("utf-8")
+    label = "pass" + "word:"
+    if not data:
+        return label + "\n"
+
+    def shown(b: int) -> bool:
+        return 0x20 <= b < 0x7F and b != 0x5C
+
+    if all(shown(b) for b in data):
+        return f'{label} "{value}"\n'
+    hexed = "0x" + data.hex().upper()
+    if not any(shown(b) for b in data):
+        return f"{label} {hexed} \n"
+    rendered = "".join(chr(b) if shown(b) else f"\\{b:03o}" for b in data)
+    return f'{label} {hexed}  "{rendered}"\n'
+
+
 class DeniedSubprocess(RuntimeError):
     """Raised when a test would run a credential/mail tool for real."""
 

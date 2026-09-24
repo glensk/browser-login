@@ -94,7 +94,7 @@ first. The one live line uses only the throw-away keychain from the tp#506 fixtu
 
 ## Steps
 
-- [ ] 1. Add `_kc_parse_password(stderr: str) -> str | None` next to `_keychain_get`.
+- [x] 1. Add `_kc_parse_password(stderr: str) -> str | None` next to `_keychain_get`.
       - Take the **last** line of `stderr` that starts with `password:`. Strip only its
         trailing `\n` (and `\r`), and look at the text after the prefix.
       - **Hex form:** the text starts with `0x`. Match `^0x([0-9A-Fa-f]*)(?: .*)?$` and ignore
@@ -107,7 +107,7 @@ first. The one live line uses only the throw-away keychain from the tp#506 fixtu
       - **Anything else** gives `None`. That covers an empty value (nothing after the prefix,
         or only spaces), a missing closing quote, and no `PW:` line at all.
       - The function never logs.
-- [ ] 2. Switch `_keychain_get` to `find-generic-password -a <acct> -s <svc> -g`, without `-w`.
+- [x] 2. Switch `_keychain_get` to `find-generic-password -a <acct> -s <svc> -g`, without `-w`.
       - Keep `capture_output=True`, `text=True`, `timeout=15` and `check=False`, and add
         `errors="replace"`.
       - Discard stdout. It holds only the attribute dump: account, service and description.
@@ -119,18 +119,18 @@ first. The one live line uses only the throw-away keychain from the tp#506 fixtu
       - A non-zero exit, `OSError` or `TimeoutExpired` returns `None` silently. The captured
         stderr is never printed.
       - Update the docstring to explain why `-g` is used: `-w` is ambiguous (tp#498).
-- [ ] 3. In `_keychain_write` (`bin/browser.py:3219-3254`), the read-back must equal `value`
+- [x] 3. In `_keychain_write` (`bin/browser.py:3219-3254`), the read-back must equal `value`
       exactly: `_keychain_get(service) == value`. Delete the `printable_ascii`/hex branch.
       Rewrite the docstring paragraph that calls the read-back "a consistency check … not proof
       of byte-exact storage (tp#498)": it is now a byte-exact round-trip check.
-- [ ] 4. Add a test helper `_security_g(value: str) -> str` that renders a value exactly like
+- [x] 4. Add a test helper `_security_g(value: str) -> str` that renders a value exactly like
       Apple's formatter, covering all three branches:
       - **Quoted:** every byte is printable ASCII and not `\` → `PW: "<value>"`.
       - **Mixed:** at least one byte is printable and not `\` →
         `PW: 0x<UPPER>  "<octal-escaped rendering>"`.
       - **Hex-only:** no such byte → `PW: 0x<UPPER>␠`, with the trailing space (␠).
       - Put the helper in `tests/conftest.py` so every test file can use it.
-- [ ] 5. Move **every** mocked keychain read to the `-g` stderr form:
+- [x] 5. Move **every** mocked keychain read to the `-g` stderr form:
       - `tests/test_credentials.py`: every `find-generic-password` answer moves from stdout to
         stderr through `_security_g`. That includes the reader tests at lines 83-104 and the
         write/batch reads at lines 108, 121, 206 and 234. The reader test asserts that argv
@@ -151,7 +151,7 @@ first. The one live line uses only the throw-away keychain from the tp#506 fixtu
         - Add to `CASES`: `"hexlike": "cafe"`, `"hexutf8": "c3a4"`, `"hexprefix": "0x41"`,
           `"quote_end": 'ab"'`, `"utf8_quote": 'ä"x'`, `"only_utf8": "ä"`, `"emoji": "😀"`,
           `"lone_backslash": "\\"`. Keep the existing cases.
-- [ ] 6. Add unit tests for `_kc_parse_password`, using the literal stderr fixtures from the
+- [x] 6. Add unit tests for `_kc_parse_password`, using the literal stderr fixtures from the
       Context table and the formatter shapes. Cover:
       - the hex-only form with its trailing space (`PW: 0xC3A4␠` → `ä`, `PW: 0x5C␠`
         → `\`);
@@ -160,17 +160,17 @@ first. The one live line uses only the throw-away keychain from the tp#506 fixtu
       - an uppercase and a lowercase hex payload;
       - an odd-length payload, `0xFF` (invalid UTF-8) and a missing closing quote → `None`;
       - a quoted value with leading and trailing spaces, kept verbatim.
-- [ ] 7. Add secrecy tests with `capsys`:
+- [x] 7. Add secrecy tests with `capsys`:
       - Feed an **unparsable** exit-0 stderr (for example `PW: 0x70C3A47373Z`) that
         contains the dummy secret in plain, hex and octal-escaped form. Assert that stdout is
         empty and that stderr is exactly the one permitted warning line, with none of the three
         renderings in it.
       - Repeat for a non-zero exit with captured stderr, and for a `TimeoutExpired` carrying
         `output`/`stderr`. Both must print nothing.
-- [ ] 8. `README.md` § Security, around lines 292-303: add one sentence. The keychain read uses
+- [x] 8. `README.md` § Security, around lines 292-303: add one sentence. The keychain read uses
       `security`'s labelled attribute dump, so a non-ASCII or hex-looking password round-trips
       exactly.
-- [ ] 9. Run every `## Verification` line in the foreground. That includes the single opt-in
+- [x] 9. Run every `## Verification` line in the foreground. That includes the single opt-in
       live line, run once against the temp keychain with no loops. Fix every lint and type
       finding in the touched files. Commit with
       `ai.py push -m "fix(keychain): read secrets via labelled dump, decode hex exactly" bin/browser.py tests/conftest.py tests/test_credentials.py tests/test_keychain_batch.py tests/test_keychain_live.py README.md PLAN_browser-py-keychain-get-returns-hex-for-non-ascii.md`.

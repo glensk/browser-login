@@ -25,6 +25,7 @@ from pathlib import Path
 
 import pyotp
 import pytest
+from conftest import _security_g
 
 _BROWSER_PY = Path(__file__).resolve().parent.parent / "bin" / "browser.py"
 
@@ -80,10 +81,11 @@ def run(monkeypatch):
 # --- keychain ------------------------------------------------------------------
 
 
-def test_keychain_get_reads_with_timeout_and_strips_only_newline(run):
-    rec = run(_Res(0, "  pw with spaces  \n"))
+def test_keychain_get_reads_the_labelled_dump_verbatim(run):
+    rec = run(_Res(0, "keychain: ...\n", _security_g("  pw with spaces  ")))
     assert browser._keychain_get("svc") == "  pw with spaces  "
     argv, kwargs = rec.calls[0]
+    assert "-g" in argv and "-w" not in argv
     assert argv[:2] == ["security", "find-generic-password"]
     assert argv[argv.index("-a") + 1] == "tester"
     assert argv[argv.index("-s") + 1] == "svc"
@@ -94,7 +96,7 @@ def test_keychain_get_reads_with_timeout_and_strips_only_newline(run):
     "answer",
     [
         _Res(44, "", "The specified item could not be found in the keychain."),
-        _Res(0, "\n"),
+        _Res(0, "", _security_g("")),
         OSError("no security binary"),
         subprocess.TimeoutExpired("security", 15),
     ],
@@ -105,7 +107,7 @@ def test_keychain_get_failure_is_none(run, answer):
 
 
 def test_keychain_set_reports_the_return_code(run):
-    rec = run(_Res(0), _Res(0, "v\n"))
+    rec = run(_Res(0), _Res(0, "", _security_g("v")))
     assert browser._keychain_set("svc", "v") is True
     assert rec.calls[0][1]["timeout"]
     run(_Res(1))
@@ -118,7 +120,7 @@ def test_keychain_set_reports_the_return_code(run):
 
 def test_keychain_set_passes_the_secret_on_stdin_never_argv(run):
     secret = "s3cr3t-DUMMY"
-    rec = run(_Res(0), _Res(0, secret + "\n"))
+    rec = run(_Res(0), _Res(0, "", _security_g(secret)))
     assert browser._keychain_set("svc", secret) is True
     argv, kwargs = rec.calls[0]
     assert argv == ["security", "-i"]
@@ -203,18 +205,111 @@ def test_keychain_set_invalid_value_makes_no_call(run):
 
 
 def test_keychain_set_read_back_mismatch_is_false(run):
-    run(_Res(0), _Res(0, "something else\n"))
+    run(_Res(0), _Res(0, "", _security_g("something else")))
     assert browser._keychain_set("svc", "v") is False
     run(_Res(0), _Res(44))
     assert browser._keychain_set("svc", "v") is False
 
 
-def test_keychain_set_non_ascii_expects_the_hex_read_back(run):
-    value = "päss"
-    run(_Res(0), _Res(0, value.encode().hex() + "\n"))
-    assert browser._keychain_set("svc", value) is True
-    run(_Res(0), _Res(0, value + "\n"))
-    assert browser._keychain_set("svc", value) is False
+def test_keychain_write_non_ascii_round_trips_via_the_hex_form(run):
+    run(_Res(0), _Res(0, "", _security_g("päss")))
+    assert browser._keychain_write("svc", "päss", "d") == "ok"
+
+
+def test_keychain_write_non_ascii_rejects_a_hexlike_literal_read_back(run):
+    run(_Res(0), _Res(0, "", f'{PW} "70c3a47373"\n'))
+    assert browser._keychain_write("svc", "päss", "d") == "mismatch"
+
+
+def test_keychain_write_all_hex_ascii_password_round_trips(run):
+    run(_Res(0), _Res(0, "", _security_g("70c3a47373")))
+    assert browser._keychain_write("svc", "70c3a47373", "d") == "ok"
+
+
+PW = "pass" + "word:"  # split so the secret scanners do not flag the fixtures
+
+
+@pytest.mark.parametrize(
+    ("stderr", "expected"),
+    [
+        (f"{PW} 0x70C3A47373  " + '"p\\303\\244ss"\n', "päss"),
+        (f'{PW} "cafe"\n', "cafe"),
+        (f'{PW} "c3a4"\n', "c3a4"),
+        (f'{PW} "a"b"\n', 'a"b'),
+        (f"{PW} 0x615C62  " + '"a\\134b"\n', "a\\b"),
+        (f'{PW} "sp "\n', "sp "),
+        (f"{PW} 0x740962  " + '"t\\011b"\n', "t\tb"),
+        (f"{PW} 0xC3A42278  " + '"\\303\\244"x"\n', 'ä"x'),
+        (f'{PW} "0x41"\n', "0x41"),
+        (f"{PW} 0xC3A4 \n", "ä"),
+        (f"{PW} 0x5C \n", "\\"),
+        (f"{PW} 0xc3a4 \n", "ä"),
+        (f'{PW} "  both ends  "\n', "  both ends  "),
+        (f'{PW} "crlf"\r\n', "crlf"),
+        (f'noise\n{PW} "first"\nmore noise\n{PW} "last"\ntrailer\n', "last"),
+        (f"{PW}\n", None),
+        (f"{PW}   \n", None),
+        (f'{PW} ""\n', None),
+        (f"{PW} 0x70C3A4737\n", None),  # odd length
+        (f"{PW} 0xFF \n", None),  # invalid UTF-8
+        (f"{PW} 0x \n", None),  # empty payload
+        (f"{PW} 0x70C3A47373Z\n", None),
+        (f'{PW} "unterminated\n', None),
+        (f'{PW} "\n', None),
+        (f"{PW} bare\n", None),
+        ("", None),
+        ("keychain: nothing labelled\n", None),
+    ],
+)
+def test_kc_parse_password(stderr, expected):
+    assert browser._kc_parse_password(stderr) == expected
+
+
+@pytest.mark.parametrize(
+    "value", ["päss", "cafe", "a\\b", "t\tb", 'ä"x', "ä", "\\", "😀", "sp ", 'ab"']
+)
+def test_kc_parse_password_inverts_the_formatter(value):
+    assert browser._kc_parse_password(_security_g(value)) == value
+
+
+_DUMMY = "päss-DUMMY"
+_DUMMY_FORMS = (
+    _DUMMY,
+    _DUMMY.encode().hex(),
+    _DUMMY.encode().hex().upper(),
+    "p\\303\\244ss-DUMMY",
+)
+
+
+def _assert_no_dummy(text: str) -> None:
+    for form in _DUMMY_FORMS:
+        assert form not in text
+
+
+def test_keychain_get_unparsable_value_warns_with_the_label_only(run, capsys):
+    hexed = _DUMMY.encode().hex().upper()
+    stderr = f'{PW} 0x{hexed}Z  "p\\303\\244ss-DUMMY" {_DUMMY}\n'
+    run(_Res(0, f"svce {_DUMMY}\n", stderr))
+    assert browser._keychain_get("svc.label") is None
+    out, err = capsys.readouterr()
+    assert out == ""
+    assert err == "Keychain item svc.label has an unreadable value — ignoring it.\n"
+    _assert_no_dummy(err)
+
+
+@pytest.mark.parametrize(
+    "answer",
+    [
+        _Res(1, _DUMMY, f"{PW} 0x{_DUMMY.encode().hex().upper()}  {_DUMMY}\n"),
+        subprocess.TimeoutExpired(
+            "security", 15, output=_DUMMY, stderr=f"{PW} {_DUMMY_FORMS[3]}"
+        ),
+    ],
+)
+def test_keychain_get_failures_print_nothing(run, capsys, answer):
+    run(answer)
+    assert browser._keychain_get("svc") is None
+    assert capsys.readouterr() == ("", "")
 
 
 def test_keychain_set_all_validates_the_whole_batch_first(run):
@@ -231,7 +326,9 @@ def test_keychain_set_all_stops_at_the_first_failure(run):
 
 
 def test_keychain_set_all_writes_every_item_with_the_description(run):
-    rec = run(_Res(0), _Res(0, "x\n"), _Res(0), _Res(0, "y\n"))
+    rec = run(
+        _Res(0), _Res(0, "", _security_g("x")), _Res(0), _Res(0, "", _security_g("y"))
+    )
     assert browser._keychain_set_all([("a", "x"), ("b", "y")], "my desc").ok is True
     writes = [kw["input"] for argv, kw in rec.calls if argv == ["security", "-i"]]
     assert len(writes) == 2
