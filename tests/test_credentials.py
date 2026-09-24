@@ -404,3 +404,48 @@ def test_scan_token_ignores_other_sites_cookies():
     ctx = _ScopedCtx([{"name": "sid", "domain": "slack.com", "value": other}])
     assert browser._scan_token(ctx, _TokPage(None)) is None
     assert None not in ctx.asked
+
+
+class _Resp:
+    status_code = 200
+    text = ""
+
+    @staticmethod
+    def json():
+        return {"username": "user", "email": "u@x.ch"}
+
+
+@pytest.fixture
+def token_env(tmp_path, monkeypatch):
+    import os
+
+    import requests
+
+    cache = tmp_path / "cscs-api" / "portal_token"
+    monkeypatch.setattr(browser, "CSCS_TOKEN_CACHE", cache)
+    monkeypatch.setattr(browser, "_scan_token", lambda ctx, page: HEX)
+    monkeypatch.setattr(requests, "get", lambda *a, **k: _Resp())
+    old = os.umask(0o022)
+    yield cache
+    os.umask(old)
+
+
+def test_token_cache_is_never_readable_by_others(token_env, monkeypatch):
+    # Regression: write_text() created the file 0644 and only a later chmod()
+    # tightened it, leaving a window where any local user could read the token.
+    # With the after-the-fact chmod neutralised, the file must still be 0600.
+    import pathlib
+
+    monkeypatch.setattr(pathlib.Path, "chmod", lambda self, mode: None)
+    assert browser._capture_and_cache_token(None, None) == 0
+    assert token_env.read_text() == HEX
+    assert token_env.stat().st_mode & 0o777 == 0o600
+
+
+def test_token_cache_tightens_a_preexisting_loose_file(token_env):
+    token_env.parent.mkdir(parents=True)
+    token_env.write_text("old-token-that-is-longer-than-the-new-one" * 2)
+    token_env.chmod(0o644)
+    assert browser._capture_and_cache_token(None, None) == 0
+    assert token_env.read_text() == HEX
+    assert token_env.stat().st_mode & 0o777 == 0o600
