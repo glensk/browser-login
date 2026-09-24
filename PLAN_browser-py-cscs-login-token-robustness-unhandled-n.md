@@ -107,7 +107,7 @@ make the verification run touch the real login keychain (Codex O5).
       and `pw.stop` called in every case; captured output never contains the dummy token, the
       response body (seeded with the token and control characters) or an exception message
       seeded with a dummy secret.
-- [ ] **D2.** Replace the precomputed OTP string with a lazy provider: a `NamedTuple`
+- [x] **D2.** Replace the precomputed OTP string with a lazy provider: a `NamedTuple`
       `CscsCreds(user, password, otp)` where `otp: Callable[[], str | None]`; update the hints of
       `_keychain_creds`, `_op_creds`, `_cscs_creds`, `_submit_keycloak_login`.
       - keychain: `_keychain_creds` still validates the seed up front (`_totp_now(seed)` must
@@ -115,17 +115,17 @@ make the verification run touch the real login keychain (Codex O5).
       - 1Password: `_op_creds` fetches username/password up front but NOT the code; `otp` = new
         `_op_otp(item, account)` running the existing `--otp` op call at fill time (timeout 20 s;
         `None` on any failure).
-- [ ] **D2 (O9).** `_fresh_totp(seed)`: parse the OTP object once (seed or `otpauth://` URI, same
+- [x] **D2 (O9).** `_fresh_totp(seed)`: parse the OTP object once (seed or `otpauth://` URI, same
       rules as `_totp_now`), sample the clock once, `remaining = interval - (now % interval)` using
       the parsed `interval`; if `remaining < min(5, interval / 3)` sleep `remaining + 0.05`,
       re-sample, and return `otp.at(new_now)`; otherwise `otp.at(now)`. `None` for malformed input.
-- [ ] **D2 (O8).** In `_submit_keycloak_login`, when the OTP field is first seen: call
+- [x] **D2 (O8).** In `_submit_keycloak_login`, when the OTP field is first seen: call
       `creds.otp()`; if `None` → return `False` without filling. Then re-check that the page is
       not `_on_portal` and still on `auth.cscs.ch`, RE-QUERY the OTP field, and only then fill and
       submit. Catch `PlaywrightError` in this block and return `False` with a fixed message (no
       exception text). The ~20 s poll loop and the per-attempt fresh `_cscs_creds` call in
       `cmd_cscs_login` stay unchanged.
-- [ ] **D2 tests.** `otp()` is called only after the OTP field appears (fake page records call
+- [x] **D2 tests.** `otp()` is called only after the OTP field appears (fake page records call
       order) and never when the portal is reached directly; `otp()` → `None` → no fill, no OTP
       submit; the page navigating / the field detaching while `otp()` runs → `False`, no fill, no
       submit click. `_fresh_totp` with a mocked clock: 10 s into a 30 s step → no sleep, RFC 6238

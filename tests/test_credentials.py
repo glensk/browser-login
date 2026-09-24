@@ -16,7 +16,7 @@ from __future__ import annotations
 # a package, so there is no public API), and build throwaway stub classes.
 # pylint: disable=protected-access,import-outside-toplevel,too-few-public-methods
 # pylint: disable=missing-function-docstring,missing-class-docstring,import-error
-# pylint: disable=unused-argument
+# pylint: disable=unused-argument,redefined-outer-name  # pytest fixtures
 import importlib.util
 import json
 import subprocess
@@ -246,7 +246,7 @@ def test_keychain_creds_generates_the_code_locally(monkeypatch):
     monkeypatch.setattr(browser, "_keychain_get", items.get)
     creds = browser._keychain_creds()
     assert creds is not None and creds[:2] == ("user", "pw")
-    assert pyotp.TOTP(SEED).verify(creds[2], valid_window=1)
+    assert pyotp.TOTP(SEED).verify(creds.otp(), valid_window=1)
 
     items[browser.KEYCHAIN_SVC_TOTP] = "not base32 !!"
     assert browser._keychain_creds() is None
@@ -300,15 +300,18 @@ def test_totp_now_changes_on_the_period_boundary(monkeypatch):
 # --- 1Password -------------------------------------------------------------------
 
 
-def test_op_creds_parses_fields_and_live_otp(run):
+def test_op_creds_parses_fields_and_defers_the_otp(run):
     fields = [
         {"label": "username", "value": "user"},
         {"label": "password", "value": "pw"},
     ]
     rec = run(_Res(0, json.dumps(fields)), _Res(0, "123456\n"))
-    assert browser._op_creds("CSCS", "acct") == ("user", "pw", "123456")
+    creds = browser._op_creds("CSCS", "acct")
+    assert creds is not None and creds[:2] == ("user", "pw")
+    assert len(rec.calls) == 1 and "--otp" not in rec.calls[0][0]
+    assert creds.otp() == "123456"  # the live code is fetched only now
+    assert len(rec.calls) == 2 and rec.calls[1][0][-1] == "--otp"
     assert all(kwargs["timeout"] for _, kwargs in rec.calls)
-    assert rec.calls[1][0][-1] == "--otp"
 
 
 @pytest.mark.parametrize(
@@ -354,7 +357,9 @@ def _store_creds_env(monkeypatch, seed: str, password: str = "pw"):
     stored: dict[str, str] = {}
     monkeypatch.setattr(browser.shutil, "which", lambda name: "/usr/bin/op")
     monkeypatch.setattr(
-        browser, "_op_creds", lambda item, acct: ("user", password, "1")
+        browser,
+        "_op_creds",
+        lambda item, acct: browser.CscsCreds("user", password, lambda: "1"),
     )
     monkeypatch.setattr(browser, "_op_totp_uri", lambda item, acct: seed)
 
@@ -464,7 +469,8 @@ class _KcPage:
 
 def test_submit_keycloak_login_fills_otp_once_and_lands_on_portal():
     page = _KcPage()
-    assert browser._submit_keycloak_login(page, ("user", "pw", "654321")) is True
+    creds = browser.CscsCreds("user", "pw", lambda: "654321")
+    assert browser._submit_keycloak_login(page, creds) is True
     assert ("fill", "#username", "user") in page.log
     assert ("fill", "#password", "pw") in page.log
     assert page.log.count(("fill", "#otp", "654321")) == 1
@@ -473,7 +479,8 @@ def test_submit_keycloak_login_fills_otp_once_and_lands_on_portal():
 
 def test_submit_keycloak_login_that_never_reaches_portal_is_false():
     page = _KcPage(reach_portal=False)
-    assert browser._submit_keycloak_login(page, ("user", "pw", "654321")) is False
+    creds = browser.CscsCreds("user", "pw", lambda: "654321")
+    assert browser._submit_keycloak_login(page, creds) is False
     assert page.log.count(("fill", "#otp", "654321")) == 1
 
 

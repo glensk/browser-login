@@ -103,7 +103,9 @@ def test_creds_are_reresolved_per_attempt(monkeypatch, capsys):
     # "which source" banner must be printed only on the first attempt.
     codes = iter(["111111", "222222"])
     monkeypatch.setattr(
-        browser, "_keychain_creds", lambda: ("aglensk", "pw", next(codes))
+        browser,
+        "_keychain_creds",
+        lambda: browser.CscsCreds("aglensk", "pw", lambda code=next(codes): code),
     )
 
     first, mode_first = browser._cscs_creds(announce=True)
@@ -111,8 +113,8 @@ def test_creds_are_reresolved_per_attempt(monkeypatch, capsys):
 
     assert (mode_first, mode_second) == ("keychain", "keychain")
     assert first is not None and second is not None
-    assert first[2] == "111111"
-    assert second[2] == "222222"
+    assert first.otp() == "111111"
+    assert second.otp() == "222222"
     out = capsys.readouterr().out
     assert out.count("macOS keychain") == 1
 
@@ -120,8 +122,11 @@ def test_creds_are_reresolved_per_attempt(monkeypatch, capsys):
 def test_creds_fall_back_to_1password(monkeypatch):
     monkeypatch.setattr(browser, "_keychain_creds", lambda: None)
     monkeypatch.setattr(
-        browser, "_op_creds", lambda item, account: ("aglensk", "pw", "333333")
+        browser,
+        "_op_creds",
+        lambda item, account: browser.CscsCreds("aglensk", "pw", lambda: "333333"),
     )
     creds, mode = browser._cscs_creds(announce=False)
     assert mode == "1password"
-    assert creds == ("aglensk", "pw", "333333")
+    assert creds is not None and creds[:2] == ("aglensk", "pw")
+    assert creds.otp() == "333333"

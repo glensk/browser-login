@@ -86,6 +86,7 @@ import argparse
 import atexit
 import contextlib
 import fcntl
+import functools
 import glob
 import json
 import os
@@ -103,7 +104,7 @@ import uuid
 from collections.abc import Callable, Iterator, Sequence
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, NamedTuple
 
 DEFAULT_CDP_PORT = int(os.environ.get("CLAUDE_BROWSER_CDP_PORT", "9222"))
 CACHE_DIR = Path.home() / ".cache" / "claude-browser"
@@ -3285,11 +3286,12 @@ def _keychain_delete(service: str) -> bool:
     return r.returncode in (0, 44)
 
 
-def _totp_now(seed_or_uri: str) -> str | None:
-    """Current 6-digit TOTP code from a base32 seed or an ``otpauth://`` URI.
+def _parse_totp(seed_or_uri: str) -> Any:
+    """A usable ``pyotp.TOTP`` from a base32 seed or an ``otpauth://`` URI.
 
     Returns ``None`` if the seed/URI is malformed (bad base32, unparseable URI),
-    empty, or not a TOTP (an ``otpauth://hotp/`` URI, ``period=0``).
+    empty, or not a TOTP (an ``otpauth://hotp/`` URI, ``period=0``) — probed by
+    generating one code, so every returned object can produce codes.
     """
     import binascii
 
@@ -3303,29 +3305,76 @@ def _totp_now(seed_or_uri: str) -> str | None:
             otp = pyotp.parse_uri(s)
         else:
             otp = pyotp.TOTP(s.replace(" ", "").upper())
-        if not isinstance(otp, pyotp.TOTP):
+        if not isinstance(otp, pyotp.TOTP) or otp.interval <= 0:
             return None
-        return str(otp.now())
+        otp.now()
     except (ValueError, ArithmeticError, binascii.Error):
         return None
+    return otp
 
 
-def _keychain_creds() -> tuple[str, str, str] | None:
-    """Read CSCS user/password/TOTP from the keychain → ``(user, password, otp)``.
+def _totp_now(seed_or_uri: str) -> str | None:
+    """Current 6-digit TOTP code from a base32 seed or an ``otpauth://`` URI.
 
-    The OTP is generated locally from the stored seed (no live 1Password call).
-    Returns ``None`` if any item is missing or the seed can't produce a code, so
-    the caller falls back to the Touch-ID ``op`` path.
+    ``None`` for anything ``_parse_totp`` rejects.
+    """
+    otp = _parse_totp(seed_or_uri)
+    return None if otp is None else str(otp.now())
+
+
+def _fresh_totp(
+    seed_or_uri: str,
+    *,
+    clock: Callable[[], float] = time.time,
+    sleep: Callable[[float], None] = time.sleep,
+) -> str | None:
+    """A TOTP code with time left to be used, or ``None`` for a bad seed.
+
+    Called at fill time (see ``CscsCreds``). A code in the last
+    ``min(5, interval / 3)`` seconds of its step could expire between the fill
+    and Keycloak's check, so then we wait for the next step (at most ~5 s) and
+    return ITS code instead. The clock is sampled once per decision.
+    """
+    otp = _parse_totp(seed_or_uri)
+    if otp is None:
+        return None
+    interval = otp.interval
+    now = clock()
+    remaining = interval - (now % interval)
+    if remaining < min(5, interval / 3):
+        sleep(remaining + 0.05)
+        now = clock()
+    return str(otp.at(now))
+
+
+class CscsCreds(NamedTuple):
+    """CSCS login credentials; the OTP is produced LAZILY at fill time.
+
+    ``otp()`` returns a fresh code (or ``None`` on failure) and is called only
+    once Keycloak shows the OTP field — a code captured before the password
+    submit could be ~20 s stale by then (tp#491 D2).
+    """
+
+    user: str
+    password: str
+    otp: Callable[[], str | None]
+
+
+def _keychain_creds() -> CscsCreds | None:
+    """Read CSCS user/password/TOTP seed from the keychain.
+
+    The OTP is generated locally from the stored seed at fill time (no live
+    1Password call). Returns ``None`` if any item is missing or the seed can't
+    produce a code, so the caller falls back to the Touch-ID ``op`` path.
     """
     user = _keychain_get(KEYCHAIN_SVC_USER)
     password = _keychain_get(KEYCHAIN_SVC_PASS)
     seed = _keychain_get(KEYCHAIN_SVC_TOTP)
     if not (user and password and seed):
         return None
-    otp = _totp_now(seed)
-    if not otp:
+    if _totp_now(seed) is None:
         return None
-    return user, password, otp
+    return CscsCreds(user, password, functools.partial(_fresh_totp, seed))
 
 
 def _op_totp_uri(item: str, account: str) -> str | None:
@@ -3373,18 +3422,44 @@ def _op_totp_uri(item: str, account: str) -> str | None:
     return None
 
 
-def _op_creds(item: str, account: str) -> tuple[str, str, str] | None:
-    """Read username, password and the live TOTP for ONE 1Password item via op.
+def _op_otp(item: str, account: str) -> str | None:
+    """The live TOTP code of ONE 1Password item (the ``--otp`` form of op).
 
-    Returns ``(username, password, otp)`` or ``None`` on failure. Secrets are
-    returned in memory and NEVER printed/logged. Touch-ID-gated when the 1Password
-    desktop app's "Integrate with 1Password CLI" is enabled.
+    Run at fill time (see ``CscsCreds``), so the code is fresh when Keycloak
+    checks it. ``None`` on any failure; the code is never printed/logged.
     """
-    base = ["op", "item", "get", item, "--account", account]
+    try:
+        r = subprocess.run(
+            ["op", "item", "get", item, "--account", account, "--otp"],
+            capture_output=True,
+            text=True,
+            timeout=20,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if r.returncode != 0:
+        return None
+    return r.stdout.strip() or None
+
+
+def _op_creds(item: str, account: str) -> CscsCreds | None:
+    """Read username + password for ONE 1Password item via op; OTP stays lazy.
+
+    Returns ``CscsCreds`` (its ``otp()`` runs ``_op_otp`` at fill time) or
+    ``None`` on failure. Secrets are returned in memory and NEVER printed/logged.
+    Touch-ID-gated when the 1Password desktop app's "Integrate with 1Password
+    CLI" is enabled.
+    """
     try:
         creds = subprocess.run(
             [
-                *base,
+                "op",
+                "item",
+                "get",
+                item,
+                "--account",
+                account,
                 "--fields",
                 "label=username,label=password",
                 "--reveal",
@@ -3396,25 +3471,18 @@ def _op_creds(item: str, account: str) -> tuple[str, str, str] | None:
             timeout=60,
             check=False,
         )
-        otp_r = subprocess.run(
-            [*base, "--otp"], capture_output=True, text=True, timeout=60, check=False
-        )
     except (OSError, subprocess.SubprocessError):
         return None
-    if creds.returncode != 0 or otp_r.returncode != 0:
+    if creds.returncode != 0:
         return None
     try:
         fields = {f.get("label"): f.get("value") for f in json.loads(creds.stdout)}
     except (ValueError, AttributeError, TypeError):
         return None
-    user, password, otp = (
-        fields.get("username"),
-        fields.get("password"),
-        otp_r.stdout.strip(),
-    )
-    if not (user and password and otp):
+    user, password = fields.get("username"), fields.get("password")
+    if not (isinstance(user, str) and isinstance(password, str) and user and password):
         return None
-    return user, password, otp
+    return CscsCreds(user, password, functools.partial(_op_otp, item, account))
 
 
 def _click_keycloak_submit(page) -> None:
@@ -3448,13 +3516,13 @@ def _on_portal(page) -> bool:
     )
 
 
-def _cscs_creds(*, announce: bool = True) -> tuple[tuple[str, str, str] | None, str]:
-    """Resolve ``(user, password, otp)`` for CSCS plus the source that produced it.
+def _cscs_creds(*, announce: bool = True) -> tuple[CscsCreds | None, str]:
+    """Resolve ``CscsCreds`` for CSCS plus the source that produced it.
 
     Keychain first (prompt-free; the 6-digit code is generated locally from the
     stored seed), else the single 1Password item (Touch-ID-gated). Called once
-    per login ATTEMPT so a retry gets a FRESH code — a TOTP is valid ~30s and a
-    retried attempt lands well past that.
+    per login ATTEMPT; the OTP itself is produced only at fill time
+    (``CscsCreds.otp``), so every OTP step gets a code with time left.
     """
     creds = _keychain_creds()
     if creds is not None:
@@ -3504,32 +3572,65 @@ def _keycloak_flow_expired(page) -> bool:
     )
 
 
-def _submit_keycloak_login(page, creds: tuple[str, str, str]) -> bool:
+def _keycloak_otp_field(page):
+    """The Keycloak OTP input element, or ``None`` when it is not on the page."""
+    return (
+        page.query_selector("#otp")
+        or page.query_selector("input[name=otp]")
+        or page.query_selector("input[autocomplete=one-time-code]")
+    )
+
+
+def _fill_keycloak_otp(page, otp: Callable[[], str | None]) -> bool:
+    """Produce a fresh code NOW, then fill + submit the OTP step; ``True`` if sent.
+
+    ``otp()`` may take seconds (``op`` / waiting out a step boundary), so the
+    page is re-checked afterwards and the field re-queried: a page that moved
+    on, or a detached field, gets NO code typed into it. Status lines are fixed
+    text — never a code or exception detail.
+    """
+    from playwright.sync_api import Error as PlaywrightError
+
+    code = otp()
+    if not code:
+        print("⚠ Could not produce a TOTP code — OTP step not submitted.")
+        return False
+    try:
+        if _on_portal(page) or "auth.cscs.ch" not in page.url:
+            print("⚠ The Keycloak page moved on before the OTP could be filled.")
+            return False
+        field = _keycloak_otp_field(page)
+        if field is None:
+            print("⚠ The Keycloak OTP field disappeared before it could be filled.")
+            return False
+        field.fill(code)
+        _click_keycloak_submit(page)
+    except PlaywrightError:
+        print("⚠ The Keycloak OTP step changed while filling it — not submitted.")
+        return False
+    return True
+
+
+def _submit_keycloak_login(page, creds: CscsCreds) -> bool:
     """Fill the Keycloak form (+ the OTP step) and wait for the portal to settle.
 
     Returns ``True`` once ``_on_portal`` holds, ``False`` after ~20s without it
-    (the caller decides whether that is a stale flow worth retrying or a real
-    credential failure).
+    or when the OTP step could not be filled (the caller decides whether that is
+    a stale flow worth retrying or a real credential failure). The OTP code is
+    generated only once the OTP field is shown (``_fill_keycloak_otp``).
     """
-    user, password, otp = creds
-    page.fill("#username", user)
-    page.fill("#password", password)
+    page.fill("#username", creds.user)
+    page.fill("#password", creds.password)
     _click_keycloak_submit(page)
     # Wait for EITHER the OTP step or a direct landing on the portal.
     otp_filled = False
     for _ in range(40):  # ~20s
         if _on_portal(page):
             return True
-        if not otp_filled:
-            otp_el = (
-                page.query_selector("#otp")
-                or page.query_selector("input[name=otp]")
-                or page.query_selector("input[autocomplete=one-time-code]")
-            )
-            if otp_el:
-                otp_el.fill(otp)
-                _click_keycloak_submit(page)
-                otp_filled = True
+        if not otp_filled and _keycloak_otp_field(page):
+            if not _fill_keycloak_otp(page, creds.otp):
+                return _on_portal(page)
+            otp_filled = True
         page.wait_for_timeout(500)
     return _on_portal(page)
 
