@@ -213,12 +213,36 @@ manual sign-in — actually happens.
 
 | Site                   | Login style                                                           |
 | :--------------------- | :------------------------------------------------------------------- |
-| `anthropic` (`claude`) | **Magic-link, fully automatic** when `ANTHROPIC_LOGIN_EMAIL` is set and `himalaya` reads that mailbox: triggers the email, extracts the `claude.ai/magic-link#<token>` URL, opens it. Otherwise **assisted** (you finish the email login once). |
+| `anthropic` (`claude`) | **Magic-link, fully automatic** when `ANTHROPIC_LOGIN_EMAIL` is set and `himalaya` reads that mailbox: triggers the email, extracts the `claude.ai/magic-link#<token>` URL, opens it — only if it passes the three login-CSRF guards below. Otherwise **assisted** (you finish the email login once). |
 | `cscs`                 | **Keycloak, unattended.** `store-creds cscs` caches username/password/TOTP-seed in the macOS keychain (from 1Password, one last Touch ID); thereafter login runs with no fingerprint. TOTP codes are generated locally with `pyotp`. A flow Keycloak aborts with `authentication_expired` (stale `session_code` on a login page left open for hours) is retried once from a fresh page with a newly generated code; a wrong password still fails on the first attempt. |
 | `openai` (`chatgpt`)   | **Assisted.** ChatGPT Business logs in via Google SSO + 2FA, which can't be replayed from a stored secret — you complete the SSO once in the shared window; the session persists. Logged-in sentinel: the 'Invite member' button on `chatgpt.com/admin/members`. |
 | `slack`                | **Assisted.** app.slack.com logs in via email-code / SSO; you sign in once and the session persists. Logged-in sentinel: a team with an `xoxc-` token in `localConfig_v2`. `browser.py slack-session` then prints `{token,cookie,team_domain}` (xoxc + httpOnly `d` cookie via CDP) so `slack-api` can call `users.admin.setInactive` on the Pro plan — where the API token is scope-blocked. Bearer creds → stdout only, never cached. |
 | `biopolwifi`           | **Keychain email+password, unattended.** SDSC Biopole WiFi units are managed via a Ruckus Cloudpath MDU portal (`cloudpath.edificom.cloud`, a plain Vue SPA). `store-creds biopolwifi` caches the portal email+password in the macOS keychain (the same items `sdsc/biopol-wifi/biopol-wifi.py` reads); login fills the form and confirms the `SDSC - Biopole` / `Properties` sentinel. No SSO, no TOTP, no token extracted. Aliases: `biopol`, `cloudpath`, `edificom`. |
 | `switch`               | **SSO click, assisted fallback.** `login switch` opens `/auth/login` and clicks the single SWITCH edu-ID button — passwordless while the browser's edu-ID IdP session lives; otherwise you finish the edu-ID login once in the window. Logged-in sentinel: on `cloud.switch.ch` outside `/auth/` with NO `/auth/openid_connect_eduid_ch` sign-in form — the anonymous root renders that form with HTTP 200, so the URL alone proves nothing. `logged-in switch` probes a background tab it closes again (never focuses the window) and exits 2 when logged out OR when it cannot tell — the `infra/status` check `switch-portal-login` runs it every 30 min. No stored credential by design: edu-ID is Albert's primary federated identity. Aliases: `switch-cloud`, `cloud.switch.ch`, `scp`. |
+
+**claude.ai magic-link guards (login CSRF).** Opening a magic link signs the
+shared browser into *whatever account the link belongs to*, so auto-login opens
+a link only when all three hold:
+
+1. **Sender allow-list** — the mail's From is in `ANTHROPIC_LOGIN_MAIL_SENDERS`
+   (default `mail.anthropic.com`; exact address or exact domain, no subdomain
+   match). The subject is only recognition — anyone can write it. The domain is
+   meaningful because `_dmarc.mail.anthropic.com` and `_dmarc.anthropic.com` are
+   `p=reject`: a DMARC-honouring receiver drops a forged From. A rejected sender
+   is named in the failure output.
+2. **Pre-trigger baseline** — before submitting the form, the sha256 of every
+   magic link already in INBOX/Archive is recorded; such a link is never opened
+   (survives the INBOX→Archive server rule). If the baseline cannot be taken,
+   auto-login is not attempted at all.
+3. **Link names `ANTHROPIC_LOGIN_EMAIL`** — the `#<token>:<base64 email>`
+   fragment must decode to that address (defense in depth: whether Anthropic's
+   server binds the token to that email is unverified).
+
+Any refusal falls back to assisted login; if auto-login never submitted the
+form (bad allow-list, no baseline), the assisted path submits it. Residual
+risk: a receiver that ignores DMARC combined with a forged fragment email that
+the server does not bind; and a mail landing between the baseline snapshot and
+the form submission (guards 1 and 3 still apply to it).
 
 CSCS back-compat aliases (`token`, `cscs-login`, `cscs-store-creds`,
 `cscs-forget-creds`) are kept because downstream tools depend on their exact stdout

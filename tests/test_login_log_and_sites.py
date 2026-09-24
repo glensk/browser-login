@@ -113,13 +113,15 @@ def _serve_inbox(monkeypatch, envs: list[dict]):
 def test_mail_clearly_older_than_the_trigger_is_skipped(monkeypatch):
     # trigger at 00:10; a mail stamped 00:06 (> 3 min before) is a previous run's.
     _serve_inbox(monkeypatch, [_mail_env("1970-01-01 00:06+00:00")])
-    assert browser._himalaya_latest_login_mail("h", "me@x.ch", 600.0) is None
+    assert browser._himalaya_login_mail_candidates("h", "me@x.ch", 600.0) == []
 
 
 def test_minute_truncated_date_within_tolerance_is_accepted(monkeypatch):
     # himalaya dates have minute precision: 00:09 may be 00:09:59 > trigger.
     _serve_inbox(monkeypatch, [_mail_env("1970-01-01 00:09+00:00")])
-    assert browser._himalaya_latest_login_mail("h", "me@x.ch", 600.0) == ("INBOX", "1")
+    assert browser._himalaya_login_mail_candidates("h", "me@x.ch", 600.0) == [
+        ("INBOX", "1")
+    ]
 
 
 def test_newest_mail_wins(monkeypatch):
@@ -130,13 +132,18 @@ def test_newest_mail_wins(monkeypatch):
             _mail_env("1970-01-01 00:12+00:00", mid="new"),
         ],
     )
-    assert browser._himalaya_latest_login_mail("h", "", 600.0) == ("INBOX", "new")
+    assert browser._himalaya_login_mail_candidates("h", "", 600.0) == [
+        ("INBOX", "new"),
+        ("INBOX", "old"),
+    ]
 
 
 def test_mail_to_another_recipient_is_skipped(monkeypatch):
     _serve_inbox(monkeypatch, [_mail_env("1970-01-01 00:10+00:00", to="x@y.ch")])
     diag: list[str] = []
-    assert browser._himalaya_latest_login_mail("h", "me@x.ch", 600.0, diag=diag) is None
+    assert (
+        browser._himalaya_login_mail_candidates("h", "me@x.ch", 600.0, diag=diag) == []
+    )
     assert any("x@y.ch" in d for d in diag)
 
 
@@ -271,25 +278,34 @@ def test_auto_login_reads_the_link_from_the_configured_account(monkeypatch):
 
     calls: list[tuple] = []
     monkeypatch.setenv("ANTHROPIC_LOGIN_HIMALAYA_ACCOUNT", "epfl")
+    monkeypatch.delenv("ANTHROPIC_LOGIN_MAIL_SENDERS", raising=False)
     monkeypatch.setattr(browser, "_claude_fill_email_and_continue", lambda p, e: True)
+
+    def fake_baseline(himalaya, account=None, diag=None):
+        calls.append(("baseline", account))
+        return set()
+
+    monkeypatch.setattr(browser, "_himalaya_login_link_baseline", fake_baseline)
     monkeypatch.setattr(
         browser,
-        "_himalaya_latest_login_mail",
-        lambda h, e, ts, account=None, diag=None: ("INBOX", "7"),
+        "_himalaya_login_mail_candidates",
+        lambda h, e, ts, **kw: [("INBOX", "7")],
     )
 
-    def fake_extract(himalaya, folder, msg_id, account=None):
-        calls.append((folder, msg_id, account))
-        return LINK
+    def fake_read(himalaya, folder, msg_id, account=None, preview=False):
+        calls.append((folder, msg_id, account, preview))
+        return f"Sign in: {LINK}"
 
-    monkeypatch.setattr(browser, "_himalaya_extract_magic_link", fake_extract)
+    monkeypatch.setattr(browser, "_himalaya_read_message", fake_read)
 
     class _Page:
         def goto(self, url, **kwargs):
             raise PlaywrightError("stop here")
 
-    assert browser._claude_auto_login(_Page(), "me@x.ch", "himalaya") is False
-    assert calls == [("INBOX", "7", "epfl")]
+    assert browser._claude_auto_login(_Page(), "user@example.com", "himalaya") == (
+        "submitted"
+    )
+    assert calls == [("baseline", "epfl"), ("INBOX", "7", "epfl", True)]
 
 
 def test_login_log_survives_corrupt_lines(logdir, capsys):

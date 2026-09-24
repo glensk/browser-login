@@ -46,8 +46,10 @@ currently ``cscs``, ``anthropic``/``claude``, ``openai``/``chatgpt``, ``slack``,
                     sites with stored credentials (CSCS Keycloak). For claude.ai:
                     FULLY automatic when $ANTHROPIC_LOGIN_EMAIL is set and himalaya
                     is installed (triggers the magic-link email, reads it, opens
-                    the link — no password, no code); otherwise ASSISTED (you
-                    complete the email login in the window). For chatgpt.com:
+                    the link — no password, no code; only a NEW link, from a
+                    sender in $ANTHROPIC_LOGIN_MAIL_SENDERS, for that email);
+                    otherwise ASSISTED (you complete the email login in the
+                    window). For chatgpt.com:
                     ASSISTED (Google SSO + 2FA once in the shared window; the
                     session persists). For the Switch Cloud Portal: clicks the
                     edu-ID sign-in button (no password while the edu-ID session
@@ -3753,12 +3755,17 @@ def _himalaya_date_epoch(s: str) -> float:
         return 0.0
 
 
-# Anthropic has renamed the magic-link subject at least once, so sender is the
-# primary signal and the subject is only a fallback hint. Observed subjects:
+# Anthropic has renamed the magic-link subject at least once. Observed subjects:
 #   2026-08  "Your secure link to Claude.ai is here | <timestamp>"
 # The original filter demanded "log in to Claude.ai", which never matched.
-_ANTHROPIC_MAIL_DOMAIN = "mail.anthropic.com"
+# The subject only RECOGNISES a login mail; the SENDER authorises it (tp#490):
+# anyone can write that subject, but a From on mail.anthropic.com is covered by
+# DMARC p=reject (anthropic.com and mail.anthropic.com), so a DMARC-honouring
+# receiver drops a forgery. The localpart is randomised per message
+# (`no-reply-<random>@mail.anthropic.com`), so the default entry is a domain.
+_ANTHROPIC_LOGIN_MAIL_SENDERS_DEFAULT = ("mail.anthropic.com",)
 _CLAUDE_SUBJECT_HINTS = ("secure link to Claude.ai", "log in to Claude.ai")
+_DOMAIN_LABEL_RE = re.compile(r"[a-z0-9](?:[a-z0-9-]*[a-z0-9])?")
 
 
 def _diag(sink: list[str] | None, msg: str) -> None:
@@ -3767,93 +3774,195 @@ def _diag(sink: list[str] | None, msg: str) -> None:
         sink.append(msg)
 
 
-def _is_claude_login_mail(env: dict) -> bool:
-    """True for an Anthropic magic-link mail.
+def _printable(s: object, limit: int = 120) -> str:
+    """`s` made safe to echo to a terminal: every non-printable character
+    (ESC, CR, LF, other control and format characters) dropped, truncated to
+    `limit` characters with '…'. For attacker-controlled senders/subjects."""
+    out = "".join(c for c in str(s) if c.isprintable())
+    return out if len(out) <= limit else out[: limit - 1] + "…"
 
-    A known subject wins outright. Otherwise fall back to the sender — the
-    localpart is randomised per message (`no-reply-<random>@mail.anthropic.com`)
-    but the domain is stable — AND require the subject to look like a link mail:
-    ordinary product mail ("You have new requests from your team") ships from
-    that same domain, and selecting it would starve the real login mail.
-    """
+
+def _valid_mail_domain(dom: str) -> bool:
+    """Lower-case DNS name with at least one dot; labels [a-z0-9-], no edge '-'."""
+    labels = dom.split(".")
+    return (
+        len(dom) <= 253
+        and len(labels) >= 2
+        and all(len(lb) <= 63 and _DOMAIN_LABEL_RE.fullmatch(lb) for lb in labels)
+    )
+
+
+def _login_mail_senders() -> tuple[tuple[str, ...], str | None]:
+    """The login-mail sender allow-list → (entries, config error).
+
+    `ANTHROPIC_LOGIN_MAIL_SENDERS` is comma-separated; each entry is an exact
+    address (`no-reply@mail.anthropic.com`) or an exact domain
+    (`mail.anthropic.com` or `@mail.anthropic.com`). Unset/blank → the default.
+    Any invalid entry makes the whole override an error (entries `()`), so a
+    typo disables auto-login instead of silently widening or narrowing it.
+    Domain entries are returned bare, address entries with their '@'."""
+    raw = os.environ.get("ANTHROPIC_LOGIN_MAIL_SENDERS", "")
+    if not raw.strip():
+        return _ANTHROPIC_LOGIN_MAIL_SENDERS_DEFAULT, None
+    entries: list[str] = []
+    for item in raw.split(","):
+        entry = item.strip().lower()
+        if not entry:
+            continue
+        if entry.startswith("@"):
+            ok = "@" not in entry[1:] and _valid_mail_domain(entry[1:])
+            entry = entry[1:]
+        elif "@" in entry:
+            local, _, dom = entry.partition("@")
+            ok = (
+                "@" not in dom
+                and bool(local)
+                and not any(c.isspace() for c in local)
+                and local.isprintable()
+                and _valid_mail_domain(dom)
+            )
+        else:
+            ok = _valid_mail_domain(entry)
+        if not ok:
+            return (), (
+                "ANTHROPIC_LOGIN_MAIL_SENDERS has an invalid entry "
+                f"{_printable(item.strip())!r} (want an address or a domain)"
+            )
+        if entry not in entries:
+            entries.append(entry)
+    if not entries:
+        return (), "ANTHROPIC_LOGIN_MAIL_SENDERS has no entries"
+    return tuple(entries), None
+
+
+def _sender_allowed(addr: str, allow: tuple[str, ...]) -> bool:
+    """Exact-address or exact-domain match — never a suffix/subdomain match."""
+    addr = (addr or "").strip().lower()
+    if addr.count("@") != 1:
+        return False
+    dom = addr.partition("@")[2]
+    return any(addr == e if "@" in e else dom == e for e in allow)
+
+
+def _mail_sender(env: dict) -> str:
+    return ((env.get("from") or {}).get("addr") or "").strip().lower()
+
+
+def _looks_like_claude_login_mail(env: dict) -> bool:
+    """Subject-only recognition of a magic-link mail — says nothing about who
+    sent it. Ordinary product mail ("You have new requests from your team")
+    ships from the same domain and must not match, or it would starve the real
+    login mail."""
     subject = (env.get("subject") or "").lower()
     if any(h.lower() in subject for h in _CLAUDE_SUBJECT_HINTS):
         return True
-    sender = ((env.get("from") or {}).get("addr") or "").lower()
-    if not sender.endswith("@" + _ANTHROPIC_MAIL_DOMAIN):
-        return False
     return "claude" in subject and "link" in subject
 
 
-def _himalaya_latest_login_mail(
+def _is_claude_login_mail(env: dict, allow: tuple[str, ...] | None = None) -> bool:
+    """A login-looking mail from an allow-listed sender (see
+    `_login_mail_senders`; an invalid override allows nobody)."""
+    if allow is None:
+        allow = _login_mail_senders()[0]
+    return _looks_like_claude_login_mail(env) and _sender_allowed(
+        _mail_sender(env), allow
+    )
+
+
+def _himalaya_list_folder(
+    himalaya: str,
+    folder: str,
+    account: str | None = None,
+    diag: list[str] | None = None,
+) -> list[dict] | None:
+    """The newest 30 envelopes of `folder`, or None (reason in `diag`)."""
+    argv = [himalaya, "envelope", "list", "--folder", folder]
+    if account:
+        argv += ["-a", account]
+    argv += ["--page-size", "30", "-o", "json"]
+    try:
+        res = subprocess.run(
+            argv,
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        _diag(diag, f"{folder}: himalaya could not be run ({exc})")
+        return None
+    if res.returncode != 0:
+        _diag(
+            diag,
+            f"{folder}: himalaya exited {res.returncode} "
+            f"({(res.stderr or '').strip()[:160] or 'no stderr'})",
+        )
+        return None
+    try:
+        envs = json.loads(res.stdout)
+    except (ValueError, TypeError) as exc:
+        _diag(diag, f"{folder}: himalaya output was not JSON ({exc})")
+        return None
+    if not isinstance(envs, list):
+        _diag(diag, f"{folder}: himalaya JSON was not a list")
+        return None
+    return [e for e in envs if isinstance(e, dict)]
+
+
+_LOGIN_MAIL_FOLDERS = ("INBOX", "Archive")  # a server rule auto-archives them
+_MAX_REJECTED_SENDERS = 5
+
+
+def _himalaya_login_mail_candidates(
     himalaya: str,
     email: str,
     since_ts: float,
+    *,
     account: str | None = None,
     diag: list[str] | None = None,
-) -> tuple[str, str] | None:
-    """Newest Anthropic magic-link mail to `email`, not clearly older than
-    `since_ts`. Searches INBOX + Archive (a server rule auto-archives them).
+    rejected_senders: list[str] | None = None,
+    allow: tuple[str, ...] | None = None,
+) -> list[tuple[str, str]]:
+    """Every eligible Anthropic magic-link mail to `email` as (folder, id),
+    newest first (a dated mail always before an undated one). Searches INBOX +
+    Archive.
 
-    Matching is on SENDER first (`*@mail.anthropic.com`) and only then on a
-    subject substring, because Anthropic has changed the subject at least once:
-    the real 2026 subject is "Your secure link to Claude.ai is here | <ts>",
-    while this function used to require "log in to Claude.ai" — a string that
-    has never appeared in either folder, so auto-login silently never engaged.
-
-    `diag`, if given, collects one-line reasons explaining why nothing matched;
-    the caller prints them, because every failure path here is otherwise silent.
-
-    Returns (folder, id) or None."""
-    # The branches ARE the diagnostics: every `diag` reason (folder missing,
-    # unparsable envelope, wrong sender, wrong subject, too old) is its own
-    # named case, and collapsing them is what made auto-login silently fail.
-    # pylint: disable=too-many-branches
-    best_folder: str | None = None
-    best_id: str | None = None
-    best_key = (-1, -1.0)  # (has_parsable_date, ts) — a dated mail always wins
-    seen = matched = 0
-    for folder in ("INBOX", "Archive"):
-        argv = [himalaya, "envelope", "list", "--folder", folder]
-        if account:
-            argv += ["-a", account]
-        argv += ["--page-size", "30", "-o", "json"]
-        try:
-            res = subprocess.run(
-                argv,
-                capture_output=True,
-                text=True,
-                timeout=30,
-                check=False,
-            )
-        except (OSError, subprocess.SubprocessError) as exc:
-            _diag(diag, f"{folder}: himalaya could not be run ({exc})")
-            continue
-        if res.returncode != 0:
-            _diag(
-                diag,
-                f"{folder}: himalaya exited {res.returncode} "
-                f"({(res.stderr or '').strip()[:160] or 'no stderr'})",
-            )
-            continue
-        try:
-            envs = json.loads(res.stdout)
-        except (ValueError, TypeError) as exc:
-            _diag(diag, f"{folder}: himalaya output was not JSON ({exc})")
-            continue
-        if not isinstance(envs, list):
-            _diag(diag, f"{folder}: himalaya JSON was not a list")
-            continue
-        for env in envs:
+    A login-looking mail from a sender outside the allow-list is never a
+    candidate; its sanitized sender goes to `rejected_senders` (de-duplicated,
+    at most 5). The `since_ts` date window is only a backstop — the caller's
+    pre-trigger baseline is what excludes old mails. `diag` collects one-line
+    reasons for every other skip; the caller prints them, because every
+    failure path here is otherwise silent."""
+    if allow is None:
+        allow = _login_mail_senders()[0]
+    ranked: list[tuple[tuple[int, float], str, str]] = []
+    seen = looked_like = 0
+    for folder in _LOGIN_MAIL_FOLDERS:
+        envs = _himalaya_list_folder(himalaya, folder, account=account, diag=diag)
+        for env in envs or []:
             seen += 1
-            if not _is_claude_login_mail(env):
+            if not _looks_like_claude_login_mail(env):
                 continue
-            matched += 1
+            looked_like += 1
+            sender = _mail_sender(env)
+            if not _sender_allowed(sender, allow):
+                msg = (
+                    f"{folder}: rejected a Claude login-looking mail from "
+                    f"{_printable(sender) or '<no sender>'} — not in "
+                    f"ANTHROPIC_LOGIN_MAIL_SENDERS ({', '.join(allow)})"
+                )
+                if (
+                    rejected_senders is not None
+                    and len(rejected_senders) < _MAX_REJECTED_SENDERS
+                ):
+                    _diag(rejected_senders, msg)
+                continue
             to = ((env.get("to") or {}).get("addr") or "").lower()
             if email and to and to != email.lower():
                 _diag(
                     diag,
-                    f"{folder}: a Claude login mail was addressed to {to}, not {email}",
+                    f"{folder}: a Claude login mail was addressed to "
+                    f"{_printable(to)}, not {email}",
                 )
                 continue
             raw_date = env.get("date") or ""
@@ -3862,32 +3971,36 @@ def _himalaya_latest_login_mail(
                 continue
             if not ts:
                 # Unparsable date: still eligible, but ranked BELOW any dated
-                # candidate. Previously ts==0.0 was falsy, so it skipped the
-                # freshness guard above AND beat best_ts=-1.0 — i.e. a date-format
-                # change would make this silently consume an arbitrary old mail.
-                _diag(diag, f"{folder}: could not parse mail date {raw_date!r}")
-            key = (1 if ts else 0, ts)
-            if key > best_key:
-                best_key, best_folder, best_id = key, folder, str(env.get("id"))
-    if best_folder is None or best_id is None:
-        if matched == 0:
-            _diag(
-                diag,
-                f"no Anthropic login mail among the {seen} newest envelopes "
-                f"(looked for sender *@{_ANTHROPIC_MAIL_DOMAIN} or subject ~ "
-                f"{_CLAUDE_SUBJECT_HINTS[0]!r})",
-            )
-        return None
-    return (best_folder, best_id)
+                # candidate — a date-format change must not make an arbitrary
+                # old mail win.
+                _diag(
+                    diag,
+                    f"{folder}: could not parse mail date {_printable(raw_date)!r}",
+                )
+            ranked.append(((1 if ts else 0, ts), folder, str(env.get("id"))))
+    if not ranked and looked_like == 0:
+        _diag(
+            diag,
+            f"no Anthropic login mail among the {seen} newest envelopes "
+            f"(looked for subject ~ {_CLAUDE_SUBJECT_HINTS[0]!r} from "
+            f"ANTHROPIC_LOGIN_MAIL_SENDERS: {', '.join(allow) or '<none>'})",
+        )
+    ranked.sort(key=lambda r: r[0], reverse=True)  # stable: listing order on ties
+    return [(folder, msg_id) for _key, folder, msg_id in ranked]
 
 
-def _himalaya_extract_magic_link(
-    himalaya: str, folder: str, msg_id: str, account: str | None = None
+def _himalaya_read_message(
+    himalaya: str,
+    folder: str,
+    msg_id: str,
+    account: str | None = None,
+    preview: bool = False,
 ) -> str | None:
-    """Read the mail body and pull out the claude.ai/magic-link#… URL (a bearer
-    credential — never printed/logged). `account` must be the one the envelope
-    was found in: a message id is only meaningful within its own mailbox."""
+    """The rendered message, or None when himalaya failed. `preview` keeps the
+    seen flag untouched (`message read --preview`)."""
     argv = [himalaya, "message", "read", msg_id, "--folder", folder]
+    if preview:
+        argv.append("--preview")
     if account:
         argv += ["-a", account]
     try:
@@ -3902,36 +4015,196 @@ def _himalaya_extract_magic_link(
         return None
     if res.returncode != 0:
         return None
-    m = _MAGIC_LINK_RE.search(res.stdout)
+    return res.stdout or ""
+
+
+def _himalaya_extract_magic_link(
+    himalaya: str,
+    folder: str,
+    msg_id: str,
+    account: str | None = None,
+    preview: bool = False,
+) -> str | None:
+    """Read the mail body and pull out the claude.ai/magic-link#… URL (a bearer
+    credential — never printed/logged). `account` must be the one the envelope
+    was found in: a message id is only meaningful within its own mailbox."""
+    body = _himalaya_read_message(
+        himalaya, folder, msg_id, account=account, preview=preview
+    )
+    m = _MAGIC_LINK_RE.search(body or "")
     return m.group(0) if m else None
 
 
-def _claude_auto_login(page, email: str, himalaya: str) -> bool:
+def _magic_link_digest(link: str) -> str:
+    """sha256 of a magic link — lets us remember a link without keeping it."""
+    import hashlib
+
+    return hashlib.sha256(link.encode("utf-8")).hexdigest()
+
+
+def _himalaya_login_link_baseline(
+    himalaya: str, account: str | None = None, diag: list[str] | None = None
+) -> set[str] | None:
+    """Digests of every magic link already in the mailbox BEFORE we trigger a
+    new one. Sender-independent on purpose, so a pre-planted forged mail is
+    excluded as well. Keyed by link (not by folder/id/date), so it survives the
+    INBOX→Archive server rule and has no minute-precision collisions.
+
+    None when any folder or login-looking body could not be read: then old and
+    new mails cannot be told apart, and the caller must not auto-login."""
+    digests: set[str] = set()
+    for folder in _LOGIN_MAIL_FOLDERS:
+        envs = _himalaya_list_folder(himalaya, folder, account=account, diag=diag)
+        if envs is None:
+            return None
+        for env in envs:
+            if not _looks_like_claude_login_mail(env):
+                continue
+            msg_id = str(env.get("id"))
+            body = _himalaya_read_message(
+                himalaya, folder, msg_id, account=account, preview=True
+            )
+            if body is None:
+                _diag(diag, f"{folder}: could not read login mail id {msg_id}")
+                return None
+            m = _MAGIC_LINK_RE.search(body)
+            if m:
+                digests.add(_magic_link_digest(m.group(0)))
+    return digests
+
+
+def _magic_link_email(link: str) -> str | None:
+    """The account a magic link names: `#<token>:<base64 email>` → the email,
+    lower-cased. Standard or URL-safe base64, padding optional. None when the
+    link is not a full `_MAGIC_LINK_RE` match or the part does not decode to
+    exactly one address."""
+    import base64
+    import binascii
+
+    if not link or not _MAGIC_LINK_RE.fullmatch(link):
+        return None
+    frag = link.partition("#")[2]
+    if ":" not in frag:
+        return None
+    b64 = frag.rsplit(":", 1)[1].rstrip("=").replace("-", "+").replace("_", "/")
+    if not b64:
+        return None
+    try:
+        raw = base64.b64decode(b64 + "=" * (-len(b64) % 4), validate=True)
+        addr = raw.decode("utf-8").strip().lower()
+    except (binascii.Error, ValueError):
+        return None
+    if addr.count("@") != 1 or not addr.isprintable() or " " in addr:
+        return None
+    local, _, dom = addr.partition("@")
+    return addr if local and dom else None
+
+
+def _claude_next_magic_link(
+    himalaya: str,
+    email: str,
+    since_ts: float,
+    *,
+    account: str | None,
+    allow: tuple[str, ...],
+    baseline: set[str],
+    rejected: dict[str, str],
+    diag: list[str],
+    rejected_senders: list[str],
+) -> str | None:
+    """One poll round: the newest candidate whose link is new (not in
+    `baseline`) and names `email`. Every refused candidate goes to `rejected`
+    (envelope key → reason) so it is never re-read and never starves an older,
+    valid candidate in the same round."""
+    want = email.strip().lower()
+    for folder, msg_id in _himalaya_login_mail_candidates(
+        himalaya,
+        email,
+        since_ts,
+        account=account,
+        diag=diag,
+        rejected_senders=rejected_senders,
+        allow=allow,
+    ):
+        key = f"{folder}\0{msg_id}"
+        if key in rejected:
+            continue
+        body = _himalaya_read_message(
+            himalaya, folder, msg_id, account=account, preview=True
+        )
+        if body is None:  # transient read failure → retry next round
+            _diag(diag, f"could not read the login mail ({folder} id {msg_id})")
+            continue
+        m = _MAGIC_LINK_RE.search(body)
+        if not m:
+            rejected[key] = f"found a mail ({folder} id {msg_id}) but no magic link"
+            continue
+        link = m.group(0)
+        if _magic_link_digest(link) in baseline:
+            rejected[key] = (
+                f"skipped a login mail ({folder} id {msg_id}) that predates "
+                "this attempt"
+            )
+            continue
+        if _magic_link_email(link) != want:
+            # Never print the link or the foreign email it names.
+            rejected[key] = (
+                f"found a login mail ({folder} id {msg_id}) whose link is for a "
+                "different account — refusing to open it"
+            )
+            continue
+        return link
+    return None
+
+
+def _claude_auto_login(page, email: str, himalaya: str) -> str:
     """Fully automatic login: trigger the magic-link email, read it via himalaya,
     open the link in the shared browser (the SPA reads the #token and signs in).
-    No password, no manual code. Returns True on success, False (→ assisted)."""
-    # One branch per step of the magic-link handshake (submit email → poll the
-    # mailbox → open the link → confirm the session), each with its own operator
-    # message before falling back to assisted login; splitting it would split
-    # the single trigger_ts window the mail poll is anchored to.
-    # pylint: disable=too-many-branches
+    No password, no manual code.
+
+    Returns "ok" (logged in), "submitted" (the email form was submitted — a
+    link is on its way — but login did not complete) or "not_submitted"
+    (nothing was requested: bad allow-list, no baseline, or the form failed).
+
+    Three guards against opening someone else's link (login CSRF, tp#490):
+    the sender allow-list, the pre-trigger baseline, and the link's embedded
+    email must equal `email` (defense in depth)."""
+    # One branch per step of the magic-link handshake (baseline → submit email
+    # → poll the mailbox → open the link → confirm the session), each with its
+    # own operator message before falling back to assisted login.
+    # pylint: disable=too-many-branches,too-many-return-statements
     from playwright.sync_api import Error as PlaywrightError
 
+    allow, err = _login_mail_senders()
+    if err:
+        print(f"  {err} — not auto-logging in.", file=sys.stderr)
+        return "not_submitted"
+    account = os.environ.get("ANTHROPIC_LOGIN_HIMALAYA_ACCOUNT")
+    diag: list[str] = []
+    baseline = _himalaya_login_link_baseline(himalaya, account=account, diag=diag)
+    if baseline is None:
+        print(
+            "  Cannot tell old login mails from new ones — not auto-logging in.",
+            file=sys.stderr,
+        )
+        for reason in diag:
+            print(f"    · {reason}", file=sys.stderr)
+        return "not_submitted"
     trigger_ts = time.time()
     if not _claude_fill_email_and_continue(page, email):
         print(
             "  Could not submit the email on the login form — no link was requested.",
             file=sys.stderr,
         )
-        return False
-    account = os.environ.get("ANTHROPIC_LOGIN_HIMALAYA_ACCOUNT")
+        return "not_submitted"
     print(
         f"  Sent a login link to {email}; reading it via himalaya"
         f"{f' (account {account})' if account else ' (default account)'}…",
         file=sys.stderr,
     )
     link = None
-    diag: list[str] = []
+    rejected: dict[str, str] = {}  # per attempt: envelope key → why refused
+    rejected_senders: list[str] = []  # kept across rounds, printed on failure
     # EPFL Exchange delivery can lag well past a minute; overridable because the
     # right value is a property of the mail path, not of this code.
     try:
@@ -3940,30 +4213,33 @@ def _claude_auto_login(page, email: str, himalaya: str) -> bool:
         wait_s = 180
     deadline = time.monotonic() + wait_s
     while time.monotonic() < deadline:
-        diag.clear()  # keep only the last round's reasons
-        hit = _himalaya_latest_login_mail(
-            himalaya, email, trigger_ts, account=account, diag=diag
+        diag.clear()  # keep only the last round's transient reasons
+        link = _claude_next_magic_link(
+            himalaya,
+            email,
+            trigger_ts,
+            account=account,
+            allow=allow,
+            baseline=baseline,
+            rejected=rejected,
+            diag=diag,
+            rejected_senders=rejected_senders,
         )
-        if hit:
-            link = _himalaya_extract_magic_link(
-                himalaya, hit[0], hit[1], account=account
-            )
-            if link:
-                break
-            _diag(
-                diag,
-                f"found the mail ({hit[0]} id {hit[1]}) but no magic link in its body",
-            )
+        if link:
+            break
         time.sleep(3)
     if not link:
-        print(f"  No magic-link email arrived within {wait_s}s.", file=sys.stderr)
-        for reason in diag:
+        print(
+            f"  No usable magic-link email arrived within {wait_s}s.", file=sys.stderr
+        )
+        reasons = [*rejected_senders, *dict.fromkeys(rejected.values()), *diag]
+        for reason in reasons:
             print(f"    · {reason}", file=sys.stderr)
-        return False
+        return "submitted"
     try:
         page.goto(link, wait_until="domcontentloaded")  # SPA consumes #token → signs in
     except PlaywrightError:
-        return False
+        return "submitted"
     # CRITICAL: let the SPA finish consuming the #token and redirect to the app
     # BEFORE navigating anywhere. Navigating mid-exchange (e.g. straight to billing)
     # aborts sign-in — that race is what made earlier attempts fail.
@@ -3978,9 +4254,9 @@ def _claude_auto_login(page, email: str, himalaya: str) -> bool:
     page.wait_for_timeout(1500)  # settle the app shell
     for _ in range(3):  # billing surface can be slow to settle after sign-in
         if _claude_logged_in(page):
-            return True
+            return "ok"
         page.wait_for_timeout(2000)
-    return False
+    return "submitted"
 
 
 def _claude_wait_for_login(page, timeout_s: int = 300) -> bool:
@@ -4040,17 +4316,18 @@ def cmd_anthropic_login(port: int) -> int:
                 pass
 
             himalaya = _himalaya_bin()
-            auto_attempted = False
+            auto_attempted = False  # True once auto-login submitted the email
             if ANTHROPIC_LOGIN_EMAIL and himalaya:
-                auto_attempted = True
                 print(
                     f"Automatic login for {ANTHROPIC_LOGIN_EMAIL} (magic-link via himalaya)…",
                     file=sys.stderr,
                 )
-                if _claude_auto_login(page, ANTHROPIC_LOGIN_EMAIL, himalaya):
+                result = _claude_auto_login(page, ANTHROPIC_LOGIN_EMAIL, himalaya)
+                if result == "ok":
                     print("✓ Logged into Claude (claude.ai).")
                     _record_login_event("anthropic", "auto")
                     return 0
+                auto_attempted = result == "submitted"
                 print(
                     "  Automatic login didn't complete — falling back to assisted.",
                     file=sys.stderr,
