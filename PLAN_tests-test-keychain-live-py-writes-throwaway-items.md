@@ -81,19 +81,19 @@ step cites the objection it comes from as `(O#)`.
 
 ## Steps
 
-- [ ] 1. Rewrite the module docstring of `tests/test_keychain_live.py`. It must say that the test
+- [x] 1. Rewrite the module docstring of `tests/test_keychain_live.py`. It must say that the test
       uses its own temporary keychain file and never the login keychain.
   - Move the `skipif` (`BROWSER_LIVE_KEYCHAIN=1` and macOS) and the `live_keychain` marker from
     module level onto the live test function, so that the offline tests from step 5 always run.
   - Capture `_REAL_RUN = subprocess.run` at module import.
   - Rename the account prefix to `tp506-live-<hex>` and the description to `"tp506 live test"`.
-- [ ] 2. `tests/conftest.py` (O6): stop exempting `live_keychain` tests from the guard. The
+- [x] 2. `tests/conftest.py` (O6): stop exempting `live_keychain` tests from the guard. The
       default-deny wrappers on `subprocess.run` and `subprocess.Popen` stay installed for every
       test.
   - Keep registering the marker, with its meaning rewritten: "may run the real `security` binary
     against its own temp keychain through the test's router".
   - Update the module docstring (lines 1-10) to match.
-- [ ] 3. Keychain lifecycle as plain functions that take a `runner`, so that fakes can test them
+- [x] 3. Keychain lifecycle as plain functions that take a `runner`, so that fakes can test them
       (O5, O8).
   - Every argv names the fixture path explicitly.
   - No call passes `timeout` (O1).
@@ -126,7 +126,7 @@ step cites the objection it comes from as `(O#)`.
   **Wiring:**
   - A function-scoped fixture `temp_keychain` binds these to `_REAL_RUN`, yields, and destroys in
     `finally`.
-- [ ] 4. The router `_make_router(keychain, identity, security_runner, fallback_run)` returns a
+- [x] 4. The router `_make_router(keychain, identity, security_runner, fallback_run)` returns a
       `run`-compatible callable (O3, O4, O6).
   - **Identity check.** Before every `security` call, lstat the path and require all of these,
     otherwise raise: a regular file, not a symlink, owner `os.getuid()`, `(st_dev, st_ino) ==
@@ -148,7 +148,7 @@ step cites the objection it comes from as `(O#)`.
   - **Execution.** Drop any inherited `timeout` kwarg and call `security_runner` (O1). Non-`security`
     programs go to `fallback_run`, which is conftest's guarded run captured at install time, so
     `op` and `himalaya` stay denied (O6).
-- [ ] 5. Add always-running offline tests. They use fake runners, never execute `security`, and the
+- [x] 5. Add always-running offline tests. They use fake runners, never execute `security`, and the
       conftest guard stays active. The tests cover:
   - the `-i` rewrite: `-U` is removed, the quoted path is appended before `\n`, and a line that is
     too long after routing raises;
@@ -168,7 +168,7 @@ step cites the objection it comes from as `(O#)`.
     `delete-keychain` raises and names the path;
   - `_items_matching` raises on a `dump-keychain` rc other than 0, and returns `[]` only for an rc 0
     empty dump (O9).
-- [ ] 6. Rewrite `test_keychain_set_round_trips_through_security_stdin` (live, opt-in) to use the
+- [x] 6. Rewrite `test_keychain_set_round_trips_through_security_stdin` (live, opt-in) to use the
       `temp_keychain` fixture.
   - Inside `with monkeypatch.context() as m:`, patch `_kc_account` and install the router on
     `subprocess.run`. The context exits before fixture teardown (O5).
@@ -179,10 +179,30 @@ step cites the objection it comes from as `(O#)`.
     that `_items_matching` in the temp keychain is empty.
   - Drop the old `_delete` loop.
   - Keep **no** `-U` update case (assumption d24e57).
-- [ ] 7. Find stale wording with `git grep -n "login keychain" -- tests/` and
+- [x] 7. Find stale wording with `git grep -n "login keychain" -- tests/` and
       `git grep -n BROWSER_LIVE_KEYCHAIN`, and fix any doc outside `plans-done/` that still says
       that the live test uses the login keychain.
-- [ ] 8. Run the full `## Verification` block in the foreground. It includes exactly one opt-in live
+- [x] 8. Run the full `## Execution notes (2026-09-24)
+
+- **Identity is re-taken after every routed call (deviation from step 4).** The first live pass
+  failed safely at the router's identity check before any add ran: securityd saves a keychain by
+  atomic rename, so the file's inode changes on every write (unlock and settings included). The
+  fixture now returns the identity after its last setup call, and the router re-records it after
+  each of its own `security` calls. A replacement BETWEEN two calls is still refused. The regular
+  file, no symlink, owner and resolved-path checks are unchanged. The offline test
+  `test_identity_follows_the_routers_own_writes` covers both cases.
+- **`_REAL_POPEN` instead of `_REAL_RUN` (deviation from step 1).** `subprocess.run` looks `Popen`
+  up at call time, and conftest's guard now wraps `Popen` for every test, so the real `run` would be
+  denied too. `_exec_security` is a timeout-free `run` built on the `Popen` captured at import. It
+  refuses any program other than `security`.
+- **Search list.** On this macOS `create-keychain` of a private file did NOT add it to the user
+  search list. After both live passes, `list-keychains -d user` showed only `login.keychain-db`,
+  and no `tp506-*.keychain-db` file remained in `$TMPDIR`.
+- **Live passes.** There were two passes: the failed pass above, then one green pass after the fix.
+  There was no loop and no `-U`.
+
+## Verification` block in the foreground. It includes exactly one opt-in live
+
       run against the temp keychain: no loops, no re-runs of the live line within one pass. Then
       run `ai.py push -m "test(keychain-live): isolate live test in a temp keychain" tests/test_keychain_live.py tests/conftest.py PLAN_tests-test-keychain-live-py-writes-throwaway-items.md`.
 

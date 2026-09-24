@@ -5,8 +5,10 @@ default-deny check: a call whose executable basename is ``security``, ``op`` or
 ``himalaya`` raises instead of running. Tests that mock ``subprocess.run``
 themselves replace the wrapper for their own duration, so the guard only bites
 when a mock is missing — exactly the case where a test would otherwise touch
-Albert's real login keychain. ``tests/test_keychain_live.py`` opts out with the
-``live_keychain`` marker (and is itself opt-in via ``BROWSER_LIVE_KEYCHAIN=1``).
+Albert's real login keychain. The guard has NO opt-out: the ``live_keychain``
+test in ``tests/test_keychain_live.py`` (opt-in via ``BROWSER_LIVE_KEYCHAIN=1``)
+runs ``security`` only through its own router, against its own temporary
+keychain file, while this guard keeps denying everything else.
 """
 
 from __future__ import annotations
@@ -23,7 +25,9 @@ _DENIED = frozenset({"security", "op", "himalaya"})
 
 def pytest_configure(config):
     config.addinivalue_line(
-        "markers", "live_keychain: may run the real `security` binary (opt-in)"
+        "markers",
+        "live_keychain: may run the real `security` binary against its own temp"
+        " keychain through the test's router (opt-in)",
     )
 
 
@@ -61,10 +65,7 @@ def _guard(real):
 
 
 @pytest.fixture(autouse=True)
-def _deny_credential_subprocesses(request, monkeypatch):
-    if request.node.get_closest_marker("live_keychain"):
-        yield
-        return
+def _deny_credential_subprocesses(monkeypatch):
     monkeypatch.setattr(subprocess, "run", _guard(subprocess.run))
     monkeypatch.setattr(subprocess, "Popen", _guard(subprocess.Popen))
     yield
