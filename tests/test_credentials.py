@@ -449,3 +449,44 @@ def test_token_cache_tightens_a_preexisting_loose_file(token_env):
     assert browser._capture_and_cache_token(None, None) == 0
     assert token_env.read_text() == HEX
     assert token_env.stat().st_mode & 0o777 == 0o600
+
+
+@pytest.mark.parametrize(
+    "answer, ok",
+    [
+        (_Res(0), True),
+        (_Res(44, "", "The specified item could not be found in the keychain."), True),
+        (_Res(51, "", "User interaction is not allowed."), False),
+        (OSError("no security binary"), False),
+    ],
+)
+def test_keychain_delete_reports_real_failures(run, answer, ok):
+    # Regression: the return code was ignored, so a locked keychain (51) was
+    # reported as "deleted" and the secret silently stayed stored.
+    run(answer)
+    assert browser._keychain_delete("svc") is ok
+
+
+@pytest.mark.parametrize(
+    "cmd", ["cmd_cscs_forget_creds", "cmd_biopolwifi_forget_creds"]
+)
+def test_forget_creds_fails_loud_when_an_item_survives(monkeypatch, capsys, cmd):
+    # Regression: forget-creds printed "✓ Removed" and exited 0 even when the
+    # secrets were still in the keychain.
+    monkeypatch.setattr(browser, "_keychain_delete", lambda svc: "pass" not in svc)
+    assert getattr(browser, cmd)() == 1
+    out = capsys.readouterr()
+    assert "✓" not in out.out and "password" in out.err
+
+
+@pytest.mark.parametrize(
+    "cmd", ["cmd_cscs_forget_creds", "cmd_biopolwifi_forget_creds"]
+)
+def test_forget_creds_succeeds_when_all_items_are_gone(monkeypatch, capsys, cmd):
+    deleted: list[str] = []
+    monkeypatch.setattr(
+        browser, "_keychain_delete", lambda svc: not deleted.append(svc)
+    )
+    assert getattr(browser, cmd)() == 0
+    assert len(deleted) == (3 if "cscs" in cmd else 2)
+    assert "✓ Removed" in capsys.readouterr().out
