@@ -3189,7 +3189,7 @@ def _keychain_set(service: str, value: str) -> bool:
 def _keychain_delete(service: str) -> bool:
     """Delete a login-keychain item; ``True`` if it was deleted or already gone."""
     try:
-        subprocess.run(
+        r = subprocess.run(
             [
                 "security",
                 "delete-generic-password",
@@ -3205,7 +3205,9 @@ def _keychain_delete(service: str) -> bool:
         )
     except (OSError, subprocess.SubprocessError):
         return False
-    return True
+    # 44 = errSecItemNotFound ("already gone"); anything else (e.g. 51, a locked
+    # keychain) means the secret is still stored.
+    return r.returncode in (0, 44)
 
 
 def _totp_now(seed_or_uri: str) -> str | None:
@@ -3607,8 +3609,10 @@ def cmd_cscs_store_creds() -> int:
 
 def cmd_cscs_forget_creds() -> int:
     """Delete the CSCS credentials stored in the macOS keychain."""
-    for svc in (KEYCHAIN_SVC_USER, KEYCHAIN_SVC_PASS, KEYCHAIN_SVC_TOTP):
-        _keychain_delete(svc)
+    services = (KEYCHAIN_SVC_USER, KEYCHAIN_SVC_PASS, KEYCHAIN_SVC_TOTP)
+    left = [svc for svc in services if not _keychain_delete(svc)]
+    if left:
+        return _fail(f"Could not remove keychain item(s): {', '.join(left)}.")
     print(
         "✓ Removed CSCS keychain credentials. `cscs-login` will fall back to "
         "1Password (Touch ID) again."
@@ -4600,8 +4604,10 @@ def cmd_biopolwifi_store_creds() -> int:
 
 def cmd_biopolwifi_forget_creds() -> int:
     """Delete the Cloudpath MDU portal credentials from the macOS keychain."""
-    for svc in (KEYCHAIN_SVC_BIOPOL_EMAIL, KEYCHAIN_SVC_BIOPOL_PASS):
-        _keychain_delete(svc)
+    services = (KEYCHAIN_SVC_BIOPOL_EMAIL, KEYCHAIN_SVC_BIOPOL_PASS)
+    left = [svc for svc in services if not _keychain_delete(svc)]
+    if left:
+        return _fail(f"Could not remove keychain item(s): {', '.join(left)}.")
     print(
         "✓ Removed the Cloudpath portal keychain credentials. "
         "`browser.py login biopolwifi` needs `store-creds biopolwifi` again."
