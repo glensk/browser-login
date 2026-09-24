@@ -490,3 +490,18 @@ def test_forget_creds_succeeds_when_all_items_are_gone(monkeypatch, capsys, cmd)
     assert getattr(browser, cmd)() == 0
     assert len(deleted) == (3 if "cscs" in cmd else 2)
     assert "✓ Removed" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize(
+    "bad",
+    [
+        f"otpauth://hotp/CSCS?secret={SEED}&counter=1",  # AttributeError: no .now()
+        f"otpauth://totp/CSCS?secret={SEED}&period=0",  # ZeroDivisionError
+        "   ",  # empty key: pyotp happily makes a code from b""
+    ],
+)
+def test_totp_now_rejects_unusable_secrets_without_crashing(bad):
+    # Regression: these crashed cscs-store-creds with a traceback, or (blank
+    # seed in the keychain) produced a code that is guaranteed wrong and burns a
+    # Keycloak attempt toward the account lockout.
+    assert browser._totp_now(bad) is None
