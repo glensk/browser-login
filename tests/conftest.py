@@ -95,3 +95,84 @@ def _deny_credential_subprocesses(monkeypatch):
     monkeypatch.setattr(subprocess, "run", _guard(subprocess.run))
     monkeypatch.setattr(subprocess, "Popen", _guard(subprocess.Popen))
     yield
+
+
+class FakeSecurityPopen:
+    """``subprocess.Popen`` stand-in for ``browser._security_run`` — runs nothing.
+
+    ``handler(argv, input)`` answers each call with ``(rc, stdout, stderr)``
+    (``str`` or ``bytes``); an exception it raises escapes ``communicate``.
+    ``not_started(argv)`` → the constructor raises ``OSError``;
+    ``interrupt(argv)`` → the first ``communicate`` runs the handler (the child
+    finishes), then raises ``KeyboardInterrupt``; the retry returns the result
+    and must not resend input. ``kill``/``terminate``/``send_signal`` raise:
+    ``security`` is never signalled. ``calls`` holds every started call as
+    ``{"argv", "kwargs", "input"}``.
+    """
+
+    def __init__(self, handler, *, not_started=None, interrupt=None):
+        self.handler = handler
+        self.not_started = not_started or (lambda argv: False)
+        self.interrupt = interrupt or (lambda argv: False)
+        self.calls: list[dict] = []
+        self.interrupts = 0
+
+    def __call__(self, argv, **kwargs):
+        argv = list(argv)
+        if self.not_started(argv):
+            raise OSError("security not runnable (fake)")
+        call = {"argv": argv, "kwargs": kwargs, "input": None}
+        self.calls.append(call)
+        return _FakeSecurityProc(self, call)
+
+    def argvs(self) -> list[list[str]]:
+        return [c["argv"] for c in self.calls]
+
+
+def _as_bytes(value) -> bytes:
+    return value.encode("utf-8") if isinstance(value, str) else bytes(value)
+
+
+class _FakeSecurityProc:
+    def __init__(self, owner: FakeSecurityPopen, call: dict):
+        self._owner, self._call = owner, call
+        self.args = call["argv"]
+        self.returncode: int | None = None
+        self._result: tuple[bytes, bytes] | None = None
+
+    def communicate(self, input=None, timeout=None):  # noqa: A002  # pylint: disable=redefined-builtin
+        assert timeout is None, "security must never be timed out"
+        if self._result is not None:
+            assert input is None, "a retried communicate must not resend input"
+            return self._result
+        self._call["input"] = input
+        rc, out, err = self._owner.handler(self.args, input)
+        self.returncode = rc
+        self._result = (_as_bytes(out), _as_bytes(err))
+        if self._owner.interrupt(self.args):
+            self._owner.interrupts += 1
+            raise KeyboardInterrupt
+        return self._result
+
+    def wait(self, timeout=None):
+        assert timeout is None, "security must never be timed out"
+        if self.returncode is None:
+            self.returncode = 0
+        return self.returncode
+
+    def kill(self):
+        raise AssertionError("security must never be killed")
+
+    terminate = send_signal = kill
+
+
+def security_op(argv) -> str:
+    """``add`` / ``find`` / ``delete`` / ``default`` / the raw subcommand."""
+    if list(argv[1:]) == ["-i"]:
+        return "add"
+    names = {
+        "find-generic-password": "find",
+        "delete-generic-password": "delete",
+        "default-keychain": "default",
+    }
+    return str(names.get(argv[1], argv[1]))

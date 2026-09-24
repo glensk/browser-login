@@ -303,6 +303,20 @@ the `himalaya` helpers. The CDP endpoint is always `http://127.0.0.1:<port>` (ne
   the set is deleted again (best effort, not atomic), and `store-creds` reports
   either "nothing changed", "no stored set remains", or the items whose cleanup
   failed (then run `forget-creds SITE`).
+- **Keychain writes are delete-then-add, never `-U`** (tp#504). Updating an existing
+  item with `add-generic-password -U` re-sets its access list, which can open a
+  SecurityAgent dialog; a fresh add does not. Both the delete and the add name the
+  same target — the user's default keychain (`security default-keychain -d user`),
+  resolved once per `store-creds`; if it cannot be resolved nothing is written. The
+  read-back is unpinned, so a shadowing copy earlier in the search list shows up as a
+  failed write. Not atomic: a concurrent login can see an item missing in between.
+- **`security` is never killed and never timed out.** On 2026-09-24 a 15 s timeout
+  killed a `security` client while its dialog was open and `securityd` aborted; every
+  later keychain read hung. Every `security` call now runs in its own session (a
+  terminal Ctrl-C does not reach it), with no deadline; a Ctrl-C in `browser.py`
+  waits for the running call to finish, removes a partially written set, then exits.
+  Consequence: a read against a LOCKED keychain waits until you unlock it, and
+  `store-creds` prints "If macOS shows a keychain dialog, answer it." first.
 
 ## License
 

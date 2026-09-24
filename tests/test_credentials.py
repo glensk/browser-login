@@ -2,10 +2,12 @@
 """Keychain / 1Password credential access and the CSCS Keycloak login (browser.py).
 
 Nothing here touches a real keychain, `op`, network or browser: `subprocess.run`
-is replaced by a recorder, and pages are tiny stand-ins. What is pinned down:
-secrets never reach argv or stdout on the READ path, every subprocess has a
-timeout, a failing tool degrades to ``None``/``False`` (never a crash, never a
-false success), and the Keycloak form flow fills the OTP exactly once.
+and ``subprocess.Popen`` are replaced by recorders, and pages are tiny
+stand-ins. What is pinned down: secrets never reach argv or stdout on the READ
+path, every ``op`` call has a timeout while ``security`` never has one and is
+never killed (tp#504), a failing tool degrades to ``None``/``False`` (never a
+crash, never a false success), and the Keycloak form flow fills the OTP
+exactly once.
 
 Run: python3 -m pytest tests/ -q     (from the repo root)
 """
@@ -17,6 +19,7 @@ from __future__ import annotations
 # pylint: disable=protected-access,import-outside-toplevel,too-few-public-methods
 # pylint: disable=missing-function-docstring,missing-class-docstring,import-error
 # pylint: disable=unused-argument,redefined-outer-name  # pytest fixtures
+# pylint: disable=too-many-lines  # one module per credential surface
 import importlib.util
 import json
 import subprocess
@@ -25,7 +28,7 @@ from pathlib import Path
 
 import pyotp
 import pytest
-from conftest import _security_g
+from conftest import FakeSecurityPopen, _security_g, security_op
 
 _BROWSER_PY = Path(__file__).resolve().parent.parent / "bin" / "browser.py"
 
@@ -80,59 +83,244 @@ def run(monkeypatch):
 
 # --- keychain ------------------------------------------------------------------
 
+NOT_STARTED = "not_started"  # the fake Popen raises OSError: nothing ran
+UNKNOWN = (-9, "", "")  # the child died by a signal: effect unknown
 
-def test_keychain_get_reads_the_labelled_dump_verbatim(run):
-    rec = run(_Res(0, "keychain: ...\n", _security_g("  pw with spaces  ")))
+
+class _Sec:
+    """``security`` via ``_security_run``: answers from a queue, never runs it.
+
+    ``default-keychain`` is answered with *keychain* (not from the queue).
+    Queue entries: ``(rc, stdout, stderr)``, ``NOT_STARTED``, or an exception
+    to raise from ``communicate``; the last entry repeats.
+    """
+
+    def __init__(self, keychain: str, answers):
+        self.keychain = keychain
+        self._answers = list(answers)
+        self._next = None
+        self.popen = FakeSecurityPopen(self._handle, not_started=self._not_started)
+
+    def _pop(self):
+        return self._answers.pop(0) if len(self._answers) > 1 else self._answers[0]
+
+    def _not_started(self, argv) -> bool:
+        if security_op(argv) == "default":
+            return False
+        self._next = self._pop()
+        return self._next == NOT_STARTED
+
+    def _handle(self, argv, _data):
+        if security_op(argv) == "default":
+            return 0, f'    "{self.keychain}"\n', ""
+        ans, self._next = self._next, None
+        if isinstance(ans, BaseException):
+            raise ans
+        return ans
+
+    @property
+    def calls(self) -> list[dict]:
+        """Every started call except the target lookup."""
+        return [c for c in self.popen.calls if security_op(c["argv"]) != "default"]
+
+
+@pytest.fixture
+def keychain_path(tmp_path) -> str:
+    path = tmp_path / "login.keychain-db"
+    path.write_bytes(b"")
+    return str(path)
+
+
+@pytest.fixture
+def sec(monkeypatch, keychain_path):
+    def install(*answers):
+        rec = _Sec(keychain_path, answers or [(0, "", "")])
+        monkeypatch.setattr(browser.subprocess, "Popen", rec.popen)
+        return rec
+
+    monkeypatch.setattr(browser, "_kc_account", lambda: "tester")
+    return install
+
+
+OK = (0, "", "")
+ABSENT = (44, "", "The specified item could not be found in the keychain.")
+
+
+def _found(value: str):
+    return (0, "", _security_g(value))
+
+
+# --- _security_run: never timed out, never killed, Ctrl-C deferred (tp#504) ---
+
+
+@pytest.mark.parametrize(
+    "argv, data, state, rc, out",
+    [
+        (["/bin/sh", "-c", "exit 3"], None, "done", 3, b""),
+        (["/bin/cat"], b"stdin bytes\n", "done", 0, b"stdin bytes\n"),
+        (["/bin/sh", "-c", "kill -9 $$"], None, "unknown", -9, b""),
+        (["/nonexistent/security-tp504"], None, "not_started", None, b""),
+    ],
+    ids=["exit-code", "stdin", "signal", "not-started"],
+)
+def test_security_run_states_with_real_processes(argv, data, state, rc, out):
+    r = browser._security_run(argv, data=data)
+    assert (r.state, r.rc, r.stdout) == (state, rc, out)
+
+
+def test_security_run_starts_a_new_session_and_never_times_out(monkeypatch):
+    popen = FakeSecurityPopen(lambda argv, data: (0, "out", "err"))
+    monkeypatch.setattr(browser.subprocess, "Popen", popen)
+    r = browser._security_run(["security", "-i"], data=b"line\n")
+    assert (r.state, r.rc, r.stdout, r.stderr) == ("done", 0, b"out", b"err")
+    assert len(popen.calls) == 1
+    call = popen.calls[0]
+    kwargs = call["kwargs"]
+    assert kwargs["start_new_session"] is True and "timeout" not in kwargs
+    assert kwargs["stdin"] == subprocess.PIPE and call["input"] == b"line\n"
+    browser._security_run(["security", "default-keychain", "-d", "user"])
+    assert popen.calls[1]["kwargs"]["stdin"] == subprocess.DEVNULL
+
+
+@pytest.mark.parametrize("rc, state", [(0, "done"), (44, "done"), (-2, "unknown")])
+def test_security_run_defers_ctrl_c_until_the_child_exits(monkeypatch, rc, state):
+    popen = FakeSecurityPopen(lambda argv, data: (rc, "o", "e"), interrupt=bool)
+    monkeypatch.setattr(browser.subprocess, "Popen", popen)
+    with pytest.raises(browser.SecurityInterrupted) as exc:
+        browser._security_run(["security", "-i"], data=b"line\n")
+    assert isinstance(exc.value, KeyboardInterrupt)
+    assert popen.interrupts == 1  # the retry did not resend input (fake asserts)
+    result = vars(exc.value)["result"]  # the finished call's outcome
+    assert (result.state, result.rc, result.stdout) == (state, rc, b"o")
+
+
+def test_security_run_reaps_after_a_broken_communicate(monkeypatch):
+    def broken(argv, data):
+        raise MemoryError
+
+    popen = FakeSecurityPopen(broken)
+    monkeypatch.setattr(browser.subprocess, "Popen", popen)
+    assert browser._security_run(["security", "-i"], data=b"x\n").state == "unknown"
+
+
+def test_keychain_code_never_times_out_or_signals_security():
+    import inspect
+
+    for name in (
+        "_security_run",
+        "_kc_target_keychain",
+        "_keychain_get",
+        "_kc_delete",
+        "_keychain_write",
+        "_keychain_set_all",
+        "_kc_cleanup",
+        "_keychain_delete",
+    ):
+        src = inspect.getsource(getattr(browser, name))
+        code = "\n".join(
+            line for line in src.splitlines() if not line.lstrip().startswith("#")
+        )
+        body = code.rsplit('"""', maxsplit=1)[-1]  # past the docstring
+        for bad in (
+            "timeout",
+            ".kill(",
+            ".terminate(",
+            "send_signal",
+            "subprocess.run",
+        ):
+            assert bad not in body, f"{name} uses {bad}"
+
+
+def test_keychain_get_reads_the_labelled_dump_verbatim(sec):
+    rec = sec((0, "keychain: ...\n", _security_g("  pw with spaces  ")))
     assert browser._keychain_get("svc") == "  pw with spaces  "
-    argv, kwargs = rec.calls[0]
-    assert "-g" in argv and "-w" not in argv
-    assert argv[:2] == ["security", "find-generic-password"]
-    assert argv[argv.index("-a") + 1] == "tester"
-    assert argv[argv.index("-s") + 1] == "svc"
-    assert kwargs["timeout"] and kwargs["capture_output"]
+    (call,) = rec.popen.calls  # a read resolves no target: it is unpinned
+    argv, kwargs = call["argv"], call["kwargs"]
+    assert argv == ["security", "find-generic-password", "-a", "tester"] + [
+        "-s",
+        "svc",
+        "-g",
+    ]
+    assert "-w" not in argv
+    assert kwargs["start_new_session"] is True and "timeout" not in kwargs
 
 
 @pytest.mark.parametrize(
     "answer",
     [
-        _Res(44, "", "The specified item could not be found in the keychain."),
-        _Res(0, "", _security_g("")),
-        OSError("no security binary"),
-        subprocess.TimeoutExpired("security", 15),
+        ABSENT,
+        _found(""),
+        NOT_STARTED,
+        UNKNOWN,
+        RuntimeError("communicate broke"),
     ],
+    ids=["absent", "empty", "not-started", "signal", "broken"],
 )
-def test_keychain_get_failure_is_none(run, answer):
-    run(answer)
+def test_keychain_get_failure_is_none(sec, answer):
+    sec(answer)
     assert browser._keychain_get("svc") is None
 
 
-def test_keychain_set_reports_the_return_code(run):
-    rec = run(_Res(0), _Res(0, "", _security_g("v")))
+def test_keychain_set_reports_the_outcome(sec):
+    sec(OK, OK, _found("v"))  # delete, add, read-back
     assert browser._keychain_set("svc", "v") is True
-    assert rec.calls[0][1]["timeout"]
-    run(_Res(1))
+    sec(OK, (1, "", ""))
     assert browser._keychain_set("svc", "v") is False
-    run(OSError("gone"))
+    sec(NOT_STARTED)
     assert browser._keychain_set("svc", "v") is False
-    run(subprocess.TimeoutExpired("security", 15))
+    sec(UNKNOWN)
     assert browser._keychain_set("svc", "v") is False
 
 
-def test_keychain_set_passes_the_secret_on_stdin_never_argv(run):
+@pytest.mark.parametrize(
+    "answers, outcome",
+    [
+        ([OK, OK, _found("v")], "ok"),
+        ([ABSENT, OK, _found("v")], "ok"),
+        ([(51, "", "")], "rejected"),
+        ([NOT_STARTED], "rejected"),
+        ([UNKNOWN], "uncertain"),
+        ([ABSENT, (45, "", "")], "rejected"),
+        ([ABSENT, NOT_STARTED], "rejected"),
+        ([OK, (45, "", "")], "lost"),
+        ([OK, NOT_STARTED], "lost"),
+        ([OK, UNKNOWN], "uncertain"),
+        ([OK, RuntimeError("broke")], "uncertain"),
+        ([OK, OK, _found("other")], "mismatch"),
+    ],
+)
+def test_keychain_write_outcomes(sec, keychain_path, answers, outcome):
+    rec = sec(*answers)
+    assert browser._keychain_write("svc", "v", "d", keychain_path) == outcome
+    ops = [security_op(c["argv"]) for c in rec.calls]
+    if answers[0] in (UNKNOWN, NOT_STARTED) or answers[0][0] == 51:
+        assert ops in ([], ["delete"])  # no add after a failed/unknown delete
+
+
+def test_keychain_set_passes_the_secret_on_stdin_never_argv(sec, keychain_path):
     secret = "s3cr3t-DUMMY"
-    rec = run(_Res(0), _Res(0, "", _security_g(secret)))
+    rec = sec(OK, OK, _found(secret))
     assert browser._keychain_set("svc", secret) is True
-    argv, kwargs = rec.calls[0]
-    assert argv == ["security", "-i"]
-    for call_argv, _ in rec.calls:
-        assert all(secret not in a for a in call_argv)
-    data = kwargs["input"]
+    assert [c["argv"] for c in rec.calls] == [
+        ["security", "delete-generic-password", "-a", "tester", "-s", "svc"]
+        + [keychain_path],
+        ["security", "-i"],
+        ["security", "find-generic-password", "-a", "tester", "-s", "svc", "-g"],
+    ]
+    for call in rec.popen.calls:
+        assert all(secret not in a for a in call["argv"])
+        assert call["kwargs"]["start_new_session"] is True
+        assert "timeout" not in call["kwargs"]
+    add = rec.calls[1]
+    data = add["input"]
     assert isinstance(data, bytes) and data.endswith(b"\n")
     assert data.count(secret.encode()) == 1
     assert b' -w "' + secret.encode() + b'" ' in data
-    assert b"-T /usr/bin/security -U\n" in data
-    assert kwargs["timeout"] and kwargs["capture_output"]
-    assert "text" not in kwargs  # bytes mode: exact UTF-8, no locale encoding
+    quoted = browser._kc_quote(keychain_path).encode()
+    assert data.endswith(b" -T /usr/bin/security " + quoted + b"\n")
+    assert b" -U" not in data
+    assert add["kwargs"]["stdin"] == subprocess.PIPE
+    assert "text" not in add["kwargs"]  # bytes mode: exact UTF-8
 
 
 def _unquote(token: str) -> str:
@@ -167,8 +355,26 @@ def test_kc_quote_round_trips(value):
     assert _unquote(quoted) == value
 
 
+KC = "/Users/tester/Library/Keychains/login.keychain-db"
+
+
+def test_kc_add_line_ends_with_the_named_keychain_and_no_update_flag(run):
+    line = browser._kc_add_line("svc", "v", "d", '/k/a "b"')
+    assert line is not None
+    assert line.endswith(b' -T /usr/bin/security "/k/a \\"b\\""\n')
+    assert b" -U" not in line
+
+
+def test_kc_add_line_counts_the_keychain_toward_the_limit(run):
+    short = browser._kc_add_line("svc", "v", "d", "/k")
+    assert short is not None
+    room = browser._KC_LINE_MAX - (len(short) - 1) + len("/k")
+    assert browser._kc_add_line("svc", "v", "d", "/" + "k" * (room - 1)) is not None
+    assert browser._kc_add_line("svc", "v", "d", "/" + "k" * room) is None
+
+
 def _line_len(value: str) -> int:
-    line = browser._kc_add_line("svc", value, "desc")
+    line = browser._kc_add_line("svc", value, "desc", KC)
     assert line is not None
     return len(line) - 1  # without the trailing newline
 
@@ -178,52 +384,90 @@ def test_kc_add_line_accepts_4000_bytes_and_rejects_4001(run):
     pad = 4000 - _line_len(head)
     exact = head + "x" * pad
     assert _line_len(exact) == 4000
-    assert browser._kc_add_line("svc", exact + "x", "desc") is None
+    assert browser._kc_add_line("svc", exact + "x", "desc", KC) is None
     # the 4001st byte coming from escape expansion alone
-    assert browser._kc_add_line("svc", head + "x" * (pad - 1) + '"', "desc") is None
-    assert browser._kc_add_line("svc", head + "x" * (pad - 1) + "ä", "desc") is None
+    for tail in ('"', "ä"):
+        line = browser._kc_add_line("svc", head + "x" * (pad - 1) + tail, "desc", KC)
+        assert line is None
 
 
 @pytest.mark.parametrize("bad", ["\n", "\r", "\0", "\t", "\x1b", "\x7f"])
-@pytest.mark.parametrize("field", ["account", "service", "value", "description"])
+@pytest.mark.parametrize(
+    "field", ["account", "service", "value", "description", "keychain"]
+)
 def test_kc_add_line_rejects_control_chars_in_every_field(monkeypatch, field, bad):
-    parts = {"account": "tester", "service": "svc", "value": "v", "description": "d"}
+    parts = {
+        "account": "tester",
+        "service": "svc",
+        "value": "v",
+        "description": "d",
+        "keychain": KC,
+    }
     parts[field] += bad
     monkeypatch.setattr(browser, "_kc_account", lambda: parts["account"])
-    line = browser._kc_add_line(parts["service"], parts["value"], parts["description"])
+    line = browser._kc_add_line(
+        parts["service"], parts["value"], parts["description"], parts["keychain"]
+    )
     assert line is None
 
 
 def test_kc_add_line_rejects_a_lone_surrogate(run):
-    assert browser._kc_add_line("svc", "a\ud800b", "d") is None
+    assert browser._kc_add_line("svc", "a\ud800b", "d", KC) is None
 
 
-def test_keychain_set_invalid_value_makes_no_call(run):
-    rec = run(_Res(0))
+def test_keychain_set_invalid_value_makes_no_mutating_call(sec):
+    rec = sec(OK)
     assert browser._keychain_set("svc", "line1\nline2") is False
     assert not rec.calls
 
 
-def test_keychain_set_read_back_mismatch_is_false(run):
-    run(_Res(0), _Res(0, "", _security_g("something else")))
+def test_keychain_set_read_back_mismatch_is_false(sec):
+    sec(OK, OK, _found("something else"))
     assert browser._keychain_set("svc", "v") is False
-    run(_Res(0), _Res(44))
+    sec(OK, OK, ABSENT)
     assert browser._keychain_set("svc", "v") is False
 
 
-def test_keychain_write_non_ascii_round_trips_via_the_hex_form(run):
-    run(_Res(0), _Res(0, "", _security_g("päss")))
-    assert browser._keychain_write("svc", "päss", "d") == "ok"
+def test_keychain_write_non_ascii_round_trips_via_the_hex_form(sec, keychain_path):
+    sec(OK, OK, _found("päss"))
+    assert browser._keychain_write("svc", "päss", "d", keychain_path) == "ok"
 
 
-def test_keychain_write_non_ascii_rejects_a_hexlike_literal_read_back(run):
-    run(_Res(0), _Res(0, "", f'{PW} "70c3a47373"\n'))
-    assert browser._keychain_write("svc", "päss", "d") == "mismatch"
+def test_keychain_write_non_ascii_rejects_a_hexlike_literal_read_back(
+    sec, keychain_path
+):
+    sec(OK, OK, (0, "", f'{PW} "70c3a47373"\n'))
+    assert browser._keychain_write("svc", "päss", "d", keychain_path) == "mismatch"
 
 
-def test_keychain_write_all_hex_ascii_password_round_trips(run):
-    run(_Res(0), _Res(0, "", _security_g("70c3a47373")))
-    assert browser._keychain_write("svc", "70c3a47373", "d") == "ok"
+def test_keychain_write_all_hex_ascii_password_round_trips(sec, keychain_path):
+    sec(OK, OK, _found("70c3a47373"))
+    assert browser._keychain_write("svc", "70c3a47373", "d", keychain_path) == "ok"
+
+
+@pytest.mark.parametrize(
+    "stdout",
+    ["", '    "/no/such/login.keychain-db"\n'],
+    ids=["empty", "missing-file"],
+)
+def test_unresolvable_target_keychain_runs_nothing(monkeypatch, stdout):
+    popen = FakeSecurityPopen(lambda argv, data: (0, stdout, ""))
+    monkeypatch.setattr(browser.subprocess, "Popen", popen)
+    monkeypatch.setattr(browser, "_kc_account", lambda: "tester")
+    assert browser._kc_target_keychain() is None
+    assert browser._keychain_set("svc", "v") is False
+    assert browser._keychain_delete("svc") is False
+    assert browser._keychain_set_all([("a", "x")], "d").ok is False
+    assert {security_op(a) for a in popen.argvs()} == {"default"}
+
+
+def test_target_keychain_strips_quotes_and_needs_a_file(monkeypatch, keychain_path):
+    popen = FakeSecurityPopen(lambda argv, data: (0, f'  "{keychain_path}"  \n', ""))
+    monkeypatch.setattr(browser.subprocess, "Popen", popen)
+    assert browser._kc_target_keychain() == keychain_path
+    assert popen.argvs() == [["security", "default-keychain", "-d", "user"]]
+    popen.handler = lambda argv, data: (1, f'"{keychain_path}"', "")
+    assert browser._kc_target_keychain() is None
 
 
 PW = "pass" + "word:"  # split so the secret scanners do not flag the fixtures
@@ -286,10 +530,10 @@ def _assert_no_dummy(text: str) -> None:
         assert form not in text
 
 
-def test_keychain_get_unparsable_value_warns_with_the_label_only(run, capsys):
+def test_keychain_get_unparsable_value_warns_with_the_label_only(sec, capsys):
     hexed = _DUMMY.encode().hex().upper()
     stderr = f'{PW} 0x{hexed}Z  "p\\303\\244ss-DUMMY" {_DUMMY}\n'
-    run(_Res(0, f"svce {_DUMMY}\n", stderr))
+    sec((0, f"svce {_DUMMY}\n", stderr))
     assert browser._keychain_get("svc.label") is None
     out, err = capsys.readouterr()
     assert out == ""
@@ -300,39 +544,39 @@ def test_keychain_get_unparsable_value_warns_with_the_label_only(run, capsys):
 @pytest.mark.parametrize(
     "answer",
     [
-        _Res(1, _DUMMY, f"{PW} 0x{_DUMMY.encode().hex().upper()}  {_DUMMY}\n"),
-        subprocess.TimeoutExpired(
-            "security", 15, output=_DUMMY, stderr=f"{PW} {_DUMMY_FORMS[3]}"
-        ),
+        (1, _DUMMY, f"{PW} 0x{_DUMMY.encode().hex().upper()}  {_DUMMY}\n"),
+        (-9, _DUMMY, f"{PW} {_DUMMY_FORMS[3]}\n"),
     ],
 )
-def test_keychain_get_failures_print_nothing(run, capsys, answer):
-    run(answer)
+def test_keychain_get_failures_print_nothing(sec, capsys, answer):
+    sec(answer)
     assert browser._keychain_get("svc") is None
     assert capsys.readouterr() == ("", "")
 
 
-def test_keychain_set_all_validates_the_whole_batch_first(run):
-    rec = run(_Res(0))
+def test_keychain_set_all_validates_the_whole_batch_first(sec):
+    rec = sec(OK)
     res = browser._keychain_set_all([("a", "fine"), ("b", "bad\n")], "d")
     assert res.ok is False and res.changed is False and not rec.calls
 
 
-def test_keychain_set_all_stops_at_the_first_failure(run):
-    rec = run(_Res(1))
+def test_keychain_set_all_stops_at_the_first_failure(sec):
+    rec = sec((51, "", ""))
     res = browser._keychain_set_all([("a", "x"), ("b", "y")], "d")
     assert res.ok is False and res.changed is False
-    assert len(rec.calls) == 1  # first write refused: nothing to clean up
+    assert len(rec.calls) == 1  # first delete refused: nothing to clean up
 
 
-def test_keychain_set_all_writes_every_item_with_the_description(run):
-    rec = run(
-        _Res(0), _Res(0, "", _security_g("x")), _Res(0), _Res(0, "", _security_g("y"))
-    )
+def test_keychain_set_all_resolves_the_target_once(sec, keychain_path):
+    rec = sec(OK, OK, _found("x"), OK, OK, _found("y"))
     assert browser._keychain_set_all([("a", "x"), ("b", "y")], "my desc").ok is True
-    writes = [kw["input"] for argv, kw in rec.calls if argv == ["security", "-i"]]
+    ops = [security_op(c["argv"]) for c in rec.popen.calls]
+    assert ops == ["default"] + ["delete", "add", "find"] * 2
+    writes = [c["input"] for c in rec.calls if c["argv"] == ["security", "-i"]]
     assert len(writes) == 2
     assert all(b'-D "my desc"' in w for w in writes)
+    deletes = [c["argv"] for c in rec.calls if security_op(c["argv"]) == "delete"]
+    assert all(a[-1] == keychain_path for a in deletes)
 
 
 def test_keychain_creds_generates_the_code_locally(monkeypatch):
@@ -461,7 +705,7 @@ def _store_creds_env(monkeypatch, seed: str, password: str = "pw"):
     )
     monkeypatch.setattr(browser, "_op_totp_uri", lambda item, acct: seed)
 
-    def fake_write(svc, v, description):
+    def fake_write(svc, v, description, keychain, touched=None):
         assert description == "cscs-api credential"
         stored[svc] = v
         return "ok"
@@ -472,6 +716,7 @@ def _store_creds_env(monkeypatch, seed: str, password: str = "pw"):
 
     monkeypatch.setattr(browser, "_keychain_write", fake_write)
     monkeypatch.setattr(browser, "_keychain_delete", fake_delete)
+    monkeypatch.setattr(browser, "_kc_target_keychain", lambda: KC)
     return stored
 
 
@@ -493,8 +738,8 @@ def test_store_creds_refuses_a_seed_that_makes_no_code(monkeypatch):
     assert not stored
 
 
-def test_store_creds_invalid_last_field_writes_nothing(monkeypatch, run):
-    rec = run(_Res(0))
+def test_store_creds_invalid_last_field_writes_nothing(monkeypatch, sec):
+    rec = sec(OK)
     real_write, real_delete = browser._keychain_write, browser._keychain_delete
     _store_creds_env(monkeypatch, SEED + "\n")  # still makes a code (stripped)
     monkeypatch.setattr(browser, "_keychain_write", real_write)
@@ -503,8 +748,8 @@ def test_store_creds_invalid_last_field_writes_nothing(monkeypatch, run):
     assert not rec.calls
 
 
-def test_biopolwifi_store_creds_labels_and_validates(monkeypatch, run):
-    rec = run(_Res(0))
+def test_biopolwifi_store_creds_labels_and_validates(monkeypatch, sec):
+    rec = sec(OK)
     answers = iter(["me@example.org"])
     monkeypatch.setattr("builtins.input", lambda _prompt="": next(answers))
     import getpass
@@ -515,7 +760,7 @@ def test_biopolwifi_store_creds_labels_and_validates(monkeypatch, run):
 
     seen: list[tuple[str, str, str]] = []
 
-    def fake_write(svc, v, description):
+    def fake_write(svc, v, description, keychain, touched=None):
         seen.append((svc, v, description))
         return "ok"
 
@@ -729,17 +974,36 @@ def test_token_cache_tightens_a_preexisting_loose_file(token_env):
 @pytest.mark.parametrize(
     "answer, ok",
     [
-        (_Res(0), True),
-        (_Res(44, "", "The specified item could not be found in the keychain."), True),
-        (_Res(51, "", "User interaction is not allowed."), False),
-        (OSError("no security binary"), False),
+        (OK, True),
+        (ABSENT, True),
+        ((51, "", "User interaction is not allowed."), False),
+        (NOT_STARTED, False),
+        (UNKNOWN, False),
     ],
 )
-def test_keychain_delete_reports_real_failures(run, answer, ok):
+def test_keychain_delete_reports_real_failures(sec, keychain_path, answer, ok):
     # Regression: the return code was ignored, so a locked keychain (51) was
     # reported as "deleted" and the secret silently stayed stored.
-    run(answer)
+    rec = sec(answer)
     assert browser._keychain_delete("svc") is ok
+    for call in rec.calls:
+        assert call["argv"][-1] == keychain_path  # pinned to the default
+
+
+@pytest.mark.parametrize(
+    "answer, outcome",
+    [
+        (OK, "deleted"),
+        (ABSENT, "absent"),
+        ((51, "", ""), "rejected"),
+        (NOT_STARTED, "rejected"),
+        (UNKNOWN, "unknown"),
+        (RuntimeError("broke"), "unknown"),
+    ],
+)
+def test_kc_delete_outcomes(sec, keychain_path, answer, outcome):
+    sec(answer)
+    assert browser._kc_delete("svc", keychain_path) == outcome
 
 
 @pytest.mark.parametrize(

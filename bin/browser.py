@@ -3178,42 +3178,120 @@ def _kc_parse_password(stderr: str) -> str | None:
     return None
 
 
+@dataclass(frozen=True)
+class SecurityResult:
+    """Outcome of one ``_security_run``.
+
+    ``state``: ``"not_started"`` (``Popen`` raised ``OSError`` — provably
+    nothing ran), ``"done"`` (the child exited normally; ``rc`` is its exit
+    code) or ``"unknown"`` (it ran, but an error after launch or a signal
+    death means its effect cannot be known).
+    """
+
+    state: str
+    rc: int | None = None
+    stdout: bytes = b""
+    stderr: bytes = b""
+
+
+class SecurityInterrupted(KeyboardInterrupt):
+    """Ctrl-C arrived while ``security`` ran; raised only after it exited.
+
+    ``result`` is that finished call's outcome, so a caller can still tell
+    whether its mutation happened before it re-raises.
+    """
+
+    def __init__(self, result: SecurityResult) -> None:
+        super().__init__()
+        self.result = result
+
+
+def _security_run(argv: Sequence[str], *, data: bytes | None = None) -> SecurityResult:
+    """Run one ``security`` command to completion; never kill it, never time it out.
+
+    On 2026-09-24 a 15 s ``subprocess.run`` timeout killed a ``security`` client
+    while its SecurityAgent prompt was open, and ``securityd`` aborted
+    (SIGABRT) at that moment — afterwards every login-keychain read hung. So:
+    no deadline (a locked keychain makes a read wait for the user's unlock),
+    no ``kill``/``terminate``/``send_signal``, and the child runs in its own
+    session (``start_new_session``) so a terminal Ctrl-C never reaches it.
+
+    A ``KeyboardInterrupt`` in the parent is deferred: the child is still
+    drained and reaped, then ``SecurityInterrupted`` (carrying the result) is
+    raised. ``data`` goes to the child's stdin (secrets never go on argv).
+    """
+    try:
+        # pylint: disable-next=consider-using-with  # reaped below, never killed
+        proc = subprocess.Popen(
+            list(argv),
+            stdin=subprocess.PIPE if data is not None else subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            start_new_session=True,
+        )
+    except OSError:
+        return SecurityResult("not_started")
+    out: bytes | None = None
+    err: bytes | None = None
+    interrupted = broken = False
+    pending = data
+    while True:
+        try:
+            if broken:
+                proc.wait()
+            else:
+                # a retry passes None: Popen keeps the unsent rest of the input
+                out, err = proc.communicate(pending)
+            break
+        except KeyboardInterrupt:
+            interrupted = True
+        except Exception:  # pylint: disable=broad-exception-caught
+            broken = True  # the child's effect is unknown; still reap it
+        pending = None
+    rc = proc.returncode
+    state = "unknown" if broken or rc is None or rc < 0 else "done"
+    result = SecurityResult(state, rc, out or b"", err or b"")
+    if interrupted:
+        raise SecurityInterrupted(result)
+    return result
+
+
+def _kc_target_keychain() -> str | None:
+    """Path of the user's default keychain (where writes go), or ``None``.
+
+    Delete and add both name this path, so they cannot address two different
+    keychains (an unnamed delete takes the first search-list match, an unnamed
+    add the default keychain). ``None`` unless it resolves to an existing file.
+    """
+    r = _security_run(["security", "default-keychain", "-d", "user"])
+    if r.state != "done" or r.rc != 0:
+        return None
+    path = r.stdout.decode("utf-8", errors="replace").strip().strip('"').strip()
+    return path if path and os.path.isfile(path) else None
+
+
 def _keychain_get(service: str) -> str | None:
     """Read a generic-password item from the login keychain (prompt-free).
 
     Returns the secret string, or ``None`` if the item is absent or its value
     cannot be decoded. Reading an already-unlocked login keychain via the
     Apple-signed ``security`` binary needs NO Touch ID — that is the whole
-    point versus the ``op`` path.
+    point versus the ``op`` path. The read names no keychain: it sees what
+    every consumer sees (the first search-list match). A LOCKED keychain makes
+    it wait for the user's unlock — ``security`` is never timed out.
 
     Uses ``-g`` (labelled dump on stderr), not ``-w``: ``-w`` prints
     non-printable values as bare hex with no marker, so ``cafe`` and the hex
     of a UTF-8 password are indistinguishable (tp#498). The captured output is
     never printed; a decode failure warns naming the service label only.
     """
-    try:
-        r = subprocess.run(
-            [
-                "security",
-                "find-generic-password",
-                "-a",
-                _kc_account(),
-                "-s",
-                service,
-                "-g",
-            ],
-            capture_output=True,
-            text=True,
-            errors="replace",
-            timeout=15,
-            check=False,
-        )
-    except (OSError, subprocess.SubprocessError):
-        return None
-    if r.returncode != 0:
+    r = _security_run(
+        ["security", "find-generic-password", "-a", _kc_account(), "-s", service, "-g"]
+    )
+    if r.state != "done" or r.rc != 0:
         return None
     # stdout holds only the attribute dump (account, service, description).
-    value = _kc_parse_password(r.stderr)
+    value = _kc_parse_password(r.stderr.decode("utf-8", errors="replace"))
     if value is None:
         print(
             f"Keychain item {service} has an unreadable value — ignoring it.",
@@ -3236,23 +3314,28 @@ def _kc_quote(s: str) -> str:
     return '"' + s.replace("\\", "\\\\").replace('"', '\\"') + '"'
 
 
-def _kc_add_line(service: str, value: str, description: str) -> bytes | None:
+def _kc_add_line(
+    service: str, value: str, description: str, keychain: str
+) -> bytes | None:
     """The ``add-generic-password`` command line for ``security -i``, or ``None``.
 
-    ``None`` when any field holds a control character (a newline would end the
-    command early and the fragment would land in the login keychain), cannot be
-    encoded as UTF-8 (lone surrogates), or the line exceeds ``_KC_LINE_MAX``
-    bytes. No keychain path is named: an invalid path falls back to the login
-    keychain anyway. The value never appears in any error text.
+    ``None`` when any field (the keychain path included) holds a control
+    character (a newline would end the command early and the fragment would
+    land in the keychain), cannot be encoded as UTF-8 (lone surrogates), or the
+    line exceeds ``_KC_LINE_MAX`` bytes. Insert-only — no ``-U``: updating an
+    existing item re-sets its access list, which can raise a SecurityAgent
+    prompt (tp#504). The keychain is named explicitly, so an invalid path
+    fails the insert instead of falling back. The value never appears in any
+    error text.
     """
-    fields = (_kc_account(), service, value, description)
+    fields = (_kc_account(), service, value, description, keychain)
     if any(ord(c) < 0x20 or ord(c) == 0x7F for f in fields for c in f):
         return None
     account = fields[0]
     line = (
         f"add-generic-password -a {_kc_quote(account)} -s {_kc_quote(service)}"
         f" -w {_kc_quote(value)} -D {_kc_quote(description)}"
-        " -T /usr/bin/security -U"
+        f" -T /usr/bin/security {_kc_quote(keychain)}"
     )
     try:
         data = line.encode("utf-8")
@@ -3263,47 +3346,108 @@ def _kc_add_line(service: str, value: str, description: str) -> bytes | None:
     return data + b"\n"
 
 
-def _keychain_write(service: str, value: str, description: str) -> str:
-    """Create/replace a login-keychain item; return the outcome as a word.
+def _kc_delete_outcome(r: SecurityResult) -> str:
+    """``"deleted"`` / ``"absent"`` / ``"rejected"`` / ``"unknown"`` for a delete."""
+    if r.state == "unknown":
+        return "unknown"
+    if r.state == "done" and r.rc == 0:
+        return "deleted"
+    # 44 = errSecItemNotFound; anything else (51: locked) left the item stored
+    return "absent" if r.state == "done" and r.rc == 44 else "rejected"
 
-    ``"ok"``; ``"invalid"`` (``_kc_add_line`` refused it — nothing was run);
-    ``"rejected"`` (``security`` exited non-zero — nothing written);
-    ``"uncertain"`` (``security`` could not be run or timed out — it may have
-    written anyway); ``"mismatch"`` (exit 0, but the read-back differs).
 
-    The secret goes to ``security -i`` on stdin, never on argv (argv is readable
-    by every same-user process via ``ps``). ``-U`` updates in place if the item
-    exists. ``-T /usr/bin/security`` scopes silent (no-prompt) access to the
-    ``security`` binary that our reads use.
+def _kc_delete(service: str, keychain: str) -> str:
+    """Delete one item from *keychain*; the outcome of ``_kc_delete_outcome``."""
+    argv = ["security", "delete-generic-password", "-a", _kc_account()]
+    return _kc_delete_outcome(_security_run([*argv, "-s", service, keychain]))
 
-    After the write the item is read back through ``_keychain_get`` and must
-    equal ``value`` exactly — a byte-exact round-trip check that also catches
-    a tokenizer divergence (tp#498).
+
+def _kc_add_outcome(add: SecurityResult, gone: str) -> str:
+    """``"added"`` / ``"uncertain"`` / ``"lost"`` / ``"rejected"`` for the add
+    that followed a delete with outcome *gone* (``"deleted"`` or ``"absent"``)."""
+    if add.state == "unknown":
+        return "uncertain"
+    if add.state == "done" and add.rc == 0:
+        return "added"
+    return "lost" if gone == "deleted" else "rejected"
+
+
+class _KcTouched:
+    """Whether a batch's keychain may already differ from before (mutable flag)."""
+
+    def __init__(self) -> None:
+        self.value = False
+
+
+def _keychain_write(
+    service: str,
+    value: str,
+    description: str,
+    keychain: str,
+    touched: _KcTouched | None = None,
+) -> str:
+    """Replace an item in *keychain* (delete, then add); return the outcome.
+
+    ``"ok"``; ``"invalid"`` (``_kc_add_line`` refused it — nothing ran);
+    ``"rejected"`` (the delete was refused, or the item was absent and the add
+    was refused — nothing changed); ``"lost"`` (the old item was deleted, then
+    the add was refused — the item is now missing); ``"uncertain"`` (the
+    delete or the add has an unknown effect; after an unknown delete no add is
+    started); ``"mismatch"`` (added, but the read-back differs).
+
+    Delete-then-add instead of ``add -U``: an update re-sets the item's access
+    list, which can prompt (tp#504); a fresh add does not. Not atomic — a
+    concurrent reader can see the item missing in between. The secret goes to
+    ``security -i`` on stdin, never on argv (argv is readable by every
+    same-user process via ``ps``); ``-T /usr/bin/security`` scopes silent
+    access to the ``security`` binary our reads use.
+
+    The read-back goes through ``_keychain_get`` (unpinned) and must equal
+    ``value`` exactly: a byte-exact round-trip check that also catches a
+    tokenizer divergence (tp#498) and a shadowing copy earlier in the search
+    list. *touched* is set while a mutation may have happened; it is reset
+    when a step proves to be a no-op, also when Ctrl-C interrupts it.
     """
-    line = _kc_add_line(service, value, description)
+    line = _kc_add_line(service, value, description, keychain)
     if line is None:
         return "invalid"
+    mark = touched if touched is not None else _KcTouched()
+    before = mark.value
+    mark.value = True
     try:
-        r = subprocess.run(
-            ["security", "-i"],
-            input=line,
-            capture_output=True,
-            timeout=15,
-            check=False,
-        )
-    except (OSError, subprocess.SubprocessError):
+        gone = _kc_delete(service, keychain)
+    except SecurityInterrupted as exc:
+        if _kc_delete_outcome(exc.result) in ("absent", "rejected"):
+            mark.value = before
+        raise
+    if gone == "unknown":
         return "uncertain"
-    if r.returncode != 0:
+    if gone == "rejected":
+        mark.value = before
         return "rejected"
+    try:
+        add = _security_run(["security", "-i"], data=line)
+    except SecurityInterrupted as exc:
+        if gone == "absent" and exc.result.state != "unknown" and exc.result.rc:
+            mark.value = before
+        raise
+    outcome = _kc_add_outcome(add, gone)
+    if outcome == "rejected":
+        mark.value = before
+    if outcome != "added":
+        return outcome
     return "ok" if _keychain_get(service) == value else "mismatch"
 
 
 def _keychain_set(
     service: str, value: str, description: str = "cscs-api credential"
 ) -> bool:
-    """Create/replace a login-keychain item; ``True`` on success (see
-    ``_keychain_write`` for the write and the read-back check)."""
-    return _keychain_write(service, value, description) == "ok"
+    """Create/replace an item in the default keychain; ``True`` on success
+    (see ``_keychain_write`` for the delete-then-add and the read-back)."""
+    keychain = _kc_target_keychain()
+    if keychain is None:
+        return False
+    return _keychain_write(service, value, description, keychain) == "ok"
 
 
 @dataclass
@@ -3321,34 +3465,77 @@ class KeychainBatchResult:
     surviving: tuple[str, ...] = ()
 
 
+def _kc_cleanup(
+    services: Sequence[str], keychain: str
+) -> tuple[tuple[str, ...], tuple[str, ...], SecurityInterrupted | None]:
+    """Delete every service from *keychain*: ``(removed, surviving, interrupt)``.
+
+    A Ctrl-C during one delete does not stop the others; the first such
+    interrupt is returned for the caller to re-raise.
+    """
+    removed: list[str] = []
+    surviving: list[str] = []
+    interrupt: SecurityInterrupted | None = None
+    for svc in services:
+        try:
+            outcome = _kc_delete(svc, keychain)
+        except SecurityInterrupted as exc:
+            interrupt = interrupt or exc
+            outcome = _kc_delete_outcome(exc.result)
+        (removed if outcome in ("deleted", "absent") else surviving).append(svc)
+    return tuple(removed), tuple(surviving), interrupt
+
+
 def _keychain_set_all(
     items: Sequence[tuple[str, str]], description: str
 ) -> KeychainBatchResult:
     """Write several ``(service, value)`` items as one credential set.
 
-    Every item is validated before the first write, so an invalid last field
-    leaves the keychain untouched. Writes stop at the first failure; unless
-    nothing can have changed (the FIRST write was refused outright), every item
-    of the batch is then deleted — a mixed old/new set would make a login submit
-    a wrong pair (lockout risk), a missing one makes it fall back to 1Password.
+    The target is the default keychain, resolved once; every delete and add
+    names it (no ``-U`` — see ``_keychain_write``). Every item is validated
+    before the first write, so an invalid last field leaves the keychain
+    untouched. Writes stop at the first failure; unless nothing can have
+    changed (the FIRST write was refused outright), every item of the batch is
+    then deleted — a mixed old/new set would make a login submit a wrong pair
+    (lockout risk), a missing one makes it fall back to 1Password. A Ctrl-C
+    that interrupts the batch after something may have changed runs the same
+    cleanup, then propagates.
 
     Best effort, NOT atomic: a login running concurrently can still read a
-    mixed set in the window, and a delete can fail (``surviving``).
+    mixed or missing set in the window, and a delete can fail (``surviving``).
     """
-    if any(_kc_add_line(svc, v, description) is None for svc, v in items):
+    keychain = _kc_target_keychain()
+    if keychain is None:
         return KeychainBatchResult(ok=False)
-    for i, (svc, v) in enumerate(items):
-        outcome = _keychain_write(svc, v, description)
-        if outcome == "ok":
-            continue
-        if i == 0 and outcome in ("rejected", "invalid"):
-            return KeychainBatchResult(ok=False)
-        removed: list[str] = []
-        surviving: list[str] = []
-        for other, _ in items:  # every item: an earlier one may hold OLD bytes
-            (removed if _keychain_delete(other) else surviving).append(other)
-        return KeychainBatchResult(False, True, tuple(removed), tuple(surviving))
-    return KeychainBatchResult(ok=True, changed=True)
+    if any(_kc_add_line(svc, v, description, keychain) is None for svc, v in items):
+        return KeychainBatchResult(ok=False)
+    services = [svc for svc, _ in items]  # every item: one may hold OLD bytes
+    touched = _KcTouched()
+    try:
+        for i, (svc, v) in enumerate(items):
+            outcome = _keychain_write(svc, v, description, keychain, touched)
+            if outcome == "ok":
+                continue
+            if i == 0 and outcome in ("rejected", "invalid"):
+                return KeychainBatchResult(ok=False)
+            break
+        else:
+            return KeychainBatchResult(ok=True, changed=True)
+    except KeyboardInterrupt:
+        if touched.value:
+            _, surviving, _ = _kc_cleanup(services, keychain)
+            print(
+                "Interrupted — the partially written keychain items were removed."
+                if not surviving
+                else "Interrupted — keychain cleanup FAILED for "
+                f"{', '.join(surviving)}; remove them with forget-creds.",
+                file=sys.stderr,
+            )
+        raise
+    removed, surviving, interrupt = _kc_cleanup(services, keychain)
+    if interrupt is not None:
+        raise interrupt
+    return KeychainBatchResult(False, True, removed, surviving)
 
 
 def _report_keychain_batch_failure(
@@ -3373,27 +3560,11 @@ def _report_keychain_batch_failure(
 
 
 def _keychain_delete(service: str) -> bool:
-    """Delete a login-keychain item; ``True`` if it was deleted or already gone."""
-    try:
-        r = subprocess.run(
-            [
-                "security",
-                "delete-generic-password",
-                "-a",
-                _kc_account(),
-                "-s",
-                service,
-            ],
-            capture_output=True,
-            text=True,
-            timeout=15,
-            check=False,
-        )
-    except (OSError, subprocess.SubprocessError):
+    """Delete an item from the default keychain; ``True`` if deleted or already gone."""
+    keychain = _kc_target_keychain()
+    if keychain is None:
         return False
-    # 44 = errSecItemNotFound ("already gone"); anything else (e.g. 51, a locked
-    # keychain) means the secret is still stored.
-    return r.returncode in (0, 44)
+    return _kc_delete(service, keychain) in ("deleted", "absent")
 
 
 def _parse_totp(seed_or_uri: str) -> Any:
@@ -3886,6 +4057,7 @@ def cmd_cscs_store_creds() -> int:
             "Nothing stored — re-run and paste the correct seed."
         )
 
+    print("If macOS shows a keychain dialog, answer it.", file=sys.stderr)
     result = _keychain_set_all(
         [
             (KEYCHAIN_SVC_USER, user),
@@ -5216,6 +5388,7 @@ def cmd_biopolwifi_store_creds() -> int:
     password = getpass.getpass("Cloudpath portal password: ")
     if not (email and password):
         return _fail("Missing email or password — nothing stored.")
+    print("If macOS shows a keychain dialog, answer it.", file=sys.stderr)
     result = _keychain_set_all(
         [
             (KEYCHAIN_SVC_BIOPOL_EMAIL, email),

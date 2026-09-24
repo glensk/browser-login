@@ -50,6 +50,10 @@ framework. It is a **provider**: other repos depend on it, not the reverse. See
   window"). Interactive flows hold the interaction lease; long-lived CDP
   clients register via `register-exec`; `switch` fails closed on unregistered
   clients. Full contract: README "Consumer contract".
+- **`security` (keychain) calls go through `_security_run` only**: new session, no
+  timeout, never `kill`/`terminate` — killing a client mid-dialog crashed
+  `securityd` (tp#504). Writes are delete-then-add pinned to the default keychain,
+  never `add-generic-password -U`. Reads wait for a locked keychain.
 - The shared browser is LIVE infrastructure with the user's real sessions:
   never `down`/`switch`/`login` it casually, and never edit `bin/browser.py`
   in place from a subagent while consumers may exec it — use a worktree.

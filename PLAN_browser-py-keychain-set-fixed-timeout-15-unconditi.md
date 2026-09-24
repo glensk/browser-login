@@ -109,7 +109,7 @@ private temp keychain created by its fixture.
       `tp question 504 -d "no deadline on any security call (reads included); …"` (assumption
       `6e6be2`). The delete-then-add and scope decisions are `c1a62d`/`c42af6`. `6d14fe` (a 15 s
       read wait) is superseded by `6e6be2`.
-- [ ] 2. In `bin/browser.py`, add the runner `_security_run(argv, *, input=None)` next to the
+- [x] 2. In `bin/browser.py`, add the runner `_security_run(argv, *, input=None)` next to the
       keychain helpers. It returns a small result object (`SecurityResult`) with
       `state: "not_started" | "done" | "unknown"`, `rc`, `stdout: bytes` and `stderr: bytes`.
       - Launch: `subprocess.Popen(argv, stdin=PIPE if input is not None else DEVNULL, stdout=PIPE, stderr=PIPE, start_new_session=True)`.
@@ -121,10 +121,10 @@ private temp keychain created by its fixture.
         negative return code → `unknown`.
       - Docstring: cite the 2026-09-24 securityd abort and state "never kill `security`, never
         time it out".
-- [ ] 3. Add `_kc_target_keychain() -> str | None`. It runs
+- [x] 3. Add `_kc_target_keychain() -> str | None`. It runs
       `security default-keychain -d user` through the runner, strips quotes and whitespace, and
       returns the path only if it exists as a file. Otherwise it returns `None`.
-- [ ] 4. Route the three existing helpers through `_security_run` and remove every `timeout=15`:
+- [x] 4. Route the three existing helpers through `_security_run` and remove every `timeout=15`:
       - `_keychain_get` stays unpinned. It decodes stderr with `errors="replace"` itself, and any
         state other than `done` with rc 0 → `None`.
       - Add `_kc_delete(service, keychain) -> "deleted" | "absent" | "rejected" | "unknown"`.
@@ -132,12 +132,12 @@ private temp keychain created by its fixture.
         `not_started` or any other positive rc → `rejected`, `unknown` → `unknown`.
       - `_keychain_delete(service)` stays a bool adapter for the forget commands. It resolves the
         target and returns `True` only for `deleted` or `absent`.
-- [ ] 5. `_kc_add_line(service, value, description, keychain)`:
+- [x] 5. `_kc_add_line(service, value, description, keychain)`:
       - Drop `-U`. The line ends `-T /usr/bin/security <quoted keychain>`, which names the target
         explicitly; an invalid path makes the plain insert fail instead of falling back.
       - The keychain counts toward `_KC_LINE_MAX` and gets the same control-character check.
       - Update its docstring.
-- [ ] 6. Make `_keychain_write(service, value, description, keychain)` delete-then-add, with
+- [x] 6. Make `_keychain_write(service, value, description, keychain)` delete-then-add, with
       outcomes:
       - `"invalid"`: the line was refused and nothing ran.
       - `"rejected"`: the delete was `rejected`, or it was `absent` and the add was then rejected.
@@ -148,7 +148,7 @@ private temp keychain created by its fixture.
       - `"mismatch"`: the unpinned read-back differs.
       - `"ok"`.
       - `_keychain_set` resolves the target itself, and returns `False` when it is `None`.
-- [ ] 7. `_keychain_set_all`:
+- [x] 7. `_keychain_set_all`:
       - Resolve the target once. If it is `None`, return `KeychainBatchResult(ok=False)` and
         nothing ran.
       - Validate every add line, then write the items in order. Only `"invalid"`/`"rejected"` on
@@ -160,10 +160,10 @@ private temp keychain created by its fixture.
         interrupt is then re-raised.
       - Update the `KeychainBatchResult`/`_keychain_set_all`/`_keychain_write` docstrings: no
         `-U`, pinned target, non-atomic.
-- [ ] 8. Before the first write, `cmd_cscs_store_creds` and `cmd_biopolwifi_store_creds` print one
+- [x] 8. Before the first write, `cmd_cscs_store_creds` and `cmd_biopolwifi_store_creds` print one
       stderr line: `If macOS shows a keychain dialog, answer it.` The line names no values. It is
       a hint only; the runner is the protection.
-- [ ] 9. Offline tests. They are mocked, never run `security`, and the conftest default-deny guard
+- [x] 9. Offline tests. They are mocked, never run `security`, and the conftest default-deny guard
       stays on.
       - The fake `Popen` records argv, kwargs and input.
       - Rewrite `tests/test_keychain_batch.py`'s fake to be INSERT-ONLY: an add of an existing
@@ -190,7 +190,7 @@ private temp keychain created by its fixture.
         - (f) The dialog hint is printed and contains no value.
         - (g) `_kc_target_keychain` returns `None` when the path is missing, and the write then
           runs nothing.
-- [ ] 10. `tests/test_keychain_live.py`:
+- [x] 10. `tests/test_keychain_live.py`:
       - Route BELOW the production runner. The router patches `browser.subprocess.Popen`. It
         asserts `start_new_session=True`, rewrites the keychain argument of
         find/delete/add-line calls to the temp keychain, and answers
@@ -206,12 +206,33 @@ private temp keychain created by its fixture.
       - Add ONE live overwrite case: `_keychain_set` twice on one service with two dummy values,
         read back the second, then delete. It is not a loop.
       - The module docstring drops the `-U` fallback paragraph.
-- [ ] 11. Update the keychain notes in README.md and the AGENTS.md conventions:
+- [x] 11. Update the keychain notes in README.md and the AGENTS.md conventions:
       - writes are delete-then-add, pinned to the default keychain, with no `-U`;
       - `security` is never killed or timed out, and reads wait for a locked keychain.
       Also fix stale `-U` wording elsewhere (`grep -n "\-U" README.md AGENTS.md bin/browser.py`).
-- [ ] 12. Run every `## Verification` line in the foreground, fix until green, tick the boxes, then
+- [x] 12. Run every `## Verification` line in the foreground, fix until green, tick the boxes, then
       `ai.py push -m "fix(keychain): delete-then-add instead of -U, never kill security" bin/browser.py tests/conftest.py tests/test_credentials.py tests/test_keychain_batch.py tests/test_keychain_live.py README.md AGENTS.md PLAN_browser-py-keychain-set-fixed-timeout-15-unconditi.md`.
+
+**Deviations (execution, 2026-09-24):**
+
+- The runner's stdin keyword is `data`, not `input` (no builtin shadowing).
+- A deferred Ctrl-C is re-raised as `SecurityInterrupted(KeyboardInterrupt)` carrying the
+  finished call's `SecurityResult`, so `_keychain_write` can tell a proven no-op (absent /
+  rejected) from a possible mutation, and `_kc_cleanup` can finish every remaining delete
+  before re-raising. A batch interrupted after a possible mutation prints one stderr line
+  (removed / cleanup FAILED for <labels>) before the interrupt propagates.
+- `_kc_add_outcome` was split out of `_keychain_write` (pylint too-many-returns).
+- Live router: since production now resolves the target through `default-keychain -d
+  user` (answered by the router), the delete and the add line already name the temp
+  keychain. The router therefore APPENDS the path only to the unpinned find and VERIFIES
+  (refuses otherwise) that delete and add name exactly the temp keychain. The add line is
+  checked when its stdin is sent; a refused line gets an empty stdin (`security -i` exits,
+  nothing ran). `RoutingRefused` is a `BaseException`, so the runner's post-launch
+  `except Exception` → `"unknown"` cannot swallow a refusal. The router also refuses a
+  call without `start_new_session=True`.
+- Shared fake `FakeSecurityPopen` + `security_op` live in `tests/conftest.py`; the fake
+  raises on `kill`/`terminate`/`send_signal` and on any `timeout`.
+- Temp keychain file prefix is now `tp504-` (was `tp506-`).
 
 NOTE: No redeploy is needed, because `browser.py` is exec'd fresh on every call. Albert's
 existing items were created with `-T /usr/bin/security`, so reads keep working. Albert re-runs
