@@ -23,10 +23,10 @@ by same-uid processes via `KERN_PROCARGS2`. Confidence: **high**.
 
 **How `security` can take the secret without argv — measured (macOS 27, `/usr/bin/security`):**
 
-| Mechanism                                         | No TTY (pipe, `start_new_session`)            | With TTY (parent on a pty)                           |
-| ------------------------------------------------- | --------------------------------------------- | ---------------------------------------------------- |
-| `security -i`, one command line on stdin          | works, exit = that command's status (0 / 45)  | works identically (stdin is our pipe); `-D`/`-T` kept |
-| `-w` as last arg (prompt, value twice on stdin)   | works (falls back to stdin, prompts on stderr) | **blocks** — prompts on `/dev/tty`, ignores our pipe |
+| Mechanism                                       | No TTY (pipe, `start_new_session`)             | With TTY (parent on a pty)                            |
+| ----------------------------------------------- | ---------------------------------------------- | ----------------------------------------------------- |
+| `security -i`, one command line on stdin        | works, exit = that command's status (0 / 45)   | works identically (stdin is our pipe); `-D`/`-T` kept |
+| `-w` as last arg (prompt, value twice on stdin) | works (falls back to stdin, prompts on stderr) | **blocks** — prompts on `/dev/tty`, ignores our pipe  |
 
 `security -i` facts the implementation must respect (all measured):
 
@@ -38,14 +38,19 @@ by same-uid processes via `KERN_PROCARGS2`. Confidence: **high**.
 - **Malformed input fails open into the default (login) keychain**: the split/truncated fragment
   of an over-long or newline-containing line — and a command naming a non-existent keychain path —
   was written to `login.keychain-db` under the given service. (The probe's stray dummy items were
-  deleted; `dump-keychain` shows none left.) So the new code must pre-validate and read back.
+  deleted; `dump-keychain` shows none left.) So the new code pre-validates every line, never
+  names a keychain path, and reads back.
 - `quit` is not a command (exit 1); send exactly one command, no trailer, and the exit code is that
   command's.
+- `security create-keychain <tmp path>` did NOT add the file to the user search list here
+  (`list-keychains -d user` showed only `login.keychain-db` afterwards) — moot, the plan creates
+  no keychain file.
 
 **Pre-existing, related (not this ticket's fix):** `find-generic-password -w` prints a non-ASCII
 secret as hex (`päss` → `70c3a47373`) whichever way it was written, so `_keychain_get`
-(`bin/browser.py:3125-3155`) returns hex for a non-ASCII password. The read-back check below
-must accept that form; the decode fix is filed as **tp#498**. The same argv defect exists in
+(`bin/browser.py:3125-3155`) returns hex for a non-ASCII password. The read-back below therefore
+is a **consistency check** against `security -i` tokenizer divergence, not proof of byte-exact
+storage; byte-exact reading is **tp#498**. The same argv defect exists in
 `sdsc/biopol-wifi/biopol-wifi.py:392-418` (own repo) — filed as **tp#497**. Neither is fixed here.
 
 **Alternatives considered.**
@@ -56,55 +61,81 @@ must accept that form; the decode fix is filed as **tp#498**. The same argv defe
 - Security.framework via `ctypes`/`pyobjc`/`keyring`: rejected — the item's creator/ACL would
   become Python, so the prompt-free reads through `/usr/bin/security` (the whole point of
   `-T /usr/bin/security`) would start prompting; large blast radius on live infrastructure.
-- **Chosen: `security -i` with a single validated, quoted command on stdin, then read-back.**
+- An explicit test keychain file (`keychain=` parameter): rejected in the Codex debate — an
+  invalid explicit path falls back to the default keychain, so the parameter would add a
+  fail-open path to production code for the sake of a test.
+- **Chosen: `security -i` with a single validated, quoted, UTF-8-encoded command on stdin,
+  all items of a batch validated before the first write, then read-back.**
 
-**Constraints.** `browser.py` is live infrastructure: work in a worktree, never on the real
-keychain items; unit tests mock `subprocess.run` completely; the opt-in live test uses its own
-temporary keychain file and cleans up. Never print a secret (including in assertion messages).
-No public CLI change.
+**Constraints.** `browser.py` is live infrastructure: implement in a git worktree, never on the
+real keychain items; unit tests mock `subprocess.run` completely; the opt-in live test only
+creates and deletes its own throw-away item (unique account + service). Never print a secret
+(including in assertion messages). No public CLI change.
+
+**Debate.** Codex (gpt-6-astra) round 1, judge converged: O1 no `keychain=` parameter (accepted),
+O2 search-list isolation (refuted by measurement, moot), O3 single expected read-back form
+(accepted), O4 validate the whole batch before writing (accepted), O5 exact UTF-8 bytes and every
+field validated (accepted), O6 verify inside the worktree before integrating (accepted; the
+block below stays the post-integration reviewer check on main).
 
 **Verification strictness.** The block runs `pytest`, `mypy` and `pylint` because the fix changes
-behaviour of a security helper, so it is not strict-eligible (not read-only-allowlist-only). The
-live keychain test is opt-in via an env var and touches only a throw-away keychain.
+behaviour of a security helper, so it is not strict-eligible. The live keychain test is opt-in
+via an env var and touches only its own throw-away item.
 
 Blocked on Albert: **no**.
 
 ## Steps
 
-- [ ] Add `_kc_quote(s: str) -> str` next to `_kc_account` in `bin/browser.py`: wrap in `"`,
-      escape `\` → `\\` and `"` → `\"` (the measured `security -i` tokenizer rules).
-- [ ] Rewrite `_keychain_set(service, value)` to run `["security", "-i"]` with
-      `input=<one line>` (`capture_output=True, text=True, timeout=15, check=False`); the line is
-      `add-generic-password -a Q(account) -s Q(service) -w Q(value) -D Q(desc) -T /usr/bin/security -U`
-      + `\n`, no `quit`, no keychain positional. The secret must appear in NO argv element.
-- [ ] Fail closed before spawning (return `False`, no subprocess call) when any field contains a
-      control character (`ord < 0x20` or `0x7f` — covers `\n`, `\r`, `\0`, `\t`) or the encoded
-      line exceeds **4000 bytes** (measured hard limit 4096; margin kept). Decision recorded:
-      `tp question 489 -d "reject control chars and lines > 4000 bytes" "What to do with secrets security -i cannot carry?"`.
-- [ ] After exit 0, read back with `_keychain_get(service)` and return `True` only if it equals
-      `value` or, for a non-ASCII value, `value.encode().hex()` (the measured `-w` output form).
-      Decision recorded: `tp question 489 -d "read back after every write" "Verify each keychain write by reading it back?"`.
-- [ ] Keep `-D` per caller: add a keyword `description: str = "cscs-api credential"` and pass
-      `"biopol-wifi credential"` from the biopolwifi store (`bin/browser.py:4886-4887`) so its items
-      match what `sdsc/biopol-wifi` writes (currently mislabelled "cscs-api credential"). Also add
-      a keyword `keychain: str | None = None` (appended quoted as the positional keychain when set)
-      used only by the live test; `_keychain_get` gets the same optional keyword for the read-back.
+- [ ] Create a worktree (`git worktree add <scratchpad>/wt -b tp489-keychain-stdin`) and do all
+      edits there — never edit the live `bin/browser.py` in place.
+- [ ] Add pure helper `_kc_quote(s: str) -> str` next to `_kc_account`: wrap in `"`, escape
+      `\` → `\\` and `"` → `\"` (the measured `security -i` tokenizer rules).
+- [ ] Add pure helper `_kc_add_line(service: str, value: str, description: str) -> bytes | None`:
+      returns `add-generic-password -a Q(account) -s Q(service) -w Q(value) -D Q(description) -T /usr/bin/security -U\n`
+      encoded as UTF-8, or `None` when any of account, service, value, description contains a
+      control character (`ord < 0x20` or `0x7f` — covers `\n`, `\r`, `\0`, `\t`), when encoding
+      raises `UnicodeEncodeError` (lone surrogates), or when the encoded line (without the
+      trailing newline) exceeds **4000 bytes** (measured hard limit 4096; margin kept). Never
+      includes the value in any error text. No keychain positional, no `quit`. Decision recorded:
+      `tp question 489 -d "reject control chars and lines > 4000 bytes" …`.
+- [ ] Rewrite `_keychain_set(service, value, description="cscs-api credential") -> bool`: build
+      the line via `_kc_add_line` (`None` → `False`, no subprocess call), run
+      `subprocess.run(["security", "-i"], input=<bytes>, capture_output=True, timeout=15, check=False)`
+      (bytes mode), non-zero exit or `OSError`/`SubprocessError` → `False`. The secret appears in
+      NO argv element.
+- [ ] Read-back in `_keychain_set` after exit 0: `_keychain_get(service)` must equal exactly ONE
+      expected form — `value` if it is printable ASCII, else `value.encode("utf-8").hex()` (the
+      measured `-w` output). Docstring states it is a consistency check, not byte-exact proof
+      (tp#498). Decision recorded: `tp question 489 -d "read back after every write" …`.
+- [ ] Add `_keychain_set_all(items: Sequence[tuple[str, str]], description: str) -> bool`:
+      serialize every item with `_kc_add_line` first and return `False` with **zero** subprocess
+      calls if any is `None`; then write sequentially via `_keychain_set`, stopping at the first
+      failure. Switch `cmd_cscs_store_creds` (`bin/browser.py:3605-3608`) and the biopolwifi store
+      (`bin/browser.py:4886-4887`, with `description="biopol-wifi credential"`, matching what
+      `sdsc/biopol-wifi` writes — today it is mislabelled "cscs-api credential") to it.
 - [ ] Unit tests in `tests/test_credentials.py` (fully mocked `subprocess.run`): argv is exactly
       `["security", "-i"]`; the secret is absent from every argv element and present exactly once,
-      quoted, in `input`; quoting round-trip cases (`space`, `"`, `'`, `\`, trailing `\`, `$;|&#`,
-      UTF-8); control-char and over-length values return `False` with zero subprocess calls;
-      non-zero exit → `False`; read-back mismatch → `False`; non-ASCII read-back in hex form →
-      `True`; `OSError`/`TimeoutExpired` → `False`. Update `test_keychain_set_reports_the_return_code`.
+      quoted, in `input`; quoting round-trip of `_kc_quote` for `space`, `"`, `'`, `\`, trailing
+      `\`, `$;|&#`, UTF-8; a full line of exactly 4000 bytes accepted and 4001 rejected, built with
+      multibyte chars and `"`/`\` escape expansion; control char in each of account, service,
+      value, description → `None`; lone surrogate → `None`; non-zero exit → `False`; read-back
+      mismatch → `False`; non-ASCII value with hex read-back → `True` and with plaintext read-back
+      → `False`; `OSError`/`TimeoutExpired` → `False`. Update
+      `test_keychain_set_reports_the_return_code` and the `_store_creds_env` fake (now patching
+      `_keychain_set_all` or `subprocess.run`). Caller tests: an invalid LAST field (CSCS seed /
+      biopol password with `\n`) → zero `security` calls.
 - [ ] Opt-in live test `tests/test_keychain_live.py`, skipped unless `BROWSER_LIVE_KEYCHAIN=1` and
-      `sys.platform == "darwin"`: creates a temp keychain file with `security create-keychain` in
-      `tmp_path` (NOT added to the search list), unlocks it, calls `_keychain_set(..., keychain=path)`
-      with dummy values covering the quoting cases, asserts round-trip via
-      `_keychain_get(..., keychain=path)`, then `delete-keychain`; teardown also deletes any item
-      with its unique test account from the default keychain (the measured fail-open path).
-      Never prints values.
+      `sys.platform == "darwin"`: account `tp489-live-<token_hex>`, services
+      `tp489-live-<token_hex>-<case>`; calls `_keychain_set` with the account monkeypatched via
+      `_kc_account` and dummy values covering the quoting cases and one UTF-8 case; asserts the
+      read-back form; before cleanup asserts no item exists under the unique account besides the
+      expected services (no escaped fragments); `finally` deletes exactly those account/service
+      pairs. Never prints values.
 - [ ] README: in the "Keychain note" section state that `store-creds` hands secrets to
       `security -i` on stdin (never argv) and the 4000-byte / no-control-char limit.
-- [ ] Lint + tests green (Verification block), commit with `ai.py push` listing every touched file.
+- [ ] Run every Verification command from inside the worktree (`cd <scratchpad>/wt && …`) and
+      fix until green; then fast-forward `main` to the branch, remove the worktree and branch, and
+      commit/push with `ai.py push` listing every touched file.
 
 NOTE: No redeploy is needed — `browser.py` is exec'd fresh per call. Albert's existing keychain
 items stay as they are; they are only rewritten the next time he runs `store-creds`.
