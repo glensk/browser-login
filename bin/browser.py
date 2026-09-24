@@ -3879,12 +3879,18 @@ def _himalaya_latest_login_mail(
     return (best_folder, best_id)
 
 
-def _himalaya_extract_magic_link(himalaya: str, folder: str, msg_id: str) -> str | None:
+def _himalaya_extract_magic_link(
+    himalaya: str, folder: str, msg_id: str, account: str | None = None
+) -> str | None:
     """Read the mail body and pull out the claude.ai/magic-link#… URL (a bearer
-    credential — never printed/logged)."""
+    credential — never printed/logged). `account` must be the one the envelope
+    was found in: a message id is only meaningful within its own mailbox."""
+    argv = [himalaya, "message", "read", msg_id, "--folder", folder]
+    if account:
+        argv += ["-a", account]
     try:
         res = subprocess.run(
-            [himalaya, "message", "read", msg_id, "--folder", folder],
+            argv,
             capture_output=True,
             text=True,
             timeout=30,
@@ -3937,7 +3943,9 @@ def _claude_auto_login(page, email: str, himalaya: str) -> bool:
             himalaya, email, trigger_ts, account=account, diag=diag
         )
         if hit:
-            link = _himalaya_extract_magic_link(himalaya, hit[0], hit[1])
+            link = _himalaya_extract_magic_link(
+                himalaya, hit[0], hit[1], account=account
+            )
             if link:
                 break
             _diag(

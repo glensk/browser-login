@@ -247,3 +247,46 @@ def test_store_creds_dispatches_to_the_site(monkeypatch):
     monkeypatch.setattr(browser, "cmd_biopolwifi_forget_creds", lambda: 8)
     assert browser.cmd_store_creds("cscs") == 7
     assert browser.cmd_forget_creds("biopol") == 8
+
+
+def test_extract_magic_link_reads_from_the_same_account(monkeypatch):
+    # Regression: the envelope search honoured ANTHROPIC_LOGIN_HIMALAYA_ACCOUNT
+    # but `message read` did not, so the id found in account X was looked up in
+    # the DEFAULT account — a different mailbox, a different message.
+    seen: list[list[str]] = []
+
+    def fake_run(argv, **kwargs):
+        seen.append(argv)
+        return _Res(0, LINK)
+
+    monkeypatch.setattr(browser.subprocess, "run", fake_run)
+    browser._himalaya_extract_magic_link("himalaya", "INBOX", "7", account="epfl")
+    assert seen[-1][seen[-1].index("-a") + 1] == "epfl"
+    browser._himalaya_extract_magic_link("himalaya", "INBOX", "7")
+    assert "-a" not in seen[-1]
+
+
+def test_auto_login_reads_the_link_from_the_configured_account(monkeypatch):
+    from playwright.sync_api import Error as PlaywrightError
+
+    calls: list[tuple] = []
+    monkeypatch.setenv("ANTHROPIC_LOGIN_HIMALAYA_ACCOUNT", "epfl")
+    monkeypatch.setattr(browser, "_claude_fill_email_and_continue", lambda p, e: True)
+    monkeypatch.setattr(
+        browser,
+        "_himalaya_latest_login_mail",
+        lambda h, e, ts, account=None, diag=None: ("INBOX", "7"),
+    )
+
+    def fake_extract(himalaya, folder, msg_id, account=None):
+        calls.append((folder, msg_id, account))
+        return LINK
+
+    monkeypatch.setattr(browser, "_himalaya_extract_magic_link", fake_extract)
+
+    class _Page:
+        def goto(self, url, **kwargs):
+            raise PlaywrightError("stop here")
+
+    assert browser._claude_auto_login(_Page(), "me@x.ch", "himalaya") is False
+    assert calls == [("INBOX", "7", "epfl")]
