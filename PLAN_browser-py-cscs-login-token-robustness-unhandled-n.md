@@ -153,7 +153,7 @@ make the verification run touch the real login keychain (Codex O5).
       read-back mismatch → cleanup; item 1 writes then raises `TimeoutExpired` → cleanup; one and
       all deletes failing → `surviving` lists them and every delete was still attempted; caller
       messages per case; stderr/stdout never contain a value.
-- [ ] **D4 (O7).** Add `_env_addrs(env, key) -> tuple[str, list[str]]` with state
+- [x] **D4 (O7).** Add `_env_addrs(env, key) -> tuple[str, list[str]]` with state
       `absent` (key missing, `None`, empty), `valid` or `malformed`: a dict uses its `addr`
       (non-string `addr` → malformed); a list is parsed element by element (dicts or strings),
       any bad element → malformed; a string is parsed completely with `email.utils.getaddresses`
@@ -162,7 +162,7 @@ make the verification run touch the real login keychain (Codex O5).
       senders never pass `_sender_allowed`). Recipient: absent → skip the check (today's
       behaviour); malformed → reject; valid → accept iff `email` is in the list. `subject` and
       `date` that are not strings are treated as `""`. Annotate `env` as `Mapping[str, object]`.
-- [ ] **D4 tests** (`tests/test_login_mail_match.py`): `from` as str / display-name str / list /
+- [x] **D4 tests** (`tests/test_login_mail_match.py`): `from` as str / display-name str / list /
       two senders / `None` / int / dict with non-string `addr`; `to` as a list containing and not
       containing the email, a mixed valid/invalid list, a comma-separated string, mixed case;
       `subject` as int; malformed `date` → no exception and the correct accept/reject.

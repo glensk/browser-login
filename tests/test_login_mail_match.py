@@ -394,3 +394,84 @@ def test_candidates_are_newest_first_dated_before_undated(monkeypatch):
 )
 def test_magic_link_email(link, want):
     assert browser._magic_link_email(link) == want
+
+
+# --- tp#491 D4: himalaya envelope field shapes vary -----------------------------
+
+_SUBJ = "Your secure link to Claude.ai is here | x"
+_GOOD = "no-reply-abc@mail.anthropic.com"
+
+
+@pytest.mark.parametrize(
+    "sender, ok",
+    [
+        (_GOOD, True),  # plain string
+        (f"Anthropic <{_GOOD}>", True),  # display-name string
+        (f"ANTHROPIC <{_GOOD.upper()}>", True),  # mixed case
+        ([{"name": "A", "addr": _GOOD}], True),  # list of dicts
+        ([_GOOD], True),  # list of strings
+        ({"addr": _GOOD}, True),
+        ([{"addr": _GOOD}, {"addr": "x@evil.example"}], False),  # two senders
+        (f"{_GOOD}, x@evil.example", False),  # two senders in one string
+        (None, False),
+        (42, False),
+        ({"addr": 42}, False),  # non-string addr
+        ({"name": "no addr"}, False),
+        ([{"addr": _GOOD}, 7], False),  # a bad element taints the list
+        ("not an address", False),
+    ],
+)
+def test_sender_shapes_never_crash_and_only_one_valid_sender_passes(sender, ok):
+    env = {"subject": _SUBJ, "from": sender, "id": "1"}
+    assert browser._is_claude_login_mail(env) is ok
+
+
+@pytest.mark.parametrize(
+    "to, ok",
+    [
+        (None, True),  # absent: no recipient check (as before)
+        ([], True),
+        ("me@example.org", True),
+        ("ME@Example.ORG", True),
+        ("Me <me@example.org>, other@example.org", True),  # comma-separated
+        ([{"addr": "other@example.org"}, {"addr": "me@example.org"}], True),
+        ([{"addr": "other@example.org"}], False),
+        ("other@example.org", False),
+        ([{"addr": "me@example.org"}, 5], False),  # mixed valid/invalid → malformed
+        ({"addr": None}, False),
+        (3.5, False),
+    ],
+)
+def test_recipient_shapes(monkeypatch, to, ok):
+    monkeypatch.delenv("ANTHROPIC_LOGIN_MAIL_SENDERS", raising=False)
+    env = {"subject": _SUBJ, "from": {"addr": _GOOD}, "to": to, "id": "7"}
+    _serve(monkeypatch, [env])
+    diag: list[str] = []
+    got = browser._himalaya_login_mail_candidates("h", "me@example.org", 0.0, diag=diag)
+    assert (got == [("INBOX", "7")]) is ok
+
+
+@pytest.mark.parametrize("subject", [5, None, ["Claude link"], {"s": 1}])
+def test_non_string_subject_is_not_a_login_mail(subject):
+    env = {"subject": subject, "from": {"addr": _GOOD}}
+    assert browser._looks_like_claude_login_mail(env) is False
+
+
+@pytest.mark.parametrize("date", [12345, None, ["2026-09-24 10:00+00:00"], "garbage"])
+def test_odd_date_ranks_as_undated_without_crashing(monkeypatch, date):
+    monkeypatch.delenv("ANTHROPIC_LOGIN_MAIL_SENDERS", raising=False)
+    env = {"subject": _SUBJ, "from": {"addr": _GOOD}, "date": date, "id": "9"}
+    _serve(monkeypatch, [env])
+    assert browser._himalaya_login_mail_candidates("h", "", 0.0) == [("INBOX", "9")]
+
+
+def test_malformed_sender_is_reported_not_silent(monkeypatch):
+    monkeypatch.delenv("ANTHROPIC_LOGIN_MAIL_SENDERS", raising=False)
+    env = {"subject": _SUBJ, "from": [{"addr": _GOOD}, {"addr": _GOOD}], "id": "1"}
+    _serve(monkeypatch, [env])
+    rejected: list[str] = []
+    got = browser._himalaya_login_mail_candidates(
+        "h", "", 0.0, rejected_senders=rejected
+    )
+    assert got == [] and len(rejected) == 1
+    assert "<no single valid sender>" in rejected[0]

@@ -101,7 +101,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 import uuid
-from collections.abc import Callable, Iterator, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, NamedTuple
@@ -4090,22 +4090,63 @@ def _sender_allowed(addr: str, allow: tuple[str, ...]) -> bool:
     return any(addr == e if "@" in e else dom == e for e in allow)
 
 
-def _mail_sender(env: dict) -> str:
-    return ((env.get("from") or {}).get("addr") or "").strip().lower()
+def _env_str(env: Mapping[str, object], key: str) -> str:
+    """A himalaya envelope field as a string; any non-string shape is ``""``."""
+    value = env.get(key)
+    return value if isinstance(value, str) else ""
 
 
-def _looks_like_claude_login_mail(env: dict) -> bool:
+def _env_addrs(env: Mapping[str, object], key: str) -> tuple[str, list[str]]:
+    """The lower-cased addresses of envelope field `key` as ``(state, addrs)``.
+
+    himalaya's JSON shape varies across versions/backends: ``{"addr": …}``, a
+    list of those or of strings, or a plain (possibly comma-separated,
+    display-named) string. ``state`` is ``"absent"`` (missing/empty),
+    ``"valid"`` or ``"malformed"`` — anything unparseable, so a sender check can
+    never turn odd input into acceptance (tp#491 D4).
+    """
+    from email.utils import getaddresses
+
+    raw = env.get(key)
+    if raw is None or raw in ("", [], {}):
+        return "absent", []
+    addrs: list[str] = []
+    for item in raw if isinstance(raw, list) else [raw]:
+        if isinstance(item, dict):
+            found = item.get("addr")
+            if not isinstance(found, str):
+                return "malformed", []
+            parsed = [found.strip()]
+        elif isinstance(item, str):
+            parsed = [a.strip() for _name, a in getaddresses([item])]
+        else:
+            return "malformed", []
+        if not parsed or any(a.count("@") != 1 for a in parsed):
+            return "malformed", []
+        addrs += [a.lower() for a in parsed]
+    return "valid", addrs
+
+
+def _mail_sender(env: Mapping[str, object]) -> str:
+    """The one sender address, or ``""`` when absent, malformed or multiple."""
+    state, addrs = _env_addrs(env, "from")
+    return addrs[0] if state == "valid" and len(addrs) == 1 else ""
+
+
+def _looks_like_claude_login_mail(env: Mapping[str, object]) -> bool:
     """Subject-only recognition of a magic-link mail — says nothing about who
     sent it. Ordinary product mail ("You have new requests from your team")
     ships from the same domain and must not match, or it would starve the real
     login mail."""
-    subject = (env.get("subject") or "").lower()
+    subject = _env_str(env, "subject").lower()
     if any(h.lower() in subject for h in _CLAUDE_SUBJECT_HINTS):
         return True
     return "claude" in subject and "link" in subject
 
 
-def _is_claude_login_mail(env: dict, allow: tuple[str, ...] | None = None) -> bool:
+def _is_claude_login_mail(
+    env: Mapping[str, object], allow: tuple[str, ...] | None = None
+) -> bool:
     """A login-looking mail from an allow-listed sender (see
     `_login_mail_senders`; an invalid override allows nobody)."""
     if allow is None:
@@ -4194,7 +4235,7 @@ def _himalaya_login_mail_candidates(
             if not _sender_allowed(sender, allow):
                 msg = (
                     f"{folder}: rejected a Claude login-looking mail from "
-                    f"{_printable(sender) or '<no sender>'} — not in "
+                    f"{_printable(sender) or '<no single valid sender>'} — not in "
                     f"ANTHROPIC_LOGIN_MAIL_SENDERS ({', '.join(allow)})"
                 )
                 if (
@@ -4203,15 +4244,18 @@ def _himalaya_login_mail_candidates(
                 ):
                     _diag(rejected_senders, msg)
                 continue
-            to = ((env.get("to") or {}).get("addr") or "").lower()
-            if email and to and to != email.lower():
+            to_state, to = _env_addrs(env, "to")
+            if email and to_state == "malformed":
+                _diag(diag, f"{folder}: a Claude login mail had an unreadable To:")
+                continue
+            if email and to_state == "valid" and email.lower() not in to:
                 _diag(
                     diag,
                     f"{folder}: a Claude login mail was addressed to "
-                    f"{_printable(to)}, not {email}",
+                    f"{_printable(', '.join(to))}, not {email}",
                 )
                 continue
-            raw_date = env.get("date") or ""
+            raw_date = _env_str(env, "date")
             ts = _himalaya_date_epoch(raw_date)
             if ts and ts + 180 < since_ts:  # clearly older than our trigger → skip
                 continue
