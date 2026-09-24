@@ -292,6 +292,11 @@ the `himalaya` helpers. The CDP endpoint is always `http://127.0.0.1:<port>` (ne
 - **Keychain note:** caching a password + TOTP seed in the login keychain collapses
   2FA to 1FA *on this machine*. FileVault + the keychain protect it at rest, not from
   code running as you. This is an explicit, documented trade-off for unattended login.
+  `store-creds` hands each secret to `security -i` on stdin, never on the command
+  line (argv is visible to every same-user process via `ps`), and reads the item back
+  to confirm the write. A value with a control character (newline, tab, …) or a
+  command line over 4000 bytes is refused before anything is written — `security -i`
+  would otherwise split it and store a fragment in the login keychain.
 
 ## License
 

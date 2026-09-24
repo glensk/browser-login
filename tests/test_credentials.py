@@ -105,13 +105,136 @@ def test_keychain_get_failure_is_none(run, answer):
 
 
 def test_keychain_set_reports_the_return_code(run):
-    rec = run(_Res(0))
+    rec = run(_Res(0), _Res(0, "v\n"))
     assert browser._keychain_set("svc", "v") is True
     assert rec.calls[0][1]["timeout"]
     run(_Res(1))
     assert browser._keychain_set("svc", "v") is False
     run(OSError("gone"))
     assert browser._keychain_set("svc", "v") is False
+    run(subprocess.TimeoutExpired("security", 15))
+    assert browser._keychain_set("svc", "v") is False
+
+
+def test_keychain_set_passes_the_secret_on_stdin_never_argv(run):
+    secret = "s3cr3t-DUMMY"
+    rec = run(_Res(0), _Res(0, secret + "\n"))
+    assert browser._keychain_set("svc", secret) is True
+    argv, kwargs = rec.calls[0]
+    assert argv == ["security", "-i"]
+    for call_argv, _ in rec.calls:
+        assert all(secret not in a for a in call_argv)
+    data = kwargs["input"]
+    assert isinstance(data, bytes) and data.endswith(b"\n")
+    assert data.count(secret.encode()) == 1
+    assert b' -w "' + secret.encode() + b'" ' in data
+    assert b"-T /usr/bin/security -U\n" in data
+    assert kwargs["timeout"] and kwargs["capture_output"]
+    assert "text" not in kwargs  # bytes mode: exact UTF-8, no locale encoding
+
+
+def _unquote(token: str) -> str:
+    """Reverse of the measured ``security -i`` rules: only \\\\ and \\" escape."""
+    assert token[0] == token[-1] == '"'
+    out, i, body = [], 0, token[1:-1]
+    while i < len(body):
+        if body[i] == "\\" and i + 1 < len(body) and body[i + 1] in '\\"':
+            out.append(body[i + 1])
+            i += 2
+        else:
+            assert body[i] != '"', "unescaped quote inside a token"
+            out.append(body[i])
+            i += 1
+    return "".join(out)
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        "with space",
+        'dq"inside',
+        "sq'inside",
+        "back\\slash",
+        "trailing\\",
+        "$;|&#`",
+        "päss✓",
+    ],
+)
+def test_kc_quote_round_trips(value):
+    quoted = browser._kc_quote(value)
+    assert _unquote(quoted) == value
+
+
+def _line_len(value: str) -> int:
+    line = browser._kc_add_line("svc", value, "desc")
+    assert line is not None
+    return len(line) - 1  # without the trailing newline
+
+
+def test_kc_add_line_accepts_4000_bytes_and_rejects_4001(run):
+    head = 'ä"\\'  # 2 + 2 + 2 bytes in the line: multibyte + escape expansion
+    pad = 4000 - _line_len(head)
+    exact = head + "x" * pad
+    assert _line_len(exact) == 4000
+    assert browser._kc_add_line("svc", exact + "x", "desc") is None
+    # the 4001st byte coming from escape expansion alone
+    assert browser._kc_add_line("svc", head + "x" * (pad - 1) + '"', "desc") is None
+    assert browser._kc_add_line("svc", head + "x" * (pad - 1) + "ä", "desc") is None
+
+
+@pytest.mark.parametrize("bad", ["\n", "\r", "\0", "\t", "\x1b", "\x7f"])
+@pytest.mark.parametrize("field", ["account", "service", "value", "description"])
+def test_kc_add_line_rejects_control_chars_in_every_field(monkeypatch, field, bad):
+    parts = {"account": "tester", "service": "svc", "value": "v", "description": "d"}
+    parts[field] += bad
+    monkeypatch.setattr(browser, "_kc_account", lambda: parts["account"])
+    line = browser._kc_add_line(parts["service"], parts["value"], parts["description"])
+    assert line is None
+
+
+def test_kc_add_line_rejects_a_lone_surrogate(run):
+    assert browser._kc_add_line("svc", "a\ud800b", "d") is None
+
+
+def test_keychain_set_invalid_value_makes_no_call(run):
+    rec = run(_Res(0))
+    assert browser._keychain_set("svc", "line1\nline2") is False
+    assert not rec.calls
+
+
+def test_keychain_set_read_back_mismatch_is_false(run):
+    run(_Res(0), _Res(0, "something else\n"))
+    assert browser._keychain_set("svc", "v") is False
+    run(_Res(0), _Res(44))
+    assert browser._keychain_set("svc", "v") is False
+
+
+def test_keychain_set_non_ascii_expects_the_hex_read_back(run):
+    value = "päss"
+    run(_Res(0), _Res(0, value.encode().hex() + "\n"))
+    assert browser._keychain_set("svc", value) is True
+    run(_Res(0), _Res(0, value + "\n"))
+    assert browser._keychain_set("svc", value) is False
+
+
+def test_keychain_set_all_validates_the_whole_batch_first(run):
+    rec = run(_Res(0))
+    ok = browser._keychain_set_all([("a", "fine"), ("b", "bad\n")], "d")
+    assert ok is False and not rec.calls
+
+
+def test_keychain_set_all_stops_at_the_first_failure(run):
+    rec = run(_Res(1))
+    assert browser._keychain_set_all([("a", "x"), ("b", "y")], "d") is False
+    assert len(rec.calls) == 1
+
+
+def test_keychain_set_all_writes_every_item_with_the_description(run):
+    rec = run(_Res(0), _Res(0, "x\n"), _Res(0), _Res(0, "y\n"))
+    assert browser._keychain_set_all([("a", "x"), ("b", "y")], "my desc") is True
+    writes = [kw["input"] for argv, kw in rec.calls if argv == ["security", "-i"]]
+    assert len(writes) == 2
+    assert all(b'-D "my desc"' in w for w in writes)
 
 
 def test_keychain_creds_generates_the_code_locally(monkeypatch):
@@ -227,13 +350,16 @@ def test_op_totp_uri_without_seed_is_none(run, answer):
 # --- cscs-store-creds ------------------------------------------------------------
 
 
-def _store_creds_env(monkeypatch, seed: str):
+def _store_creds_env(monkeypatch, seed: str, password: str = "pw"):
     stored: dict[str, str] = {}
     monkeypatch.setattr(browser.shutil, "which", lambda name: "/usr/bin/op")
-    monkeypatch.setattr(browser, "_op_creds", lambda item, acct: ("user", "pw", "1"))
+    monkeypatch.setattr(
+        browser, "_op_creds", lambda item, acct: ("user", password, "1")
+    )
     monkeypatch.setattr(browser, "_op_totp_uri", lambda item, acct: seed)
 
-    def fake_set(svc, v):
+    def fake_set(svc, v, description="cscs-api credential"):
+        assert description == "cscs-api credential"
         stored[svc] = v
         return True
 
@@ -257,6 +383,41 @@ def test_store_creds_refuses_a_seed_that_makes_no_code(monkeypatch):
     stored = _store_creds_env(monkeypatch, "not base32 !!")
     assert browser.cmd_cscs_store_creds() == 1
     assert not stored
+
+
+def test_store_creds_invalid_last_field_writes_nothing(monkeypatch, run):
+    rec = run(_Res(0))
+    real_set = browser._keychain_set
+    _store_creds_env(monkeypatch, SEED + "\n")  # still makes a code (stripped)
+    monkeypatch.setattr(browser, "_keychain_set", real_set)
+    assert browser.cmd_cscs_store_creds() == 1
+    assert not rec.calls
+
+
+def test_biopolwifi_store_creds_labels_and_validates(monkeypatch, run):
+    rec = run(_Res(0))
+    answers = iter(["me@example.org"])
+    monkeypatch.setattr("builtins.input", lambda _prompt="": next(answers))
+    import getpass
+
+    monkeypatch.setattr(getpass, "getpass", lambda _prompt="": "pw\nrest")
+    assert browser.cmd_biopolwifi_store_creds() == 1
+    assert not rec.calls
+
+    seen: list[tuple[str, str, str]] = []
+
+    def fake_set(svc, v, description="cscs-api credential"):
+        seen.append((svc, v, description))
+        return True
+
+    monkeypatch.setattr(browser, "_keychain_set", fake_set)
+    answers = iter(["me@example.org"])
+    monkeypatch.setattr(getpass, "getpass", lambda _prompt="": "pw")
+    assert browser.cmd_biopolwifi_store_creds() == 0
+    assert seen == [
+        (browser.KEYCHAIN_SVC_BIOPOL_EMAIL, "me@example.org", "biopol-wifi credential"),
+        (browser.KEYCHAIN_SVC_BIOPOL_PASS, "pw", "biopol-wifi credential"),
+    ]
 
 
 # --- Keycloak form ---------------------------------------------------------------

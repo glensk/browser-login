@@ -100,7 +100,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 import uuid
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterator, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -3155,37 +3155,91 @@ def _keychain_get(service: str) -> str | None:
     return value or None
 
 
-def _keychain_set(service: str, value: str) -> bool:
+# `security -i` reads one command per line into a 4096-byte buffer; a longer
+# line is split and its tail parsed as a new command (measured). Margin kept.
+_KC_LINE_MAX = 4000
+
+
+def _kc_quote(s: str) -> str:
+    """Quote one token for the ``security -i`` tokenizer.
+
+    Inside ``"…"`` only ``\\`` and ``\"`` are escapes (measured: spaces, quotes,
+    backslashes, ``$;|&#`` and UTF-8 round-trip exactly).
+    """
+    return '"' + s.replace("\\", "\\\\").replace('"', '\\"') + '"'
+
+
+def _kc_add_line(service: str, value: str, description: str) -> bytes | None:
+    """The ``add-generic-password`` command line for ``security -i``, or ``None``.
+
+    ``None`` when any field holds a control character (a newline would end the
+    command early and the fragment would land in the login keychain), cannot be
+    encoded as UTF-8 (lone surrogates), or the line exceeds ``_KC_LINE_MAX``
+    bytes. No keychain path is named: an invalid path falls back to the login
+    keychain anyway. The value never appears in any error text.
+    """
+    fields = (_kc_account(), service, value, description)
+    if any(ord(c) < 0x20 or ord(c) == 0x7F for f in fields for c in f):
+        return None
+    account = fields[0]
+    line = (
+        f"add-generic-password -a {_kc_quote(account)} -s {_kc_quote(service)}"
+        f" -w {_kc_quote(value)} -D {_kc_quote(description)}"
+        " -T /usr/bin/security -U"
+    )
+    try:
+        data = line.encode("utf-8")
+    except UnicodeEncodeError:
+        return None
+    if len(data) > _KC_LINE_MAX:
+        return None
+    return data + b"\n"
+
+
+def _keychain_set(
+    service: str, value: str, description: str = "cscs-api credential"
+) -> bool:
     """Create/replace a login-keychain item; return ``True`` on success.
 
-    ``-U`` updates in place if the item exists. ``-T /usr/bin/security`` scopes
-    silent (no-prompt) access to the ``security`` binary that our reads use.
+    The secret goes to ``security -i`` on stdin, never on argv (argv is readable
+    by every same-user process via ``ps``). ``-U`` updates in place if the item
+    exists. ``-T /usr/bin/security`` scopes silent (no-prompt) access to the
+    ``security`` binary that our reads use.
+
+    After the write the item is read back and must equal the one form
+    ``find-generic-password -w`` prints: the value itself when it is printable
+    ASCII, else its UTF-8 bytes as hex. That is a consistency check against a
+    tokenizer divergence, not proof of byte-exact storage (tp#498).
     """
+    line = _kc_add_line(service, value, description)
+    if line is None:
+        return False
     try:
         r = subprocess.run(
-            [
-                "security",
-                "add-generic-password",
-                "-a",
-                _kc_account(),
-                "-s",
-                service,
-                "-w",
-                value,
-                "-D",
-                "cscs-api credential",
-                "-T",
-                "/usr/bin/security",
-                "-U",
-            ],
+            ["security", "-i"],
+            input=line,
             capture_output=True,
-            text=True,
             timeout=15,
             check=False,
         )
     except (OSError, subprocess.SubprocessError):
         return False
-    return r.returncode == 0
+    if r.returncode != 0:
+        return False
+    printable_ascii = all(0x20 <= ord(c) < 0x7F for c in value)
+    expected = value if printable_ascii else value.encode("utf-8").hex()
+    return _keychain_get(service) == expected
+
+
+def _keychain_set_all(items: Sequence[tuple[str, str]], description: str) -> bool:
+    """Write several ``(service, value)`` items; ``True`` only if all succeed.
+
+    Every item is validated before the first write, so an invalid last field
+    leaves the keychain untouched. Writes stop at the first failure.
+    """
+    if any(_kc_add_line(svc, v, description) is None for svc, v in items):
+        return False
+    return all(_keychain_set(svc, v, description) for svc, v in items)
 
 
 def _keychain_delete(service: str) -> bool:
@@ -3602,10 +3656,13 @@ def cmd_cscs_store_creds() -> int:
             "Nothing stored — re-run and paste the correct seed."
         )
 
-    if not (
-        _keychain_set(KEYCHAIN_SVC_USER, user)
-        and _keychain_set(KEYCHAIN_SVC_PASS, password)
-        and _keychain_set(KEYCHAIN_SVC_TOTP, seed)
+    if not _keychain_set_all(
+        [
+            (KEYCHAIN_SVC_USER, user),
+            (KEYCHAIN_SVC_PASS, password),
+            (KEYCHAIN_SVC_TOTP, seed),
+        ],
+        "cscs-api credential",
     ):
         return _fail("Failed to write one or more keychain items.")
 
@@ -4882,9 +4939,12 @@ def cmd_biopolwifi_store_creds() -> int:
     password = getpass.getpass("Cloudpath portal password: ")
     if not (email and password):
         return _fail("Missing email or password — nothing stored.")
-    if not (
-        _keychain_set(KEYCHAIN_SVC_BIOPOL_EMAIL, email)
-        and _keychain_set(KEYCHAIN_SVC_BIOPOL_PASS, password)
+    if not _keychain_set_all(
+        [
+            (KEYCHAIN_SVC_BIOPOL_EMAIL, email),
+            (KEYCHAIN_SVC_BIOPOL_PASS, password),
+        ],
+        "biopol-wifi credential",
     ):
         return _fail("Failed to write one or more keychain items.")
     print(
