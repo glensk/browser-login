@@ -2962,8 +2962,10 @@ def cmd_doctor(port: int) -> int:
 def _scan_token(ctx, page) -> str | None:
     """Find the 40-hex Waldur DRF token in the portal tab's storage, or None.
 
-    Scans ``localStorage`` (where Waldur HomePort keeps it) first, then cookies
-    (incl. httpOnly ones invisible to ``document.cookie``). Returns ``None``
+    Scans ``localStorage`` (where Waldur HomePort keeps it) first, then the
+    cookies sent to the portal (incl. httpOnly ones invisible to
+    ``document.cookie``) — never the whole profile's: a 40-hex cookie from
+    another site must not be cached and sent to CSCS as a token. Returns ``None``
     rather than raising if the page navigates mid-scan — the SPA periodically
     re-renders/redirects, destroying the JS execution context — so the caller can
     just retry.
@@ -2979,7 +2981,7 @@ def _scan_token(ctx, page) -> str | None:
         )
         if token:
             return str(token)
-        for ck in ctx.cookies():
+        for ck in ctx.cookies(PORTAL_PROFILE_URL):
             m = HEX40.search(str(ck.get("value", "")))
             if m:
                 return m.group(0)

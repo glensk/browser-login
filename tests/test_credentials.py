@@ -378,3 +378,29 @@ def test_scan_token_survives_a_navigation_mid_scan():
 
     page = _TokPage(exc=PlaywrightError("Execution context was destroyed"))
     assert browser._scan_token(_Ctx([]), page) is None
+
+
+class _ScopedCtx:
+    """Like a Playwright context: ``cookies(urls)`` filters by URL, ``cookies()``
+    returns EVERY site's cookies."""
+
+    def __init__(self, cookies):
+        self._cookies = cookies
+        self.asked: list = []
+
+    def cookies(self, urls=None):
+        self.asked.append(urls)
+        if urls is None:
+            return list(self._cookies)
+        urls = [urls] if isinstance(urls, str) else urls
+        return [c for c in self._cookies if any(c["domain"] in u for u in urls)]
+
+
+def test_scan_token_ignores_other_sites_cookies():
+    # Regression: the cookie fallback scanned ctx.cookies() — every site's
+    # cookies in the shared profile — so a 40-hex session cookie from another
+    # site was cached as the CSCS token and sent to portal.cscs.ch.
+    other = "fedcba9876543210fedcba9876543210fedcba98"
+    ctx = _ScopedCtx([{"name": "sid", "domain": "slack.com", "value": other}])
+    assert browser._scan_token(ctx, _TokPage(None)) is None
+    assert None not in ctx.asked
