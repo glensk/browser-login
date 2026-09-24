@@ -290,3 +290,19 @@ def test_auto_login_reads_the_link_from_the_configured_account(monkeypatch):
 
     assert browser._claude_auto_login(_Page(), "me@x.ch", "himalaya") is False
     assert calls == [("INBOX", "7", "epfl")]
+
+
+def test_login_log_survives_corrupt_lines(logdir, capsys):
+    # Regression: a torn or foreign line crashed `login-log` — a bare JSON
+    # scalar raised AttributeError (.setdefault), a record without a numeric
+    # "ts" raised KeyError/TypeError in the stats, and a non-UTF-8 byte raised
+    # UnicodeDecodeError before any line was parsed.
+    browser._record_login_event("cscs", "keychain")
+    with (logdir / "cscs.jsonl").open("ab") as fh:
+        fh.write(b'42\n["x"]\n{"mode": "no-ts"}\n{"ts": "abc"}\n\xff\xfe\n{"ts": 1\n')
+    browser._record_login_event("cscs", "1password")
+    events = browser._load_login_events("cscs")
+    assert [e["mode"] for e in events] == ["keychain", "1password"]
+    assert browser.cmd_login_log("cscs") == 0
+    assert browser.cmd_login_log(None) == 0
+    assert "2 real login(s)" in capsys.readouterr().out
