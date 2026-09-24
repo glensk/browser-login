@@ -3213,18 +3213,25 @@ def _keychain_delete(service: str) -> bool:
 def _totp_now(seed_or_uri: str) -> str | None:
     """Current 6-digit TOTP code from a base32 seed or an ``otpauth://`` URI.
 
-    Returns ``None`` if the seed/URI is malformed (bad base32, unparseable URI).
+    Returns ``None`` if the seed/URI is malformed (bad base32, unparseable URI),
+    empty, or not a TOTP (an ``otpauth://hotp/`` URI, ``period=0``).
     """
     import binascii
 
     import pyotp
 
     s = seed_or_uri.strip()
+    if not s:  # pyotp turns an empty key into a (necessarily wrong) code
+        return None
     try:
         if s.lower().startswith("otpauth://"):
-            return str(pyotp.parse_uri(s).now())
-        return str(pyotp.TOTP(s.replace(" ", "").upper()).now())
-    except (ValueError, binascii.Error):
+            otp = pyotp.parse_uri(s)
+        else:
+            otp = pyotp.TOTP(s.replace(" ", "").upper())
+        if not isinstance(otp, pyotp.TOTP):
+            return None
+        return str(otp.now())
+    except (ValueError, ArithmeticError, binascii.Error):
         return None
 
 
