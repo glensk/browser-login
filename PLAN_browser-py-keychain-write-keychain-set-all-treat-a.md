@@ -64,85 +64,64 @@ re-checked both claims against HEAD `b3f6398`.
 **Blocked on Albert:** no. Every decision is settled from the evidence below, and the tests are
 fully mocked. The only live check uses a private temp keychain behind `BROWSER_LIVE_KEYCHAIN=1`.
 
-**Decisions** (recorded with `tp question 509 -d`; Albert can overrule):
+**Decisions** (recorded with `tp question 509 -d`; Albert can overrule). The Opus-adversary debate
+(below) revised decisions 1, 2 and 4 of the first plan version:
 
-1. **Probe instead of blanket cleanup.** After an absent-then-refused add, run one pinned,
-   attributes-only probe: `security find-generic-password -a <acct> -s <svc> <target keychain>`,
-   with no `-g` and no `-w`, so no secret is read and no ACL prompt is possible.
-   - rc 44 (`errSecItemNotFound`) proves "nothing changed" → `"rejected"`, as today.
-   - Anything else (rc 0 = the item exists, another rc, `unknown`, `not_started`) → `"uncertain"`,
-     which leaves `touched` set, so the batch cleans up.
-   - Rejected alternative: biopol-wifi's uniform rule (58057c9: any failed write → delete the
-     whole set). A transient refusal of item 0 would then also delete an intact OLD set, turning
-     a harmless no-op into a forced 1Password fallback. The probe keeps the no-op a no-op when
-     it is provably one.
-2. **Ctrl-C during that add.** Handle it the same way: probe (still inside the handler, before
-   re-raising), and reset `touched` only on probe rc 44. If the probe itself is interrupted,
-   leave `touched` set.
-3. **The refused delete (case a) stays "nothing changed".** It is a single
-   `SecKeychainItemDelete`, with no create or modify involved.
-4. **No call-site `try/except`.** See Claim 2. Instead, a regression test pins the batch-owned
-   cleanup for the first item's add.
+1. **No probe: uniform cleanup after an absent-then-refused add** (revises a4d021). The first
+   version rejected this because "a transient refusal of item 0 would also delete an intact OLD
+   set". That premise is false: in this path the delete just returned rc 44, so item 0 is already
+   missing from the target keychain. Every consumer needs the whole set: `_keychain_creds` returns
+   `None`, and the biopolwifi reader fails with "run store-creds". The leftover items 1..n are
+   therefore unusable, and deleting them costs nothing. A finished add with a non-zero rc after
+   `"absent"` → `"uncertain"`: `touched` stays set, and the batch cleans up. This matches
+   biopol-wifi `58057c9`.
+2. **An add that never started stays a provable no-op.** `not_started` means `Popen` raised
+   `OSError`: after `"absent"` it returns `"rejected"`, after `"deleted"` it returns `"lost"`.
+3. **Ctrl-C during the add keeps `touched` set** (revises a27faf). A `SecurityInterrupted` is
+   raised only after the child ran (its state is never `not_started`), so no reset is possible.
+   No probe runs inside the interrupt handler.
+4. **A refused delete (case a) stays "nothing changed"** (d24f8c).
+5. **No call-site `try/except`, but the batch catches `BaseException`** (revises 3bc9d2 in part).
+   The batch's handler widens from `KeyboardInterrupt` to `BaseException`, so any unexpected
+   exception after a possible mutation runs the same `touched`-gated cleanup and then re-raises.
+   The message says "Interrupted" for `KeyboardInterrupt` and "Aborted" otherwise.
+6. **The dead `"invalid"` stays in the `i == 0` tuple.** It cannot be reached because
+   `_keychain_set_all` validates every line first. It is still a correct no-op mapping if that
+   ever changes.
 
 Why the Verification block is not strict-eligible: it runs `pytest`, `mypy` and `pylint` (through
 `uv run`), not only the allowlisted read-only checks.
 
 ## Steps
 
-- [ ] 1. Add `_kc_probe(service: str, keychain: str) -> str` next to `_kc_delete`
-      (`bin/browser.py` ~`:3360`).
-      - It runs `_security_run(["security", "find-generic-password", "-a", _kc_account(), "-s",
-        service, keychain])`, which names the keychain and passes no `-g`/`-w`.
-      - It returns `"absent"` only for `state == "done"` and rc 44, and `"present"` for rc 0.
-        Anything else returns `"unknown"`.
-      - stdout/stderr are never printed. A `SecurityInterrupted` raised inside it propagates to
-        the caller.
-- [ ] 2. In `_keychain_write`, when the item was absent and the add was refused
-      (`_kc_add_outcome` → `"rejected"`), call `_kc_probe`.
-      - `"absent"` → reset `touched`, return `"rejected"`.
-      - Otherwise → keep `touched` set, return `"uncertain"`.
-      - Update the docstring: `"rejected"` now means proven unchanged, and it names the probe.
-- [ ] 3. In `_keychain_write`'s `except SecurityInterrupted` around the add (`:3426-3429`), replace
-      the rc-based reset.
-      - When `gone == "absent"` and the interrupted add finished with `state == "done"` and a
-        non-zero rc, run `_kc_probe`, and reset `touched` only on `"absent"`.
-      - If the probe raises `SecurityInterrupted`, keep `touched` set.
-      - Always re-raise the original interrupt, so the batch's `except KeyboardInterrupt` decides
-        on cleanup.
-- [ ] 4. Update the `_keychain_set_all` docstring (`:3491-3505`): cleanup is skipped only when the
-      first write is PROVEN to have changed nothing (a refused delete, or a refused add confirmed
-      absent by the probe).
-      - No change to the `i == 0` branch logic, because `"uncertain"` already falls through to
-        cleanup.
-      - Remove the dead `"invalid"` from that tuple only if mypy/pylint stay clean. Otherwise
-        leave it.
-- [ ] 5. `tests/test_keychain_batch.py`: extend `FakeKeychain._apply` for the probe.
-      - A `find` that names a keychain and carries no `-g` looks only in that keychain: rc 0 when
-        present, 44 when absent.
-      - Keep the existing assert that the `-g` read-back is unpinned.
-      - Probe faults stay keyed as `("find", svc, n)`.
-- [ ] 6. Tests in `tests/test_keychain_batch.py`, all mocked:
-      - (a) Rework `test_first_item_absent_then_add_rejected_changes_nothing`. It must also assert
-        that exactly one pinned probe ran and that no cleanup delete followed.
-      - (b) New: absent, then the add is refused, but the fake stores the item anyway (a new fault
-        kind `"commit_then_fail"`, where the add stores the value and returns 45) → probe rc 0 →
-        `changed=True`, every service is deleted, and `_report_keychain_batch_failure` does NOT
-        print "nothing changed".
-      - (c) New: absent, the add is refused, and the probe returns `unknown` (-9) or rc 51 →
-        cleanup runs (parametrized).
-      - (d) New: Ctrl-C during the first item's add after an absent delete, with a non-zero rc.
-        Probe rc 44 → no cleanup and nothing on stderr. Item present → cleanup, then propagate.
-        Probe interrupted → cleanup, then propagate.
-      - (e) New: `_kc_probe` argv names the target keychain last and contains neither `-g` nor
-        `-w`.
-      - Every existing test must stay green unchanged except (a).
-- [ ] 7. `tests/test_keychain_live.py`: make sure the router accepts the pinned probe shape (a
-      find with a keychain argument and no `-g`) and rewrites it to the temp keychain.
-      - Add one live case: add an item to the temp keychain, confirm the probe returns
-        `"present"`; delete it, confirm the probe returns `"absent"`.
-      - It uses only the fixture's temp keychain and never the search list or the login keychain.
-- [ ] 8. Update the README's keychain section (the "nothing changed" wording) and
-      `repo_scope.md`, if either describes the first-write rule.
+- [ ] 1. `_kc_add_outcome` (`bin/browser.py`): `unknown` → `"uncertain"`; `done` with rc 0 →
+      `"added"`; `not_started` → `"lost"` after `"deleted"`, `"rejected"` after `"absent"`;
+      `done` with a non-zero rc → `"lost"` after `"deleted"`, `"uncertain"` after `"absent"`.
+- [ ] 2. `_keychain_write`: remove the `touched` reset from the `except SecurityInterrupted`
+      around the add, so it only re-raises. Keep the post-add reset for `"rejected"`, which now
+      means `not_started`. Update the docstring: `"rejected"` = a refused delete, or an add that
+      never started; `"uncertain"` includes a refused add after `"absent"`. A concurrent writer's
+      item (rc 45) is deleted by the cleanup too.
+- [ ] 3. `_keychain_set_all`: widen `except KeyboardInterrupt` to `except BaseException as exc`,
+      with the message word depending on the exception type. Update the docstring: cleanup is
+      skipped only when the first write provably changed nothing (a refused delete, or an add
+      that never started).
+- [ ] 4. `tests/test_keychain_batch.py`, all mocked:
+      - (a) Rework `test_first_item_absent_then_add_rejected_changes_nothing`: now
+        `changed=True`, and every service gets a cleanup delete.
+      - (b) New: after `"absent"`, the add is `not_started` → `changed=False`, and there is no
+        cleanup delete.
+      - (c) New: Ctrl-C during the first item's add after `"absent"`, with a non-zero rc →
+        cleanup, then propagate.
+      - (d) New: an unexpected exception (the read-back raises `RuntimeError`) after a mutation →
+        cleanup, the "Aborted" message, then propagate.
+      - (e) New: a locked keychain, where the add after `"absent"` and every cleanup delete return
+        51 → the message names every service as a survivor.
+      - (f) Extend the `store` message tests (for both cscs and biopolwifi): an absent first item
+        with a refused add prints the "removed" message, not "nothing changed", and prints no
+        captured `security` output.
+- [ ] 5. Update the README keychain section ("nothing changed" wording). Update `repo_scope.md`
+      only if it describes the first-write rule.
 
 NOTE: after this lands, Albert re-runs `browser.py store-creds cscs` / `store-creds biopolwifi`
 himself when he next rotates those credentials. No action is needed for items that are already
@@ -158,6 +137,26 @@ cd /Users/albert/obsidian/42-Git/home/browser-login && uv run mypy bin/browser.p
 cd /Users/albert/obsidian/42-Git/home/browser-login && uv run pylint bin/browser.py
 cd /Users/albert/obsidian/42-Git/home/browser-login && uv run pytest -q tests/test_keychain_batch.py tests/test_credentials.py
 cd /Users/albert/obsidian/42-Git/home/browser-login && uv run pytest -q
-cd /Users/albert/obsidian/42-Git/home/browser-login && env BROWSER_LIVE_KEYCHAIN=1 uv run pytest -q tests/test_keychain_live.py
+cd /Users/albert/obsidian/42-Git/home/browser-login && env BROWSER_LIVE_KEYCHAIN=1 uv run pytest -q tests/test_keychain_live.py  # temp keychain only
 cd /Users/albert/obsidian/42-Git/home/browser-login && bin/browser.py -h
 ```
+
+## Debate outcome (Opus adversary)
+
+Round 1 (a fresh Opus reviewer, read-only), and round 2 on the one severe objection I rejected.
+
+| #   | Sev  | Objection                                                                                          | Disposition                                                                                                                |
+| --- | ---- | -------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------- |
+| 1   | high | The probe rests on a false premise: the old set is never intact after absent-then-refused          | **Accepted.** Probe dropped; uniform cleanup (Decision 1)                                                                  |
+| 2   | high | A locked keychain gives "cleanup FAILED … run forget-creds", and forget-creds deletes old 1..n     | **Rejected.** Items 1..n are unusable without item 0, and forget-creds only touches the target keychain. Round 2 confirmed |
+| 3   | med  | A `not_started` add was probed and cleaned up                                                      | **Accepted.** `not_started` = no-op (Decision 2)                                                                           |
+| 4   | med  | rc 44 alone is weak proof for the probe                                                            | Moot (no probe)                                                                                                            |
+| 5   | med  | The live-router rewrite would hide a mis-pinned probe                                              | Moot (no probe)                                                                                                            |
+| 6   | med  | The probe's fault keys collide with the read-back's                                                | Moot (no probe)                                                                                                            |
+| 7   | med  | A probe inside the Ctrl-C handler can block on an unlock dialog                                    | **Accepted.** No probe; the handler keeps `touched` (Decision 3)                                                           |
+| 8   | low  | Non-`KeyboardInterrupt` exceptions skip cleanup                                                    | **Accepted.** `except BaseException` (Decision 5)                                                                          |
+| 9   | low  | A racing writer's item gets deleted                                                                | **Accepted** as a docstring note (step 2)                                                                                  |
+| 10  | low  | The "invalid" removal depends on the lint result                                                   | **Accepted.** Decided now: keep it (Decision 6)                                                                            |
+| 11  | low  | Message tests for both stores; the live run must not be a gate                                     | Message tests **accepted** (4f). Live run kept: it uses only a temp keychain, never the search list                        |
+| 12  | low  | The README should describe the refused-first-write outcomes                                        | **Accepted** (step 5)                                                                                                      |
+| R2  | —    | The Ctrl-C reset condition is inverted relative to the plan                                        | **Accepted.** The reset is removed entirely (step 2)                                                                       |

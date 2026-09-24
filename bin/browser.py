@@ -3364,12 +3364,19 @@ def _kc_delete(service: str, keychain: str) -> str:
 
 def _kc_add_outcome(add: SecurityResult, gone: str) -> str:
     """``"added"`` / ``"uncertain"`` / ``"lost"`` / ``"rejected"`` for the add
-    that followed a delete with outcome *gone* (``"deleted"`` or ``"absent"``)."""
+    that followed a delete with outcome *gone* (``"deleted"`` or ``"absent"``).
+
+    Only an add that never started is a provable no-op: a finished add with a
+    non-zero exit is not proof that nothing was stored (tp#509), so after
+    ``"absent"`` it is ``"uncertain"``.
+    """
     if add.state == "unknown":
         return "uncertain"
     if add.state == "done" and add.rc == 0:
         return "added"
-    return "lost" if gone == "deleted" else "rejected"
+    if gone == "deleted":
+        return "lost"
+    return "rejected" if add.state == "not_started" else "uncertain"
 
 
 class _KcTouched:
@@ -3390,10 +3397,12 @@ def _keychain_write(
 
     ``"ok"``; ``"invalid"`` (``_kc_add_line`` refused it — nothing ran);
     ``"rejected"`` (the delete was refused, or the item was absent and the add
-    was refused — nothing changed); ``"lost"`` (the old item was deleted, then
-    the add was refused — the item is now missing); ``"uncertain"`` (the
-    delete or the add has an unknown effect; after an unknown delete no add is
-    started); ``"mismatch"`` (added, but the read-back differs).
+    never started — nothing changed); ``"lost"`` (the old item was deleted,
+    then the add was refused — the item is now missing); ``"uncertain"`` (the
+    delete or the add has an unknown effect, or the item was absent and the
+    add exited non-zero — it may still have stored the item; after an unknown
+    delete no add is started); ``"mismatch"`` (added, but the read-back
+    differs).
 
     Delete-then-add instead of ``add -U``: an update re-sets the item's access
     list, which can prompt (tp#504); a fresh add does not. Not atomic — a
@@ -3406,7 +3415,9 @@ def _keychain_write(
     ``value`` exactly: a byte-exact round-trip check that also catches a
     tokenizer divergence (tp#498) and a shadowing copy earlier in the search
     list. *touched* is set while a mutation may have happened; it is reset
-    when a step proves to be a no-op, also when Ctrl-C interrupts it.
+    only when a step proves to be a no-op (a refused delete, an add that never
+    started), also when Ctrl-C interrupts the delete. A Ctrl-C during the add
+    keeps it set: the add ran, so its effect is not provably nil.
     """
     line = _kc_add_line(service, value, description, keychain)
     if line is None:
@@ -3425,12 +3436,7 @@ def _keychain_write(
     if gone == "rejected":
         mark.value = before
         return "rejected"
-    try:
-        add = _security_run(["security", "-i"], data=line)
-    except SecurityInterrupted as exc:
-        if gone == "absent" and exc.result.state != "unknown" and exc.result.rc:
-            mark.value = before
-        raise
+    add = _security_run(["security", "-i"], data=line)
     outcome = _kc_add_outcome(add, gone)
     if outcome == "rejected":
         mark.value = before
@@ -3494,12 +3500,16 @@ def _keychain_set_all(
     The target is the default keychain, resolved once; every delete and add
     names it (no ``-U`` — see ``_keychain_write``). Every item is validated
     before the first write, so an invalid last field leaves the keychain
-    untouched. Writes stop at the first failure; unless nothing can have
-    changed (the FIRST write was refused outright), every item of the batch is
-    then deleted — a mixed old/new set would make a login submit a wrong pair
-    (lockout risk), a missing one makes it fall back to 1Password. A Ctrl-C
-    that interrupts the batch after something may have changed runs the same
-    cleanup, then propagates.
+    untouched. Writes stop at the first failure; unless the FIRST write
+    provably changed nothing (its delete was refused, or its add never
+    started), every item of the batch is then deleted — a mixed old/new set
+    would make a login submit a wrong pair (lockout risk), a missing one makes
+    it fall back to 1Password. A refused add after an absent first item is
+    cleaned up too: the add may have stored it, and the old set was already
+    unusable without that item. The cleanup can also delete an item a
+    concurrent writer just created. A Ctrl-C (or any other exception) that
+    aborts the batch after something may have changed runs the same cleanup,
+    then propagates.
 
     Best effort, NOT atomic: a login running concurrently can still read a
     mixed or missing set in the window, and a delete can fail (``surviving``).
@@ -3521,13 +3531,14 @@ def _keychain_set_all(
             break
         else:
             return KeychainBatchResult(ok=True, changed=True)
-    except KeyboardInterrupt:
+    except BaseException as exc:
         if touched.value:
             _, surviving, _ = _kc_cleanup(services, keychain)
+            word = "Interrupted" if isinstance(exc, KeyboardInterrupt) else "Aborted"
             print(
-                "Interrupted — the partially written keychain items were removed."
+                f"{word} — the partially written keychain items were removed."
                 if not surviving
-                else "Interrupted — keychain cleanup FAILED for "
+                else f"{word} — keychain cleanup FAILED for "
                 f"{', '.join(surviving)}; remove them with forget-creds.",
                 file=sys.stderr,
             )

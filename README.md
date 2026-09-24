@@ -302,7 +302,11 @@ the `himalaya` helpers. The CDP endpoint is always `http://127.0.0.1:<port>` (ne
   that fails part-way never leaves a mixed old/new credential set: every item of
   the set is deleted again (best effort, not atomic), and `store-creds` reports
   either "nothing changed", "no stored set remains", or the items whose cleanup
-  failed (then run `forget-creds SITE`).
+  failed (then run `forget-creds SITE`). "Nothing changed" is reported only when
+  the first write provably changed nothing: its delete was refused, or its add
+  never started. A refused add counts as a possible write (tp#509), so the set
+  is cleaned up. When the first item was already missing, this only removes
+  leftovers that no login could use anyway.
 - **Keychain writes are delete-then-add, never `-U`** (tp#504). Updating an existing
   item with `add-generic-password -U` re-sets its access list, which can open a
   SecurityAgent dialog; a fresh add does not. Both the delete and the add name the

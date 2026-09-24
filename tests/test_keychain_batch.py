@@ -58,8 +58,9 @@ class FakeKeychain:
     ``default`` the default keychain. Named deletes/adds only touch the named
     keychain. ``fault(op, svc, answer, nth)`` makes the *nth* (0-based) call of
     *op* for *svc* answer differently: an int rc (nothing done), ``"unknown"``
-    (done, then the child dies by a signal), ``"not_started"`` or ``"garble"``
-    (add stores something else, rc 0). ``interrupt_at(op, svc, nth)`` raises
+    (done, then the child dies by a signal), ``"not_started"``, ``"garble"``
+    (add stores something else, rc 0) or ``"commit_then_fail"`` (add stores
+    the value, then exits 45). ``interrupt_at(op, svc, nth)`` raises
     Ctrl-C in the parent while that call runs (the call itself completes).
     """
 
@@ -157,6 +158,8 @@ class FakeKeychain:
         rc, out, err = self._apply(argv, data)
         if answer == "unknown":
             return -9, "", ""
+        if answer == "commit_then_fail":
+            return 45, "", ""  # it stored the item, yet exited non-zero
         if answer == "garble" and op == "add" and rc == 0:
             self.kcs[self._parse(argv, data)[2] or self.default][svc] = "garbled"
         return rc, out, err
@@ -241,12 +244,36 @@ def test_first_item_add_rejected_after_delete_is_lost_and_cleaned_up(kc):
     assert not kc.items
 
 
-def test_first_item_absent_then_add_rejected_changes_nothing(kc):
+@pytest.mark.parametrize("answer", [1, 51, "commit_then_fail"])
+def test_first_item_absent_then_add_refused_is_cleaned_up(kc, answer):
+    # tp#509: a refused add is no proof that nothing was stored; the old set
+    # was already unusable without svc.a, so its leftovers go too
     kc.items = {"svc.b": "OLD-VALUE-B"}
-    kc.fault("add", "svc.a", 1)
+    kc.fault("add", "svc.a", answer)
+    res = _batch()
+    assert (res.ok, res.changed) == (False, True)
+    assert kc.ops("delete") == ["svc.a", *NEW]
+    assert res.removed == tuple(NEW) and res.surviving == ()
+    assert not kc.items
+
+
+def test_first_item_absent_then_add_not_started_changes_nothing(kc):
+    kc.items = {"svc.b": "OLD-VALUE-B"}
+    kc.fault("add", "svc.a", "not_started")
     res = _batch()
     assert (res.ok, res.changed) == (False, False)
     assert kc.ops("delete") == ["svc.a"] and kc.items == {"svc.b": "OLD-VALUE-B"}
+
+
+def test_locked_keychain_after_absent_first_item_names_every_survivor(kc):
+    kc.items = {"svc.b": "OLD-VALUE-B"}
+    kc.fault("add", "svc.a", 51)
+    kc.fault("delete", "svc.a", 51, nth=1)
+    kc.fault("delete", "svc.b", 51)
+    kc.fault("delete", "svc.c", 51)
+    res = _batch()
+    assert (res.ok, res.changed) == (False, True)
+    assert res.removed == () and res.surviving == tuple(NEW)
 
 
 def test_first_item_delete_rejected_changes_nothing(kc):
@@ -350,6 +377,32 @@ def test_interrupt_after_a_mutation_cleans_up_then_propagates(kc, capsys, op, sv
     assert kc.ops("delete")[-3:] == list(NEW)  # the cleanup
     assert not kc.items
     assert "partially written keychain items were removed" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("answer", [1, "commit_then_fail"])
+def test_interrupt_during_a_refused_add_after_absent_cleans_up(kc, capsys, answer):
+    kc.items = {"svc.b": "OLD-VALUE-B"}
+    kc.fault("add", "svc.a", answer)
+    kc.interrupt_at("add", "svc.a")
+    with pytest.raises(KeyboardInterrupt):
+        _batch()
+    assert kc.ops("delete") == ["svc.a", *NEW]
+    assert not kc.items
+    assert "Interrupted — the partially written" in capsys.readouterr().err
+
+
+def test_unexpected_exception_after_a_mutation_cleans_up_then_propagates(
+    kc, capsys, monkeypatch
+):
+    def boom(_service):
+        raise RuntimeError("read-back broke")
+
+    monkeypatch.setattr(browser, "_keychain_get", boom)
+    with pytest.raises(RuntimeError):
+        _batch()
+    assert kc.ops("delete") == ["svc.a", *NEW]
+    assert not kc.items
+    assert "Aborted — the partially written" in capsys.readouterr().err
 
 
 def test_interrupt_during_a_rejected_first_delete_skips_cleanup(kc, capsys):
@@ -461,10 +514,22 @@ def test_store_prints_the_dialog_hint_without_values(store, capsys):
 
 def test_store_nothing_changed_message(store, capsys):
     which, kc = store
-    kc.fault("add", _first_svc(which), 1)
+    kc.items = {_first_svc(which): "OLD"}
+    kc.fault("delete", _first_svc(which), 51)
     assert _run_store(which) == 1
     err = _no_values(capsys)
     assert "nothing changed" in err
+    assert kc.items == {_first_svc(which): "OLD"}
+
+
+def test_store_refused_first_add_is_not_nothing_changed(store, capsys):
+    which, kc = store  # the set is empty: the first item is absent
+    kc.fault("add", _first_svc(which), "commit_then_fail")
+    assert _run_store(which) == 1
+    err = _no_values(capsys)
+    assert "nothing changed" not in err
+    assert "no stored set remains" in err
+    assert not kc.items
 
 
 def test_store_partial_write_removed_message(store, capsys):

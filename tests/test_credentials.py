@@ -280,7 +280,7 @@ def test_keychain_set_reports_the_outcome(sec):
         ([(51, "", "")], "rejected"),
         ([NOT_STARTED], "rejected"),
         ([UNKNOWN], "uncertain"),
-        ([ABSENT, (45, "", "")], "rejected"),
+        ([ABSENT, (45, "", "")], "uncertain"),  # may have stored it (tp#509)
         ([ABSENT, NOT_STARTED], "rejected"),
         ([OK, (45, "", "")], "lost"),
         ([OK, NOT_STARTED], "lost"),
