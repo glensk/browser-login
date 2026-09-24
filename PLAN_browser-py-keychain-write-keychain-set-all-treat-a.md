@@ -94,19 +94,19 @@ Why the Verification block is not strict-eligible: it runs `pytest`, `mypy` and 
 
 ## Steps
 
-- [ ] 1. `_kc_add_outcome` (`bin/browser.py`): `unknown` → `"uncertain"`; `done` with rc 0 →
+- [x] 1. `_kc_add_outcome` (`bin/browser.py`): `unknown` → `"uncertain"`; `done` with rc 0 →
       `"added"`; `not_started` → `"lost"` after `"deleted"`, `"rejected"` after `"absent"`;
       `done` with a non-zero rc → `"lost"` after `"deleted"`, `"uncertain"` after `"absent"`.
-- [ ] 2. `_keychain_write`: remove the `touched` reset from the `except SecurityInterrupted`
+- [x] 2. `_keychain_write`: remove the `touched` reset from the `except SecurityInterrupted`
       around the add, so it only re-raises. Keep the post-add reset for `"rejected"`, which now
       means `not_started`. Update the docstring: `"rejected"` = a refused delete, or an add that
       never started; `"uncertain"` includes a refused add after `"absent"`. A concurrent writer's
       item (rc 45) is deleted by the cleanup too.
-- [ ] 3. `_keychain_set_all`: widen `except KeyboardInterrupt` to `except BaseException as exc`,
+- [x] 3. `_keychain_set_all`: widen `except KeyboardInterrupt` to `except BaseException as exc`,
       with the message word depending on the exception type. Update the docstring: cleanup is
       skipped only when the first write provably changed nothing (a refused delete, or an add
       that never started).
-- [ ] 4. `tests/test_keychain_batch.py`, all mocked:
+- [x] 4. `tests/test_keychain_batch.py`, all mocked:
       - (a) Rework `test_first_item_absent_then_add_rejected_changes_nothing`: now
         `changed=True`, and every service gets a cleanup delete.
       - (b) New: after `"absent"`, the add is `not_started` → `changed=False`, and there is no
@@ -120,8 +120,9 @@ Why the Verification block is not strict-eligible: it runs `pytest`, `mypy` and 
       - (f) Extend the `store` message tests (for both cscs and biopolwifi): an absent first item
         with a refused add prints the "removed" message, not "nothing changed", and prints no
         captured `security` output.
-- [ ] 5. Update the README keychain section ("nothing changed" wording). Update `repo_scope.md`
-      only if it describes the first-write rule.
+- [x] 5. Update the README keychain section ("nothing changed" wording). Update `repo_scope.md`
+      only if it describes the first-write rule (it does not, so it is unchanged). Also updated
+      `tests/test_credentials.py`: `[ABSENT, 45]` now expects `"uncertain"`.
 
 NOTE: after this lands, Albert re-runs `browser.py store-creds cscs` / `store-creds biopolwifi`
 himself when he next rotates those credentials. No action is needed for items that are already
