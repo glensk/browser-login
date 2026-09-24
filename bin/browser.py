@@ -4950,18 +4950,26 @@ ASSISTED_MODES = {"assisted", "1password"}
 
 def _load_login_events(site_name: str) -> list[dict]:
     """All recorded real-login events for one site, each tagged with `site`.
-    Empty list when nothing's recorded yet."""
+    Empty list when nothing's recorded yet. Lines that are not a JSON object
+    with a numeric `ts` (torn writes, hand edits) are skipped, not fatal."""
     path = LOGIN_LOG_DIR / f"{site_name}.jsonl"
     if not path.is_file():
         return []
+    try:
+        text = path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return []
     events: list[dict] = []
-    for line in path.read_text(encoding="utf-8").splitlines():
+    for line in text.splitlines():
         line = line.strip()
         if not line:
             continue
         try:
             e = json.loads(line)
         except ValueError:
+            continue
+        ts = e.get("ts") if isinstance(e, dict) else None
+        if isinstance(ts, bool) or not isinstance(ts, (int, float)):
             continue
         e.setdefault("site", site_name)
         events.append(e)
