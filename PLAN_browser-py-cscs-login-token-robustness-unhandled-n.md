@@ -166,13 +166,23 @@ make the verification run touch the real login keychain (Codex O5).
       two senders / `None` / int / dict with non-string `addr`; `to` as a list containing and not
       containing the email, a mixed valid/invalid list, a comma-separated string, mixed case;
       `subject` as int; malformed `date` → no exception and the correct accept/reject.
-- [ ] Run the Verification block; fix every lint/type finding on the spot.
-- [ ] Update README (CSCS login section: OTP generated at fill time; store-creds failure leaves no
+- [x] Run the Verification block; fix every lint/type finding on the spot.
+- [x] Update README (CSCS login section: OTP generated at fill time; store-creds failure leaves no
       partial set, or names what survived) where it states otherwise.
 
 NOTE: no live check against the real CSCS Keycloak is part of this plan (it needs Albert's real
 credentials and the shared browser). Albert's next ordinary `browser.py cscs-login` exercises D1/D2
 in production; nothing needs re-arming or deploying (browser.py runs from the repo on each call).
+
+## Execution log (2026-09-24)
+
+All steps done in session `5bc9a4f7-906a-4ca5-b473-9fea01d1d597`: D1 `d0a6b52`, D2 `c8881ff`,
+D3 `2fdac9e`, D4 `371b91a`, README + this log in the final commit. Deviations:
+`KeychainBatchResult.removed/surviving` are tuples (immutable, no `dataclasses.field`, whose
+name collides with locals called `field`); new test files: `tests/test_token_verify.py` (D1),
+`tests/test_keycloak_otp.py` (D2), `tests/test_keychain_batch.py` (D3),
+`tests/test_subprocess_guard.py` (the conftest guard). A malformed/multi-address sender shows
+as `<no single valid sender>` in the rejected-senders diag line.
 
 ## Verification
 

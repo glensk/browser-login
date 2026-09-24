@@ -214,7 +214,7 @@ manual sign-in — actually happens.
 | Site                   | Login style                                                           |
 | :--------------------- | :------------------------------------------------------------------- |
 | `anthropic` (`claude`) | **Magic-link, fully automatic** when `ANTHROPIC_LOGIN_EMAIL` is set and `himalaya` reads that mailbox: triggers the email, extracts the `claude.ai/magic-link#<token>` URL, opens it — only if it passes the three login-CSRF guards below. Otherwise **assisted** (you finish the email login once). |
-| `cscs`                 | **Keycloak, unattended.** `store-creds cscs` caches username/password/TOTP-seed in the macOS keychain (from 1Password, one last Touch ID); thereafter login runs with no fingerprint. TOTP codes are generated locally with `pyotp`. A flow Keycloak aborts with `authentication_expired` (stale `session_code` on a login page left open for hours) is retried once from a fresh page with a newly generated code; a wrong password still fails on the first attempt. |
+| `cscs`                 | **Keycloak, unattended.** `store-creds cscs` caches username/password/TOTP-seed in the macOS keychain (from 1Password, one last Touch ID); thereafter login runs with no fingerprint. TOTP codes are generated locally with `pyotp` only once the OTP field appears (never before the password submit), waiting for the next 30 s step when the current one has under 5 s left; the 1Password fallback likewise fetches its live code at fill time. A flow Keycloak aborts with `authentication_expired` (stale `session_code` on a login page left open for hours) is retried once from a fresh page with a newly generated code; a wrong password still fails on the first attempt. After login the token is cached (0600) and checked against `/api/me/`; a network error or an unexpected answer exits 1 with a one-line reason, never a traceback. |
 | `openai` (`chatgpt`)   | **Assisted.** ChatGPT Business logs in via Google SSO + 2FA, which can't be replayed from a stored secret — you complete the SSO once in the shared window; the session persists. Logged-in sentinel: the 'Invite member' button on `chatgpt.com/admin/members`. |
 | `slack`                | **Assisted.** app.slack.com logs in via email-code / SSO; you sign in once and the session persists. Logged-in sentinel: a team with an `xoxc-` token in `localConfig_v2`. `browser.py slack-session` then prints `{token,cookie,team_domain}` (xoxc + httpOnly `d` cookie via CDP) so `slack-api` can call `users.admin.setInactive` on the Pro plan — where the API token is scope-blocked. Bearer creds → stdout only, never cached. |
 | `biopolwifi`           | **Keychain email+password, unattended.** SDSC Biopole WiFi units are managed via a Ruckus Cloudpath MDU portal (`cloudpath.edificom.cloud`, a plain Vue SPA). `store-creds biopolwifi` caches the portal email+password in the macOS keychain (the same items `sdsc/biopol-wifi/biopol-wifi.py` reads); login fills the form and confirms the `SDSC - Biopole` / `Properties` sentinel. No SSO, no TOTP, no token extracted. Aliases: `biopol`, `cloudpath`, `edificom`. |
@@ -278,7 +278,7 @@ Two shapes cover almost everything:
 Steps: write `cmd_<site>_login(port)` and `cmd_<site>_logged_in(port)` (check a DOM
 sentinel on a stable post-login surface — never "the URL isn't `/login`"), optionally
 `cmd_<site>_store_creds()`, then register a `Site(...)` in `_sites()`. Reuse the
-keychain helpers (`_keychain_get/set`, `_totp_now`, `_op_creds`) and, for email flows,
+keychain helpers (`_keychain_get/set/set_all`, `_totp_now`/`_fresh_totp`, `_op_creds`) and, for email flows,
 the `himalaya` helpers. The CDP endpoint is always `http://127.0.0.1:<port>` (never
 `localhost` — Chrome's debug port is IPv4-only and `localhost`→`::1` stalls on macOS).
 
@@ -296,7 +296,11 @@ the `himalaya` helpers. The CDP endpoint is always `http://127.0.0.1:<port>` (ne
   line (argv is visible to every same-user process via `ps`), and reads the item back
   to confirm the write. A value with a control character (newline, tab, …) or a
   command line over 4000 bytes is refused before anything is written — `security -i`
-  would otherwise split it and store a fragment in the login keychain.
+  would otherwise split it and store a fragment in the login keychain. A write
+  that fails part-way never leaves a mixed old/new credential set: every item of
+  the set is deleted again (best effort, not atomic), and `store-creds` reports
+  either "nothing changed", "no stored set remains", or the items whose cleanup
+  failed (then run `forget-creds SITE`).
 
 ## License
 
