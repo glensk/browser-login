@@ -3034,16 +3034,35 @@ def _capture_and_cache_token(ctx, page) -> int:
         os.fchmod(fh.fileno(), 0o600)
         fh.write(token)
     print(f"✓ Token cached at {CSCS_TOKEN_CACHE} (mode 0600).")
-    resp = requests.get(
-        PORTAL_API_ME, headers={"Authorization": f"Token {token}"}, timeout=15
-    )
-    if resp.status_code == 200:
-        data = resp.json()
-        print(f"✓ Authenticated as: {data.get('username')} ({data.get('email')})")
-        return 0
-    return _fail(
-        f"Portal rejected the cached token ({resp.status_code}): {resp.text[:200]}"
-    )
+    # Cached BEFORE the check on purpose: a token scanned from the logged-in
+    # portal is almost always valid, and cscs-api.py self-heals on a 401. A
+    # failed check exits 1 (cscs-api.py maps 2 to "needs login", which it isn't).
+    # Error lines name only the exception TYPE and the status code — a response
+    # body or exception text may echo the token.
+    try:
+        resp = requests.get(
+            PORTAL_API_ME, headers={"Authorization": f"Token {token}"}, timeout=15
+        )
+        data = resp.json() if resp.status_code == 200 else None
+    except (requests.RequestException, ValueError) as exc:
+        return _fail(
+            f"Token cached at {CSCS_TOKEN_CACHE}, but verifying it against the "
+            f"portal failed ({type(exc).__name__}) — check the network, then "
+            "re-run: browser.py token"
+        )
+    if resp.status_code != 200:
+        return _fail(
+            f"Portal rejected the cached token (HTTP {resp.status_code}) — "
+            "log into CSCS again (browser.py cscs-login)."
+        )
+    if not isinstance(data, dict):
+        return _fail(
+            f"Token cached at {CSCS_TOKEN_CACHE}, but the portal's /api/me/ "
+            "answer was not a JSON object — cannot confirm the token."
+        )
+    user, email = _printable(data.get("username")), _printable(data.get("email"))
+    print(f"✓ Authenticated as: {user} ({email})")
+    return 0
 
 
 def _pick_portal_page(browser):

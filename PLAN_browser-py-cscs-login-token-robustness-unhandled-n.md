@@ -93,14 +93,14 @@ make the verification run touch the real login keychain (Codex O5).
       basename is `security`, `op` or `himalaya` raises before executing; `tests/test_keychain_live.py`
       opts out via a marker. Update the `_store_creds_env` fixture (`tests/test_credentials.py:353`)
       to mock the new internal write helper and `_keychain_delete`, not only `_keychain_set`.
-- [ ] **D1 (+O6).** In `_capture_and_cache_token`, wrap the `/api/me` check (`requests.get` +
+- [x] **D1 (+O6).** In `_capture_and_cache_token`, wrap the `/api/me` check (`requests.get` +
       `resp.json()`) in `try/except (requests.RequestException, ValueError)`. On error return
       `_fail("Token cached at <path>, but verifying it against the portal failed (<ExcType>) …")`
       (exit 1; names only the exception TYPE). A 200 whose JSON is not a dict is a failure too.
       Non-200: report the status code and a fixed explanation — drop `resp.text` entirely. Keep
       caching BEFORE verification (a token scanned from the logged-in portal is almost always
       valid; `cscs-api.py` self-heals on 401).
-- [ ] **D1 (O10).** Command-level tests for `cmd_token` AND `cmd_cscs_login` with a mocked
+- [x] **D1 (O10).** Command-level tests for `cmd_token` AND `cmd_cscs_login` with a mocked
       `_connect`: verified → 0; `ConnectionError`/`Timeout`, a `ValueError` from `.json()`,
       non-dict JSON (`null`, list, scalar) and non-200 → 1 with the cache file written 0600;
       Keycloak redirect in `cmd_token` → 2 unchanged; `_close_stale_cscs_tabs`, `browser.close`

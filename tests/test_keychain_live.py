@@ -22,10 +22,13 @@ from pathlib import Path
 
 import pytest
 
-pytestmark = pytest.mark.skipif(
-    os.environ.get("BROWSER_LIVE_KEYCHAIN") != "1" or sys.platform != "darwin",
-    reason="live keychain test: set BROWSER_LIVE_KEYCHAIN=1 on macOS",
-)
+pytestmark = [
+    pytest.mark.skipif(
+        os.environ.get("BROWSER_LIVE_KEYCHAIN") != "1" or sys.platform != "darwin",
+        reason="live keychain test: set BROWSER_LIVE_KEYCHAIN=1 on macOS",
+    ),
+    pytest.mark.live_keychain,  # opts out of conftest's default-deny guard
+]
 
 _BROWSER_PY = Path(__file__).resolve().parent.parent / "bin" / "browser.py"
 
