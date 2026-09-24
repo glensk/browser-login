@@ -52,7 +52,7 @@ CASES = {
 }
 
 
-def _items_matching(account: str, prefix: str) -> list[tuple[str, str]]:
+def _items_matching(prefix: str) -> list[tuple[str, str]]:
     """(account, service) of every login-keychain item touching our namespace.
 
     ``dump-keychain`` without ``-d`` prints attributes only, never secrets;
@@ -104,11 +104,11 @@ def test_keychain_set_round_trips_through_security_stdin(monkeypatch):
         # client mid-prompt made securityd abort (see PLAN execution notes).
         # an invalid value must not reach the keychain at all
         assert not browser._keychain_set(f"{account}-newline", "a\nb", "tp489")
-        found = _items_matching(account, account)
+        found = _items_matching(account)
         assert sorted(found) == sorted((account, s) for s in services.values()), (
             "unexpected items under the throw-away account"
         )
     finally:
         for svc in [*services.values(), f"{account}-newline"]:
             _delete(account, svc)
-    assert not _items_matching(account, account)
+    assert not _items_matching(account)
