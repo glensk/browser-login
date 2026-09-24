@@ -505,3 +505,61 @@ def test_totp_now_rejects_unusable_secrets_without_crashing(bad):
     # seed in the keychain) produced a code that is guaranteed wrong and burns a
     # Keycloak attempt toward the account lockout.
     assert browser._totp_now(bad) is None
+
+
+class _LoginPage:
+    def __init__(self, url: str, after_goto: str):
+        self.url = url
+        self._after = after_goto
+
+    def goto(self, url, **kwargs):
+        self.url = self._after
+
+    def wait_for_timeout(self, _ms):
+        pass
+
+
+def _cscs_login_env(monkeypatch, page):
+    import contextlib
+
+    class _Closer:
+        def close(self):
+            pass
+
+        def stop(self):
+            pass
+
+    monkeypatch.setattr(browser, "_connect", lambda port: (_Closer(), _Closer()))
+    monkeypatch.setattr(
+        browser, "_interaction_lease", lambda *a, **k: contextlib.nullcontext()
+    )
+    monkeypatch.setattr(browser, "_pick_portal_page", lambda b: (None, page))
+    monkeypatch.setattr(browser, "_close_stale_cscs_tabs", lambda ctx, keep=None: 0)
+    monkeypatch.setattr(browser, "_cscs_creds", lambda announce: (("u", "p", "1"), "k"))
+    monkeypatch.setattr(browser, "_submit_keycloak_login", lambda pg, creds: False)
+    monkeypatch.setattr(browser, "_keycloak_flow_expired", lambda pg: False)
+    recorded: list = []
+    monkeypatch.setattr(browser, "_record_login_event", lambda *a: recorded.append(a))
+    return recorded
+
+
+@pytest.mark.parametrize(
+    "after_goto",
+    [
+        # OAuth callback carrying a live authorization code → "Unexpected page"
+        "https://portal.cscs.ch/api-auth/keycloak/complete/?code=SECRETCODE&state=S",
+        # Keycloak form with its session_code → "Login did not reach the portal"
+        "https://auth.cscs.ch/auth/realms/cscs/login-actions/authenticate"
+        "?session_code=SECRETCODE&execution=e&tab_id=t",
+    ],
+)
+def test_cscs_login_errors_print_only_the_origin(monkeypatch, capsys, after_goto):
+    # Regression: the failure lines interpolated the raw page URL, so an OAuth
+    # authorization code / Keycloak session code landed in stderr, logs and LLM
+    # transcripts (AGENTS.md: tab URLs in error lines go through _tab_hint).
+    recorded = _cscs_login_env(monkeypatch, _LoginPage("about:blank", after_goto))
+    assert browser.cmd_cscs_login(9222) == 1
+    err = capsys.readouterr().err
+    assert "SECRETCODE" not in err
+    assert browser._tab_hint(after_goto) in err
+    assert not recorded  # a failed login is never logged as a real login

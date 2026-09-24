@@ -3490,7 +3490,9 @@ def cmd_cscs_login(port: int) -> int:
             if _on_portal(page):
                 print("✓ Already logged into CSCS.")
             elif "auth.cscs.ch" not in page.url:
-                return _fail(f"Unexpected page (not portal, not Keycloak): {page.url}")
+                return _fail(
+                    f"Unexpected page (not portal, not Keycloak): {_tab_hint(page.url)}"
+                )
             else:
                 cscs_login_mode = "keychain"
                 for attempt in (1, 2):
@@ -3512,7 +3514,7 @@ def cmd_cscs_login(port: int) -> int:
                         return _fail(
                             "Login did not reach the portal — wrong "
                             "username/password/OTP, or an unexpected page "
-                            f"({page.url})."
+                            f"({_tab_hint(page.url)})."
                         )
                     print(
                         "Keycloak aborted the flow (authentication_expired) — "
@@ -3525,7 +3527,7 @@ def cmd_cscs_login(port: int) -> int:
                         break  # the fresh authorization request re-used the SSO session
                     if "auth.cscs.ch" not in page.url:
                         return _fail(
-                            f"Retry did not reach the Keycloak form ({page.url})."
+                            f"Retry did not reach the Keycloak form ({_tab_hint(page.url)})."
                         )
                 print("✓ Logged into CSCS.")
                 _record_login_event("cscs", cscs_login_mode)
