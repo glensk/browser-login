@@ -124,7 +124,7 @@ Steps 1-4 (the code) and 6-9 (the tests) must land as **one** change. The curren
 `FakeSecurity` calls `biopol._printable_ascii` (`tests/test_biopol_wifi.py:395-396`), which step 4
 deletes. Split up, the change leaves a broken suite.
 
-- [ ] 1. `sdsc/biopol-wifi/biopol-wifi.py`: port the runner.
+- [x] 1. `sdsc/biopol-wifi/biopol-wifi.py`: port the runner.
       - Add `SecurityResult`, `SecurityInterrupted` and `_security_run(argv, *, data=None)`,
         copied from `home/browser-login/bin/browser.py:3185-3257` with an origin comment. The
         runner:
@@ -140,7 +140,7 @@ deletes. Split up, the change leaves a broken suite.
       - A deferred Ctrl-C raises `SecurityInterrupted(result)`, a subclass of
         `KeyboardInterrupt`.
       - `argv[0]` stays `_security_bin()`.
-- [ ] 2. `biopol-wifi.py`: port the parser and rewrite `_keychain_get` (`:365-389`).
+- [x] 2. `biopol-wifi.py`: port the parser and rewrite `_keychain_get` (`:365-389`).
       - Add `_KC_PW_PREFIX`, `_KC_HEX_RE` and `_kc_parse_password(stderr: str) -> str | None`,
         copied from `bin/browser.py:3145-3183` with an origin comment naming tp#498/tp#511.
         `re` is already imported. The parser works like this:
@@ -162,7 +162,7 @@ deletes. Split up, the change leaves a broken suite.
           That includes an empty stored value, as in browser.py.
       - Update the docstring: why `-g` (tp#498), why there is no timeout and no kill (tp#504),
         and that the captured output is never printed.
-- [ ] 3. `biopol-wifi.py`: move the other calls to the runner, and make the read-back exact.
+- [x] 3. `biopol-wifi.py`: move the other calls to the runner, and make the read-back exact.
       - `_keychain_write` sends its `-i` line through `_security_run([sec, "-i"], data=line)`.
         - `"failed"` stays the word for: not started, unknown, or done with a non-zero rc.
         - A `SecurityInterrupted` propagates, so `store_creds`' `except BaseException` cleanup
@@ -173,11 +173,11 @@ deletes. Split up, the change leaves a broken suite.
           a byte-exact round-trip check.
       - `_keychain_delete` uses `_security_run` too. It returns `True` only for `done` with rc
         0 or 44.
-- [ ] 4. `store_creds`: delete the non-printable-ASCII refusal loop (`biopol-wifi.py:553-562`)
+- [x] 4. `store_creds`: delete the non-printable-ASCII refusal loop (`biopol-wifi.py:553-562`)
       and `_printable_ascii`, which has no other user. Keep the `_kc_add_line` pre-validation
       loop: control characters are still refused there, before any write, with "nothing
       stored".
-- [ ] 5. `sdsc/biopol-wifi/README.md` § Credentials, lines 42-50: drop the "must be printable
+- [x] 5. `sdsc/biopol-wifi/README.md` § Credentials, lines 42-50: drop the "must be printable
       ASCII" bullet. Write instead:
       - non-ASCII values round-trip exactly, because the read uses `security`'s labelled `-g`
         dump (tp#498/tp#511);
@@ -185,7 +185,7 @@ deletes. Split up, the change leaves a broken suite.
       - the read-back is byte-exact;
       - `security` is never timed out or killed, so a locked keychain waits for the unlock.
       Do **not** claim the write path is otherwise hardened: `-U` remains (see NOTE).
-- [ ] 6. New `sdsc/biopol-wifi/tests/conftest.py`, and the fake.
+- [x] 6. New `sdsc/biopol-wifi/tests/conftest.py`, and the fake.
       - **Default-deny guard.** Add an autouse fixture that replaces `subprocess.run` and
         `subprocess.Popen`, as seen by `biopol`, with a raiser. `fake_security` and the runner
         unit tests override it. The live test opts out through a marker or a fixture override.
@@ -203,7 +203,7 @@ deletes. Split up, the change leaves a broken suite.
           "-g"]`.
         - A hit answers `("done", 0, b"", _security_g(v).encode() + b"\n")`.
         - A miss answers rc 44.
-- [ ] 7. Tests in `tests/test_biopol_wifi.py`, part 1: the runner, the reads and the read-back.
+- [x] 7. Tests in `tests/test_biopol_wifi.py`, part 1: the runner, the reads and the read-back.
       - **Runner unit tests**, with a fake `Popen`:
         - `start_new_session=True` is passed.
         - `stdin` is `DEVNULL` without data.
@@ -224,7 +224,7 @@ deletes. Split up, the change leaves a broken suite.
         - `unknown` (a signal).
         An exit-0 empty `password:` line also returns `None`, but prints exactly the one
         warning line.
-- [ ] 8. Tests part 2: the parser and secrecy.
+- [x] 8. Tests part 2: the parser and secrecy.
       - **Parser unit tests** for `_kc_parse_password`. Cover:
         - the quoted form, including `ab"` and `ä"x`;
         - the mixed form, in uppercase and lowercase hex;
@@ -237,7 +237,7 @@ deletes. Split up, the change leaves a broken suite.
         - Case 1: an unparsable exit-0 stderr that holds a dummy secret in plain, hex and octal
           form. stdout stays empty, and stderr is exactly the warning line.
         - Case 2: a non-zero exit whose stderr holds the secret. Nothing is printed.
-- [ ] 9. Tests part 3: the consumers.
+- [x] 9. Tests part 3: the consumers.
       - **`load_credentials()` with non-ASCII items.**
         - First run `monkeypatch.delenv` for `ENV_EMAIL` and `ENV_PASSWORD`, so real exported
           credentials can never reach an assertion diff.
@@ -248,7 +248,7 @@ deletes. Split up, the change leaves a broken suite.
         case. That case is still refused before any write.
       - **A `SecurityInterrupted` during the second write** still runs `_cleanup_pair` and
         re-raises.
-- [ ] 10. New `sdsc/biopol-wifi/tests/test_keychain_live.py`. It is skipped unless
+- [x] 10. New `sdsc/biopol-wifi/tests/test_keychain_live.py`. It is skipped unless
       `BIOPOL_LIVE_KEYCHAIN=1` and `sys.platform == "darwin"`. Every lifecycle call goes
       through `biopol._security_run`, called directly: it never kills, has no timeout, and runs
       each call in a new session.
@@ -299,7 +299,7 @@ deletes. Split up, the change leaves a broken suite.
         - No `-U` loops.
         - Never call `_keychain_write`, `_keychain_set`, `_keychain_delete`, `store_creds` or
           `forget_creds`.
-- [ ] 11. Run every `## Verification` line in the foreground. The opt-in live line runs once,
+- [x] 11. Run every `## Verification` line in the foreground. The opt-in live line runs once,
       with no loops. Fix every lint and type finding in the touched files.
       - Commit in biopol-wifi with
         `ai.py push -m "fix(keychain): read secrets via labelled dump, never kill security (tp#511)" biopol-wifi.py README.md tests/conftest.py tests/test_biopol_wifi.py tests/test_keychain_live.py`.
