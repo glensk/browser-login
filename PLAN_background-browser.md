@@ -24,6 +24,10 @@ human asked for it.
 ## Facts established 2026-08-19/20
 
 1. Window launches behind everything (`open -g -n`), never takes focus.
+   **Changed 2026-09-29 (tp#703):** `up` now spawns the binary directly —
+   `open -a` made macOS Local Network privacy block every LAN address. The
+   direct launch measured identical: window behind the frontmost app, no
+   focus change. `CLAUDE_BROWSER_OPEN_LAUNCH=1` restores `open -g -n`.
 2. macOS pauses rendering of the occluded window: rAF freezes → Playwright
    actionability ("stable" needs 2 rAF frames) and screenshots stall. The
    `--disable-backgrounding-*` launch flags did NOT unfreeze rAF.
