@@ -85,8 +85,8 @@ browser.py down [-f]          # quit the shared browser (graceful CDP close → 
                               #   -f/--force stops anyway; a stale record with no browser is cleared
 ```
 
-`up` launches in the background (via `open -g` on macOS) so Chrome for Testing
-never pops over what you're doing, and on a cold start it **wipes stale
+`up` launches the binary directly (detached) so Chrome for Testing opens behind
+the frontmost app and never pops over what you're doing, and on a cold start it **wipes stale
 session-restore state** so it opens ONE clean tab instead of resurrecting every
 tab from last time (your logins persist — they live in Cookies/Local Storage,
 not the session files). `open` likewise reuses a blank tab or creates new tabs
@@ -94,7 +94,8 @@ via CDP `Target.createTarget` with `background: true`. Only the assisted login
 flows intentionally raise the window because you must act in it.
 
 Env toggles: `CLAUDE_BROWSER_KEEP_TABS=1` keeps last session's tabs (skip the
-wipe); `CLAUDE_BROWSER_FOREGROUND=1` launches in the foreground (skip `open -g`);
+wipe); `CLAUDE_BROWSER_OPEN_LAUNCH=1` launches via `open -g -n` instead (breaks LAN
+access — see below); `CLAUDE_BROWSER_FOREGROUND=1` forces the direct launch;
 `CLAUDE_BROWSER_HEADLESS=1` makes `up` default to headless;
 `CLAUDE_BROWSER_CONNECT_TIMEOUT_S` (default 30) bounds every Playwright attach
 (see Troubleshooting).
@@ -108,7 +109,13 @@ desktop**: no focus steal, no window raising, no z-order change. How that is
 achieved (and where the sharp edges are — all measured, see
 `PLAN_background-browser.md` for the evidence):
 
-- **Background launch.** `open -g -n` opens the window *behind* everything;
+- **Background launch.** The binary is spawned directly (not `open -a`); its
+  window opens *behind* the frontmost app without taking focus (measured
+  2026-09-29, same as `open -g -n`). Why not `open`: LaunchServices makes the
+  app its own responsible process, and macOS Local Network privacy then
+  blocked every LAN address (`ERR_ADDRESS_UNREACHABLE` on 192.168.178.x and
+  `*.dom42.space`) even with the toggle ON; spawned directly it inherits the
+  launching terminal's grant (tp#703);
   new tabs are created with `Target.createTarget {background: true}`, which
   does not raise the window.
 - **Occlusion freezes rendering.** When the window is fully occluded, macOS

@@ -984,20 +984,24 @@ def _launch_browser(
 ) -> int | None:
     """Start the browser detached and WITHOUT stealing window focus.
 
-    On macOS a subprocess-launched ``.app`` activates itself and grabs the
-    foreground — it pops over whatever you're working on. ``open -g`` launches it
-    in the background (its window opens *behind* the current app), and ``-n``
-    forces our profile instance instead of focusing an unrelated running one.
-    ``open`` doesn't return the browser's PID, so the caller resolves it after
-    CDP is up (``_record_running`` → ``_find_root_pids``). On other platforms a
-    plain detached ``Popen`` doesn't steal focus and yields the real PID. With ``headless`` there
-    is no window to hide, so the ``open`` dance is pointless — go straight to
-    ``Popen``, which also hands back the real PID immediately. Returns the PID if
-    known immediately, else None. Opt out of background launch with
-    ``CLAUDE_BROWSER_FOREGROUND=1`` (falls back to a direct foreground launch).
+    The default on every platform is a plain detached ``Popen`` of the binary,
+    which yields the real PID. On macOS it must NOT go through ``open -a``
+    (tp#703, 2026-09-29): LaunchServices makes the app its own "responsible
+    process", and macOS Local Network privacy then judges the browser by its
+    own entry, which denied every LAN address (``ERR_ADDRESS_UNREACHABLE`` on
+    192.168.178.x and *.dom42.space) even with the toggle ON. Spawned directly,
+    the browser inherits the launching terminal's Local Network grant — the
+    same binary then reaches the LAN. Measured the same day: the direct launch
+    opens its window behind the frontmost app and does not take focus, exactly
+    like ``open -g -n``. ``CLAUDE_BROWSER_OPEN_LAUNCH=1`` restores the old
+    ``open -g -n`` launch (no PID; the caller resolves it after CDP is up via
+    ``_record_running`` → ``_find_root_pids``). Returns the PID if known
+    immediately, else None. ``CLAUDE_BROWSER_FOREGROUND=1`` forces the direct
+    launch even when ``CLAUDE_BROWSER_OPEN_LAUNCH=1`` is set.
     """
     foreground = os.environ.get("CLAUDE_BROWSER_FOREGROUND") == "1"
-    if sys.platform == "darwin" and not foreground and not headless:
+    open_launch = os.environ.get("CLAUDE_BROWSER_OPEN_LAUNCH") == "1"
+    if sys.platform == "darwin" and open_launch and not foreground and not headless:
         app = _app_bundle(binary)
         if app is not None:
             subprocess.run(
@@ -1573,7 +1577,7 @@ def _launch_and_record(port: int, headless: bool) -> int:
         "--no-default-browser-check",
         "--hide-crash-restore-bubble",
         "--remote-allow-origins=*",
-        # The window deliberately opens in the background (open -g) and is
+        # The window deliberately opens behind the frontmost app and is
         # therefore usually OCCLUDED — macOS then pauses rendering, freezing
         # requestAnimationFrame, which makes Playwright's click actionability
         # wait ("stable" = 2 consecutive rAF frames) time out for EVERY driver
