@@ -50,6 +50,17 @@ framework. It is a **provider**: other repos depend on it, not the reverse. See
   window"). Interactive flows hold the interaction lease; long-lived CDP
   clients register via `register-exec`; `switch` fails closed on unregistered
   clients. Full contract: README "Consumer contract".
+- **A Playwright attach is bounded and can be blocked by ONE tab** (tp#693):
+  `connect_over_cdp` waits for every page target, so `_connect` passes
+  `timeout=CONNECT_TIMEOUT_S` and turns a timeout into `BrowserAttachTimeout`
+  naming the wedged tab. Anything that must work while a tab is wedged
+  (`_cdp_browser_close`, `_probe_targets`, `close-hung`, doctor's probe-tab
+  cleanup) uses the raw CDP helper `_cdp_ws_call` (one websocket, one command,
+  one monotonic deadline) — never Playwright. The raw helpers are
+  registration-free (shutdown calls them while holding the gate exclusively);
+  the COMMANDS built on them register a client and, for `close-hung`, take the
+  interaction lease. Nothing closes a real tab without `close-hung`'s
+  three-probe + confirmation contract.
 - **`security` (keychain) calls go through `_security_run` only**: new session, no
   timeout, never `kill`/`terminate` — killing a client mid-dialog crashed
   `securityd` (tp#504). Writes are delete-then-add pinned to the default keychain,

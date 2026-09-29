@@ -18,7 +18,12 @@ Generic lifecycle:
             [-H|--headless] opts into a windowless browser (same profile, same
             logins) — everything works except assisted (human) logins.
   status    Show CDP health, browser version, open tabs (origins only; -f full
-            URLs), and the lifecycle record.
+            URLs), and the lifecycle record. [-p|--probe] also probes every tab
+            over raw CDP and marks the ones that answer nothing.
+  close-hung [-y|--yes]
+            Close tabs whose renderer answers no CDP command — one such tab
+            blocks every Playwright attach. Only tabs that failed three
+            consecutive probes; asks first unless -y.
   switch MODE
             Transactionally switch to headed|headless: stop the browser and
             relaunch it on the SAME profile (every login persists). Waits for
@@ -38,6 +43,10 @@ Generic lifecycle:
             browser behind it is cleared without waiting.
   open URL  Open/navigate a tab to URL in the shared browser.
   eval JS   Run a JS expression in the active (or --url-matched) tab; print JSON.
+            [-t|--timeout SECONDS] hard deadline (default 60), attach included.
+
+Every Playwright attach gives up after $CLAUDE_BROWSER_CONNECT_TIMEOUT_S (default
+30) and names the tab that blocked it (see `status -p` / `close-hung`).
 
 Generic multi-site login (a SITE is one of the entries in the SITES registry —
 currently ``cscs``, ``anthropic``/``claude``, ``openai``/``chatgpt``, ``slack``,
@@ -107,7 +116,30 @@ from pathlib import Path
 from typing import Any, NamedTuple
 
 DEFAULT_CDP_PORT = int(os.environ.get("CLAUDE_BROWSER_CDP_PORT", "9222"))
-CACHE_DIR = Path.home() / ".cache" / "claude-browser"
+
+
+def _connect_timeout_s(raw: str | None, default: float = 30.0) -> float:
+    """Parse ``CLAUDE_BROWSER_CONNECT_TIMEOUT_S``; invalid or <= 0 → `default`."""
+    try:
+        value = float(raw) if raw is not None else default
+    except ValueError:
+        return default
+    return value if 0 < value < float("inf") else default  # NaN fails both
+
+
+# How long a Playwright attach (`connect_over_cdp`) may take before browser.py
+# gives up and names the tab that blocks it (tp#693). Playwright's own default
+# is its 180 s launch timeout — long enough to look like a hang to every caller.
+CONNECT_TIMEOUT_S = _connect_timeout_s(
+    os.environ.get("CLAUDE_BROWSER_CONNECT_TIMEOUT_S")
+)
+# Test-only override: the tests point every coordination file (registry, lease,
+# lifecycle) at a temp dir so they never touch the live browser's state.
+CACHE_DIR = (
+    Path(os.environ["CLAUDE_BROWSER_CACHE_DIR"])
+    if os.environ.get("CLAUDE_BROWSER_CACHE_DIR")
+    else Path.home() / ".cache" / "claude-browser"
+)
 PROFILE_DIR = CACHE_DIR / "profile"
 PID_FILE = CACHE_DIR / "browser.pid"
 # Single source of truth for "what is the shared browser doing right now" — see
@@ -201,6 +233,21 @@ KEYCHAIN_SVC_BIOPOL_PASS = "biopol-wifi: password"
 LOGIN_LOG_DIR = CACHE_DIR / "login-log"
 
 
+# `eval`'s default hard deadline (seconds), attach included — see cmd_eval.
+EVAL_TIMEOUT_S = 60.0
+
+
+def _positive_seconds(raw: str) -> float:
+    """argparse type: a finite number of seconds > 0."""
+    try:
+        value = float(raw)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"not a number: {raw!r}") from None
+    if not 0 < value < float("inf"):
+        raise argparse.ArgumentTypeError(f"must be > 0 seconds: {raw!r}")
+    return value
+
+
 def parse_args() -> argparse.Namespace:
     """Parse args before any heavy import so ``-h`` is instant."""
     p = argparse.ArgumentParser(
@@ -219,7 +266,9 @@ def parse_args() -> argparse.Namespace:
             "  ./browser.py clients            # who is attached over CDP\n"
             "  ./browser.py doctor             # full health check (disposable tab)\n"
             "  ./browser.py open https://portal.cscs.ch/profile/\n"
-            "  ./browser.py eval 'document.title'\n"
+            "  ./browser.py eval -t 20 'document.title'\n"
+            "  ./browser.py status -p          # + mark tabs that answer no CDP\n"
+            "  ./browser.py close-hung         # close such tabs (asks first)\n"
             "  ./browser.py token              # cache the CSCS portal token\n"
             "  ./browser.py cscs-store-creds   # one-time: cache CSCS creds in keychain\n"
             "  ./browser.py cscs-login         # auto-login to CSCS (keychain, no Touch ID)\n"
@@ -257,6 +306,28 @@ def parse_args() -> argparse.Namespace:
         help="print each tab's full URL — path, query and fragment. UNSAFE from an "
         "agent session: in-flight auth tabs carry codes/tokens and status output "
         "lands in logs and LLM transcripts. Default: origin only.",
+    )
+    pst.add_argument(
+        "-p",
+        "--probe",
+        action="store_true",
+        help="also probe every tab over raw CDP (read-only Runtime.evaluate('1'), "
+        f"{PROBE_BUDGET_S:g}s budget) and mark the ones that answer nothing: "
+        "'⚠ unresponsive' (such a tab blocks every Playwright attach — see "
+        "close-hung) or '? indeterminate'. Exit 1 when the tab list is unreadable.",
+    )
+    pch = sub.add_parser(
+        "close-hung",
+        help="Close tabs whose renderer answers no CDP command (they block every "
+        "Playwright attach). Closes only tabs that failed three consecutive CDP "
+        "probes; a responsive tab is never a candidate. Asks first.",
+    )
+    pch.add_argument(
+        "-y",
+        "--yes",
+        action="store_true",
+        help="close without asking (default: list the candidates and ask; no TTY "
+        "without -y closes nothing and exits 1).",
     )
     psw = sub.add_parser(
         "switch",
@@ -332,6 +403,16 @@ def parse_args() -> argparse.Namespace:
         help="Substring to pick the target tab (default: first/active tab). "
         "Exits 1 when no tab matches — never evaluates in another tab.",
     )
+    pe.add_argument(
+        "-t",
+        "--timeout",
+        type=_positive_seconds,
+        default=EVAL_TIMEOUT_S,
+        metavar="SECONDS",
+        help=f"hard deadline for the whole eval, attach included (default "
+        f"{EVAL_TIMEOUT_S:g}). On expiry: a ❌ line and exit 1. JS already "
+        "running in the page is NOT stopped.",
+    )
     sub.add_parser("token", help="Cache the CSCS portal token from the portal tab.")
     sub.add_parser(
         "slack-session",
@@ -397,6 +478,7 @@ def ensure_deps():  # literal "def ensure_deps():" required by pre-commit hook
         import playwright  # noqa: F401  # pylint: disable=unused-import
         import pyotp  # noqa: F401  # pylint: disable=unused-import
         import requests  # noqa: F401  # pylint: disable=unused-import
+        import websockets  # noqa: F401  # pylint: disable=unused-import
 
         return
     except ImportError:
@@ -404,7 +486,7 @@ def ensure_deps():  # literal "def ensure_deps():" required by pre-commit hook
 
     venv_dir = Path.home() / ".cache" / "claude-browser" / "venv"
     venv_python = venv_dir / "bin" / "python3"
-    deps = ["playwright", "requests", "pyotp"]
+    deps = ["playwright", "requests", "pyotp", "websockets>=15"]
     sys.argv[0] = os.path.abspath(sys.argv[0])
 
     def _pip_install() -> None:
@@ -424,12 +506,12 @@ def ensure_deps():  # literal "def ensure_deps():" required by pre-commit hook
             os.execv(str(venv_python), [str(venv_python), *sys.argv])
         # Inside the venv but a dep is missing (e.g. pyotp added after creation).
         # Self-heal by installing the missing deps rather than erroring out.
-        print("Installing missing browser deps (pyotp)…", file=sys.stderr)
+        print("Installing missing browser deps (pyotp, websockets)…", file=sys.stderr)
         _pip_install()
         os.execv(str(venv_python), [str(venv_python), *sys.argv])
 
     print(
-        "First run: creating browser venv (playwright, requests, pyotp)...",
+        "First run: creating browser venv (playwright, requests, pyotp, websockets)...",
         file=sys.stderr,
     )
     try:
@@ -537,6 +619,285 @@ def _ensure_page_target(port: int, timeout: float = 5.0) -> None:
 
 def _is_up(port: int) -> bool:
     return _cdp_get(port, "/json/version") is not None
+
+
+# ---------------------------------------------------------------------------
+# Raw CDP over one websocket — the path that still works when Playwright hangs
+# ---------------------------------------------------------------------------
+# Playwright's `connect_over_cdp` attaches to EVERY page target and waits until
+# each one answers its initialisation commands, so a single tab whose renderer
+# stopped answering CDP blocks every attach (tp#693). These helpers talk to ONE
+# target (or the browser endpoint) directly, under a hard monotonic deadline,
+# so they can diagnose, and close, such a tab. They are registration-free on
+# purpose: `down`/`switch` call `_cdp_browser_close` while holding the client
+# gate exclusively (see the deadlock rule in the client-coordination section);
+# the COMMANDS built on them (`status -p`, `close-hung`, `doctor`) register.
+
+# Per-connection caps inside a call's budget: the TCP connect + websocket
+# handshake, and the closing handshake. Both are ALSO capped by what is left of
+# the budget — events or a slow close can never extend a call.
+CDP_WS_OPEN_TIMEOUT_S = 1.0
+CDP_WS_CLOSE_TIMEOUT_S = 1.0
+# `_probe_targets`: the shared budget of one probe round, and the thread cap.
+PROBE_BUDGET_S = 6.0
+PROBE_MAX_TARGETS = 32
+
+
+@dataclass
+class CdpResult:
+    """Outcome of one `_cdp_ws_call`.
+
+    ``status`` is ``ok`` (a reply with our id arrived — including a CDP error
+    reply, which still proves the target answers), ``timeout`` (no reply within
+    the budget) or ``transport-error``. ``opened`` says whether the websocket
+    handshake completed, ``sent`` whether the command went out: a connection
+    dropped AFTER sending is how a target that closes itself (``Browser.close``)
+    answers.
+    """
+
+    status: str
+    opened: bool = False
+    sent: bool = False
+    result: dict | None = None
+    error: str = ""
+
+
+def _cdp_ws_call(
+    ws_url: str, method: str, params: dict | None = None, budget_s: float = 5.0
+) -> CdpResult:
+    """Send ONE CDP command over its own websocket; wait for the reply by id.
+
+    One monotonic deadline covers the whole call — connect, handshake, reply
+    and close. Events (messages without our id) are ignored and never extend
+    it. Never raises: every failure is a tagged `CdpResult`.
+    """
+    deadline = time.monotonic() + budget_s
+
+    def left() -> float:
+        return max(0.0, deadline - time.monotonic())
+
+    try:
+        from websockets.sync.client import connect as ws_connect
+    except ImportError as exc:
+        return CdpResult("transport-error", error=f"websockets unavailable: {exc}")
+    out = CdpResult("timeout")
+    try:
+        with ws_connect(
+            ws_url,
+            open_timeout=max(0.01, min(CDP_WS_OPEN_TIMEOUT_S, left())),
+            close_timeout=max(0.01, min(CDP_WS_CLOSE_TIMEOUT_S, left())),
+            proxy=None,  # 127.0.0.1 only — never route through $ALL_PROXY
+            compression=None,
+            max_size=None,  # a CDP reply (a frame tree, a screenshot) can be big
+            ping_interval=None,
+            user_agent_header=None,
+        ) as ws:
+            out.opened = True
+            _cdp_ws_exchange(ws, method, params, left, out)
+            # The closing handshake gets only what is left of the budget.
+            ws.close_timeout = max(0.01, min(CDP_WS_CLOSE_TIMEOUT_S, left()))
+    except Exception as exc:  # pylint: disable=broad-exception-caught
+        if out.opened:
+            return out  # only the close failed; the exchange's result is final
+        # TimeoutError = the handshake stalled; everything else (refused,
+        # websockets' InvalidHandshake family — e.g. a 404 for a vanished
+        # target) is a transport error.
+        if isinstance(exc, TimeoutError):
+            return CdpResult("timeout", error="websocket handshake timed out")
+        return CdpResult("transport-error", error=_exc_line(exc))
+    return out
+
+
+def _cdp_ws_exchange(
+    ws: Any,
+    method: str,
+    params: dict | None,
+    left: Callable[[], float],
+    out: CdpResult,
+) -> None:
+    """Send one command on the open `ws`; fill `out` from the reply with our id."""
+    msg_id = 1
+    try:
+        ws.send(json.dumps({"id": msg_id, "method": method, "params": params or {}}))
+        out.sent = True
+        while True:
+            remaining = left()
+            if remaining <= 0:
+                out.status, out.error = "timeout", f"no reply to {method}"
+                return
+            try:
+                raw = ws.recv(timeout=remaining)
+            except TimeoutError:
+                out.status, out.error = "timeout", f"no reply to {method}"
+                return
+            try:
+                msg = json.loads(raw)
+            except ValueError:
+                continue
+            if isinstance(msg, dict) and msg.get("id") == msg_id:
+                out.status = "ok"
+                res = msg.get("result")
+                out.result = res if isinstance(res, dict) else {}
+                if "error" in msg:
+                    out.error = str(msg.get("error"))[:200]
+                return
+    except Exception as exc:  # pylint: disable=broad-exception-caught
+        # ConnectionClosed after `sent` is how Browser.close "answers".
+        out.status, out.error = "transport-error", _exc_line(exc)
+
+
+def _browser_ws_url(port: int) -> str | None:
+    """The browser-level ``webSocketDebuggerUrl`` from ``/json/version``."""
+    ver = _cdp_get(port, "/json/version")
+    url = ver.get("webSocketDebuggerUrl") if isinstance(ver, dict) else None
+    return url if isinstance(url, str) and url else None
+
+
+def _cdp_close_target(port: int, target_id: str, budget_s: float = 5.0) -> bool:
+    """Close ONE target by id over the browser-level websocket; True on success."""
+    ws_url = _browser_ws_url(port)
+    if ws_url is None:
+        return False
+    res = _cdp_ws_call(ws_url, "Target.closeTarget", {"targetId": target_id}, budget_s)
+    return (
+        res.status == "ok"
+        and not res.error
+        and bool((res.result or {}).get("success", True))
+    )
+
+
+@dataclass
+class TargetProbe:
+    """One page target and how it answered `_probe_targets`' ``Runtime.evaluate``.
+
+    ``outcome``: ``responsive`` | ``unresponsive`` (websocket open, no reply
+    within the budget — the renderer is wedged) | ``gone`` (the target
+    vanished while we probed) | ``indeterminate`` (any other failure: we
+    cannot tell, so nothing may act on it).
+    """
+
+    target_id: str
+    url: str
+    title: str
+    outcome: str
+    detail: str = ""
+
+    def label(self) -> str:
+        """Origin-only, fail-closed human name: ``title → origin [id8]``."""
+        return (
+            f"{_tab_title(self.title, self.url)}  →  {_tab_hint(self.url)}  "
+            f"[id {self.target_id[:8]}]"
+        )
+
+
+@dataclass
+class ProbeReport:
+    """Result of one `_probe_targets` round.
+
+    ``indeterminate`` (a reason string) means the target list itself could not
+    be read — then ``targets`` is empty and NOTHING may be concluded.
+    """
+
+    targets: list[TargetProbe]
+    indeterminate: str | None = None
+
+    def with_outcome(self, outcome: str) -> list[TargetProbe]:
+        """The probed targets whose outcome is `outcome`."""
+        return [t for t in self.targets if t.outcome == outcome]
+
+
+def _probe_one(ws_url: str, budget_s: float, slot: list[CdpResult]) -> None:
+    """Thread body: one read-only ``Runtime.evaluate("1")`` into ``slot``."""
+    slot.append(_cdp_ws_call(ws_url, "Runtime.evaluate", {"expression": "1"}, budget_s))
+
+
+def _probe_targets(
+    port: int, budget_s: float | None = None, only_ids: Sequence[str] | None = None
+) -> ProbeReport:
+    """Ask every page target (or just `only_ids`) to evaluate ``1``; classify each.
+
+    Read-only: the ONLY command sent is ``Runtime.evaluate("1")``, over each
+    target's own ``webSocketDebuggerUrl`` — Playwright is never involved, so a
+    wedged tab cannot block the probe the way it blocks `connect_over_cdp`.
+    Targets are probed concurrently (one thread each, at most
+    PROBE_MAX_TARGETS; the rest count as indeterminate) under ONE shared
+    monotonic budget (`budget_s`, default PROBE_BUDGET_S). Uses its own
+    ``/json/list`` read, not `_page_targets`, because that one maps a failure
+    to "no tabs".
+    """
+    budget_s = PROBE_BUDGET_S if budget_s is None else budget_s
+    deadline = time.monotonic() + budget_s
+    listing = _cdp_get(port, "/json/list", timeout=min(2.0, budget_s))
+    if not isinstance(listing, list):
+        return ProbeReport([], indeterminate="could not read /json/list")
+    pages = [t for t in listing if isinstance(t, dict) and t.get("type") == "page"]
+    if only_ids is not None:
+        wanted = set(only_ids)
+        pages = [t for t in pages if t.get("id") in wanted]
+    report = ProbeReport([])
+    jobs: list[tuple[TargetProbe, threading.Thread, list[CdpResult]]] = []
+    for i, t in enumerate(pages):
+        url, title = t.get("url"), t.get("title")
+        probe = TargetProbe(
+            target_id=str(t.get("id") or ""),
+            url=url if isinstance(url, str) else "",
+            title=title if isinstance(title, str) else "",
+            outcome="indeterminate",
+        )
+        report.targets.append(probe)
+        ws_url = t.get("webSocketDebuggerUrl")
+        if i >= PROBE_MAX_TARGETS:
+            probe.detail = f"not probed (more than {PROBE_MAX_TARGETS} tabs)"
+            continue
+        if not isinstance(ws_url, str) or not ws_url:
+            # Chrome omits the URL while another client holds an exclusive
+            # session (legacy single-client mode) — we cannot tell.
+            probe.detail = "no webSocketDebuggerUrl"
+            continue
+        slot: list[CdpResult] = []
+        th = threading.Thread(
+            target=_probe_one,
+            args=(ws_url, max(0.0, deadline - time.monotonic()), slot),
+            name=f"cdp-probe-{probe.target_id[:8]}",
+            daemon=True,
+        )
+        th.start()
+        jobs.append((probe, th, slot))
+    for probe, th, slot in jobs:
+        # The call bounds itself; the small slack only covers thread scheduling.
+        th.join(timeout=max(0.0, deadline - time.monotonic()) + 0.5)
+        _classify_probe(probe, slot[0] if slot else None)
+    _mark_gone(port, [p for p, _th, _slot in jobs if p.outcome == "indeterminate"])
+    return report
+
+
+def _classify_probe(probe: TargetProbe, res: CdpResult | None) -> None:
+    """Set `probe`'s outcome from its call result (None = the thread hung)."""
+    if res is None:
+        probe.detail = "probe thread did not finish"
+    elif res.status == "ok":
+        probe.outcome = "responsive"
+    elif res.status == "timeout" and res.opened:
+        probe.outcome, probe.detail = "unresponsive", res.error
+    else:
+        probe.detail = res.error or res.status
+
+
+def _mark_gone(port: int, failed: list[TargetProbe]) -> None:
+    """Re-list the targets once; a failed probe whose target vanished is ``gone``.
+
+    A socket refused or closed under us usually means the tab closed
+    meanwhile; only a fresh listing can tell "gone" from "cannot tell".
+    """
+    if not failed:
+        return
+    again = _cdp_get(port, "/json/list", timeout=1.0)
+    if not isinstance(again, list):
+        return
+    alive = {t.get("id") for t in again if isinstance(t, dict)}
+    for p in failed:
+        if p.target_id not in alive:
+            p.outcome = "gone"
 
 
 def _browser_mode(port: int) -> str | None:
@@ -970,47 +1331,26 @@ def _lifecycle_problems(port: int) -> list[str]:
     return problems
 
 
-def _cdp_browser_close(port: int) -> bool:
+def _cdp_browser_close(port: int, budget_s: float = 5.0) -> bool:
     """Ask the browser to quit itself over CDP (``Browser.close``); True if sent.
 
     The graceful path: Chrome flushes the profile (cookies, sessions) and
     removes its own SingletonLock, neither of which a signal-based kill gets
     right. A dropped connection while the command is in flight is the EXPECTED
-    success case (the browser died before answering), so that counts as sent.
-    Deliberately not routed through `_connect`, which ``sys.exit``s when the
-    browser is down — and, since `switch`/`down` call this while they hold the
-    client gate EXCLUSIVELY, must NOT register a client here either: a second fd
-    asking for the same gate shared would deadlock against our own hold (see the
-    deadlock rule in the client-coordination section). Keep it CDP-only.
+    success case (the browser died before answering), so that counts as sent;
+    a timeout counts as NOT sent, so `_shutdown_browser` escalates with its
+    budget intact. Raw CDP on the browser-level websocket (`_cdp_ws_call`),
+    never Playwright: a Playwright attach waits for every tab and one wedged
+    renderer stalls it (tp#693). Registration-free on purpose — `switch`/`down`
+    call this while they hold the client gate EXCLUSIVELY, and a second fd
+    asking for the same gate shared would deadlock against our own hold (see
+    the deadlock rule in the client-coordination section).
     """
-    try:
-        from playwright.sync_api import Error as PlaywrightError
-        from playwright.sync_api import sync_playwright
-    except ImportError:
+    ws_url = _browser_ws_url(port)
+    if ws_url is None:
         return False
-    try:
-        pw = sync_playwright().start()
-    except (PlaywrightError, OSError):
-        return False
-    sent = False
-    try:
-        browser = pw.chromium.connect_over_cdp(f"http://127.0.0.1:{port}")
-        browser.new_browser_cdp_session().send("Browser.close")
-        sent = True
-    except PlaywrightError as exc:
-        # "Target closed"/"connection closed" == the browser went away while the
-        # command was in flight, which is exactly what we asked for.
-        sent = any(
-            m in str(exc).lower() for m in ("closed", "disconnected", "not connected")
-        )
-    except OSError:
-        sent = False
-    finally:
-        try:
-            pw.stop()
-        except (PlaywrightError, OSError):
-            pass
-    return sent
+    res = _cdp_ws_call(ws_url, "Browser.close", None, budget_s)
+    return res.status == "ok" or (res.status == "transport-error" and res.sent)
 
 
 def _wait_for_roots_gone(port: int, timeout_s: float) -> bool:
@@ -1874,13 +2214,20 @@ def _print_lifecycle(port: int) -> None:
         print(f"  ⚠ {problem}")
 
 
-def cmd_status(port: int, full_urls: bool = False) -> int:
+PROBE_MARKS = {"unresponsive": "  ⚠ unresponsive", "indeterminate": "  ? indeterminate"}
+
+
+def cmd_status(port: int, full_urls: bool = False, probe: bool = False) -> int:
     """Print CDP health, browser version, open tabs, and the lifecycle state.
 
     Tab lines show origins only (`_tab_line`): this output lands in logs and
     LLM transcripts, and an in-flight OAuth/magic-link tab carries its code or
     token in the path/query (tp#365). ``full_urls`` is the human opt-in.
+    ``probe`` adds `_probe_targets`' verdict to each tab line (registered as a
+    client for the probe's lifetime); without it `status` stays HTTP-only.
     """
+    if probe:
+        return _cmd_status_probe(port, full_urls)
     ver = _cdp_get(port, "/json/version")
     if ver is None:
         print(
@@ -1899,6 +2246,134 @@ def cmd_status(port: int, full_urls: bool = False) -> int:
         print(_tab_line(t, full_urls))
     _print_lifecycle(port)
     return 0
+
+
+def _cmd_status_probe(port: int, full_urls: bool) -> int:
+    """`status -p`: the tab list with a responsiveness mark per tab."""
+    if _cdp_get(port, "/json/version") is None:
+        return cmd_status(port, full_urls)  # the DOWN report, exit 1
+    release = _registry_register("browser.py", _purpose(), port)
+    try:
+        report = _probe_targets(port)
+    finally:
+        release()
+    ver = _cdp_get(port, "/json/version")
+    browser_name = ver.get("Browser") if isinstance(ver, dict) else "?"
+    mode = _browser_mode(port) or "?"
+    print(f"✓ Up — {browser_name} ({mode}) | CDP http://localhost:{port}")
+    if report.indeterminate:
+        print(f"  probe indeterminate: {report.indeterminate}")
+        _print_lifecycle(port)
+        return 1
+    print(f"  {len(report.targets)} tab(s), probed:")
+    for t in report.targets:
+        line = _tab_line({"url": t.url, "title": t.title}, full_urls)
+        print(line + PROBE_MARKS.get(t.outcome, ""))
+    hung = report.with_outcome("unresponsive")
+    if hung:
+        print(
+            f"  ⚠ {len(hung)} tab(s) answer no CDP command — they block every "
+            "Playwright attach (open/eval/doctor/login). Remedy: "
+            "`browser.py close-hung`."
+        )
+    _print_lifecycle(port)
+    return 0
+
+
+def _confirm(prompt: str) -> bool:
+    """Ask yes/no on the TTY; False on no TTY, EOF or anything but y/yes."""
+    if not sys.stdin.isatty():
+        return False
+    try:
+        answer = input(prompt)
+    except EOFError:
+        return False
+    return answer.strip().lower() in ("y", "yes")
+
+
+def cmd_close_hung(port: int, assume_yes: bool = False) -> int:
+    """Close the tabs whose renderer answers no CDP command — only after asking.
+
+    Contract: closes only tabs that failed THREE consecutive CDP probes (the
+    listing probe, a re-probe, and a final re-probe AFTER confirmation, with
+    an unchanged URL); a responsive tab is never a candidate. Never automatic —
+    `open`/`eval`/`doctor` only NAME such a tab. Registered as a client and
+    holding the interaction lease (gate-then-lease order) for the whole run.
+    Exit 0 when nothing was hung or every approved candidate was closed or
+    recovered; 1 on an indeterminate probe, a declined prompt, or a failed close.
+    """
+    if not _is_up(port):
+        return _fail("Shared browser is down — nothing to close.")
+    release = _registry_register("browser.py", _purpose(), port)
+    try:
+        with _interaction_lease("close-hung"):
+            return _close_hung_locked(port, assume_yes)
+    finally:
+        release()
+
+
+def _close_hung_locked(port: int, assume_yes: bool) -> int:
+    """`close-hung` body; the caller holds the registration and the lease."""
+    first = _probe_targets(port)
+    if first.indeterminate:
+        return _fail(f"probe indeterminate: {first.indeterminate} — closed nothing.")
+    unsure = first.with_outcome("indeterminate")
+    if unsure:
+        print(f"? {len(unsure)} tab(s) could not be probed (left alone).")
+    hung1 = first.with_outcome("unresponsive")
+    if not hung1:
+        print(f"✓ No unresponsive tab ({len(first.targets)} probed).")
+        return 0
+    second = _probe_targets(port, only_ids=[t.target_id for t in hung1])
+    if second.indeterminate:
+        return _fail(f"probe indeterminate: {second.indeterminate} — closed nothing.")
+    urls1 = {t.target_id: t.url for t in hung1}
+    cands = [
+        t
+        for t in second.with_outcome("unresponsive")
+        if urls1.get(t.target_id) == t.url
+    ]
+    if not cands:
+        print(f"✓ The {len(hung1)} unresponsive tab(s) recovered on a re-probe.")
+        return 0
+    print(f"{len(cands)} tab(s) failed two consecutive CDP probes:")
+    for t in cands:
+        print(f"   - {t.label()}")
+    if not assume_yes and not _confirm("Close them? [y/N] "):
+        print("Nothing closed (not confirmed; -y/--yes skips the question).")
+        return 1
+    return _close_approved(port, cands)
+
+
+def _close_approved(port: int, cands: list[TargetProbe]) -> int:
+    """Probe #3 on the approved tabs; close each one that is STILL wedged.
+
+    A tab closes only when it is still ``unresponsive`` with an unchanged URL;
+    a recovered, changed or vanished one is skipped and said so. 1 on an
+    indeterminate probe or a failed close.
+    """
+    third = _probe_targets(port, only_ids=[t.target_id for t in cands])
+    if third.indeterminate:
+        return _fail(f"probe indeterminate: {third.indeterminate} — closed nothing.")
+    now = {t.target_id: t for t in third.targets}
+    failed = 0
+    for t in cands:
+        cur = now.get(t.target_id)
+        if cur is None or cur.outcome == "gone":
+            print(f"   skipped (already gone): {t.label()}")
+        elif cur.outcome == "responsive":
+            print(f"   skipped (recovered): {t.label()}")
+        elif cur.outcome != "unresponsive":
+            print(f"   skipped (probe indeterminate): {t.label()}")
+            failed += 1
+        elif cur.url != t.url:
+            print(f"   skipped (changed): {t.label()}")
+        elif _cdp_close_target(port, t.target_id):
+            print(f"✓ closed: {t.label()}")
+        else:
+            print(f"❌ close failed: {t.label()}", file=sys.stderr)
+            failed += 1
+    return 1 if failed else 0
 
 
 def cmd_clients(port: int) -> int:
@@ -2113,6 +2588,7 @@ def _connect(port: int, purpose: str = ""):
     gate and leaves every call site untouched. NEVER call this from a path that
     already holds the gate exclusively — see the deadlock rule above.
     """
+    from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
     from playwright.sync_api import sync_playwright
 
     if not _is_up(port):
@@ -2120,9 +2596,68 @@ def _connect(port: int, purpose: str = ""):
     _ensure_page_target(port)  # zero tabs => connect_over_cdp dies (tp#317)
     atexit.register(_registry_register("browser.py", purpose or _purpose(), port))
     pw = sync_playwright().start()
-    # 127.0.0.1, not localhost — see _cdp_get (avoids the IPv6 ::1 stall).
-    browser = pw.chromium.connect_over_cdp(f"http://127.0.0.1:{port}")
+    try:
+        # 127.0.0.1, not localhost — see _cdp_get (avoids the IPv6 ::1 stall).
+        # The explicit timeout replaces Playwright's 180 s launch default: one
+        # tab whose renderer answers no CDP command stalls the attach (tp#693).
+        browser = pw.chromium.connect_over_cdp(
+            f"http://127.0.0.1:{port}", timeout=CONNECT_TIMEOUT_S * 1000
+        )
+    except PlaywrightTimeoutError:
+        _stop_playwright_bounded(pw)
+        raise BrowserAttachTimeout(_attach_timeout_message(port)) from None
     return pw, browser
+
+
+class BrowserAttachTimeout(Exception):
+    """Playwright could not attach within CONNECT_TIMEOUT_S; the message names why.
+
+    `main` turns it into a ❌ line and exit 1; `doctor` reports it as a check.
+    """
+
+
+def _stop_playwright_bounded(pw: Any, wait_s: float = 5.0) -> None:
+    """``pw.stop()`` in a daemon thread, errors suppressed, joined for `wait_s`."""
+
+    def _stop() -> None:
+        with contextlib.suppress(Exception):
+            pw.stop()
+
+    th = threading.Thread(target=_stop, name="playwright-stop", daemon=True)
+    th.start()
+    th.join(timeout=wait_s)
+
+
+def _attach_timeout_message(port: int) -> str:
+    """Diagnose a timed-out attach with `_probe_targets` and word the ❌ message."""
+    report = _probe_targets(port)
+    head = (
+        f"Playwright could not attach to the shared browser within "
+        f"{CONNECT_TIMEOUT_S:g}s (CLAUDE_BROWSER_CONNECT_TIMEOUT_S)."
+    )
+    if report.indeterminate:
+        return (
+            f"{head}\n   Tab probe indeterminate ({report.indeterminate}) — retry, "
+            "or run `browser.py status -p`."
+        )
+    hung = report.with_outcome("unresponsive")
+    unsure = len(report.with_outcome("indeterminate"))
+    if not hung:
+        return (
+            f"{head}\n   No tab failed the CDP probe ({unsure} indeterminate) — "
+            "the stall is elsewhere; retry, or run `browser.py status -p`."
+        )
+    lines = [
+        f"{head}",
+        f"   {len(hung)} tab(s) answer no CDP command, and one such tab blocks "
+        "every Playwright attach:",
+        *(f"   - {t.label()}" for t in hung),
+        "   Remedy: `browser.py close-hung` (asks before closing), or reload/close "
+        "that tab by hand.",
+    ]
+    if unsure:
+        lines.append(f"   ({unsure} more tab(s) could not be probed.)")
+    return "\n".join(lines)
 
 
 def _is_blank(url: str) -> bool:
@@ -2131,7 +2666,7 @@ def _is_blank(url: str) -> bool:
 
 
 def _open_background_tab(port: int, browser, url: str) -> dict:
-    """Open URL in a NEW tab WITHOUT focusing it; return {url, title}.
+    """Open URL in a NEW tab WITHOUT focusing it; return {url, title, id}.
 
     Playwright's ``ctx.new_page()`` sends CDP ``Target.createTarget`` with
     ``background: false``, which activates the tab and raises the Chrome
@@ -2156,7 +2691,7 @@ def _open_background_tab(port: int, browser, url: str) -> dict:
         if info.get("url") not in (None, "", "about:blank"):
             break
         time.sleep(0.25)
-    return {"url": info.get("url", url), "title": info.get("title", "")}
+    return {"url": info.get("url", url), "title": info.get("title", ""), "id": tid}
 
 
 def _pick_page(browser, url_substr: str | None, *, require_match: bool = False):
@@ -2297,8 +2832,42 @@ def cmd_open(port: int, url: str, reuse: bool = False) -> int:
         pw.stop()
 
 
-def cmd_eval(port: int, js: str, url_substr: str | None) -> int:
-    """Eval a JS expression in a tab and print the JSON result."""
+def _eval_watchdog_fire(timeout_s: float) -> None:
+    """`eval`'s deadline expired: say so and leave NOW, from the timer thread.
+
+    ``os._exit`` because the main thread is blocked inside Playwright, where no
+    exception can reach it. Skipping the atexit handlers is safe: the registry
+    flock dies with the process and `_registry_live_clients` reaps the file.
+    """
+    sys.stderr.write(
+        f"❌ eval: no result after {timeout_s:g}s (tab unresponsive or expression "
+        "never settled)\n"
+    )
+    sys.stderr.flush()
+    os._exit(1)  # pylint: disable=protected-access
+
+
+def cmd_eval(
+    port: int, js: str, url_substr: str | None, timeout_s: float = EVAL_TIMEOUT_S
+) -> int:
+    """Eval a JS expression in a tab and print the JSON result.
+
+    ``timeout_s`` is a Python-side hard deadline over the whole command, armed
+    BEFORE the attach: a timer inside the page could not bound it, because it
+    would run in the very renderer that stopped answering (tp#693). An
+    abandoned expression may keep running in the page.
+    """
+    watchdog = threading.Timer(timeout_s, _eval_watchdog_fire, args=(timeout_s,))
+    watchdog.daemon = True
+    watchdog.start()
+    try:
+        return _eval_attached(port, js, url_substr)
+    finally:
+        watchdog.cancel()
+
+
+def _eval_attached(port: int, js: str, url_substr: str | None) -> int:
+    """`eval`'s attach-pick-evaluate body (the watchdog is the caller's)."""
     pw, browser = _connect(port)
     try:
         ctx, page = _pick_page(browser, url_substr, require_match=True)
@@ -2825,17 +3394,21 @@ def _doctor_drivability(log: list[str], page) -> None:
     _doctor_screenshot(log, page)
 
 
-def _doctor_open_probe(log: list[str], port: int) -> bool:
+def _doctor_open_probe(log: list[str], port: int, created: list[str]) -> bool:
     """Create the disposable probe tab in the BACKGROUND; True if it loaded.
 
     Created over CDP with ``background: true`` (see `_open_background_tab`) so
     it cannot raise the window, and this connection is then dropped again:
     Playwright only adopts targets that already existed when it attached, so the
-    page object has to come from a FRESH connection.
+    page object has to come from a FRESH connection. The new target's id is
+    appended to `created` the moment it exists, so the caller's cleanup can
+    close it by id even when Playwright never gets to see it.
     """
     pw, browser = _connect(port)
     try:
         info = _open_background_tab(port, browser, DOCTOR_PROBE_URL)
+        if info.get("id"):
+            created.append(str(info["id"]))
     finally:
         browser.close()
         pw.stop()
@@ -2875,21 +3448,66 @@ def _close_probe_targets(port: int, browser) -> int:
     return closed
 
 
+def _doctor_responsiveness(log: list[str], port: int) -> bool:
+    """Probe every tab over raw CDP; False when one is wedged (skip the probe).
+
+    A tab whose renderer answers no CDP command blocks every Playwright attach
+    (tp#693) — the drivability probe would only time out behind it, so it is
+    skipped and the tab is named instead. An indeterminate result is a ⚠: the
+    probe still runs, bounded by CONNECT_TIMEOUT_S.
+    """
+    report = _probe_targets(port)
+    if report.indeterminate:
+        _doctor_add(
+            log, "warn", "tab responsiveness", f"indeterminate: {report.indeterminate}"
+        )
+        return True
+    hung = report.with_outcome("unresponsive")
+    unsure = report.with_outcome("indeterminate")
+    if hung:
+        names = "; ".join(t.label() for t in hung)
+        _doctor_add(
+            log,
+            "fail",
+            "tab responsiveness",
+            f"{len(hung)} tab(s) answer no CDP command ({names}) — they block every "
+            "Playwright attach; run `browser.py close-hung`. Drivability probe skipped.",
+        )
+        return False
+    if unsure:
+        _doctor_add(
+            log,
+            "warn",
+            "tab responsiveness",
+            f"{len(unsure)} of {len(report.targets)} tab(s) could not be probed",
+        )
+        return True
+    _doctor_add(
+        log,
+        "ok",
+        "tab responsiveness",
+        f"all {len(report.targets)} tab(s) answer CDP",
+    )
+    return True
+
+
 def _doctor_probe(log: list[str], port: int) -> None:
     """Drive a disposable probe page and report every drivability check.
 
     Nothing here touches a real tab: the page is created by
-    `_doctor_open_probe`, driven, and closed again in a ``finally`` — including
-    the path where Playwright cannot see it, which is cleaned up over CDP. A
-    failed check therefore costs a throwaway tab at worst, never a login.
+    `_doctor_open_probe`, driven, and closed again in ONE ``finally`` that also
+    covers the tab creation and the reconnect — by ``page.close()`` when
+    Playwright has the page, else by the created target's id over raw CDP, else
+    by the `_is_probe_url` sweep. A timed-out attach is a ❌ line, not a crash.
+    A failed check therefore costs a throwaway tab at worst, never a login.
     """
-    from playwright.sync_api import Error as PlaywrightError
 
-    if not _doctor_open_probe(log, port):
-        return
-    pw, browser = _connect(port)
-    page = None
+    created: list[str] = []
+    pw = browser = page = None
     try:
+        if not _doctor_open_probe(log, port, created):
+            return
+        pw, browser = _connect(port)
         pages = [pg for ctx in browser.contexts for pg in ctx.pages]
         for candidate in pages:
             if _is_probe_url(candidate.url):
@@ -2905,15 +3523,44 @@ def _doctor_probe(log: list[str], port: int) -> None:
             )
             return
         _doctor_drivability(log, page)
+    except BrowserAttachTimeout as exc:
+        _doctor_add(log, "fail", "attach", str(exc).replace("\n", " "))
     finally:
-        if page is not None:
-            with contextlib.suppress(PlaywrightError):
-                page.close()
-        else:
-            with contextlib.suppress(PlaywrightError):
-                _close_probe_targets(port, browser)
-        browser.close()
-        pw.stop()
+        _doctor_probe_cleanup(log, port, page, created, (pw, browser))
+
+
+def _doctor_probe_cleanup(
+    log: list[str], port: int, page: Any, created: list[str], conn: tuple[Any, Any]
+) -> None:
+    """Close the probe tab however we can, then drop the Playwright connection.
+
+    ``page.close()`` when Playwright has the page; else the created target's id
+    over raw CDP (works even when the re-attach timed out); else, with a live
+    connection but no id, the `_is_probe_url` sweep. Never raises.
+    """
+    from playwright.sync_api import Error as PlaywrightError
+
+    pw, browser = conn
+    if page is not None:
+        with contextlib.suppress(PlaywrightError):
+            page.close()
+    elif created:
+        for tid in created:
+            if not _cdp_close_target(port, tid):
+                _doctor_add(
+                    log,
+                    "warn",
+                    "probe cleanup",
+                    f"could not close the probe tab [id {tid[:8]}]",
+                )
+    elif browser is not None:
+        with contextlib.suppress(PlaywrightError):
+            _close_probe_targets(port, browser)
+    if browser is not None:
+        with contextlib.suppress(PlaywrightError):
+            browser.close()
+    if pw is not None:
+        _stop_playwright_bounded(pw)
 
 
 def cmd_doctor(port: int) -> int:
@@ -2923,7 +3570,9 @@ def cmd_doctor(port: int) -> int:
     process first (a browser that disagrees with its own record is not worth
     probing, and a cleanly DOWN one is not certifiable at all — doctor's job is
     certifying a running browser, so that exits 1), then who else is attached,
-    then the desktop snapshot, then the probe itself.
+    then the desktop snapshot, then whether every tab answers CDP at all (one
+    wedged tab blocks every Playwright attach, so the probe is skipped behind
+    it), then the probe itself.
 
     LOCKS: a client registration is held for the WHOLE probe before the
     interaction lease is taken — the documented gate-then-lease order — which
@@ -2949,7 +3598,8 @@ def cmd_doctor(port: int) -> int:
                 if owner == "inherited"
                 else f"held exclusively for the probe (owner {owner[:8]})",
             )
-            _doctor_probe(log, port)
+            if _doctor_responsiveness(log, port):
+                _doctor_probe(log, port)
             if before is not None:
                 _doctor_windows_after(log, before)
     finally:
@@ -5963,22 +6613,33 @@ def _fail(msg: str) -> int:
 
 
 def main() -> int:
-    """Dispatch the chosen subcommand."""
-    # A flat `if args.cmd == …: return cmd_…(…)` chain: one branch and one return
-    # per subcommand, each forwarding a different argument set. A dispatch table
-    # would need a per-command adapter lambda — more indirection, not less.
-    # pylint: disable=too-many-return-statements,too-many-branches
+    """Parse, bootstrap, and dispatch; a timed-out Playwright attach is a ❌ line."""
     args = parse_args()
     ensure_deps()
-    port = args.cdp_port
     # Say what we are doing BEFORE anything attaches over CDP: this is the
     # `purpose` every client registration reports to whoever waits on the gate.
     site = getattr(args, "site", None)
     _set_purpose(f"{args.cmd} {site}" if site else str(args.cmd))
+    try:
+        return _dispatch(args, args.cdp_port)
+    except BrowserAttachTimeout as exc:
+        return _fail(str(exc))
+
+
+def _dispatch(args: argparse.Namespace, port: int) -> int:
+    """Run the chosen subcommand."""
+    # A flat `if args.cmd == …: return cmd_…(…)` chain: one branch and one return
+    # per subcommand, each forwarding a different argument set. A dispatch table
+    # would need a per-command adapter lambda — more indirection, not less.
+    # pylint: disable=too-many-return-statements,too-many-branches
     if args.cmd == "up":
         return cmd_up(port, args.headless)
     if args.cmd == "status":
+        if args.probe:
+            return cmd_status(port, args.full_urls, probe=True)
         return cmd_status(port, args.full_urls)
+    if args.cmd == "close-hung":
+        return cmd_close_hung(port, assume_yes=args.yes)
     if args.cmd == "switch":
         return cmd_switch(port, args.mode, args.force)
     if args.cmd == "clients":
@@ -5992,7 +6653,7 @@ def main() -> int:
     if args.cmd == "open":
         return cmd_open(port, args.url, reuse=args.reuse)
     if args.cmd == "eval":
-        return cmd_eval(port, args.js, args.url)
+        return cmd_eval(port, args.js, args.url, timeout_s=args.timeout)
     if args.cmd == "token":
         return cmd_token(port)
     if args.cmd == "slack-session":

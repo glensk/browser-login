@@ -39,7 +39,7 @@ shipping its own brittle auth flow.
 | `himalaya`              | full-auto claude.ai magic-link login (reads the email) | optional |
 | `op` (1Password CLI)    | CSCS credential fallback before the keychain is set up | optional |
 
-`playwright`, `pyotp`, and `requests` are declared in `pyproject.toml`. You don't
+`playwright`, `pyotp`, `requests` and `websockets` (raw-CDP tab probe) are declared in `pyproject.toml`. You don't
 have to install them yourself: on first run `browser.py` **self-bootstraps** an
 isolated venv at `~/.cache/claude-browser/venv` via `uv` and re-execs into it.
 
@@ -65,6 +65,8 @@ That's it — `browser.py` creates its own venv on first use.
 browser.py up                 # launch the shared Chromium (idempotent, BACKGROUND, clean tab)
 browser.py up --headless      # opt-in windowless mode (same profile — see the headless note!)
 browser.py status             # CDP health, version, open tabs (origins only; -f full URLs) + the lifecycle record
+browser.py status -p          # + probe every tab over raw CDP: marks '⚠ unresponsive' / '? indeterminate'
+browser.py close-hung [-y]    # close tabs that answer no CDP command (asks first; see Troubleshooting)
 browser.py switch headless    # transactional mode switch (stop + relaunch, logins persist)
 browser.py clients            # who is attached over CDP (registered + unknown clients)
 browser.py doctor             # full health check on a disposable tab (never touches real tabs)
@@ -74,7 +76,10 @@ browser.py open -r https://…  # --reuse: navigate an existing same-URL tab (no
 browser.py eval 'document.title' [--url SUBSTR]   # run JS in the active/matched tab → JSON
                               #   --url with no matching tab exits 1 (it never falls back to
                               #   another tab; the error names the open tabs by origin only —
-                              #   no path, query or fragment); zero tabs → a blank one is created
+                              #   no path, query or fragment); zero tabs → a blank one is created;
+                              #   -t/--timeout SECONDS (default 60) is a hard deadline, attach
+                              #   included: ❌ + exit 1 on expiry — JS already running in the
+                              #   page is NOT stopped
 browser.py down [-f]          # quit the shared browser (graceful CDP close → validated escalation);
                               #   refuses while a registered client (MCP server) stays attached —
                               #   -f/--force stops anyway; a stale record with no browser is cleared
@@ -90,7 +95,9 @@ flows intentionally raise the window because you must act in it.
 
 Env toggles: `CLAUDE_BROWSER_KEEP_TABS=1` keeps last session's tabs (skip the
 wipe); `CLAUDE_BROWSER_FOREGROUND=1` launches in the foreground (skip `open -g`);
-`CLAUDE_BROWSER_HEADLESS=1` makes `up` default to headless.
+`CLAUDE_BROWSER_HEADLESS=1` makes `up` default to headless;
+`CLAUDE_BROWSER_CONNECT_TIMEOUT_S` (default 30) bounds every Playwright attach
+(see Troubleshooting).
 Separately, the Claude Code wrapper only auto-starts the browser when
 `CLAUDE_BROWSER_AUTOSTART=1` — by default it is lazy (started on first use).
 
@@ -247,6 +254,31 @@ the form submission (guards 1 and 3 still apply to it).
 CSCS back-compat aliases (`token`, `cscs-login`, `cscs-store-creds`,
 `cscs-forget-creds`) are kept because downstream tools depend on their exact stdout
 markers and exit codes.
+
+## Troubleshooting
+
+**`open` / `eval` / `doctor` / `login` fail with "could not attach … within
+30s" while `status` works.** One tab's renderer stopped answering CDP — seen
+on 2026-09-29 with a Cloudflare Access sign-in tab stuck mid-navigation
+(tp#693). Playwright's `connect_over_cdp` attaches to
+EVERY tab and waits for each to answer, so that one tab blocks every Playwright
+attach (Playwright's own default wait is 180 s; browser.py gives up after
+`CLAUDE_BROWSER_CONNECT_TIMEOUT_S`, default 30). `status` still works because
+it only reads the HTTP `/json/*` endpoints. The error names the tab (title,
+origin, 8-char target id). Then:
+
+```commands
+browser.py status -p          # which tab(s) answer no CDP command (read-only probe)
+browser.py close-hung         # close them — asks first; -y/--yes skips the question
+```
+
+`close-hung` closes only tabs that failed three consecutive CDP probes (the
+listing, a re-probe, and one more AFTER you confirm, with an unchanged URL); a
+responsive tab is never a candidate. Nothing closes a tab automatically —
+reloading or closing it by hand in the window works too. The Playwright MCP
+server (`browser_*` tools) attaches the same way and stalls on the same tab;
+`close-hung` is the shared remedy. `doctor` probes tab responsiveness first and
+skips its Playwright probe (❌) while such a tab exists.
 
 ## How other tools consume it
 

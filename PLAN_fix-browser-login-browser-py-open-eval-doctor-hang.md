@@ -96,12 +96,12 @@ the tests exercise, against a fake CDP endpoint whose page target never answers.
 
 ## Steps
 
-- [ ] 1. Create a git worktree of `home/browser-login` and do all edits there (never the live
+- [x] 1. Create a git worktree of `home/browser-login` and do all edits there (never the live
   `bin/browser.py`). Add a module constant `CONNECT_TIMEOUT_S`, read from the env var
   `CLAUDE_BROWSER_CONNECT_TIMEOUT_S`, default 30. Invalid or non-positive values fall back to 30.
   Put it next to `DEFAULT_CDP_PORT` (`bin/browser.py:109`) and document it in `.env.example` under
   "shared browser".
-- [ ] 2. Raw CDP layer, registration-free. Add `websockets` to `ensure_deps` (import check, `deps`
+- [x] 2. Raw CDP layer, registration-free. Add `websockets` to `ensure_deps` (import check, `deps`
   list, both "creating venv" messages) and to `pyproject.toml` `dependencies`, then `uv lock`.
   Add helpers:
   - `_cdp_ws_call(ws_url, method, params, budget_s)`: one monotonic deadline over the whole call.
@@ -109,7 +109,7 @@ the tests exercise, against a fake CDP endpoint whose page target never answers.
     reply is matched by CDP `id`. Events are ignored and never extend the deadline. It returns a
     tagged result: ok / timeout / transport-error.
   - `_browser_ws_url(port)` reads the browser-level `webSocketDebuggerUrl` from `/json/version`.
-- [ ] 3. `_probe_targets(port, budget_s=6.0) -> ProbeReport`: enumerate `type == "page"` targets
+- [x] 3. `_probe_targets(port, budget_s=6.0) -> ProbeReport`: enumerate `type == "page"` targets
   from `/json/list`, with its own `_cdp_get`, NOT `_page_targets` (that one maps a failure to `[]`).
   A failed enumeration makes the report `indeterminate` as a whole. Otherwise probe each target
   concurrently with `Runtime.evaluate {"expression": "1"}` over its `webSocketDebuggerUrl`: one
@@ -118,22 +118,22 @@ the tests exercise, against a fake CDP endpoint whose page target never answers.
   (websocket opened but no reply within the budget), `gone` (target vanished or the socket was
   refused because the target closed), `indeterminate` (any other transport error). Read-only: the
   only command sent is `Runtime.evaluate("1")`.
-- [ ] 4. `_connect` (`bin/browser.py:2101`) passes `timeout=CONNECT_TIMEOUT_S * 1000` to
+- [x] 4. `_connect` (`bin/browser.py:2101`) passes `timeout=CONNECT_TIMEOUT_S * 1000` to
   `connect_over_cdp`. On Playwright `TimeoutError` it stops Playwright (bounded, errors suppressed),
   runs `_probe_targets`, and raises a new `BrowserAttachTimeout` whose message names each
   `unresponsive` tab by `_tab_title` + `_tab_hint` origin + 8-char target id, plus the remedy
   (`browser.py close-hung`, or reload/close that tab by hand). If no tab is unresponsive, the message
   says so and reports the indeterminate count. `main()` turns `BrowserAttachTimeout` into
   `_fail(...)` (exit 1). `doctor` catches it itself (step 8). The ~19 other callers need no change.
-- [ ] 5. `_cdp_browser_close` (`bin/browser.py:973`) sends `Browser.close` through `_cdp_ws_call`
+- [x] 5. `_cdp_browser_close` (`bin/browser.py:973`) sends `Browser.close` through `_cdp_ws_call`
   on the browser-level websocket with a 5 s budget, and no longer uses Playwright. A connection
   dropped mid-command counts as sent, as it does today. A timeout counts as "not sent", so
   `_shutdown_browser` escalates with its budget intact.
-- [ ] 6. `status -p/--probe` registers a client (`_registry_register`) for the probe's lifetime,
+- [x] 6. `status -p/--probe` registers a client (`_registry_register`) for the probe's lifetime,
   then appends a marker to each tab line: `⚠ unresponsive`, `? indeterminate` or nothing.
   Enumeration failure prints `probe indeterminate: <reason>` and exits 1. Without `-p`, output and
   speed are unchanged (HTTP only).
-- [ ] 7. New subcommand `close-hung` with `-y/--yes`, in this order: register a client, take the
+- [x] 7. New subcommand `close-hung` with `-y/--yes`, in this order: register a client, take the
   interaction lease, run probe #1, re-probe the `unresponsive` ones (probe #2), then list the
   candidates (origin-only, id8). Ask for confirmation (skipped with `-y`; a declined prompt or no TTY
   without `-y` exits 1 and closes nothing). AFTER confirmation, re-probe exactly the approved target
@@ -142,7 +142,7 @@ the tests exercise, against a fake CDP endpoint whose page target never answers.
   as recovered or changed. Exit 0 when nothing was hung or every approved candidate was closed or
   had recovered, 1 on an indeterminate probe or a failed close. Contract in help and README: "closes
   only tabs that failed three consecutive CDP probes; a responsive tab is never a candidate".
-- [ ] 8. `doctor`:
+- [x] 8. `doctor`:
   - (a) Before the probe, add a check `tab responsiveness` via `_probe_targets`: ✅ when every tab
     answers; ❌ naming the unresponsive tab(s) and the `close-hung` remedy, and skip the Playwright
     probe; ⚠ when the result is indeterminate.
@@ -151,13 +151,13 @@ the tests exercise, against a fake CDP endpoint whose page target never answers.
     return the created target id. When Playwright never got the page, cleanup closes that id via
     browser-level `Target.closeTarget` (bounded). A `BrowserAttachTimeout` there becomes a ❌ line,
     and `_doctor_windows_after` still runs.
-- [ ] 9. `eval -t/--timeout SECONDS` (default 60; must be > 0): arm a daemon `threading.Timer`
+- [x] 9. `eval -t/--timeout SECONDS` (default 60; must be > 0): arm a daemon `threading.Timer`
   BEFORE `_connect`. On expiry it writes `❌ eval: no result after Ns (tab unresponsive or
   expression never settled)` to stderr and calls `os._exit(1)`. The registry flock goes away with
   the process, and `_registry_live_clients` already drops records whose PID is dead. Check that
   last point and fix it if not. Help and README note that JS already running in the page is not
   stopped.
-- [ ] 10. Tests in `tests/test_connect_hang.py`. No real browser. Coordination dirs are redirected
+- [x] 10. Tests in `tests/test_connect_hang.py`. No real browser. Coordination dirs are redirected
   to `tmp_path` (monkeypatch `CACHE_DIR`/`CLIENTS_DIR` in-process; for subprocess tests, add a
   test-only env override `CLAUDE_BROWSER_CACHE_DIR`, documented in `.env.example`). Fake CDP
   endpoint on an ephemeral `127.0.0.1` port: stdlib HTTP for `/json/version` and `/json/list`, and a
@@ -181,17 +181,23 @@ the tests exercise, against a fake CDP endpoint whose page target never answers.
 
   NOTE: the project venv locks Playwright 1.60 (`uv.lock`) while the bootstrap venv runs 1.62. Both
   use `launch_timeout` for `connectOverCDP`. Bump the lock only if a test shows the two differ.
-- [ ] 11. Docs: README (subcommand list; a troubleshooting entry "one hung tab blocks every
+- [x] 11. Docs: README (subcommand list; a troubleshooting entry "one hung tab blocks every
   Playwright attach, so run `status -p` / `close-hung`"; the new env vars; the eval deadline caveat),
   the module docstring's subcommand list, AGENTS.md (the raw-CDP helper and registration rule), and
   `.env.example`.
-- [ ] 12. From the WORKTREE root, run every Verification command below (same argv, worktree path)
+- [x] 12. From the WORKTREE root, run every Verification command below (same argv, worktree path)
   until green. Then do the live read-only smoke against the shared browser, as Albert's item rule
   allows: `bin/browser.py status -p` and `timeout 120 bin/browser.py open https://example.com`.
   Each must end within `CONNECT_TIMEOUT_S` + 10 s, either with success or with the named hung-tab
   diagnosis. Never run `eval` in a real tab or `close-hung` against the shared browser. Merge the
   worktree into main, re-run the Verification block on the main checkout, and commit with
   `ai.py push <files>`.
+
+Status 2026-09-29: steps 1–12 done. Live smoke against the shared browser: `status -p` (7 s) marked
+exactly the `Sign in ・ Cloudflare Access` tab `⚠ unresponsive`; `open https://example.com` ended in
+37 s with the named hung-tab diagnosis (`[id EEE09E93]`) instead of hanging for 180 s. The bootstrap
+venv self-healed `websockets` on that first run. `uv.lock` resolves websockets 16.1.1 (Python 3.10)
+and 17.1 (≥ 3.11); `_cdp_ws_call` uses the `with connect(...)` form, which both support.
 
 NOTE (albert, optional): once this lands, run `browser.py status -p`, then `browser.py close-hung`
 if the Cloudflare Access tab is still wedged. Closing a real tab of the shared browser is your call,
