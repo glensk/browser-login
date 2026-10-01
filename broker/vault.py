@@ -253,6 +253,31 @@ class FixtureVault:
         return secret_from_json(_find(self._raw(), site, dev=self.dev))
 
 
+# Known bw failure messages -> a fixed reason (never the message itself).
+_BW_REASONS = (
+    ("invalid master password", "wrong master password in bootstrap.json"),
+    ("invalid api key", "wrong client_id/client_secret in bootstrap.json"),
+    ("client_id", "wrong client_id/client_secret in bootstrap.json"),
+    ("username or password is incorrect", "wrong credentials in bootstrap.json"),
+    ("you are not logged in", "bw is not logged in"),
+    ("collection", "collection id not found or not accessible"),
+    ("certificate", "TLS certificate problem reaching Vaultwarden"),
+    ("econnrefused", "Vaultwarden not reachable"),
+    ("enotfound", "Vaultwarden host not resolvable"),
+    ("getaddrinfo", "Vaultwarden host not resolvable"),
+    ("timed out", "Vaultwarden timed out"),
+)
+
+
+def _bw_reason(text: str) -> str:
+    """': <fixed reason>' for a recognised bw error, else ''."""
+    low = text.lower()
+    for needle, reason in _BW_REASONS:
+        if needle in low:
+            return f": {reason}"
+    return ""
+
+
 # The self-hosted Vaultwarden the broker account lives on.
 DEFAULT_SERVER_URL = "https://vaultwarden.dom42.space"
 
@@ -323,8 +348,10 @@ class BwVault:
         except (OSError, subprocess.TimeoutExpired) as exc:
             raise VaultError(f"bw {args[0]} could not run") from exc
         if proc.returncode != 0:
-            # stderr is NOT echoed: bw may quote input back.
-            raise VaultError(f"bw {args[0]} failed (exit {proc.returncode})")
+            # stderr is NOT echoed (bw may quote input back); only a fixed,
+            # secret-free reason picked from known messages is reported.
+            reason = _bw_reason(proc.stderr + proc.stdout)
+            raise VaultError(f"bw {args[0]} failed (exit {proc.returncode}){reason}")
         return proc.stdout
 
     def _status(self) -> str:

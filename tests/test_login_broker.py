@@ -1231,3 +1231,10 @@ def test_install_role_account_uid_range_and_remnant_check() -> None:
     assert (
         "role_uid >/dev/null" in script
     )  # existence = has a UniqueID, not just a record
+
+
+def test_bw_reason_is_fixed_text_never_the_message() -> None:
+    msg = "Invalid master password. hunter2-secret"
+    assert vault._bw_reason(msg) == ": wrong master password in bootstrap.json"
+    assert "hunter2" not in vault._bw_reason(msg)
+    assert vault._bw_reason("something odd") == ""
