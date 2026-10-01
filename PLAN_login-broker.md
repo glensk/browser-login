@@ -121,6 +121,20 @@ the agent the portal session. Record as Albert's decision of 2026-10-01 in
 > cookies (no expiry) are lost when the broker profile closes, so such sites log in fresh each time.
 > `login-cscs-assisted` (TTY-only) keeps the old keychain/1Password path until 3.3.
 > Vaultwarden: Albert creates a NEW organization for the broker (not "Family").
+>
+> **Status 2026-10-02 00:20 (live):** broker INSTALLED (`/usr/local/libexec/login-broker`, role
+> account `_loginbroker` uid 450, socket `/var/db/login-broker-run/broker.sock`), enrolled
+> (Vaultwarden org "Agents", collection `agent-login`, broker user
+> `albert.glensk+loginbroker@gmail.com`), Bitwarden readable (`./agent-login.py` 🟢). Items in
+> the collection: Kleinanzeigen, anibis, Ricardo. Fixes shipped tonight: role UID 450-499,
+> `bw config server` → Vaultwarden, launchd unload wait, fixed-text bw error reasons.
+> **Open bug:** `login kleinanzeigen` reported success but the shared browser was not logged in
+> (account page → `login.kleinanzeigen.de/u/login/identifier`). Kleinanzeigen, anibis, Ricardo are
+> all Auth0 identifier-first (two-step). Fix in progress by a builder per
+> `scratchpad/builder_spec2.md` (positive success proof via check URL, start from check URL,
+> two-step flow) in worktree `scratchpad/bl-wt2`; after review+commit Albert runs
+> `sudo install/install.sh`, then `./agent-login.py -t kleinanzeigen` / `-t anibis` and verify
+> on the account page. Shared Chromium was switched to headless.
 
 - [ ] 0.1 **Bot-defence spike, per candidate site** (ricardo, kleinanzeigen, geizhals, toppreise,
       cscs): headless Chrome for Testing as `_loginbroker` with no WindowServer, real login with
