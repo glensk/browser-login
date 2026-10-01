@@ -1208,3 +1208,15 @@ def test_e2e_dev_foreign_form_action_refused(sockdir, tmp_path):
         httpd.shutdown()
     assert resp["error"] == "origin_violation", resp
     assert not _LoginApp.posts
+
+
+def test_install_role_account_uid_range_and_remnant_check() -> None:
+    """macOS role accounts need a UID in 450-499; a record without UniqueID is repaired."""
+    script = (
+        Path(__file__).resolve().parent.parent / "install" / "install.sh"
+    ).read_text()
+    assert "/usr/bin/seq 450 499" in script
+    assert "seq 200 400" not in script
+    assert (
+        "role_uid >/dev/null" in script
+    )  # existence = has a UniqueID, not just a record

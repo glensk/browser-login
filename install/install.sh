@@ -2,7 +2,7 @@
 # install.sh — install, update, uninstall or enrol the login broker (needs root).
 #
 # Layout (PLAN_login-broker.md 0.2):
-#   _loginbroker                       role account (UID 200-400, no shell)
+#   _loginbroker                       role account (UID 450-499, no shell)
 #   /var/db/login-broker               0700 _loginbroker   state, profiles, bw, bootstrap
 #   /var/db/login-broker-run           0775 root:_loginbroker   socket dir (persistent:
 #                                      macOS clears /var/run at boot)
@@ -160,14 +160,15 @@ check_repo() {
 	printf '%s\n' "$head"
 }
 
-# free_role_id — first id in 200-400 used neither as a UID nor as a GID.
+# free_role_id — first id in 450-499 (macOS role-account UID range) used
+# neither as a UID nor as a GID.
 free_role_id() {
 	local used id
 	used="$(
 		/usr/bin/dscl . -list /Users UniqueID | /usr/bin/awk '{print $2}'
 		/usr/bin/dscl . -list /Groups PrimaryGroupID | /usr/bin/awk '{print $2}'
 	)"
-	for id in $(/usr/bin/seq 200 400); do
+	for id in $(/usr/bin/seq 450 499); do
 		if ! /usr/bin/grep -qx "$id" <<<"$used"; then
 			echo "$id"
 			return 0
@@ -176,21 +177,42 @@ free_role_id() {
 	return 1
 }
 
+# role_uid — the role account's UniqueID; fails when it has none (dscl exits 0
+# on a missing key, so the output is what counts).
+role_uid() {
+	/usr/bin/dscl . -read "/Users/${ROLE}" UniqueID 2>/dev/null |
+		/usr/bin/awk '$1 == "UniqueID:" { print $2; found = 1 } END { exit !found }'
+}
+
 ensure_role_account() {
-	if /usr/bin/dscl . -read "/Users/${ROLE}" >/dev/null 2>&1; then
+	if role_uid >/dev/null; then
 		echo "✓ role account ${ROLE} exists"
 		return 0
 	fi
-	local id
-	if ((DRY)); then
-		id="<free id 200-400>"
-	else
-		id="$(free_role_id)" || die "no free UID/GID in 200-400"
+	# A record without UniqueID is the remnant of an interrupted create.
+	if /usr/bin/dscl . -read "/Users/${ROLE}" >/dev/null 2>&1; then
+		run /usr/bin/dscl . -delete "/Users/${ROLE}"
 	fi
-	run /usr/sbin/dseditgroup -o create -i "$id" -r "login broker" "$ROLE"
+	local id gid
+	if ((DRY)); then
+		id="<free id 450-499>"
+	else
+		id="$(free_role_id)" || die "no free UID/GID in 450-499"
+	fi
+	# A group left by an earlier, failed run is reused with its own GID.
+	gid="$(/usr/bin/dscl . -read "/Groups/${ROLE}" PrimaryGroupID 2>/dev/null |
+		/usr/bin/awk '{print $2}')"
+	if [[ -z "$gid" ]]; then
+		gid="$id"
+		run /usr/sbin/dseditgroup -o create -i "$gid" -r "login broker" "$ROLE"
+	fi
 	run /usr/sbin/sysadminctl -addUser "$ROLE" -UID "$id" -roleAccount \
 		-home "$HOME_DIR" -shell /usr/bin/false -fullName "login broker"
-	run /usr/bin/dscl . -create "/Users/${ROLE}" PrimaryGroupID "$id"
+	# sysadminctl exits 0 even when it refuses, so verify the account exists.
+	if ! ((DRY)) && ! role_uid >/dev/null; then
+		die "sysadminctl did not create ${ROLE} (see its message above)"
+	fi
+	run /usr/bin/dscl . -create "/Users/${ROLE}" PrimaryGroupID "$gid"
 	run /usr/sbin/dseditgroup -o edit -a "$ROLE" -t user "$ROLE"
 }
 
