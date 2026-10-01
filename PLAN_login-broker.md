@@ -114,6 +114,12 @@ the agent the portal session. Record as Albert's decision of 2026-10-01 in
       Albert's test credentials typed by Albert, then inject the bundle into the headed shared
       Chromium and check the session survives the User-Agent/IP switch (`cf_clearance` and similar
       bot cookies bound to UA). Record go/no-go per site here; drop no-go sites before Phase 1.
+      *Pre-spike 2026-10-01 (uid 501, no credentials, page load only):* default Playwright
+      headless shell → ricardo + toppreise blocked (Cloudflare "Nur einen Moment…", 403).
+      `channel="chromium"` (new headless) + normal Chrome User-Agent +
+      `--disable-blink-features=AutomationControlled` → ricardo, toppreise, kleinanzeigen
+      (login form), geizhals, cscs (`auth.cscs.ch` login form) all load. ⇒ the broker uses
+      that launch profile; the real-login go/no-go as `_loginbroker` is still open.
 - [ ] 0.2 `install/install.sh` (sudo, idempotent, `-U` uninstalls, shellcheck-clean): role account
       `_loginbroker` with home `/var/db/login-broker` (0700); `/usr/local/libexec/login-broker`
       (root 0755: code, uv venv, pinned `bw` + Node, Playwright browsers via
