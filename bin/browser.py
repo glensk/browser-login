@@ -135,7 +135,10 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.realpath(__file__))))
 from broker.bundle import IDP_HOSTS as BROKER_IDP_HOSTS  # noqa: E402
 from broker.bundle import IDP_LABELS as BROKER_IDP_LABELS  # noqa: E402
 from broker.recipes import click_keycloak_submit as _click_keycloak_submit  # noqa: E402
+from broker.recipes import cscs_on_portal as _broker_cscs_on_portal  # noqa: E402
 from broker.recipes import fresh_totp as _broker_fresh_totp  # noqa: E402
+from broker.recipes import interstitial_title as _broker_interstitial  # noqa: E402
+from broker.recipes import off_fill_origins as _broker_off_fill_origins  # noqa: E402
 from broker.recipes import parse_totp as _parse_totp  # noqa: E402
 
 # pylint: enable=wrong-import-position
@@ -6689,39 +6692,61 @@ def _broker_entry_or_rc(site: str) -> tuple[dict | None, int]:
     return entry, 0
 
 
-def _broker_logged_in(port: int, site: str) -> int:
-    """Exit 0 if the shared browser is logged into broker site `site`, 2 if not.
+def _broker_probe(page, entry: dict) -> bool:
+    """The broker's positive check, client side, on the loaded check page.
 
-    READ-ONLY: one background tab on the item's login URL, closed again. With
-    the item's ``agent_logged_in_selector`` the sentinel must be visible;
-    without one, no visible password field counts as logged in.
+    Logged in iff the item's sentinel is visible, or — the item has a check
+    URL — the page ended OFF every fill origin (https only), shows no bot
+    challenge and no visible password field. CSCS: the settled portal app.
+    "No password field" alone proves nothing (page 2 of an Auth0 login).
     """
     from playwright.sync_api import Error as PlaywrightError
 
+    page.wait_for_timeout(1000)
+    if entry.get("site") == "cscs":
+        return _broker_cscs_on_portal(page.url)
+    sentinel = entry.get("logged_in_selector")
+    if sentinel:
+        try:
+            page.wait_for_selector(str(sentinel), state="visible", timeout=8_000)
+            return True
+        except PlaywrightError:
+            pass
+    if not entry.get("check_url"):
+        return False
+    fill = [str(o) for o in entry.get("fill_origins") or []]
+    if not _broker_off_fill_origins(page.url, fill, dev=False):
+        return False
+    if _broker_interstitial(page):
+        return False
+    return not any(
+        el.is_visible() for el in page.query_selector_all("input[type=password]")
+    )
+
+
+def _broker_logged_in(port: int, site: str) -> int:
+    """Exit 0 if the shared browser is logged into broker site `site`, 2 if not.
+
+    READ-ONLY: one BACKGROUND tab (never brought to front) on the item's check
+    URL (``check_url`` from the broker's ``sites`` list; sentinel-only items:
+    the login URL), closed again; ``_broker_probe`` decides.
+    """
     entry, rc = _broker_entry_or_rc(site)
     if entry is None:
         return rc
-    url = str(entry.get("login_url") or "")
-    if not url.startswith("https://"):
-        return _broker_fail(2, f"{site}: the broker lists no https login URL.")
-    sentinel = entry.get("logged_in_selector")
-
-    def probe(page) -> bool:
-        page.wait_for_timeout(1000)
-        if sentinel:
-            try:
-                page.wait_for_selector(str(sentinel), state="visible", timeout=8_000)
-                return True
-            except PlaywrightError:
-                return False
-        return not any(
-            el.is_visible() for el in page.query_selector_all("input[type=password]")
+    check_url = str(entry.get("check_url") or "")
+    if not check_url and not entry.get("logged_in_selector"):
+        return _broker_fail(
+            2, f"{site}: the broker lists no check URL or sentinel — cannot verify."
         )
+    url = check_url or str(entry.get("login_url") or "")
+    if not url.startswith("https://"):
+        return _broker_fail(2, f"{site}: the broker lists no https check URL.")
 
-    if _with_background_page(port, url, probe):
-        print(f"✓ Logged into {site}.")
+    if _with_background_page(port, url, lambda page: _broker_probe(page, entry)):
+        print(f"✓ Logged into {site} (checked {_tab_hint(url)}).")
         return 0
-    print(f"Not logged into {site}.", file=sys.stderr)
+    print(f"Not logged into {site} (checked {_tab_hint(url)}).", file=sys.stderr)
     return 2
 
 
@@ -6846,16 +6871,25 @@ def cmd_broker_sites() -> int:
     if not sites:
         print("(no items in Bitwarden agent-logins)")
         return 0
-    rows = [("SITE", "FILL ORIGINS", "STATUS")]
+    rows = [("SITE", "FILL ORIGINS", "CHECK", "STATUS")]
     for s in sorted(sites, key=lambda e: str(e.get("site"))):
         status = f"refused: {s.get('reason') or '?'}" if s.get("refused") else "ok"
+        check = str(s.get("check_url") or "") or (
+            "sentinel" if s.get("logged_in_selector") else "-"
+        )
         rows.append(
-            (str(s.get("site")), ", ".join(s.get("fill_origins") or []) or "-", status)
+            (
+                str(s.get("site")),
+                ", ".join(s.get("fill_origins") or []) or "-",
+                check,
+                status,
+            )
         )
     w0 = max(len(r[0]) for r in rows)
     w1 = max(len(r[1]) for r in rows)
+    w2 = max(len(r[2]) for r in rows)
     for r in rows:
-        print(f"{r[0]:<{w0}}  {r[1]:<{w1}}  {r[2]}")
+        print(f"{r[0]:<{w0}}  {r[1]:<{w1}}  {r[2]:<{w2}}  {r[3]}")
     return 0
 
 

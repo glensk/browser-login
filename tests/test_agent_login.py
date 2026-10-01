@@ -15,7 +15,9 @@ _SPEC.loader.exec_module(al)
 
 KA = next(t for t in al.TARGETS if t.site == "kleinanzeigen")
 ANIBIS = next(t for t in al.TARGETS if t.site == "anibis")
+RICARDO = next(t for t in al.TARGETS if t.site == "ricardo")
 TUTTI = next(t for t in al.TARGETS if t.site == "tutti")
+GEIZHALS = next(t for t in al.TARGETS if t.site == "geizhals")
 
 
 def test_ready_when_listed_and_flow_supported() -> None:
@@ -23,9 +25,20 @@ def test_ready_when_listed_and_flow_supported() -> None:
     assert al.classify(KA, listed)[0] == "ready"
 
 
-def test_two_step_listed_needs_flow() -> None:
-    listed = {"anibis": {"site": "anibis", "refused": False}}
-    assert al.classify(ANIBIS, listed)[0] == "needs-flow"
+def test_two_step_flows_are_supported() -> None:
+    assert "two-step" in al.SUPPORTED_FLOWS
+    for target in (KA, ANIBIS, RICARDO, TUTTI):
+        assert target.flow == "two-step", target.site
+        listed = {target.site: {"site": target.site, "refused": False}}
+        assert al.classify(target, listed)[0] == "ready", target.site
+    assert "Cloudflare check" in RICARDO.note
+    assert TUTTI.fill_origin == "https://auth.tutti.ch" and TUTTI.note == ""
+
+
+def test_unsupported_flow_needs_flow() -> None:
+    odd = al.Target("odd", "Odd", "https://login.odd.example", "magic-link", "n")
+    listed = {"odd": {"site": "odd", "refused": False}}
+    assert al.classify(odd, listed) == ("needs-flow", "n")
 
 
 def test_refused_missing_unknown_unchecked() -> None:
@@ -34,7 +47,8 @@ def test_refused_missing_unknown_unchecked() -> None:
     }
     assert al.classify(KA, listed) == ("refused", "x")
     assert al.classify(KA, {})[0] == "missing"
-    assert al.classify(TUTTI, {})[0] == "unknown"
+    assert al.classify(TUTTI, {})[0] == "missing"
+    assert al.classify(GEIZHALS, {})[0] == "unknown"
     assert al.classify(KA, {}, readable=False)[0] == "unchecked"
 
 
@@ -43,3 +57,16 @@ def test_overview_broker_down(monkeypatch) -> None:
     data = al.overview()
     assert not data["broker_ok"]
     assert {r["status"] for r in data["rows"]} <= {"unchecked", "unknown"}
+
+
+def test_overview_rows_carry_check_url(monkeypatch) -> None:
+    sites = [
+        {"site": "ricardo", "refused": False, "check_url": "https://r.example/me"},
+        {"site": "extra", "refused": False, "check_url": "https://e.example/me"},
+    ]
+    monkeypatch.setattr(al, "broker_state", lambda: ("running, Bitwarden ok", sites))
+    rows = {r["site"]: r for r in al.overview()["rows"]}
+    assert rows["ricardo"]["check_url"] == "https://r.example/me"  # broker wins
+    assert rows["extra"]["check_url"] == "https://e.example/me"
+    assert rows["kleinanzeigen"]["check_url"] == al.DEFAULT_CHECK_URLS["kleinanzeigen"]
+    assert rows["geizhals"]["check_url"] == ""

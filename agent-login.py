@@ -24,13 +24,17 @@ import sys
 from dataclasses import asdict, dataclass
 from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))  # the repo's `broker` package
+# pylint: disable-next=wrong-import-position
+from broker.recipes import DEFAULT_CHECK_URLS  # noqa: E402
+
 SOCKET = os.environ.get("LOGIN_BROKER_SOCKET", "/var/db/login-broker-run/broker.sock")
 CODE_DIR = Path("/usr/local/libexec/login-broker/current")
 BROWSER_PY = Path(__file__).resolve().parent / "bin" / "browser.py"
 VAULT_URL = "https://vaultwarden.dom42.space"
 
 # Login flows the broker's recipes can drive today.
-SUPPORTED_FLOWS = {"one-page", "cscs"}
+SUPPORTED_FLOWS = {"one-page", "two-step", "cscs"}
 
 
 @dataclass(frozen=True)
@@ -46,7 +50,7 @@ class Target:
 
 TARGETS = (
     Target(
-        "kleinanzeigen", "Kleinanzeigen", "https://login.kleinanzeigen.de", "one-page"
+        "kleinanzeigen", "Kleinanzeigen", "https://login.kleinanzeigen.de", "two-step"
     ),
     Target("toppreise", "Toppreise", "https://www.toppreise.ch", "one-page"),
     Target(
@@ -63,7 +67,7 @@ TARGETS = (
         "two-step",
         "two pages + Cloudflare check",
     ),
-    Target("tutti", "tutti", "", "unknown", "login address not known yet"),
+    Target("tutti", "tutti", "https://auth.tutti.ch", "two-step"),
     Target("geizhals", "geizhals", "", "unknown", "login address not known yet"),
     Target(
         "cscs",
@@ -157,7 +161,11 @@ def overview() -> dict:
     rows = []
     for t in TARGETS:
         status, detail = classify(t, listed, readable=readable)
-        rows.append({**asdict(t), "status": status, "detail": detail})
+        entry = listed.get(t.site) or {}
+        check = str(entry.get("check_url") or DEFAULT_CHECK_URLS.get(t.site, ""))
+        rows.append(
+            {**asdict(t), "check_url": check, "status": status, "detail": detail}
+        )
     planned = {t.site for t in TARGETS}
     for site, entry in sorted(listed.items()):
         if site in planned:
@@ -170,6 +178,7 @@ def overview() -> dict:
                 "fill_origin": ", ".join(entry.get("fill_origins") or []),
                 "flow": "one-page",
                 "note": "",
+                "check_url": str(entry.get("check_url") or ""),
                 "status": "refused" if refused else "extra",
                 "detail": str(entry.get("reason") or "") if refused else "",
             }
@@ -224,14 +233,20 @@ def print_overview(data: dict) -> None:
 
 
 def run_test(site: str) -> int:
-    """Real end-to-end test: broker login → session in the shared Chromium → check."""
+    """Real end-to-end test: broker login → session in the shared Chromium → the
+    client's POSITIVE check (check URL / sentinel, in a background tab).
+
+    The verdict is the positive check, never the login command's exit code
+    alone: a login that "succeeded" while the check page still redirects to the
+    login page is reported as NOT logged in.
+    """
     print(f"▶ browser.py login {site}  (the broker logs in; you see no password)")
-    rc = subprocess.run(
+    login_rc = subprocess.run(
         [sys.executable, str(BROWSER_PY), "login", site], check=False
     ).returncode
-    if rc != 0:
-        print(f"❌ login {site} failed (exit {rc})")
-        return rc
+    if login_rc != 0:
+        print(f"❌ login {site} failed (exit {login_rc})")
+    print(f"▶ browser.py logged-in {site}  (positive check on the check URL)")
     rc = subprocess.run(
         [sys.executable, str(BROWSER_PY), "logged-in", site], check=False
     ).returncode
@@ -239,8 +254,9 @@ def run_test(site: str) -> int:
         ("✅ " if rc == 0 else "❌ ")
         + f"{site}: shared Chromium is "
         + ("logged in" if rc == 0 else "NOT logged in")
+        + " (positive check)"
     )
-    return rc
+    return rc or login_rc
 
 
 def main() -> int:

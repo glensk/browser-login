@@ -6,6 +6,12 @@ action must both be one of the item's ``agent_fill_origins`` (exact scheme +
 host + port). A redirect to a look-alike host between two fills is caught
 because the check runs again right before each one.
 
+Success needs POSITIVE proof (``check_logged_in``): on the site's check page
+(``agent_check_url`` or a built-in default from ``DEFAULT_CHECK_URLS``) either
+the item's sentinel is visible, or the page ended OFF every fill origin with
+no visible password field. "The password field went away" alone proves
+nothing — page 2 of an identifier-first (Auth0) login has none either.
+
 Exceptions carry ``submitted``: whether a secret had already been submitted
 when the recipe gave up. The daemon maps a failure after submission to the
 limiter's ``unknown`` outcome (never retried automatically).
@@ -17,12 +23,20 @@ import re
 import time
 import urllib.parse
 from collections.abc import Callable
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
-from broker.origins import form_action_allowed, origin_allowed
-from broker.vault import Secret, SiteItem
+from broker.origins import form_action_allowed, origin_allowed, url_origin
+
+if TYPE_CHECKING:  # annotations only: vault imports DEFAULT_CHECK_URLS from here
+    from broker.vault import Secret, SiteItem
 
 PASSWORD_SELECTOR = "input[type=password]"
+# Username / e-mail field of an identifier-first page (Auth0: type=email
+# name=username autocomplete=email).
+USERNAME_SELECTOR = (
+    "input[type=email], input[autocomplete~=username], input[autocomplete~=email], "
+    "input[name=username], input[name=email], input[name=identifier], input#username"
+)
 OTP_SELECTOR = "input[autocomplete=one-time-code], input[name*=otp i], #otp"
 CHALLENGE_SRC_RE = re.compile(
     r"recaptcha|hcaptcha|turnstile|challenges\.cloudflare", re.IGNORECASE
@@ -34,6 +48,20 @@ SETTLE_TIMEOUT_S = 30.0
 CSCS_AUTH_ORIGIN = "https://auth.cscs.ch"
 CSCS_PORTAL_ORIGIN = "https://portal.cscs.ch"
 CSCS_LOGIN_URL = CSCS_PORTAL_ORIGIN + "/profile/"
+SUBMIT_CHANGE_S = 3.0
+
+# Built-in check URLs: a page that needs the login and, when logged out,
+# redirects to the site's login page on a fill origin (each verified with an
+# unauthenticated headless load, 2026-10-02). An item's `agent_check_url`
+# overrides. Toppreise has none: its account pages show the login form INLINE
+# on www.toppreise.ch, so such an item needs `agent_logged_in_selector`.
+DEFAULT_CHECK_URLS = {
+    "kleinanzeigen": "https://www.kleinanzeigen.de/m-meine-anzeigen.html",
+    "anibis": "https://www.anibis.ch/fr/user/searches",
+    "ricardo": "https://www.ricardo.ch/de/my-ricardo/saved/articles/",
+    "tutti": "https://www.tutti.ch/de/myads/active",
+    "cscs": CSCS_LOGIN_URL,
+}
 
 # Effective action of the form around an input: the default submit button's
 # `formaction` overrides the form's `action`. `null` = no form.
@@ -42,6 +70,14 @@ _FORM_ACTION_JS = """e => {
   if (!f) return {form: false, action: null};
   const b = f.querySelector('button[type=submit], input[type=submit], button:not([type])');
   return {form: true, action: (b && b.getAttribute('formaction')) || f.getAttribute('action')};
+}"""
+
+# The visible submit button of the form around an input (first in DOM order).
+_SUBMIT_BUTTON_JS = """e => {
+  const scope = e.form || document;
+  const vis = el => !!(el.offsetWidth || el.offsetHeight || el.getClientRects().length);
+  return Array.from(scope.querySelectorAll(
+      'button[type=submit], input[type=submit], button:not([type])')).find(vis) || null;
 }"""
 
 # Username field for a password input: an autocomplete=username input in the
@@ -141,13 +177,18 @@ def fresh_totp(
     return str(otp.at(now))
 
 
-def challenge_reason(page: Any) -> str | None:
-    """``"captcha"`` when a captcha / bot-challenge is on the page, else None."""
+def interstitial_title(page: Any) -> bool:
+    """True on a bot-check interstitial ("Just a moment…")."""
     try:
         title = (page.title() or "").strip().lower()
     except Exception:  # pylint: disable=broad-exception-caught
         title = ""
-    if any(title.startswith(t) for t in CHALLENGE_TITLES):
+    return any(title.startswith(t) for t in CHALLENGE_TITLES)
+
+
+def challenge_reason(page: Any) -> str | None:
+    """``"captcha"`` when a captcha / bot-challenge is on the page, else None."""
+    if interstitial_title(page):
         return "captcha"
     try:
         frames = [f.url for f in page.frames]
@@ -195,22 +236,32 @@ def _visible(page: Any, selector: str) -> Any:
     return None
 
 
-def _on_login_path(url: str, item: SiteItem) -> bool:
-    """True while `url` is the login URL's path on a fill origin."""
-    try:
-        cur = urllib.parse.urlsplit(url)
-        login = urllib.parse.urlsplit(item.login_url)
-    except ValueError:
-        return True
-    # dev=True only widens which URLs are RECOGNISED as the login page (a dev
-    # item may list http://127.0.0.1); erring here means "not logged in".
-    on_fill = origin_allowed(url, item.fill_origins, dev=True)
-    return on_fill and cur.path.rstrip("/") == login.path.rstrip("/")
+def off_fill_origins(url: str, fill_origins: list[str], *, dev: bool) -> bool:
+    """True iff `url` is a real http(s) page (http only for the dev loopback)
+    whose origin is NOT one of `fill_origins` — the "left the login" half of
+    the positive check. ``chrome-error://``, ``about:blank`` and unparsable
+    URLs are False."""
+    origin = url_origin(url, dev=dev)
+    return origin is not None and origin not in fill_origins
 
 
-def logged_in(page: Any, item: SiteItem, *, wait_s: float = 8.0) -> bool:
-    """Generic success test: the sentinel is visible, or (no sentinel) the
-    password field is gone and the page left the login path."""
+def check_page_url(item: SiteItem) -> str:
+    """Where the positive check looks: the check URL, else (sentinel-only
+    items) the login URL."""
+    return item.check_url or item.login_url
+
+
+def logged_in(
+    page: Any, item: SiteItem, *, wait_s: float = 8.0, dev: bool = False
+) -> bool:
+    """Positive success test on the CURRENT page (the check page).
+
+    True iff the item's sentinel is visible, or — the item has a check URL —
+    the page is off every fill origin, shows no bot challenge and no visible
+    password field. No check URL and no sentinel: never logged in. Only the
+    interstitial TITLE counts as a challenge here — a logged-in account page
+    may well embed a reCAPTCHA iframe.
+    """
     if item.logged_in_selector:
         try:
             page.wait_for_selector(
@@ -218,10 +269,39 @@ def logged_in(page: Any, item: SiteItem, *, wait_s: float = 8.0) -> bool:
             )
             return True
         except Exception:  # pylint: disable=broad-exception-caught
-            return False
-    if _visible(page, PASSWORD_SELECTOR) is not None:
+            pass
+    if not item.check_url:
         return False
-    return not _on_login_path(page.url, item)
+    if not off_fill_origins(page.url, list(item.fill_origins), dev=dev):
+        return False
+    if interstitial_title(page):
+        return False
+    return _visible(page, PASSWORD_SELECTOR) is None
+
+
+def check_logged_in(
+    page: Any, item: SiteItem, *, dev: bool = False, wait_s: float = 8.0
+) -> bool:
+    """Navigate to the check page and decide (see ``logged_in``).
+
+    CSCS keeps its own rule: the settled ``https://portal.cscs.ch`` app. An
+    HTTP error status on the check page is never a login.
+    """
+    url = check_page_url(item)
+    if not url:
+        return False
+    resp = page.goto(url, wait_until="domcontentloaded")
+    try:
+        page.wait_for_load_state("load", timeout=10_000)
+    except Exception:  # pylint: disable=broad-exception-caught
+        pass
+    page.wait_for_timeout(1500 if item.site == "cscs" else 1000)
+    if item.site == "cscs":
+        return cscs_on_portal(page.url)
+    status = getattr(resp, "status", None) if resp is not None else None
+    if isinstance(status, int) and status >= 400:
+        return False
+    return logged_in(page, item, wait_s=wait_s, dev=dev)
 
 
 def _check_challenge(page: Any, *, submitted: bool) -> None:
@@ -261,6 +341,90 @@ def _fill_otp(
     otp_field.press("Enter")
 
 
+def _wait_login_fields(page: Any, timeout_s: float) -> tuple[Any, Any]:
+    """(visible username field, visible password field) once either shows up.
+
+    Visibility is what counts: Auth0's identifier page carries a HIDDEN
+    password input. Both None after `timeout_s`.
+    """
+    deadline = time.monotonic() + timeout_s
+    while True:
+        pw_field = _visible(page, PASSWORD_SELECTOR)
+        user_field = _visible(page, USERNAME_SELECTOR)
+        if pw_field is not None or user_field is not None:
+            return user_field, pw_field
+        if time.monotonic() >= deadline:
+            return None, None
+        _check_challenge(page, submitted=False)
+        page.wait_for_timeout(250)
+
+
+def _wait_password(page: Any, timeout_s: float) -> Any:
+    """The visible password field of step 2, or None; bot checks abort early."""
+    deadline = time.monotonic() + timeout_s
+    while time.monotonic() < deadline:
+        el = _visible(page, PASSWORD_SELECTOR)
+        if el is not None:
+            return el
+        _check_challenge(page, submitted=False)
+        page.wait_for_timeout(250)
+    return None
+
+
+def _still_there(field: Any) -> bool:
+    try:
+        return bool(field.is_visible())
+    except Exception:  # pylint: disable=broad-exception-caught
+        return False  # detached: the page moved on
+
+
+def _submit_identifier(
+    page: Any, user_field: Any, allowed: list[str], *, dev: bool
+) -> None:
+    """Submit the username step: Enter in the field; if neither the URL nor the
+    DOM changes within ``SUBMIT_CHANGE_S``, click the form's visible submit
+    button (re-guarded: the button's own ``formaction`` must stay on a fill
+    origin too)."""
+    before = page.url
+    user_field.press("Enter")
+    deadline = time.monotonic() + SUBMIT_CHANGE_S
+    while time.monotonic() < deadline:
+        page.wait_for_timeout(250)
+        if (
+            page.url != before
+            or not _still_there(user_field)
+            or _visible(page, PASSWORD_SELECTOR) is not None
+        ):
+            return
+    handle = user_field.evaluate_handle(_SUBMIT_BUTTON_JS)
+    button = handle.as_element() if handle is not None else None
+    if button is None:
+        return
+    _guard(page, user_field, allowed, dev=dev)
+    try:
+        frame = button.owner_frame()
+        frame_url = frame.url if frame is not None else ""
+    except Exception:  # pylint: disable=broad-exception-caught
+        frame_url = ""
+    own_action = button.get_attribute("formaction")
+    if own_action and not form_action_allowed(frame_url, own_action, allowed, dev=dev):
+        raise OriginViolation("submit button posts off the fill origins")
+    button.click()
+
+
+def _needs_fill(field: Any, username: str) -> bool:
+    """False when the field already holds `username` or is read-only (Auth0's
+    password page echoes the identifier typed on page 1 read-only)."""
+    try:
+        value = str(field.input_value() or "").strip()
+        editable = bool(field.is_editable())
+    except Exception:  # pylint: disable=broad-exception-caught
+        return True
+    if value and value.casefold() == username.strip().casefold():
+        return False
+    return editable
+
+
 def generic_login(
     page: Any,
     item: SiteItem,
@@ -269,19 +433,36 @@ def generic_login(
     dev: bool = False,
     settle_s: float = SETTLE_TIMEOUT_S,
 ) -> None:
-    """Ordinary username/password(/TOTP) form login; returns on success, raises else."""
+    """Username/password(/TOTP) form login, one-page or identifier-first.
+
+    Starts at the login URL (= the check URL when the item sets no
+    ``agent_login_url``: an Auth0 login needs the ``state`` the site creates).
+    Returns once the page left the login (sentinel visible / off the fill
+    origins) or `settle_s` passed; the caller then runs the POSITIVE check
+    ``check_logged_in`` — this function's return alone proves nothing.
+    """
     allowed = list(item.fill_origins)
     page.goto(item.login_url, wait_until="domcontentloaded")
     _check_challenge(page, submitted=False)
-    pw_field = _wait_visible(page, PASSWORD_SELECTOR, STEP_TIMEOUT_S)
-    if pw_field is None:
+    user_field, pw_field = _wait_login_fields(page, STEP_TIMEOUT_S)
+    if user_field is None and pw_field is None:
         _check_challenge(page, submitted=False)
-        raise LoginFailed("no visible password field on the login page")
+        raise LoginFailed("no visible username or password field on the login page")
+    if pw_field is None:  # identifier-first: username page, then password page
+        _guard(page, user_field, allowed, dev=dev)
+        user_field.fill(secret.username)
+        _guard(page, user_field, allowed, dev=dev)
+        _submit_identifier(page, user_field, allowed, dev=dev)
+        pw_field = _wait_password(page, STEP_TIMEOUT_S)
+        if pw_field is None:
+            _check_challenge(page, submitted=False)
+            raise LoginFailed("no visible password field after the username step")
     user_handle = pw_field.evaluate_handle(_USERNAME_JS)
     user_field = user_handle.as_element() if user_handle is not None else None
     if user_field is not None and secret.username:
-        _guard(page, user_field, allowed, dev=dev)
-        user_field.fill(secret.username)
+        if _needs_fill(user_field, secret.username):
+            _guard(page, user_field, allowed, dev=dev)
+            user_field.fill(secret.username)
     _guard(page, pw_field, allowed, dev=dev)
     pw_field.fill(secret.password)
     _guard(page, pw_field, allowed, dev=dev)
@@ -297,9 +478,17 @@ def generic_login(
             _fill_otp(page, otp_field, secret, allowed, dev=dev)
             otp_done = True
             continue
-        if logged_in(page, item, wait_s=0.5):
+        if _left_login(page, item, dev=dev):
             return
-    raise LoginFailed("login did not reach a logged-in state", submitted=True)
+
+
+def _left_login(page: Any, item: SiteItem, *, dev: bool) -> bool:
+    """Cheap "the login is over" signal for the settle loop (NOT the proof)."""
+    if item.logged_in_selector and _visible(page, item.logged_in_selector):
+        return True
+    return off_fill_origins(page.url, list(item.fill_origins), dev=dev) and (
+        _visible(page, PASSWORD_SELECTOR) is None
+    )
 
 
 def cscs_on_portal(url: str) -> bool:

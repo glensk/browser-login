@@ -83,6 +83,12 @@ def parse_fill_origins(field: str, *, dev: bool = False) -> list[str]:
     return out
 
 
+def url_origin(url: str, *, dev: bool = False) -> str | None:
+    """Normalised ``scheme://host[:port]`` of `url`, or None when not acceptable
+    (non-https, ``chrome-error://``, userinfo, odd host; http only in dev)."""
+    return _origin_of(url, dev=dev)
+
+
 def origin_allowed(url: str, allowed: list[str], *, dev: bool = False) -> bool:
     """True iff `url`'s origin equals one of `allowed` exactly (scheme, host, port)."""
     origin = _origin_of(url, dev=dev)

@@ -115,9 +115,17 @@ the agent the portal session. Record as Albert's decision of 2026-10-01 in
 > socket dir `/var/db/login-broker-run`; install.sh runs as root only system binaries plus pinned,
 > sha256-checked downloads (uv 0.12.18, bw 2026.9.0 native arm64), installs only a clean tree whose
 > HEAD is on origin/main (`git archive`), logs commit + diffstat; limiter = 12 h cooldown after a
-> post-submit failure, hard block (root reset) after 3 in a row; generic recipe does NOT handle
-> two-step (username → password page) forms yet — ricardo (`login.ricardo.ch`, Auth0
-> identifier-first, Cloudflare Turnstile) needs that; geizhals login host unknown. Session-only
+> post-submit failure, hard block (root reset) after 3 in a row.
+> **2026-10-02 (positive proof, two-step):** success needs a visible sentinel OR, on the item's
+> check URL (`agent_check_url`, else `DEFAULT_CHECK_URLS` in `broker/recipes.py`: kleinanzeigen,
+> anibis, ricardo, tutti, cscs), a final page off every fill origin with no visible password
+> field — checked by the broker after every login and by the client in a background tab; items
+> with neither are refused. Without `agent_login_url` the flow starts at the check URL (Auth0
+> `state`). The generic recipe handles identifier-first (Auth0) two-step forms; ricardo still
+> faces Cloudflare Turnstile. Default cookie scope = the check page's site domain
+> (`kleinanzeigen.de`) + fill-origin hosts, IdP hosts still dropped. Toppreise logs in inline on
+> www.toppreise.ch — it needs `agent_logged_in_selector`. geizhals: one-page overlay
+> `https://geizhals.de/?loginbox=login` (maybe reCAPTCHA), no check page known yet. Session-only
 > cookies (no expiry) are lost when the broker profile closes, so such sites log in fresh each time.
 > `login-cscs-assisted` (TTY-only) keeps the old keychain/1Password path until 3.3.
 > Vaultwarden: Albert creates a NEW organization for the broker (not "Family").
@@ -130,11 +138,11 @@ the agent the portal session. Record as Albert's decision of 2026-10-01 in
 > `bw config server` → Vaultwarden, launchd unload wait, fixed-text bw error reasons.
 > **Open bug:** `login kleinanzeigen` reported success but the shared browser was not logged in
 > (account page → `login.kleinanzeigen.de/u/login/identifier`). Kleinanzeigen, anibis, Ricardo are
-> all Auth0 identifier-first (two-step). Fix in progress by a builder per
-> `scratchpad/builder_spec2.md` (positive success proof via check URL, start from check URL,
-> two-step flow) in worktree `scratchpad/bl-wt2`; after review+commit Albert runs
-> `sudo install/install.sh`, then `./agent-login.py -t kleinanzeigen` / `-t anibis` and verify
-> on the account page. Shared Chromium was switched to headless.
+> all Auth0 identifier-first (two-step). **Fixed and committed 2026-10-02** (positive proof,
+> two-step, cookie scope — see above). NEXT: Albert runs `sudo install/install.sh`, then
+> `./agent-login.py -t kleinanzeigen` / `-t anibis` and verify on the account page (open
+> `https://www.kleinanzeigen.de/m-meine-anzeigen.html` in the shared browser — must NOT land on
+> `login.kleinanzeigen.de`). Shared Chromium runs headless.
 
 - [ ] 0.1 **Bot-defence spike, per candidate site** (ricardo, kleinanzeigen, geizhals, toppreise,
       cscs): headless Chrome for Testing as `_loginbroker` with no WindowServer, real login with

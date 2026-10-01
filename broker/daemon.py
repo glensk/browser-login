@@ -6,7 +6,8 @@ LOCAL_PEERCRED. One JSON request per connection, newline-terminated, at most
 64 KiB:
 
   {"op": "ping"}
-  {"op": "sites"}                 ids, fill origins, cookie scope — never secrets
+  {"op": "sites"}                 ids, fill origins, cookie scope, check URL and
+                                  sentinel — never secrets
   {"op": "login", "site": "X"}    -> {"ok": true, "bundle": {...}}
   {"op": "logout", "site": "X"}   delete the broker's own profile for X
 
@@ -47,9 +48,9 @@ from broker.limiter import Limiter  # noqa: E402
 from broker.origins import origin_allowed  # noqa: E402
 from broker.peercred import peer_uid  # noqa: E402
 from broker.recipes import (  # noqa: E402
+    LoginFailed,
     RecipeError,
-    cscs_on_portal,
-    logged_in,
+    check_logged_in,
     recipe_for,
 )
 from broker.vault import (  # noqa: E402
@@ -121,14 +122,9 @@ class PlaywrightRunner:
             return pw.chromium.launch_persistent_context(**kwargs)
 
     def _profile_logged_in(self, page: Any, item: SiteItem) -> bool:
+        """The positive check (check URL / sentinel) on the broker's own profile."""
         try:
-            page.goto(item.login_url, wait_until="domcontentloaded")
-            with contextlib.suppress(Exception):
-                page.wait_for_load_state("load", timeout=10_000)
-            page.wait_for_timeout(1000)
-            if item.site == "cscs":
-                return cscs_on_portal(page.url)
-            return logged_in(page, item, wait_s=5.0)
+            return check_logged_in(page, item, dev=self.dev, wait_s=5.0)
         except Exception:  # pylint: disable=broad-exception-caught
             return False
 
@@ -176,6 +172,13 @@ class PlaywrightRunner:
                 else:
                     secret = get_secret()
                     recipe_for(item.site)(page, item, secret, dev=self.dev)
+                    # Positive proof after EVERY login, whatever the recipe saw.
+                    if not self._profile_logged_in(page, item):
+                        raise LoginFailed(
+                            "login did not reach a logged-in state "
+                            "(check URL / sentinel)",
+                            submitted=True,
+                        )
                     via = "login"
                 return self.export_bundle(ctx, item, via)
             finally:

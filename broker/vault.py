@@ -2,8 +2,11 @@
 
 Whitelisting a site = its login item sits in the ``agent-logins`` collection AND
 carries the custom field ``agent_fill_origins``. Items without it are listed as
-refused. Secrets never leave this module except as a ``Secret`` handed to a
-recipe; ``Secret`` has a redacting ``repr`` so a stray log line shows nothing.
+refused, and so are items with neither a check URL (``agent_check_url`` or a
+built-in default for the site id) nor a sentinel (``agent_logged_in_selector``):
+without one the broker cannot PROVE a login worked. Secrets never leave this
+module except as a ``Secret`` handed to a recipe; ``Secret`` has a redacting
+``repr`` so a stray log line shows nothing.
 
 ``BwVault`` drives the ``bw`` CLI with secrets in the ENVIRONMENT only (never
 argv): the API key logs the broker's own Vaultwarden user in, the master
@@ -17,6 +20,7 @@ import json
 import os
 import re
 import subprocess
+import urllib.parse
 from collections.abc import Iterator, Mapping
 from contextlib import contextmanager
 from dataclasses import dataclass, field
@@ -25,6 +29,7 @@ from typing import Any, Protocol
 
 from broker.bundle import SiteBundleSpec, is_idp_host
 from broker.origins import parse_fill_origins
+from broker.recipes import DEFAULT_CHECK_URLS
 
 SITE_ID_RE = re.compile(r"^[a-z0-9][a-z0-9._-]{0,63}$")
 BW_TIMEOUT_S = 120.0
@@ -57,6 +62,7 @@ class SiteItem:  # pylint: disable=too-many-instance-attributes
     cookie_names: list[str] | None = None
     storage_keys: dict[str, list[str]] = field(default_factory=dict)
     login_url: str = ""
+    check_url: str = ""
     logged_in_selector: str | None = None
     refused: str | None = None
     item_id: str = ""
@@ -80,6 +86,7 @@ class SiteItem:  # pylint: disable=too-many-instance-attributes
             "cookie_names": list(self.cookie_names) if self.cookie_names else None,
             "storage_origins": sorted(self.storage_keys),
             "login_url": self.login_url,
+            "check_url": self.check_url,
             "logged_in_selector": self.logged_in_selector,
             "refused": self.refused is not None,
             "reason": self.refused or "",
@@ -109,8 +116,41 @@ def _fields(item: Mapping[str, Any]) -> dict[str, str]:
     return out
 
 
+def _page_url_ok(url: str, *, dev: bool) -> bool:
+    """An https page URL (``http://127.0.0.1…`` only in dev)."""
+    if url.startswith("https://"):
+        return True
+    return dev and url.startswith("http://127.0.0.1")
+
+
 def _split_list(raw: str) -> list[str]:
     return [p.strip() for p in re.split(r"[,\n]", raw) if p.strip()]
+
+
+def _site_domain(host: str) -> str:
+    """``www.kleinanzeigen.de`` -> ``kleinanzeigen.de`` (last two labels; enough for
+    the .de/.ch/.com sites this broker serves, and an IP or bare host stays as is)."""
+    labels = host.split(".")
+    if len(labels) <= 2 or host.replace(".", "").isdigit():
+        return host
+    return ".".join(labels[-2:])
+
+
+def _default_cookie_hosts(fill_origins: list[str], check_url: str) -> list[str]:
+    """Default cookie scope: the check page's site domain (the session usually lives
+    on ``.site.tld`` / ``www.``, not on the login host) plus the fill-origin hosts,
+    minus identity providers. Cookies of an IdP host below an allowed domain are
+    still dropped by the bundle filter."""
+    hosts: list[str] = []
+    candidates = [o.split("://", 1)[1].split(":", 1)[0] for o in fill_origins]
+    if check_url:
+        check_host = (urllib.parse.urlsplit(check_url).hostname or "").lower()
+        if check_host:
+            candidates.insert(0, _site_domain(check_host))
+    for host in candidates:
+        if host and not is_idp_host(host) and host not in hosts:
+            hosts.append(host)
+    return hosts
 
 
 # A flat validator: one early `refused(...)` per field rule, in field order.
@@ -135,17 +175,6 @@ def site_item_from_json(item: Mapping[str, Any], *, dev: bool = False) -> SiteIt
     except ValueError as exc:
         return refused(f"bad agent_fill_origins: {exc}")
 
-    hosts_raw = fields.get("agent_cookie_hosts", "").strip()
-    if hosts_raw:
-        cookie_hosts = [h.lstrip(".").lower() for h in _split_list(hosts_raw)]
-    else:  # default: the fill-origin hosts, minus identity providers
-        cookie_hosts = []
-        for o in fill_origins:
-            host = o.split("://", 1)[1].split(":", 1)[0]
-            if not is_idp_host(host) and host not in cookie_hosts:
-                cookie_hosts.append(host)
-    if not cookie_hosts:
-        return refused("no cookie host (set agent_cookie_hosts)")
     names_raw = fields.get("agent_cookie_names", "").strip()
     cookie_names = _split_list(names_raw) or None
 
@@ -164,18 +193,34 @@ def site_item_from_json(item: Mapping[str, Any], *, dev: bool = False) -> SiteIt
         except ValueError as exc:
             return refused(f"bad agent_storage_keys: {exc}")
 
-    login_url = fields.get("agent_login_url", "").strip() or fill_origins[0] + "/"
-    if not login_url.startswith(("https://", "http://127.0.0.1")):
-        return refused("bad agent_login_url")
-    if login_url.startswith("http://") and not dev:
-        return refused("bad agent_login_url")
+    check_url = fields.get("agent_check_url", "").strip()
+    if check_url and not _page_url_ok(check_url, dev=dev):
+        return refused("bad agent_check_url")
+    check_url = check_url or DEFAULT_CHECK_URLS.get(site, "")
     sentinel = fields.get("agent_logged_in_selector", "").strip() or None
+    if not check_url and not sentinel:
+        return refused("needs agent_check_url (or agent_logged_in_selector)")
+    hosts_raw = fields.get("agent_cookie_hosts", "").strip()
+    if hosts_raw:
+        cookie_hosts = [h.lstrip(".").lower() for h in _split_list(hosts_raw)]
+    else:
+        cookie_hosts = _default_cookie_hosts(fill_origins, check_url)
+    if not cookie_hosts:
+        return refused("no cookie host (set agent_cookie_hosts)")
+    # No explicit login URL: start at the check URL — it redirects to the
+    # login page WITH the state an Auth0-style login needs.
+    login_url = (
+        fields.get("agent_login_url", "").strip() or check_url or fill_origins[0] + "/"
+    )
+    if not _page_url_ok(login_url, dev=dev):
+        return refused("bad agent_login_url")
     return SiteItem(
         fill_origins=fill_origins,
         cookie_hosts=cookie_hosts,
         cookie_names=cookie_names,
         storage_keys=storage_keys,
         login_url=login_url,
+        check_url=check_url,
         logged_in_selector=sentinel,
         site=site,
         name=name,

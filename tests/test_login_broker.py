@@ -472,15 +472,75 @@ def test_site_items_and_refusal():
     items = {it.site: it for it in vault.build_items(FIXTURE_ITEMS)}
     assert items["ricardo"].refused is None
     assert items["ricardo"].fill_origins == ["https://login.ricardo.ch"]
-    assert items["ricardo"].login_url == "https://login.ricardo.ch/"
+    # no agent_login_url: the flow starts at the (built-in) check URL
+    ricardo_check = recipes.DEFAULT_CHECK_URLS["ricardo"]
+    assert items["ricardo"].check_url == ricardo_check
+    assert items["ricardo"].login_url == ricardo_check
     assert items["noorigins"].refused == "missing agent_fill_origins"
     assert items["cscs"].cookie_hosts == ["portal.cscs.ch"]
+    assert items["cscs"].check_url == recipes.CSCS_LOGIN_URL
+
+
+def test_item_without_check_url_or_sentinel_refused():
+    bare = vault.site_item_from_json(
+        _item("Shop", {"agent_fill_origins": "https://login.shop.example"})
+    )
+    assert bare.refused and "needs agent_check_url" in bare.refused
+    with_check = vault.site_item_from_json(
+        _item(
+            "Shop",
+            {
+                "agent_fill_origins": "https://login.shop.example",
+                "agent_check_url": "https://www.shop.example/account",
+            },
+        )
+    )
+    assert with_check.refused is None
+    assert with_check.check_url == "https://www.shop.example/account"
+    assert with_check.login_url == "https://www.shop.example/account"
+    assert with_check.public()["check_url"] == "https://www.shop.example/account"
+    explicit = vault.site_item_from_json(
+        _item(
+            "Shop",
+            {
+                "agent_fill_origins": "https://login.shop.example",
+                "agent_check_url": "https://www.shop.example/account",
+                "agent_login_url": "https://login.shop.example/start",
+            },
+        )
+    )
+    assert explicit.login_url == "https://login.shop.example/start"
+    sentinel_only = vault.site_item_from_json(
+        _item(
+            "Shop",
+            {
+                "agent_fill_origins": "https://login.shop.example",
+                "agent_logged_in_selector": "#me",
+            },
+        )
+    )
+    assert sentinel_only.refused is None and sentinel_only.check_url == ""
+    for bad in ("http://www.shop.example/a", "javascript:alert(1)", "/account"):
+        it = vault.site_item_from_json(
+            _item(
+                "Shop",
+                {
+                    "agent_fill_origins": "https://login.shop.example",
+                    "agent_check_url": bad,
+                },
+            )
+        )
+        assert it.refused == "bad agent_check_url", bad
 
 
 def test_default_cookie_hosts_skip_idp():
     it = vault.site_item_from_json(
         _item(
-            "x", {"agent_fill_origins": "https://auth.cscs.ch, https://www.x.example"}
+            "x",
+            {
+                "agent_fill_origins": "https://auth.cscs.ch, https://www.x.example",
+                "agent_logged_in_selector": "#me",
+            },
         )
     )
     assert it.site == "x" and it.cookie_hosts == ["www.x.example"]
@@ -647,6 +707,112 @@ def test_guard_resolves_action_against_frame_url():
     recipes._guard(_Page("https://auth.cscs.ch/"), field, allowed, dev=False)
 
 
+class _El:
+    def __init__(self, visible=True):
+        self._visible = visible
+
+    def is_visible(self):
+        return self._visible
+
+
+class _CheckPage:
+    """Just enough of a Playwright page for the positive check."""
+
+    def __init__(self, url, *, password=False, sentinel=False, title="Account"):
+        self.url = url
+        self._password = password
+        self._sentinel = sentinel
+        self._title = title
+        self.frames = []
+        self.waited = []
+
+    def title(self):
+        return self._title
+
+    def query_selector_all(self, selector):
+        if selector == recipes.PASSWORD_SELECTOR or "password" in selector:
+            return [_El(True)] if self._password else [_El(False)]
+        return []
+
+    def eval_on_selector_all(self, _sel, _js):
+        return []
+
+    def wait_for_selector(self, _sel, **_kw):
+        if not self._sentinel:
+            raise TimeoutError("no sentinel")
+        return _El()
+
+    def wait_for_timeout(self, ms):
+        self.waited.append(ms)
+
+
+SHOP_FILL = "https://login.shop.example"
+SHOP_CHECK = "https://www.shop.example/account"
+
+
+def _shop_item(**fields):
+    base = {"agent_site": "shop", "agent_fill_origins": SHOP_FILL}
+    return vault.site_item_from_json(_item("Shop", {**base, **fields}))
+
+
+@pytest.mark.parametrize(
+    "url, password, ok",
+    [
+        # regression (2026-10-02): page 2 of an identifier-first login has no
+        # visible password field and a path other than the login URL's
+        (SHOP_FILL + "/u/login/identifier?state=x", False, False),
+        (SHOP_FILL + "/u/login/password?state=x", False, False),
+        (SHOP_CHECK, True, False),  # inline login form on the site itself
+        ("chrome-error://chromewebdata/", False, False),
+        ("http://www.shop.example/account", False, False),  # not https
+        (SHOP_CHECK, False, True),
+    ],
+)
+def test_positive_check_rule(url, password, ok):
+    item = _shop_item(agent_check_url=SHOP_CHECK)
+    assert recipes.logged_in(_CheckPage(url, password=password), item, wait_s=0) is ok
+
+
+def test_positive_check_challenge_and_sentinel():
+    item = _shop_item(agent_check_url=SHOP_CHECK)
+    page = _CheckPage(SHOP_CHECK, title="Just a moment...")
+    assert not recipes.logged_in(page, item, wait_s=0)
+    only_sentinel = _shop_item(agent_logged_in_selector="#me")
+    assert not recipes.logged_in(_CheckPage(SHOP_CHECK), only_sentinel, wait_s=0)
+    page = _CheckPage(SHOP_FILL + "/x", sentinel=True)
+    assert recipes.logged_in(page, only_sentinel, wait_s=0)
+
+
+def test_client_broker_logged_in_uses_check_url(monkeypatch, capsys):
+    entry = {
+        "site": "shop",
+        "fill_origins": [SHOP_FILL],
+        "login_url": SHOP_FILL + "/",
+        "check_url": SHOP_CHECK,
+        "logged_in_selector": None,
+    }
+    monkeypatch.setattr(browser, "_broker_entry_or_rc", lambda site: (entry, 0))
+    opened = []
+    final = {"url": ""}
+
+    def fake_bg(port, url, fn):
+        opened.append(url)
+        return fn(_CheckPage(final["url"]))
+
+    monkeypatch.setattr(browser, "_with_background_page", fake_bg)
+    # still on the login (Auth0 page 2: no visible password) -> NOT logged in
+    final["url"] = SHOP_FILL + "/u/login/password?state=x"
+    assert browser._broker_logged_in(9222, "shop") == 2
+    final["url"] = SHOP_CHECK
+    assert browser._broker_logged_in(9222, "shop") == 0
+    assert opened == [SHOP_CHECK, SHOP_CHECK]
+    # neither check URL nor sentinel: refuses to call it logged in, opens nothing
+    entry["check_url"] = ""
+    assert browser._broker_logged_in(9222, "shop") == 2
+    assert len(opened) == 2
+    assert "no check URL or sentinel" in capsys.readouterr().err
+
+
 # ---------------------------------------------------------------------------
 # daemon over a real socket
 # ---------------------------------------------------------------------------
@@ -724,13 +890,13 @@ def _ask(path, obj, raw=None):
         s.settimeout(30)
         s.connect(path)
         s.sendall(raw if raw is not None else json.dumps(obj).encode() + b"\n")
-        buf = b""
-        while not buf.endswith(b"\n"):
+        chunks: list[bytes] = []
+        while not chunks or not chunks[-1].endswith(b"\n"):
             chunk = s.recv(65536)
             if not chunk:
                 break
-            buf += chunk
-    return buf
+            chunks.append(chunk)
+    return b"".join(chunks)
 
 
 def test_daemon_forbidden_for_other_uid(sockdir, tmp_path):
@@ -754,6 +920,8 @@ def test_daemon_ping_and_sites_without_secrets(sockdir, tmp_path):
     assert sites["ricardo"]["refused"] is False
     assert sites["ricardo"]["fill_origins"] == ["https://login.ricardo.ch"]
     assert sites["ricardo"]["cookie_hosts"] == ["ricardo.ch"]
+    assert sites["ricardo"]["check_url"] == recipes.DEFAULT_CHECK_URLS["ricardo"]
+    assert sites["ricardo"]["logged_in_selector"] == "#account"
     assert sites["noorigins"]["refused"] is True
     assert "agent_fill_origins" in sites["noorigins"]["reason"]
 
@@ -1075,6 +1243,7 @@ def test_selfcheck_flags_bad_processes_and_own_dirs(tmp_path):
 
 E2E_USER = "alice"
 E2E_SESSION = "sess-0123456789"
+E2E_EMAIL = "alice@example.com"  # type=email fields validate the identifier
 
 
 class _LoginApp(http.server.BaseHTTPRequestHandler):
@@ -1206,6 +1375,7 @@ def test_e2e_dev_foreign_form_action_refused(sockdir, tmp_path):
                 "agent_site": "evil",
                 "agent_fill_origins": origin,
                 "agent_login_url": origin + "/evil-login",
+                "agent_check_url": origin + "/home",
             },
             user=E2E_USER,
             totp=None,
@@ -1219,6 +1389,186 @@ def test_e2e_dev_foreign_form_action_refused(sockdir, tmp_path):
         httpd.shutdown()
     assert resp["error"] == "origin_violation", resp
     assert not _LoginApp.posts
+
+
+class _TwoStepApp(http.server.BaseHTTPRequestHandler):
+    """An Auth0-like identifier-first login on one origin (the fill origin)
+    and the site with its check page on another (same host, other port)."""
+
+    login_origin = ""
+    site_origin = ""
+    password_page_users: list[str] = []  # usernames posted on page 2
+
+    def log_message(self, *args):
+        return
+
+    def _send(self, code, body="", headers=()):
+        self.send_response(code)
+        for k, v in headers:
+            self.send_header(k, v)
+        self.send_header("Content-Type", "text/html")
+        self.end_headers()
+        self.wfile.write(body.encode())
+
+    def _form(self):
+        n = int(self.headers.get("Content-Length") or 0)
+        from urllib.parse import parse_qs
+
+        return parse_qs(self.rfile.read(n).decode(), keep_blank_values=True)
+
+    def do_GET(self):  # noqa: N802
+        logged = f"session={E2E_SESSION}" in (self.headers.get("Cookie") or "")
+        cls = type(self)
+        if self.path.startswith("/account"):  # the check URL
+            if logged:
+                self._send(200, "<html><body><h1>My account</h1></body></html>")
+            else:
+                loc = cls.login_origin + "/u/login/identifier?state=s1"
+                self._send(302, headers=[("Location", loc)])
+            return
+        if self.path.startswith("/landing"):  # no password field, no session
+            self._send(200, "<html><body><p>Thanks!</p></body></html>")
+            return
+        if self.path.startswith("/u/login/identifier"):
+            if "state=s1" not in self.path:  # Auth0 needs the site's state
+                self._send(400, "<html><body>missing state</body></html>")
+                return
+            self._send(
+                200,
+                "<html><head><title>Log in</title></head><body>"
+                "<form method=post action=/u/login/identifier?state=s1>"
+                "<input type=email name=username autocomplete=email>"
+                "<input type=password name=password style='display:none'>"
+                "<button type=submit>Continue</button></form></body></html>",
+            )
+            return
+        if self.path.startswith("/u/login/password"):
+            self._send(
+                200,
+                "<html><head><title>Password</title></head><body>"
+                "<form method=post action=/u/login/password?state=s1>"
+                f"<input type=email name=username value={E2E_EMAIL} readonly "
+                "autocomplete=username>"
+                "<input type=password name=password>"
+                "<button type=submit>Log in</button></form></body></html>",
+            )
+            return
+        if self.path.startswith("/login2"):  # one-page form that "vanishes"
+            self._send(
+                200,
+                "<html><body><form method=post action=/login2>"
+                "<input type=text name=user><input type=password name=pw>"
+                "<button type=submit>Go</button></form></body></html>",
+            )
+            return
+        self._send(404, "nope")
+
+    def do_POST(self):  # noqa: N802
+        q = self._form()
+        cls = type(self)
+        if self.path.startswith("/u/login/identifier"):
+            if q.get("username") == [E2E_EMAIL]:
+                loc = "/u/login/password?state=s1"
+            else:
+                loc = "/u/login/identifier?state=s1&err=1"
+            self._send(302, headers=[("Location", loc)])
+            return
+        if self.path.startswith("/u/login/password"):
+            cls.password_page_users.append((q.get("username") or [""])[0])
+            if q.get("username") == [E2E_EMAIL] and q.get("password") == [PASSWORD]:
+                cookie = f"session={E2E_SESSION}; Path=/; Max-Age=3600; HttpOnly"
+                self._send(
+                    302,
+                    headers=[
+                        ("Set-Cookie", cookie),
+                        ("Location", cls.site_origin + "/account"),
+                    ],
+                )
+            else:
+                self._send(302, headers=[("Location", "/u/login/password?err=1")])
+            return
+        if self.path.startswith("/login2"):  # accepts anything, sets NO session
+            self._send(302, headers=[("Location", cls.site_origin + "/landing")])
+            return
+        self._send(404, "nope")
+
+
+@contextlib.contextmanager
+def _two_step_servers():
+    servers = [
+        http.server.ThreadingHTTPServer(("127.0.0.1", 0), _TwoStepApp) for _ in range(2)
+    ]
+    for srv in servers:
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+    login, site = (f"http://127.0.0.1:{srv.server_address[1]}" for srv in servers)
+    _TwoStepApp.login_origin, _TwoStepApp.site_origin = login, site
+    _TwoStepApp.password_page_users = []
+    try:
+        yield login, site
+    finally:
+        for srv in servers:
+            srv.shutdown()
+            srv.server_close()
+
+
+@pytest.mark.browser
+@pytest.mark.skipif(
+    os.environ.get("LOGIN_BROKER_E2E") != "1", reason="set LOGIN_BROKER_E2E=1"
+)
+def test_e2e_two_step_login_from_check_url(sockdir, tmp_path):
+    with _two_step_servers() as (login, site):
+        items = [
+            _item(
+                "TwoStep",
+                {
+                    "agent_site": "twostep",
+                    "agent_fill_origins": login,
+                    "agent_check_url": site + "/account",
+                },
+                user=E2E_EMAIL,
+                totp=None,
+            )
+        ]
+        runner = daemon.PlaywrightRunner(tmp_path / "home", dev=True)
+        with running(sockdir, tmp_path, runner, items=items) as (_brk, path):
+            first = json.loads(_ask(path, {"op": "login", "site": "twostep"}))
+            second = json.loads(_ask(path, {"op": "login", "site": "twostep"}))
+    assert first["ok"], first
+    b = first["bundle"]
+    assert b["via"] == "login"
+    assert [(c["name"], c["value"]) for c in b["cookies"]] == [("session", E2E_SESSION)]
+    assert PASSWORD not in json.dumps(first)
+    # the read-only identifier on page 2 was submitted as shown, not refilled
+    assert _TwoStepApp.password_page_users == [E2E_EMAIL]
+    assert second["ok"] and second["bundle"]["via"] == "profile"
+
+
+@pytest.mark.browser
+@pytest.mark.skipif(
+    os.environ.get("LOGIN_BROKER_E2E") != "1", reason="set LOGIN_BROKER_E2E=1"
+)
+def test_e2e_vanished_password_page_is_not_success(sockdir, tmp_path):
+    """Regression (2026-10-02): the password page disappears after submit, but
+    the check URL still redirects to the login -> login_failed, never ok."""
+    with _two_step_servers() as (login, site):
+        items = [
+            _item(
+                "Vanish",
+                {
+                    "agent_site": "vanish",
+                    "agent_fill_origins": login,
+                    "agent_login_url": login + "/login2",
+                    "agent_check_url": site + "/account",
+                },
+                user=E2E_EMAIL,
+                totp=None,
+            )
+        ]
+        runner = daemon.PlaywrightRunner(tmp_path / "home", dev=True)
+        with running(sockdir, tmp_path, runner, items=items) as (_brk, path):
+            resp = json.loads(_ask(path, {"op": "login", "site": "vanish"}))
+    assert resp["ok"] is False and resp["error"] == "login_failed", resp
+    assert "check URL" in resp["detail"] and "bundle" not in resp
 
 
 def test_install_role_account_uid_range_and_remnant_check() -> None:
@@ -1238,3 +1588,25 @@ def test_bw_reason_is_fixed_text_never_the_message() -> None:
     assert vault._bw_reason(msg) == ": wrong master password in bootstrap.json"
     assert "hunter2" not in vault._bw_reason(msg)
     assert vault._bw_reason("something odd") == ""
+
+
+def test_default_cookie_hosts_cover_the_site_domain() -> None:
+    hosts = vault._default_cookie_hosts(
+        ["https://login.kleinanzeigen.de"],
+        "https://www.kleinanzeigen.de/m-meine-anzeigen.html",
+    )
+    assert hosts == ["kleinanzeigen.de", "login.kleinanzeigen.de"]
+    spec = bundle.SiteBundleSpec(cookie_hosts=hosts, cookie_names=None, storage_keys={})
+    assert bundle.cookie_in_scope(".kleinanzeigen.de", "session", spec)
+    assert bundle.cookie_in_scope("www.kleinanzeigen.de", "s", spec)
+    assert not bundle.cookie_in_scope("evil.de", "s", spec)
+
+
+def test_default_cookie_hosts_keep_idp_out() -> None:
+    hosts = vault._default_cookie_hosts(
+        ["https://auth.cscs.ch"], "https://portal.cscs.ch/profile/"
+    )
+    assert hosts == ["cscs.ch"]
+    spec = bundle.SiteBundleSpec(cookie_hosts=hosts, cookie_names=None, storage_keys={})
+    assert bundle.cookie_in_scope("portal.cscs.ch", "sid", spec)
+    assert not bundle.cookie_in_scope("auth.cscs.ch", "KEYCLOAK_SESSION", spec)
