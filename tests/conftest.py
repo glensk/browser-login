@@ -29,6 +29,11 @@ def pytest_configure(config):
         "live_keychain: may run the real `security` binary against its own temp"
         " keychain through the test's router (opt-in)",
     )
+    config.addinivalue_line(
+        "markers",
+        "browser: drives a real headless Chromium against a local fixture site"
+        " (opt-in via LOGIN_BROKER_E2E=1)",
+    )
 
 
 def _executable(args) -> str:

@@ -55,7 +55,7 @@ agent being able to read the password or the TOTP secret**.
    │ logged-in? → yes: done (no broker call)
    │ {"op":"login","site":"ricardo"}
    ├──────────── unix socket ────────────▶ login-broker (LaunchDaemon, root-owned code)
-   │             /var/run/login-broker/      ├─ peer uid check (LOCAL_PEERCRED == 501)
+   │             /var/db/login-broker-run/   ├─ peer uid check (LOCAL_PEERCRED == 501)
    │                                         ├─ per-site mutex (coalesces concurrent calls)
    │                                         ├─ limiter (fsync'd state, root-only reset)
    │                                         ├─ own profile still logged in? → re-export
@@ -109,6 +109,19 @@ the agent the portal session. Record as Albert's decision of 2026-10-01 in
 
 ### Phase 0 — prove the platform (go/no-go before anything else)
 
+> **Status 2026-10-01:** code for 0.2–0.4, Phase 2 and the 3.2 CSCS recipe is built and
+> hermetically tested (`broker/`, `install/install.sh`, client in `bin/browser.py`; 2 real-browser
+> E2E tests against a local login page). Nothing is installed yet. Deviations from the text below:
+> socket dir `/var/db/login-broker-run`; install.sh runs as root only system binaries plus pinned,
+> sha256-checked downloads (uv 0.12.18, bw 2026.9.0 native arm64), installs only a clean tree whose
+> HEAD is on origin/main (`git archive`), logs commit + diffstat; limiter = 12 h cooldown after a
+> post-submit failure, hard block (root reset) after 3 in a row; generic recipe does NOT handle
+> two-step (username → password page) forms yet — ricardo (`login.ricardo.ch`, Auth0
+> identifier-first, Cloudflare Turnstile) needs that; geizhals login host unknown. Session-only
+> cookies (no expiry) are lost when the broker profile closes, so such sites log in fresh each time.
+> `login-cscs-assisted` (TTY-only) keeps the old keychain/1Password path until 3.3.
+> Vaultwarden: Albert creates a NEW organization for the broker (not "Family").
+
 - [ ] 0.1 **Bot-defence spike, per candidate site** (ricardo, kleinanzeigen, geizhals, toppreise,
       cscs): headless Chrome for Testing as `_loginbroker` with no WindowServer, real login with
       Albert's test credentials typed by Albert, then inject the bundle into the headed shared
@@ -123,7 +136,7 @@ the agent the portal session. Record as Albert's decision of 2026-10-01 in
 - [ ] 0.2 `install/install.sh` (sudo, idempotent, `-U` uninstalls, shellcheck-clean): role account
       `_loginbroker` with home `/var/db/login-broker` (0700); `/usr/local/libexec/login-broker`
       (root 0755: code, uv venv, pinned `bw` + Node, Playwright browsers via
-      `PLAYWRIGHT_BROWSERS_PATH`); `/var/run/login-broker` (root:`_loginbroker` 0755); log
+      `PLAYWRIGHT_BROWSERS_PATH`); `/var/db/login-broker-run` (root:`_loginbroker` 0775; /var/run is wiped at boot); log
       `/var/log/login-broker.log`; LaunchDaemon `com.albert.login-broker` (`UserName=_loginbroker`).
       Rollout: install into a versioned dir, selfcheck, then swap the `current` symlink; rollback
       = previous symlink.
@@ -150,18 +163,18 @@ the agent the portal session. Record as Albert's decision of 2026-10-01 in
 
 ### Phase 2 — login + handoff
 
-- [ ] 2.1 Generic recipe: open the first `agent_fill_origins` origin's login page, find
+- [x] 2.1 Generic recipe: open the first `agent_fill_origins` origin's login page, find
       username/password fields, exact-origin check before each fill and submit, TOTP step if the
       item has one, verify the logged-in sentinel. Before logging in, check whether the broker's
       own profile is still logged in → re-export instead of logging in again.
-- [ ] 2.2 Session bundle: cookies filtered by per-site host+name allowlist (IdP hosts excluded by
+- [x] 2.2 Session bundle: cookies filtered by per-site host+name allowlist (IdP hosts excluded by
       default) + named localStorage/sessionStorage keys per origin. Never the whole jar.
-- [ ] 2.3 Client in `browser.py`: name resolution = static `Site` registry → broker `sites` list →
+- [x] 2.3 Client in `browser.py`: name resolution = static `Site` registry → broker `sites` list →
       exit 2 "not whitelisted / broker down" (no assisted fallback for broker-only sites). Flow:
       `logged-in SITE` first (no broker call when already logged in) → interaction lease → delete
       the site's allowlisted cookies → `Storage.setCookies` + `DOMStorage.setDOMStorageItem` →
       `logged-in` check. New: `browser.py broker-sites`, `browser.py logout SITE`.
-- [ ] 2.4 Limiter: per site minimum interval, hourly and daily cap; state fsync'd under
+- [x] 2.4 Limiter: per site minimum interval, hourly and daily cap; state fsync'd under
       `/var/db/login-broker`; root-only reset; an unknown outcome (crash, timeout mid-submit) is
       never retried automatically. `needs_human` path: one ntfy push per site per day.
 
@@ -183,7 +196,7 @@ the agent the portal session. Record as Albert's decision of 2026-10-01 in
 
 ### Phase 4 — close out
 
-- [ ] 4.1 Hermetic tests (`tests/test_login_broker.py`): origin checker (incl.
+- [x] 4.1 Hermetic tests (`tests/test_login_broker.py`): origin checker (incl.
       `https://evil.example/?auth.cscs.ch`), cookie/storage filter, peer-cred check, limiter
       persistence, mutex coalescing, name resolution, re-run idempotence.
 - [ ] 4.2 README / AGENTS.md / `browser-login` skill; credplane plan + tp#97 note (D5); memory.

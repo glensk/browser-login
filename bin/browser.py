@@ -69,6 +69,17 @@ currently ``cscs``, ``anthropic``/``claude``, ``openai``/``chatgpt``, ``slack``,
   store-creds SITE  Store SITE credentials in the macOS keychain (password+TOTP
                     sites only, e.g. cscs). forget-creds SITE removes them.
 
+Login broker (PLAN_login-broker.md): a root-installed broker logs into the sites
+Albert whitelisted in Bitwarden `agent-logins` and hands over a session bundle
+(cookies + named storage keys), never a password. `login SITE` resolves the
+static registry first, then the broker's list ($LOGIN_BROKER_SOCKET overrides
+the socket). Exit codes: 0 ok, 2 not logged in, 3 broker unavailable, 4 needs a
+human.
+  broker-sites      List the broker's sites (id, fill origins, status).
+  logout SITE       Drop the broker profile for SITE + delete its cookies here.
+  login-cscs-assisted
+                    Human-only pre-broker CSCS login (keychain / 1Password).
+
 CSCS aliases (kept for back-compat; cscs-api.py depends on them):
   token             Read the 40-hex Waldur DRF token from the portal tab and cache
                     it at ~/.cache/cscs-api/portal_token (what cscs-api.py uses).
@@ -94,6 +105,7 @@ disk). No system browser is touched, so this never collides with your daily Brav
 import argparse
 import atexit
 import contextlib
+import dataclasses
 import fcntl
 import functools
 import glob
@@ -102,6 +114,7 @@ import os
 import re
 import shutil
 import signal
+import socket
 import subprocess
 import sys
 import threading
@@ -115,6 +128,17 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, NamedTuple
 
+# The broker package (repo root) is the one home of the TOTP, Keycloak-submit
+# and identity-provider helpers; browser.py reuses them instead of copies.
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.realpath(__file__))))
+# pylint: disable=wrong-import-position
+from broker.bundle import IDP_HOSTS as BROKER_IDP_HOSTS  # noqa: E402
+from broker.bundle import IDP_LABELS as BROKER_IDP_LABELS  # noqa: E402
+from broker.recipes import click_keycloak_submit as _click_keycloak_submit  # noqa: E402
+from broker.recipes import fresh_totp as _broker_fresh_totp  # noqa: E402
+from broker.recipes import parse_totp as _parse_totp  # noqa: E402
+
+# pylint: enable=wrong-import-position
 DEFAULT_CDP_PORT = int(os.environ.get("CLAUDE_BROWSER_CDP_PORT", "9222"))
 
 
@@ -274,6 +298,9 @@ def parse_args() -> argparse.Namespace:
             "  ./browser.py cscs-login         # auto-login to CSCS (keychain, no Touch ID)\n"
             "  ./browser.py store-creds biopolwifi  # one-time: cache Cloudpath portal creds\n"
             "  ./browser.py login biopolwifi   # auto-login to the Cloudpath MDU WiFi portal\n"
+            "  ./browser.py broker-sites       # sites the login broker may log into\n"
+            "  ./browser.py login ricardo      # broker site: session bundle, no password\n"
+            "  ./browser.py logout ricardo     # drop that session again\n"
             "  ./browser.py down               # quit the shared browser\n"
         ),
     )
@@ -465,6 +492,24 @@ def parse_args() -> argparse.Namespace:
         "forget-creds", help="Delete SITE credentials from the macOS keychain."
     )
     pfc.add_argument("site", help="Site whose credentials to forget.")
+
+    # --- login broker (Bitwarden agent-logins; PLAN_login-broker.md) ---
+    sub.add_parser(
+        "broker-sites",
+        help="List the login broker's sites: id, fill origins, status (exit 3 "
+        "when no broker answers).",
+    )
+    plo = sub.add_parser(
+        "logout",
+        help="Remove the broker's own profile for SITE and delete SITE's "
+        "allowlisted cookies from the shared browser.",
+    )
+    plo.add_argument("site", help="Broker site to log out.")
+    sub.add_parser(
+        "login-cscs-assisted",
+        help="Human-only: the pre-broker CSCS login (keychain / 1Password), "
+        "refused without a terminal.",
+    )
     return p.parse_args()
 
 
@@ -4232,33 +4277,6 @@ def _keychain_delete(service: str) -> bool:
     return _kc_delete(service, keychain) in ("deleted", "absent")
 
 
-def _parse_totp(seed_or_uri: str) -> Any:
-    """A usable ``pyotp.TOTP`` from a base32 seed or an ``otpauth://`` URI.
-
-    Returns ``None`` if the seed/URI is malformed (bad base32, unparseable URI),
-    empty, or not a TOTP (an ``otpauth://hotp/`` URI, ``period=0``) — probed by
-    generating one code, so every returned object can produce codes.
-    """
-    import binascii
-
-    import pyotp
-
-    s = seed_or_uri.strip()
-    if not s:  # pyotp turns an empty key into a (necessarily wrong) code
-        return None
-    try:
-        if s.lower().startswith("otpauth://"):
-            otp = pyotp.parse_uri(s)
-        else:
-            otp = pyotp.TOTP(s.replace(" ", "").upper())
-        if not isinstance(otp, pyotp.TOTP) or otp.interval <= 0:
-            return None
-        otp.now()
-    except (ValueError, ArithmeticError, binascii.Error):
-        return None
-    return otp
-
-
 def _totp_now(seed_or_uri: str) -> str | None:
     """Current 6-digit TOTP code from a base32 seed or an ``otpauth://`` URI.
 
@@ -4274,23 +4292,12 @@ def _fresh_totp(
     clock: Callable[[], float] = time.time,
     sleep: Callable[[float], None] = time.sleep,
 ) -> str | None:
-    """A TOTP code with time left to be used, or ``None`` for a bad seed.
+    """A TOTP code with time left to be used (``broker.recipes.fresh_totp``).
 
-    Called at fill time (see ``CscsCreds``). A code in the last
-    ``min(5, interval / 3)`` seconds of its step could expire between the fill
-    and Keycloak's check, so then we wait for the next step (at most ~5 s) and
-    return ITS code instead. The clock is sampled once per decision.
+    Called at fill time (see ``CscsCreds``) so a code is never stale by the
+    time Keycloak checks it (tp#491 D2).
     """
-    otp = _parse_totp(seed_or_uri)
-    if otp is None:
-        return None
-    interval = otp.interval
-    now = clock()
-    remaining = interval - (now % interval)
-    if remaining < min(5, interval / 3):
-        sleep(remaining + 0.05)
-        now = clock()
-    return str(otp.at(now))
+    return _broker_fresh_totp(seed_or_uri, clock=clock, sleep=sleep)
 
 
 class CscsCreds(NamedTuple):
@@ -4429,20 +4436,6 @@ def _op_creds(item: str, account: str) -> CscsCreds | None:
     if not (isinstance(user, str) and isinstance(password, str) and user and password):
         return None
     return CscsCreds(user, password, functools.partial(_op_otp, item, account))
-
-
-def _click_keycloak_submit(page) -> None:
-    """Click the Keycloak login/submit button (tolerant of theme differences)."""
-    for sel in (
-        "#kc-login",
-        "input[name=login]",
-        "button[type=submit]",
-        "input[type=submit]",
-    ):
-        el = page.query_selector(sel)
-        if el:
-            el.click()
-            return
 
 
 def _on_portal(page) -> bool:
@@ -6499,6 +6492,442 @@ def cmd_login_log(site_name: str | None) -> int:
 
 
 # ---------------------------------------------------------------------------
+# Login broker client (PLAN_login-broker.md) — sessions without credentials
+# ---------------------------------------------------------------------------
+#
+# A root-installed broker (`broker/daemon.py`, its own uid) logs into sites Albert
+# whitelisted in Bitwarden `agent-logins` and hands this process a SESSION BUNDLE
+# (allowlisted cookies + named localStorage keys) — never a password or TOTP seed.
+# We inject the bundle into the shared browser. Exit codes of the broker paths:
+# 0 logged in · 2 not logged in / not whitelisted · 3 broker unavailable ·
+# 4 the site needs a human (captcha / second factor).
+
+BROKER_SOCKET_DEFAULT = "/var/db/login-broker-run/broker.sock"
+BROKER_TIMEOUT_S = 180.0
+BROKER_MAX_RESPONSE = 16 * 1024 * 1024
+BROKER_ERRORS = {
+    "needs_human": "the site wants a human (captcha / bot check / second factor)",
+    "origin_violation": "the login page left the item's agent_fill_origins — "
+    "the broker refused to type there",
+    "rate_limited": "rate limited by the broker",
+    "login_failed": "the broker's login did not reach a logged-in state",
+    "unknown_site": "not whitelisted in Bitwarden agent-logins",
+    "refused": "the agent-logins item is refused",
+    "vault_error": "the broker cannot read Bitwarden",
+    "forbidden": "the broker does not serve this uid",
+    "bad_request": "the broker rejected the request",
+    "internal": "internal broker error",
+}
+_BROKER_SITES_CACHE: list[list[dict]] = []
+
+
+class BrokerUnavailable(Exception):
+    """No (working) login broker answers on the socket."""
+
+
+def _broker_socket() -> str:
+    """The broker socket: $LOGIN_BROKER_SOCKET or the installed default."""
+    return os.environ.get("LOGIN_BROKER_SOCKET") or BROKER_SOCKET_DEFAULT
+
+
+def _broker_request(op: str, *, timeout: float = BROKER_TIMEOUT_S, **kw: Any) -> dict:
+    """One JSON request over the broker's Unix socket; the decoded reply.
+
+    Raises ``BrokerUnavailable`` when nothing answers, the reply is cut off, or
+    it is not a JSON object. A broker-side error is a normal reply
+    (``{"ok": false, "error": …}``) — the caller maps it.
+    """
+    payload = json.dumps({"op": op, **kw}).encode() + b"\n"
+    path = _broker_socket()
+    buf = bytearray()
+    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:
+        sock.settimeout(timeout)
+        try:
+            sock.connect(path)
+        except OSError as exc:
+            raise BrokerUnavailable(
+                f"no login broker at {path} ({exc.strerror or exc})"
+            ) from None
+        try:
+            sock.sendall(payload)
+            while not buf.endswith(b"\n"):
+                chunk = sock.recv(65536)
+                if not chunk:
+                    break
+                buf += chunk
+                if len(buf) > BROKER_MAX_RESPONSE:
+                    raise BrokerUnavailable("login broker reply too large")
+        except OSError as exc:  # socket.timeout is an OSError
+            raise BrokerUnavailable(f"login broker did not answer ({exc})") from None
+    try:
+        resp = json.loads(bytes(buf))
+    except ValueError:
+        raise BrokerUnavailable("login broker sent no JSON") from None
+    if not isinstance(resp, dict):
+        raise BrokerUnavailable("login broker sent no JSON object")
+    return resp
+
+
+def _broker_sites() -> list[dict]:
+    """The broker's ``sites`` list (cached per process)."""
+    if _BROKER_SITES_CACHE:
+        return _BROKER_SITES_CACHE[0]
+    resp = _broker_request("sites", timeout=60)
+    if not resp.get("ok"):
+        code = str(resp.get("error"))
+        raise BrokerUnavailable(
+            f"login broker: {BROKER_ERRORS.get(code, code)}"
+            + (f" ({resp['detail']})" if resp.get("detail") else "")
+        )
+    sites = [s for s in resp.get("sites") or [] if isinstance(s, dict)]
+    _BROKER_SITES_CACHE[:] = [sites]
+    return sites
+
+
+def _broker_site(site: str) -> dict | None:
+    """The broker's entry for `site` (refused ones included), or None."""
+    for entry in _broker_sites():
+        if entry.get("site") == site:
+            return entry
+    return None
+
+
+def _broker_cookie_in_scope(
+    domain: str, name: str, hosts: Sequence[str], names: Sequence[str] | None
+) -> bool:
+    """Client copy of broker/bundle.py ``cookie_in_scope``: host (or subdomain)
+    allowlist, identity-provider hosts only when named exactly, name allowlist."""
+    d = (domain or "").strip().lstrip(".").lower()
+    norm = [h.strip().lstrip(".").lower() for h in hosts if h and h.strip()]
+    if not d or not any(d == h or d.endswith("." + h) for h in norm):
+        return False
+    idp = d in BROKER_IDP_HOSTS or d.split(".", 1)[0] in BROKER_IDP_LABELS
+    if idp and d not in norm:
+        return False
+    return names is None or name in names
+
+
+def _url_origin(url: str) -> str:
+    """``scheme://host[:port]`` of `url` (default ports dropped), '' if unparsable."""
+    try:
+        parts = urllib.parse.urlsplit(url)
+        host, port = parts.hostname, parts.port
+    except ValueError:
+        return ""
+    if not host:
+        return ""
+    default = {"https": 443, "http": 80}.get(parts.scheme)
+    suffix = "" if port in (None, default) else f":{port}"
+    return f"{parts.scheme}://{host.lower()}{suffix}"
+
+
+def _with_background_page(port: int, url: str, fn: Callable[[Any], Any]) -> Any:
+    """Open `url` in a BACKGROUND tab (never focused), run ``fn(page)``, close it.
+
+    The `_switch_probe` dance: create the target over CDP with
+    ``background: true``, reconnect so Playwright adopts it, find it by target
+    id, call `fn`, close. Returns ``fn``'s result, or None when anything fails.
+    """
+    from playwright.sync_api import Error as PlaywrightError
+
+    pw, browser = _connect(port)
+    tid = ""
+    try:
+        created = browser.new_browser_cdp_session().send(
+            "Target.createTarget", {"url": url, "background": True}
+        )
+        tid = str(created.get("targetId") or "")
+    except PlaywrightError:
+        return None
+    finally:
+        browser.close()
+        pw.stop()
+    if not tid:
+        return None
+    pw, browser = _connect(port)
+    page = None
+    try:
+        page = _switch_page_by_target(browser, tid)
+        if page is None:
+            return None
+        page.wait_for_load_state("domcontentloaded", timeout=15_000)
+        with contextlib.suppress(PlaywrightError):
+            page.wait_for_load_state("load", timeout=10_000)
+        return fn(page)
+    except PlaywrightError:
+        return None
+    finally:
+        if page is not None:
+            with contextlib.suppress(PlaywrightError):
+                page.close()
+        else:
+            with contextlib.suppress(PlaywrightError):
+                _switch_close_target(browser, tid)
+        browser.close()
+        pw.stop()
+
+
+def _broker_fail(rc: int, msg: str) -> int:
+    print(f"❌ {msg}", file=sys.stderr)
+    return rc
+
+
+def _broker_entry_or_rc(site: str) -> tuple[dict | None, int]:
+    """(entry, 0) for a usable broker site, else (None, exit code) after a message."""
+    try:
+        entry = _broker_site(site)
+    except BrokerUnavailable as exc:
+        return None, _broker_fail(3, str(exc))
+    if entry is None:
+        return None, _broker_fail(
+            2, f"{site}: not whitelisted in Bitwarden agent-logins."
+        )
+    if entry.get("refused"):
+        return None, _broker_fail(
+            2, f"{site}: agent-logins item refused — {entry.get('reason') or '?'}"
+        )
+    return entry, 0
+
+
+def _broker_logged_in(port: int, site: str) -> int:
+    """Exit 0 if the shared browser is logged into broker site `site`, 2 if not.
+
+    READ-ONLY: one background tab on the item's login URL, closed again. With
+    the item's ``agent_logged_in_selector`` the sentinel must be visible;
+    without one, no visible password field counts as logged in.
+    """
+    from playwright.sync_api import Error as PlaywrightError
+
+    entry, rc = _broker_entry_or_rc(site)
+    if entry is None:
+        return rc
+    url = str(entry.get("login_url") or "")
+    if not url.startswith("https://"):
+        return _broker_fail(2, f"{site}: the broker lists no https login URL.")
+    sentinel = entry.get("logged_in_selector")
+
+    def probe(page) -> bool:
+        page.wait_for_timeout(1000)
+        if sentinel:
+            try:
+                page.wait_for_selector(str(sentinel), state="visible", timeout=8_000)
+                return True
+            except PlaywrightError:
+                return False
+        return not any(
+            el.is_visible() for el in page.query_selector_all("input[type=password]")
+        )
+
+    if _with_background_page(port, url, probe):
+        print(f"✓ Logged into {site}.")
+        return 0
+    print(f"Not logged into {site}.", file=sys.stderr)
+    return 2
+
+
+def _broker_replace_cookies(browser, bundle: dict) -> int:
+    """Delete the shared browser's in-scope cookies, add the bundle's; return count."""
+    ctx = browser.contexts[0] if browser.contexts else browser.new_context()
+    hosts = [str(h) for h in bundle.get("cookie_hosts") or []]
+    raw_names = bundle.get("cookie_names")
+    names = [str(n) for n in raw_names] if isinstance(raw_names, list) else None
+    for ck in ctx.cookies():
+        if _broker_cookie_in_scope(
+            str(ck.get("domain")), str(ck.get("name")), hosts, names
+        ):
+            ctx.clear_cookies(name=ck["name"], domain=ck["domain"], path=ck["path"])
+    # Defence in depth: never inject a cookie outside the declared scope.
+    cookies = [
+        c
+        for c in bundle.get("cookies") or []
+        if isinstance(c, dict)
+        and _broker_cookie_in_scope(
+            str(c.get("domain")), str(c.get("name")), hosts, names
+        )
+    ]
+    if cookies:
+        ctx.add_cookies(cookies)
+    return len(cookies)
+
+
+def _broker_write_storage(port: int, bundle: dict) -> int:
+    """``localStorage.setItem`` of the bundle's keys, one background tab per origin."""
+    written = 0
+    storage = bundle.get("storage") or {}
+    for origin, kv in storage.items() if isinstance(storage, dict) else []:
+        if not isinstance(kv, dict) or _url_origin(str(origin)) != origin:
+            continue
+        if not str(origin).startswith("https://"):
+            continue
+
+        def write(page, origin=origin, kv=kv) -> bool:
+            if _url_origin(page.url) != origin:  # redirected elsewhere: write nothing
+                return False
+            page.evaluate(
+                "kv => { for (const [k, v] of Object.entries(kv)) "
+                "localStorage.setItem(k, v); return true; }",
+                {str(k): str(v) for k, v in kv.items()},
+            )
+            return True
+
+        if _with_background_page(port, origin + "/", write):
+            written += len(kv)
+        else:
+            print(f"⚠ could not write localStorage on {origin}", file=sys.stderr)
+    return written
+
+
+def _broker_after_login(port: int, site: str) -> int:
+    """Site-specific follow-up once logged in: CSCS caches its API token."""
+    return cmd_token(port) if site == "cscs" else 0
+
+
+# One return per exit code of the broker contract (0 / 2 / 3 / 4) + the cscs follow-up.
+def _broker_login(port: int, site: str) -> int:  # pylint: disable=too-many-return-statements
+    """Log the shared browser into broker site `site` via a session bundle.
+
+    Already logged in → no broker call. Else: interaction lease (gate first,
+    via `_connect`, then the lease — the documented lock order), request the
+    bundle, replace the site's in-scope cookies, write its storage keys, then
+    verify with `_broker_logged_in`.
+    """
+    rc = _broker_logged_in(port, site)
+    if rc == 0:
+        return _broker_after_login(port, site)
+    if rc != 2:
+        return rc
+    entry, rc = _broker_entry_or_rc(site)
+    if entry is None:
+        return rc
+    pw, browser = _connect(port)
+    connected = True
+    try:
+        with _interaction_lease(f"login {site}"):
+            try:
+                resp = _broker_request("login", site=site)
+            except BrokerUnavailable as exc:
+                return _broker_fail(3, str(exc))
+            if not resp.get("ok"):
+                code = str(resp.get("error"))
+                detail = str(resp.get("detail") or "")
+                msg = f"{site}: {BROKER_ERRORS.get(code, code)}"
+                return _broker_fail(
+                    4 if code == "needs_human" else 2,
+                    msg + (f" ({detail})" if detail else ""),
+                )
+            bundle = resp.get("bundle") if isinstance(resp.get("bundle"), dict) else {}
+            n_cookies = _broker_replace_cookies(browser, bundle or {})
+            browser.close()
+            pw.stop()
+            connected = False
+            n_keys = _broker_write_storage(port, bundle or {})
+            print(
+                f"Injected {n_cookies} cookie(s) and {n_keys} storage key(s) for {site}."
+            )
+    finally:
+        if connected:
+            browser.close()
+            pw.stop()
+    rc = _broker_logged_in(port, site)
+    if rc != 0:
+        return _broker_fail(
+            2, f"{site}: session injected but the site is not logged in."
+        )
+    _record_login_event(site, "broker")
+    return _broker_after_login(port, site)
+
+
+def cmd_broker_sites() -> int:
+    """Table of the broker's sites: id, fill origins, status."""
+    try:
+        sites = _broker_sites()
+    except BrokerUnavailable as exc:
+        return _broker_fail(3, str(exc))
+    if not sites:
+        print("(no items in Bitwarden agent-logins)")
+        return 0
+    rows = [("SITE", "FILL ORIGINS", "STATUS")]
+    for s in sorted(sites, key=lambda e: str(e.get("site"))):
+        status = f"refused: {s.get('reason') or '?'}" if s.get("refused") else "ok"
+        rows.append(
+            (str(s.get("site")), ", ".join(s.get("fill_origins") or []) or "-", status)
+        )
+    w0 = max(len(r[0]) for r in rows)
+    w1 = max(len(r[1]) for r in rows)
+    for r in rows:
+        print(f"{r[0]:<{w0}}  {r[1]:<{w1}}  {r[2]}")
+    return 0
+
+
+def cmd_broker_logout(port: int, site_name: str) -> int:
+    """Drop the broker's own profile for SITE and delete SITE's in-scope cookies
+    from the shared browser (the session ends here; server-side sessions live on
+    until the site expires them)."""
+    site = site_name.strip().lower()
+    try:
+        entry = _broker_site(site)
+        resp = _broker_request("logout", site=site)
+    except BrokerUnavailable as exc:
+        return _broker_fail(3, str(exc))
+    if not resp.get("ok"):
+        code = str(resp.get("error"))
+        return _broker_fail(2, f"{site}: {BROKER_ERRORS.get(code, code)}")
+    print(
+        f"✓ broker profile for {site} removed."
+        if resp.get("removed")
+        else f"✓ broker had no profile for {site}."
+    )
+    if entry is None:
+        return _broker_fail(
+            2,
+            f"{site} is not listed by the broker — its cookie scope is unknown, so "
+            "no cookie in the shared browser was touched.",
+        )
+    hosts = [str(h) for h in entry.get("cookie_hosts") or []]
+    raw_names = entry.get("cookie_names")
+    names = [str(n) for n in raw_names] if isinstance(raw_names, list) else None
+    pw, browser = _connect(port)
+    try:
+        with _interaction_lease(f"logout {site}"):
+            ctx = browser.contexts[0] if browser.contexts else browser.new_context()
+            gone = 0
+            for ck in ctx.cookies():
+                if _broker_cookie_in_scope(
+                    str(ck.get("domain")), str(ck.get("name")), hosts, names
+                ):
+                    ctx.clear_cookies(
+                        name=ck["name"], domain=ck["domain"], path=ck["path"]
+                    )
+                    gone += 1
+    finally:
+        browser.close()
+        pw.stop()
+    print(f"✓ deleted {gone} {site} cookie(s) from the shared browser.")
+    return 0
+
+
+def cmd_login_cscs_assisted(port: int) -> int:
+    """The pre-broker CSCS login (keychain / 1Password) — human-only."""
+    if not sys.stdin.isatty():
+        return _fail(
+            "login-cscs-assisted is human-only (needs a terminal). Agents use "
+            "`browser.py login cscs` (login broker)."
+        )
+    return cmd_cscs_login(port)
+
+
+def _broker_site_obj(site: str) -> "Site":
+    """A dynamic registry entry for a broker-only site."""
+    return Site(
+        name=site,
+        aliases=(),
+        blurb="login broker (Bitwarden agent-logins)",
+        login=functools.partial(_broker_login, site=site),
+        logged_in=functools.partial(_broker_logged_in, site=site),
+    )
+
+
+# ---------------------------------------------------------------------------
 # Site registry — generic multi-site login (facade over per-site functions)
 # ---------------------------------------------------------------------------
 
@@ -6572,20 +7001,50 @@ def _sites() -> list[Site]:
     ]
 
 
-def _resolve_site(name: str) -> Site:
-    """Find a Site by name or alias (case-insensitive), or exit with the list."""
+def _resolve_site(name: str, *, for_login: bool = False) -> Site:
+    """Find a Site: static registry first, then the login broker's `sites` list.
+
+    Static names win. For ``login cscs`` (`for_login`) a broker that lists cscs
+    takes over the login itself (the keychain flow stays reachable only as the
+    human-only ``login-cscs-assisted``). An unknown name that the broker lists
+    (not refused) becomes a dynamic broker Site; anything else exits 2.
+    """
     key = name.strip().lower()
     for site in _sites():
         if key == site.name or key in site.aliases:
+            if site.name == "cscs" and for_login:
+                try:
+                    entry = _broker_site("cscs")
+                except BrokerUnavailable:
+                    entry = None
+                if entry is not None and not entry.get("refused"):
+                    return dataclasses.replace(
+                        site,
+                        blurb="CSCS portal via the login broker",
+                        login=functools.partial(_broker_login, site="cscs"),
+                    )
             return site
+    reason = ""
+    try:
+        entry = _broker_site(key)
+    except BrokerUnavailable as exc:
+        entry, reason = None, f" ({exc})"
+    if entry is not None and not entry.get("refused"):
+        return _broker_site_obj(key)
+    if entry is not None:
+        reason = f" (agent-logins item refused: {entry.get('reason') or '?'})"
     avail = "\n".join(f"  {s.name:<10} {s.blurb}" for s in _sites())
-    print(f"❌ Unknown site: {name!r}. Available:\n{avail}", file=sys.stderr)
+    print(
+        f"❌ Unknown site: {name!r} — not whitelisted in Bitwarden agent-logins or "
+        f"broker down{reason}.\nBuilt-in sites:\n{avail}",
+        file=sys.stderr,
+    )
     sys.exit(2)
 
 
 def cmd_login(port: int, site_name: str) -> int:
     """Ensure SITE is logged in (automated or assisted, per the site)."""
-    return _resolve_site(site_name).login(port)
+    return _resolve_site(site_name, for_login=True).login(port)
 
 
 def cmd_logged_in(port: int, site_name: str) -> int:
@@ -6673,6 +7132,13 @@ def _dispatch(args: argparse.Namespace, port: int) -> int:
         return cmd_store_creds(args.site)
     if args.cmd == "forget-creds":
         return cmd_forget_creds(args.site)
+    # Login broker (sessions for Bitwarden agent-logins sites).
+    if args.cmd == "broker-sites":
+        return cmd_broker_sites()
+    if args.cmd == "logout":
+        return cmd_broker_logout(port, args.site)
+    if args.cmd == "login-cscs-assisted":
+        return cmd_login_cscs_assisted(port)
     # CSCS aliases (back-compat; cscs-api.py depends on these names).
     if args.cmd == "cscs-login":
         return cmd_login(port, "cscs")
