@@ -547,6 +547,11 @@ def test_bw_vault_env_only_secrets(tmp_path):
     assert verbs.count("unlock") == verbs.count("lock") >= 2
     assert ["list", "items", "--collectionid", "coll-1"] in [c["argv"] for c in calls]
     assert all(c["appdata"] == str(tmp_path / "appdata") for c in calls)
+    # bw defaults to the Bitwarden cloud: the server is set before every login.
+    argvs = [c["argv"] for c in calls]
+    server = ["config", "server", vault.DEFAULT_SERVER_URL]
+    assert server in argvs
+    assert argvs.index(server) < argvs.index(["login", "--apikey"])
     assert all(not c["has_pw"] for c in calls if c["argv"][0] != "unlock")
 
 
@@ -1007,9 +1012,15 @@ def test_install_sh_dry_run_executes_only_trusted_paths():
                 if not prog.startswith(SYSTEM_DIRS + (LIBEXEC,)):
                     bad.append(cmd)
     assert not bad, bad
-    # The pinned downloads are verified before use.
+    # The pinned downloads are verified before use. On a machine where the pinned
+    # tools are already installed the dry run skips the download, so check the
+    # script itself for the verify step and the dry run only for the rest.
     out = proc.stdout
-    assert "verify sha256" in out and "--require-hashes" in out
+    script = INSTALL_SH.read_text()
+    assert 'fetch_verified "$UV_URL" "$UV_SHA256"' in script
+    assert 'fetch_verified "$BW_URL" "$BW_SHA256"' in script
+    assert "/usr/bin/shasum -a 256 -c" in script
+    assert "--require-hashes" in out
     assert "/usr/bin/sudo -H -u" in out and "archive" in out
 
 

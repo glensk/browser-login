@@ -253,6 +253,10 @@ class FixtureVault:
         return secret_from_json(_find(self._raw(), site, dev=self.dev))
 
 
+# The self-hosted Vaultwarden the broker account lives on.
+DEFAULT_SERVER_URL = "https://vaultwarden.dom42.space"
+
+
 @dataclass(frozen=True)
 class BwBootstrap:
     """Contents of ``<home>/bootstrap.json`` (written by ``install.sh -e``)."""
@@ -261,6 +265,7 @@ class BwBootstrap:
     client_secret: str = field(repr=False)
     master_password: str = field(repr=False)
     collection_id: str
+    server_url: str = DEFAULT_SERVER_URL
 
     @classmethod
     def load(cls, path: str | os.PathLike[str]) -> BwBootstrap:
@@ -274,7 +279,10 @@ class BwBootstrap:
             isinstance(data.get(k), str) and data[k] for k in keys
         ):
             raise VaultError(f"bootstrap {path} lacks one of {', '.join(keys)}")
-        return cls(**{k: data[k] for k in keys})
+        server = data.get("server_url") or DEFAULT_SERVER_URL
+        if not isinstance(server, str) or not server.startswith("https://"):
+            raise VaultError(f"bootstrap {path}: server_url must be an https:// URL")
+        return cls(**{k: data[k] for k in keys}, server_url=server)
 
 
 class BwVault:
@@ -329,6 +337,9 @@ class BwVault:
     @contextmanager
     def _session(self) -> Iterator[str]:
         if self._status() == "unauthenticated":
+            # bw defaults to the Bitwarden cloud; point it at Vaultwarden first
+            # (only allowed while logged out).
+            self._run(["config", "server", self.boot.server_url], self._env())
             self._run(
                 ["login", "--apikey"],
                 self._env(
