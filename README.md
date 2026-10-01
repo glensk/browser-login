@@ -364,3 +364,29 @@ the `himalaya` helpers. The CDP endpoint is always `http://127.0.0.1:<port>` (ne
 ## License
 
 [Apache-2.0](LICENSE).
+
+---
+
+## READONLY created by README-help-add.py
+
+### `agent-login.py --help`
+
+agent-login.py — which of Albert's logins can agents use through the login broker?
+
+Without arguments: a health line for the broker, the logins agents can use right now, and the full list of logins we want to make work, each with its status and what is missing. Read-only: it asks the broker for its site list (never a secret) and logs into nothing unless you pass -t.
+
+Examples:
+
+```bash
+./agent-login.py              # overview
+./agent-login.py -t kleinanzeigen   # real test: broker logs in, session lands in the
+                                    # shared Chromium, then the logged-in check
+./agent-login.py -j           # the same overview as JSON
+```
+
+#### Options
+
+| Flag | Description |
+|------|-------------|
+| `-t`, `--test` `SITE` | real login test for SITE |
+| `-j`, `--json` | print the overview as JSON |
