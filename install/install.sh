@@ -380,12 +380,29 @@ bootout() {
 		run /bin/launchctl bootout "system/${LABEL}"
 	else
 		/bin/launchctl bootout "system/${LABEL}" 2>/dev/null || true
+		# bootout returns before the service is gone; a bootstrap in that window
+		# fails with "5: Input/output error", so wait until launchd forgot it.
+		for _ in $(/usr/bin/seq 1 40); do
+			/bin/launchctl print "system/${LABEL}" >/dev/null 2>&1 || return 0
+			/bin/sleep 0.25
+		done
 	fi
 }
 
 restart_daemon() {
 	bootout
-	run /bin/launchctl bootstrap system "$PLIST"
+	if ((DRY)); then
+		run /bin/launchctl bootstrap system "$PLIST"
+		return 0
+	fi
+	local try
+	for try in 1 2 3 4 5; do
+		echo "+ /bin/launchctl bootstrap system ${PLIST}"
+		/bin/launchctl bootstrap system "$PLIST" && return 0
+		echo "  bootstrap attempt ${try} failed; retrying"
+		/bin/sleep 1
+	done
+	die "launchctl bootstrap kept failing; try: sudo /bin/launchctl bootstrap system ${PLIST}"
 }
 
 wait_for_socket() {
