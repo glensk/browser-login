@@ -4,162 +4,210 @@
 
 Resume: `c --resume c3d7e4e6-c54d-42eb-8b30-c40a70341a4f`
 
+## Context
+
+tp#733. Albert (2026-10-01): "log in yourself" interrupts unattended runs. He wants to decide
+which of his logins agents may use, have a trusted component log in for them, and never let the
+agent see the credentials. CSCS agent login comes back the same way.
+
 ## Goal
 
-An agent (Claude Code, Codex, scripts) running as uid 501 (`albert`) can get a **logged-in
-session** for a site Albert has whitelisted, **without Albert being present and without the
-agent ever being able to read the password or the 2FA (TOTP) secret**.
+An agent running as uid 501 (`albert`) — Claude Code, Codex, scripts — gets a **logged-in
+session** for a site Albert has whitelisted, **without Albert being present** and **without the
+agent being able to read the password or the TOTP secret**.
 
-`browser.py login ricardo` → the shared Chromium is logged into ricardo.ch a few seconds
-later. No terminal prompt, no Touch ID, no human.
+`browser.py login ricardo` → the shared Chromium is logged into ricardo.ch seconds later.
 
 ## Decisions (Albert, 2026-10-01)
 
 | #  | Decision                                                                                       |
 | :- | :--------------------------------------------------------------------------------------------- |
-| D1 | **Handoff = session cookies.** The broker logs in inside its own browser and returns only that site's cookies; the client injects them into the shared Chromium. The agent holds a session (bounded, revocable), never the password/TOTP. |
-| D2 | **Always automatic.** No per-login approval. Oversight = audit log only.                       |
+| D1 | **Handoff = a session bundle** (cookies + the site's named origin storage, see 2.2) injected into the shared Chromium. The agent holds a session, never the password/TOTP. |
+| D2 | **Always automatic.** No per-login approval. Oversight = audit log.                            |
 | D3 | **Credentials come from Bitwarden (self-hosted Vaultwarden), pulled by the broker itself** with its own account. No 1Password anywhere. |
 | D4 | **Lives in this repo** (browser-login); deployed root-owned.                                   |
-| D5 | **CSCS agent login comes back** through the broker (reverses the tp#97 credential-plane rule "`browser.py login cscs` stays human-only" — see "Relation to tp#97"). |
+| D5 | **CSCS agent login comes back** via the broker. Reverses `plans-done/PLAN_cscs-cred-daemon_SUPERSEDED.md` A8 ("human-only, no session injection") and tp#97 credplane 4.3 ("token stays inside the minter"). |
 
-### D3 refinement: Vaultwarden has no Secrets-Manager "service account"
+### D3: Vaultwarden has no Secrets-Manager machine accounts
 
-`bw status` → `https://vaultwarden.dom42.space`. Vaultwarden does not implement the Bitwarden
-Secrets Manager API (no machine accounts). Equivalent that Vaultwarden does support:
+`bw status` → `https://vaultwarden.dom42.space`; server has `SIGNUPS_ALLOWED=false`,
+`INVITATIONS_ALLOWED=true`, `SMTP_HOST=smtp.gmail.com`. Equivalent that works:
 
-- A **dedicated Vaultwarden user** for the broker (e.g. `albert.glensk+loginbroker@gmail.com`),
-  invited by Albert (`SIGNUPS_ALLOWED=false`, `INVITATIONS_ALLOWED=true` on the server).
-- An **organization collection `agent-logins`**; the broker user is a member with read-only
-  access to that collection only.
-- **Whitelisting a site = putting its login item into `agent-logins`.** Removing it revokes
-  the agent's ability to obtain new sessions. Albert manages the allowlist in the normal
-  Bitwarden UI — no Mac-side config, no sudo.
-- The item supplies username, password, TOTP secret (Vaultwarden serves TOTP for free) and
-  its **URIs = the exact origins the broker may type secrets into**. A custom field
-  `agent_site` gives the short site id (`ricardo`, `cscs`); default = item name slug.
-- Broker bootstrap: that user's API key (`client_id`/`client_secret`) + master password, in a
-  file only the broker uid can read. One console action (remove from org / deauthorize
-  sessions / change password) revokes it.
+- A **dedicated Vaultwarden user** for the broker (e.g. `albert.glensk+loginbroker@gmail.com`).
+- An **organization collection `agent-logins`**; the broker user is a *confirmed* member with
+  read-only access to that collection only.
+- **Whitelisting a site = moving its login item into `agent-logins`** (moving transfers it to
+  the org; Albert stays owner, single copy, no drift). Removing it stops NEW sessions (see
+  "Revocation").
+- Each item must carry a custom field **`agent_fill_origins`**: exact HTTPS origins where the
+  broker may type secrets (e.g. `https://auth.cscs.ch`). The item's ordinary autofill URIs are
+  NOT trusted for this. Items without the field are refused. Optional fields: `agent_site`
+  (short id; default = name slug), `agent_cookie_hosts` (cookie host allowlist override).
+- Bootstrap: the broker user's API key (`client_id`/`client_secret`) + master password, in a file
+  only the broker uid can read.
 
 ## Architecture
 
 ```
- agent (uid 501)                         _loginbroker (role account, uid ~ 2xx)
- ───────────────                         ─────────────────────────────────────
+ agent (uid 501)                          _loginbroker (role account)
+ ───────────────                          ───────────────────────────
  browser.py login ricardo
-   │  {"op":"login","site":"ricardo"}
-   ├──────────── unix socket ───────────▶ login-broker daemon (LaunchDaemon, root-owned code)
-   │             /var/run/login-broker/     ├─ peer uid check (LOCAL_PEERCRED == 501)
-   │                                        ├─ rate limiter (persisted)
-   │                                        ├─ bw CLI (own data dir) → Vaultwarden item
-   │                                        │     agent-logins/<site>: user, pw, totp, URIs
-   │                                        ├─ own headless Chromium, own profile per site,
-   │                                        │     sandbox ON, CDP over pipe only
-   │                                        ├─ recipe: exact-origin check before every fill
-   │                                        ├─ verify logged_in sentinel
-   │  ◀──── cookies for the item's domains ─┘ └─ audit log (no secrets)
-   ▼
- CDP Storage.setCookies → shared Chromium (127.0.0.1:9222) → logged in
+   │ logged-in? → yes: done (no broker call)
+   │ {"op":"login","site":"ricardo"}
+   ├──────────── unix socket ────────────▶ login-broker (LaunchDaemon, root-owned code)
+   │             /var/run/login-broker/      ├─ peer uid check (LOCAL_PEERCRED == 501)
+   │                                         ├─ per-site mutex (coalesces concurrent calls)
+   │                                         ├─ limiter (fsync'd state, root-only reset)
+   │                                         ├─ own profile still logged in? → re-export
+   │                                         ├─ bw (own appdata) → agent-logins/<site>
+   │                                         ├─ own headless Chromium, profile per site,
+   │                                         │    sandbox ON, CDP over pipe, mock keychain
+   │                                         ├─ recipe: exact-origin check before each fill
+   │                                         ├─ verify logged-in sentinel
+   │ ◀── session bundle (allowlisted ───────┘ └─ audit log (no secrets)
+   │      cookies + named storage keys)
+   ▼ interaction lease → delete site's allowlisted cookies → inject (CDP) → logged-in check
+ shared Chromium (127.0.0.1:9222)
 ```
 
 ### Why the agent cannot get the credentials
 
 | Path the agent could try                         | Blocked by                                                                 |
 | :----------------------------------------------- | :------------------------------------------------------------------------- |
-| Read the bootstrap / bw data / broker profiles   | `/var/db/login-broker` owned `_loginbroker` 0700                           |
-| Attach a debugger / read broker memory           | different uid; macOS denies `task_for_pid` across users without root       |
-| Attach to the broker's Chromium over CDP         | pipe transport only, no TCP debug port (test asserts on live argv)         |
-| Edit the broker code or a site recipe            | code + venv + Playwright browsers root-owned under `/usr/local/libexec/login-broker`; updates need Albert's sudo |
-| Ask the broker to type the password on a page the agent controls | site id only — origins come from the Vaultwarden item URIs, exact host match + HTTPS, re-checked right before every fill and submit; foreign form actions rejected |
-| Read the agent's own Vaultwarden access          | Albert's `bw` is locked; the broker's account sees only `agent-logins`     |
-| Request cookies for another domain               | cookie export filtered to the item's registrable domains                   |
+| Read bootstrap / bw data / broker profiles       | `/var/db/login-broker` owned `_loginbroker` 0700 (selfcheck asserts)       |
+| Read broker memory / attach a debugger           | different uid; no `task_for_pid` across users without root                 |
+| Attach to the broker's Chromium                  | pipe transport only; selfcheck fails on `--remote-debugging-port` or `--no-sandbox` in live argv |
+| Edit broker code or a recipe                     | code, venv, `bw`, Node and Playwright browsers root-owned under `/usr/local/libexec/login-broker`; updates need Albert's sudo |
+| Make the broker type a secret on its own page    | request carries a site id only; fill origins come from `agent_fill_origins` (Albert's vault), exact host + HTTPS, re-checked right before every fill and submit; foreign form actions rejected |
+| Old uid-501 copies (keychain, 1Password fallback, transcripts) | 3.3 deletes the code paths and keychain items; 3.4 rotates the CSCS password and TOTP before enrolment |
+| Request cookies of another domain / an IdP       | per-site cookie host+name allowlist; IdP hosts (accounts.google.com, Keycloak `auth.*`, SwissID …) excluded by default |
 
 ### Accepted residuals (stated, not solved)
 
-- **The session itself is power.** While cookies are valid the agent can do anything Albert
-  can on that site that does not re-ask for the password (D1). Mitigation: allowlist only
-  what an agent needs; audit log; cookies expire.
-- **Albert's admin account.** An agent running as albert can wait for Albert to type his
-  sudo/login password into something it controls (keylogger LaunchAgent). Same residual
-  as tp#97's threat model.
-- **Captcha / "new device" e-mail codes.** Some logins will occasionally need a human. The
-  broker returns `needs_human: <reason>` and sends one ntfy push; it never loops.
-- **Recipe updates need sudo** (a recipe decides where secrets are typed, so it must not be
-  agent-writable). The generic recipe (username + password + optional TOTP on the item's
-  exact origin) covers most sites, so adding a *site* is a Bitwarden action, not a sudo one.
+- **The session is power** (D1). While valid, the agent can do on that site anything that does
+  not re-ask for the password.
+- **Revocation.** Removing an item from `agent-logins` only stops NEW sessions. A session
+  already injected lives on until the site expires it. Real revocation = `browser.py logout
+  SITE` (server-side logout from the shared browser + delete its cookies) or log out /
+  rotate at the provider.
+- **Bot defences.** Some sites refuse a headless broker. Phase 0.1 measures this per site; a
+  failing site is dropped, not built for. A runtime captcha returns `needs_human: <reason>` +
+  one ntfy push, never a retry loop.
+- **Albert's admin account.** An agent running as albert could keylog a later sudo/login
+  password (same residual as tp#97's threat model).
+- **Recipe changes need sudo** (a recipe decides where secrets are typed). The generic recipe
+  covers ordinary username/password(/TOTP) forms, so whitelisting a *site* is a Bitwarden
+  action, not a sudo one.
 
 ## Relation to tp#97 (credential plane)
 
-`tp/plans/PLAN_credential-plane.md` 4.3 specifies a separate-uid **CSCS minter** that keeps
-the derived token inside its own boundary and serves named operations. This broker is the
-same building block (separate uid, hardened Chromium, exact-origin fill, persistent limiter)
-generalised to N sites, with **D1/D5 deliberately weaker**: the agent receives the session.
-Record this in the credplane plan as Albert's decision of 2026-10-01; 4.3's minter becomes
-"login broker + CSCS recipe"; 4.4's removal of shared-browser refresh is superseded for CSCS.
+credplane 4.3's separate-uid CSCS minter is this broker's CSCS recipe; D1/D5 deliberately give
+the agent the portal session. Record as Albert's decision of 2026-10-01 in
+`tp/plans/PLAN_credential-plane.md` (4.3/4.4) and in tp#97.
 
 ## Steps
 
-### Phase 0 — prove the platform (no secrets)
+### Phase 0 — prove the platform (go/no-go before anything else)
 
-- [ ] 0.1 `install/install.sh` (run once with sudo): create role account `_loginbroker`
-      (`sysadminctl -addUser _loginbroker -roleAccount`), dirs `/usr/local/libexec/login-broker`
-      (root 0755), `/var/db/login-broker` (`_loginbroker` 0700), `/var/run/login-broker`
-      (root:`_loginbroker` 0755), log `/var/log/login-broker.log`; copy code, build a uv venv,
-      install pinned Playwright Chromium into `PLAYWRIGHT_BROWSERS_PATH` under libexec;
-      LaunchDaemon `com.albert.login-broker` with `UserName=_loginbroker`. Idempotent;
-      `-U` uninstalls. Must be shellcheck-clean.
-- [ ] 0.2 Daemon skeleton: socket, `LOCAL_PEERCRED` peer-uid check, JSON protocol
-      (`ping`, `sites`, `login`, `logout`), audit log.
-- [ ] 0.3 Prove headless Chromium runs as `_loginbroker` under launchd (no WindowServer):
-      log into a public test page, export cookies, inject into the shared Chromium.
-- [ ] 0.4 Boundary tests (run as uid 501): cannot read `/var/db/login-broker`, cannot
-      attach to the broker Chromium, live argv has no `--remote-debugging-port` and no
-      `--no-sandbox`, socket refuses a foreign uid (simulated via a second test user if
-      available, else unit-level).
+- [ ] 0.1 **Bot-defence spike, per candidate site** (ricardo, kleinanzeigen, geizhals, toppreise,
+      cscs): headless Chrome for Testing as `_loginbroker` with no WindowServer, real login with
+      Albert's test credentials typed by Albert, then inject the bundle into the headed shared
+      Chromium and check the session survives the User-Agent/IP switch (`cf_clearance` and similar
+      bot cookies bound to UA). Record go/no-go per site here; drop no-go sites before Phase 1.
+- [ ] 0.2 `install/install.sh` (sudo, idempotent, `-U` uninstalls, shellcheck-clean): role account
+      `_loginbroker` with home `/var/db/login-broker` (0700); `/usr/local/libexec/login-broker`
+      (root 0755: code, uv venv, pinned `bw` + Node, Playwright browsers via
+      `PLAYWRIGHT_BROWSERS_PATH`); `/var/run/login-broker` (root:`_loginbroker` 0755); log
+      `/var/log/login-broker.log`; LaunchDaemon `com.albert.login-broker` (`UserName=_loginbroker`).
+      Rollout: install into a versioned dir, selfcheck, then swap the `current` symlink; rollback
+      = previous symlink.
+- [ ] 0.3 Daemon skeleton: socket, `LOCAL_PEERCRED` check, JSON protocol (`ping`, `sites`,
+      `login`, `logout`), per-site mutex, audit log. Chromium launched with `--use-mock-keychain`
+      and a persistent per-site profile; acceptance: after a broker restart the per-site session
+      is still valid (no "new device" login).
+- [ ] 0.4 `broker/selfcheck.py -b`: read-only boundary check run as uid 501: live broker Chromium
+      argv has no `--remote-debugging-port`/`--no-sandbox`; `/var/db/login-broker` unreadable;
+      libexec not writable by 501; socket refuses a request whose peer uid is not 501
+      (unit-level); exit non-zero on any violation.
 
 ### Phase 1 — Vaultwarden
 
-- [ ] 1.1 Albert (one time, in the Bitwarden UI): org + collection `agent-logins`, invite
-      the broker user, accept the invite, generate its API key.
-- [ ] 1.2 `sudo login-broker enroll-bootstrap`: reads the broker account's API key + master
-      password from Albert's terminal (getpass) into `/var/db/login-broker/bootstrap`
-      (0600). Agent never sees it (it is typed, not passed via argv/env/clipboard).
-- [ ] 1.3 Broker-side `bw` (own `BITWARDENCLI_APPDATA_DIR`): login with API key, unlock per
-      request (session key in memory only), `list items --collectionid`, `get totp`, lock.
-- [ ] 1.4 `sites` op: lists site ids + allowed origins (never secrets).
+- [ ] 1.1 Albert (Bitwarden UI, one time): organization + collection `agent-logins`; invite the
+      broker user; accept the invite (mail via SMTP); **confirm the member** (Admin Console →
+      Members → Confirm); give it read-only on `agent-logins` only; create its API key.
+- [ ] 1.2 `sudo login-broker enroll-bootstrap`: getpass in Albert's terminal → bootstrap file
+      0600 (never argv/env/clipboard).
+- [ ] 1.3 Broker `bw` with own `BITWARDENCLI_APPDATA_DIR`: `login --apikey`, unlock per request
+      (session key in memory only), list the collection, `get totp`, lock.
+- [ ] 1.4 `sites` op: site ids + fill origins + cookie hosts, never secrets. Items without
+      `agent_fill_origins` are listed as refused.
 
 ### Phase 2 — login + handoff
 
-- [ ] 2.1 Generic recipe: navigate to item's first URI, find username/password fields,
-      exact-origin check before each fill and submit, TOTP step if the item has one,
-      verify a logged-in sentinel, persistent per-site broker profile (fewer "new device"
-      challenges).
-- [ ] 2.2 Cookie export filtered to the item's registrable domains; return over the socket.
-- [ ] 2.3 Client: `browser.py login SITE` asks the broker first (if socket present), injects
-      cookies via CDP, re-checks `logged-in SITE`; falls back to today's assisted flow.
-      `browser.py broker-sites` lists what is available.
-- [ ] 2.4 Persistent rate limiter (per site: min interval, hourly cap, no retry on unknown
-      outcome) + `needs_human` path with one ntfy push.
+- [ ] 2.1 Generic recipe: open the first `agent_fill_origins` origin's login page, find
+      username/password fields, exact-origin check before each fill and submit, TOTP step if the
+      item has one, verify the logged-in sentinel. Before logging in, check whether the broker's
+      own profile is still logged in → re-export instead of logging in again.
+- [ ] 2.2 Session bundle: cookies filtered by per-site host+name allowlist (IdP hosts excluded by
+      default) + named localStorage/sessionStorage keys per origin. Never the whole jar.
+- [ ] 2.3 Client in `browser.py`: name resolution = static `Site` registry → broker `sites` list →
+      exit 2 "not whitelisted / broker down" (no assisted fallback for broker-only sites). Flow:
+      `logged-in SITE` first (no broker call when already logged in) → interaction lease → delete
+      the site's allowlisted cookies → `Storage.setCookies` + `DOMStorage.setDOMStorageItem` →
+      `logged-in` check. New: `browser.py broker-sites`, `browser.py logout SITE`.
+- [ ] 2.4 Limiter: per site minimum interval, hourly and daily cap; state fsync'd under
+      `/var/db/login-broker`; root-only reset; an unknown outcome (crash, timeout mid-submit) is
+      never retried automatically. `needs_human` path: one ntfy push per site per day.
 
-### Phase 3 — site recipes
+### Phase 3 — sites
 
-- [ ] 3.1 Ricardo, Kleinanzeigen, geizhals, Toppreise (generic recipe; site-specific only
-      where the generic one fails).
-- [ ] 3.2 CSCS recipe from `daemon/cscs_login_flow.py` (SPNEGO → password → OTP) with exact
-      host equality (fixes the substring checks noted in credplane 4.3), then
-      `browser.py token` works again unattended.
-- [ ] 3.3 Remove the uid-501 keychain credential path for every site moved to the broker
-      (`store-creds`/`cscs-store-creds` print a pointer to Bitwarden instead).
+- [ ] 3.1 Generic-recipe sites that passed 0.1 (expected: kleinanzeigen, geizhals, toppreise,
+      ricardo if not captcha-gated); per-site sentinel + cookie allowlist.
+- [ ] 3.2 CSCS recipe from `cmd_cscs_login` / `_submit_keycloak_login` / `_fill_keycloak_otp` with
+      exact host equality (replaces the substring checks at bin/browser.py:4458/4545/4614/4650).
+      Bundle = portal.cscs.ch cookies + the Waldur token from portal localStorage (what
+      `_scan_token` bin/browser.py:3619-3646 reads); Keycloak `auth.cscs.ch` cookies are NOT
+      handed over. Acceptance: `browser.py token` succeeds unattended after `browser.py login cscs`.
+- [ ] 3.3 Remove uid-501 credential paths: delete `_op_creds` and the keychain read in
+      `_cscs_creds`, `cscs-store-creds`/`store-creds` print a pointer to Bitwarden; delete any
+      remaining keychain items; test asserts no credential-reading path remains for broker sites.
+- [ ] 3.4 Albert: rotate the CSCS password and re-enrol TOTP at CSCS, then put the item (with
+      `agent_fill_origins`) into `agent-logins`. Same for any site whose password ever sat in a
+      uid-501 store.
 
 ### Phase 4 — close out
 
-- [ ] 4.1 Tests: origin checker, cookie filter, peer-cred check, rate limiter, protocol
-      (hermetic); attended end-to-end per site.
-- [ ] 4.2 README / AGENTS.md / skill `browser-login` updated; credplane plan + tp#97 updated
-      (D5); memory updated.
+- [ ] 4.1 Hermetic tests (`tests/test_login_broker.py`): origin checker (incl.
+      `https://evil.example/?auth.cscs.ch`), cookie/storage filter, peer-cred check, limiter
+      persistence, mutex coalescing, name resolution, re-run idempotence.
+- [ ] 4.2 README / AGENTS.md / `browser-login` skill; credplane plan + tp#97 note (D5); memory.
 
-## Open questions
+## Verification
 
-- Which sites go into `agent-logins` first (proposal: ricardo, kleinanzeigen, geizhals,
-  toppreise, cscs).
+Hermetic tests cover the origin checker, bundle filter, limiter, mutex and name resolution;
+`selfcheck.py -b` checks the live security boundary (argv, file modes, socket peer uid), which is
+why the block is not strict-eligible.
+
+```
+cd /Users/albert/obsidian/42-Git/home/browser-login && uv run --no-sync pytest tests/test_login_broker.py
+cd /Users/albert/obsidian/42-Git/home/browser-login && ruff check broker bin
+cd /Users/albert/obsidian/42-Git/home/browser-login && shellcheck install/install.sh
+cd /Users/albert/obsidian/42-Git/home/browser-login && uv run --no-sync python broker/selfcheck.py -b
+```
+
+## Debate outcome (Opus adversary)
+
+Critic: fresh Opus subagent, 2026-10-01, 1 round (Codex seats rate-limited). All accepted.
+
+1. [blocker] Cookies alone cannot restore the CSCS Waldur token (localStorage) — accepted: D1 becomes a session bundle (cookies + named storage keys); 3.2 hands over the portal token.
+2. [blocker] ricardo etc. are not in the Site registry, no assisted fallback — accepted: 2.3 resolution order registry → broker list → exit 2.
+3. [blocker] Headless proven only on a test page — accepted: 0.1 per-site bot-defence go/no-go spike first, incl. UA switch after injection.
+4. [major] Registrable-domain filter leaks IdP/SSO cookies — accepted: per-site host+name allowlist, IdP excluded; Keycloak cookies not handed over.
+5. [major] uid-501 keychain/1Password copies remain, no rotation — accepted: 3.3 removes paths, 3.4 rotation before enrolment.
+6. [major] Org member confirm step missing — accepted: 1.1 confirm + SMTP evidence + move-not-clone.
+7. [major] Role account keychain/home for Chromium and bw — accepted: home `/var/db/login-broker`, `--use-mock-keychain`, pinned bw+Node, restart-keeps-session acceptance.
+8. [major] No concurrency/idempotence — accepted: broker per-site mutex, client lease + cookie clear + logged-in-first.
+9. [major] Agent-triggerable lockout, weak limiter — accepted: logged-in-first, re-export, daily cap, fsync'd state, root reset, no unknown-outcome retry.
+10. [minor] Verification does not test security claims — accepted: `selfcheck.py -b`, `uv run --no-sync`.
+11. [minor] Loose item URIs as fill origins — accepted: mandatory `agent_fill_origins` field.
+12. [minor] Revocation overstated — accepted: residual stated, `logout SITE` added.
