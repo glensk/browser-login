@@ -513,9 +513,9 @@ def test_plist() -> None:
 
 
 def test_unattended_import_only_where_safe() -> None:
-    """Ricardo (Cloudflare blocks automation) and Kleinanzeigen (refresh-token
-    rotation could log Safari out) are never imported by the daily check."""
+    """Ricardo (Cloudflare blocks automation) is never imported by the daily check;
+    Kleinanzeigen is, since a copied refresh_token did not log Safari out."""
     assert sc.SAFARI_SITES["anibis"].auto and sc.SAFARI_SITES["tutti"].auto
     assert not sc.SAFARI_SITES["ricardo"].auto
-    assert not sc.SAFARI_SITES["kleinanzeigen"].auto
+    assert sc.SAFARI_SITES["kleinanzeigen"].auto
     assert sc.SAFARI_SITES["kleinanzeigen"].session_cookies == ("refresh_token",)

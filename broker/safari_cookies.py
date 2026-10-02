@@ -69,13 +69,12 @@ SAFARI_SITES: dict[str, SafariSite] = {
     # Cloudflare challenges the automated browser on every Ricardo page, so a
     # copied session cannot be used there: agents work in Albert's Safari instead.
     "ricardo": SafariSite(("ricardo.ch",), session_cookies=("appSession",), auto=False),
-    # Kleinanzeigen keeps an Auth0 refresh_token; using it from a second browser may
-    # rotate it and log Safari out. Manual imports only until that is tested.
+    # Kleinanzeigen keeps an Auth0 refresh_token; tested: Chromium using a copy did
+    # not log Safari out, so it is imported unattended like anibis/tutti.
     "kleinanzeigen": SafariSite(
         ("kleinanzeigen.de",),
         broker_fallback=True,
         session_cookies=("refresh_token",),
-        auto=False,
     ),
 }
 
