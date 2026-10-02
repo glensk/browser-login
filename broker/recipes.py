@@ -186,6 +186,15 @@ def interstitial_title(page: Any) -> bool:
     return any(title.startswith(t) for t in CHALLENGE_TITLES)
 
 
+# Fraud-protection pages: retrying makes them worse, so they mean "needs a human".
+BLOCKED_TEXT_RE = re.compile(
+    r"IP-Bereich vor\u00fcbergehend gesperrt|IP-Bereich gesperrt|temporarily blocked"
+    r"|too many (?:login )?attempts|zu viele (?:Anmelde)?versuche"
+    r"|trop de tentatives|Zugriff vor\u00fcbergehend gesperrt",
+    re.IGNORECASE,
+)
+
+
 def challenge_reason(page: Any) -> str | None:
     """``"captcha"`` when a captcha / bot-challenge is on the page, else None."""
     if interstitial_title(page):
@@ -199,6 +208,16 @@ def challenge_reason(page: Any) -> str | None:
         return None
     if any(CHALLENGE_SRC_RE.search(str(u or "")) for u in [*frames, *srcs]):
         return "captcha"
+    try:
+        text = str(
+            page.evaluate("() => (document.body?.innerText || '').slice(0, 4000)")
+        )
+    except Exception:  # pylint: disable=broad-exception-caught
+        return None
+    if BLOCKED_TEXT_RE.search(text):
+        return (
+            "the site blocked this IP range / too many attempts — stop and retry later"
+        )
     return None
 
 
@@ -302,6 +321,44 @@ def check_logged_in(
     if isinstance(status, int) and status >= 400:
         return False
     return logged_in(page, item, wait_s=wait_s, dev=dev)
+
+
+# A freshly shown password page may still re-render (and clear inputs) while its
+# JS hydrates; give it this long before typing, then verify the value stuck.
+HYDRATE_S = 1.5
+
+
+def _fill_password(
+    page: Any, pw_field: Any, secret: Secret, allowed: list[str], *, dev: bool
+) -> Any:
+    """Type the password and make sure the field KEEPS it; returns the field used.
+
+    One retry types it key by key into the (re-located) visible password field;
+    a field that still drops the value fails BEFORE anything is submitted.
+    """
+    page.wait_for_timeout(HYDRATE_S * 1000)
+    _check_challenge(page, submitted=False)
+    pw_field = _visible(page, PASSWORD_SELECTOR) or pw_field
+    _guard(page, pw_field, allowed, dev=dev)
+    pw_field.fill(secret.password)
+    page.wait_for_timeout(500)
+    if _field_value(pw_field) == secret.password:
+        return pw_field
+    pw_field = _visible(page, PASSWORD_SELECTOR) or pw_field
+    _guard(page, pw_field, allowed, dev=dev)
+    pw_field.fill("")
+    pw_field.press_sequentially(secret.password, delay=60)
+    page.wait_for_timeout(500)
+    if _field_value(pw_field) != secret.password:
+        raise LoginFailed("the password field did not keep the typed value")
+    return pw_field
+
+
+def _field_value(field: Any) -> str | None:
+    try:
+        return str(field.input_value())
+    except Exception:  # pylint: disable=broad-exception-caught
+        return None
 
 
 def _check_challenge(page: Any, *, submitted: bool) -> None:
@@ -463,8 +520,7 @@ def generic_login(
         if _needs_fill(user_field, secret.username):
             _guard(page, user_field, allowed, dev=dev)
             user_field.fill(secret.username)
-    _guard(page, pw_field, allowed, dev=dev)
-    pw_field.fill(secret.password)
+    pw_field = _fill_password(page, pw_field, secret, allowed, dev=dev)
     _guard(page, pw_field, allowed, dev=dev)
     pw_field.press("Enter")
 

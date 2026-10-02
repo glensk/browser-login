@@ -148,6 +148,14 @@ the agent the portal session. Record as Albert's decision of 2026-10-01 in
 > inputs, messages/buttons with username+password masked, iframe hosts, bot check) + screenshot
 > `/var/db/login-broker-run/last-failure-<site>.png` (password fields blanked first); cooldown 30 min;
 > `sudo install/install.sh -r SITE` clears a site's limiter.
+> **2026-10-02 13:40:** report showed Kleinanzeigen's password page saying "Das ist ein Pflichtfeld"
+> (password empty at submit; in a manual repro the value stays → likely a hydration race). Fix:
+> wait 1.5 s on the password page, fill, verify `input_value()`, retry key by key, fail before
+> submit if it still drops. Then Kleinanzeigen showed **"IP-Bereich vorübergehend gesperrt"** for
+> the EPFL range (128.179.x) — triggered by 3 broker attempts + dummy test submits. Block pages
+> are now detected (`BLOCKED_TEXT_RE` → needs_human). RULE: never submit dummy credentials to a
+> production login; one real attempt per site, then read the report. Retry Kleinanzeigen only
+> after the block lifts (hours), ideally from another network.
 
 - [ ] 0.1 **Bot-defence spike, per candidate site** (ricardo, kleinanzeigen, geizhals, toppreise,
       cscs): headless Chrome for Testing as `_loginbroker` with no WindowServer, real login with

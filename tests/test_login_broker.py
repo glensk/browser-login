@@ -1685,3 +1685,61 @@ def test_item_named_like_a_domain_maps_to_the_known_site() -> None:
         "x", {"agent_fill_origins": "https://auth.tutti.ch", "agent_site": "mine"}
     )
     assert vault.site_item_from_json(explicit).site == "mine"
+
+
+class _BlockedPage:
+    """Fake page showing a fraud-protection block."""
+
+    url = "https://login.example.de/u/login/password"
+    frames: list = []
+
+    def title(self) -> str:
+        return "Anmelden"
+
+    def eval_on_selector_all(self, _sel: str, _js: str) -> list:
+        return []
+
+    body = "IP-Bereich vorübergehend gesperrt. In deinem IP-Bereich kam es ..."
+
+    def evaluate(self, _js: str) -> str:
+        return self.body
+
+    def wait_for_timeout(self, _ms: float) -> None:
+        return None
+
+
+def test_block_page_is_needs_human() -> None:
+    reason = recipes.challenge_reason(_BlockedPage())
+    assert reason and "blocked" in reason
+
+
+class _DroppyField:
+    """Password field that loses the first fill (page still hydrating)."""
+
+    def __init__(self) -> None:
+        self.value = ""
+        self.fills = 0
+
+    def fill(self, v: str) -> None:
+        self.fills += 1
+        self.value = "" if self.fills == 1 else v
+
+    def press_sequentially(self, v: str, delay: int = 0) -> None:
+        del delay
+        self.value += v
+
+    def input_value(self) -> str:
+        return self.value
+
+
+def test_fill_password_retries_when_value_is_dropped(monkeypatch) -> None:
+    field = _DroppyField()
+    page = _BlockedPage()
+    page.body = ""  # no block text: the password step itself is tested
+    monkeypatch.setattr(recipes, "_visible", lambda _p, _s: field)
+    monkeypatch.setattr(recipes, "_guard", lambda *_a, **_k: None)
+    sec = vault.Secret("u@example.com", PASSWORD, None)
+    used = recipes._fill_password(
+        page, field, sec, ["https://login.example.de"], dev=False
+    )
+    assert used is field and field.input_value() == PASSWORD
