@@ -136,6 +136,18 @@ def _site_domain(host: str) -> str:
     return ".".join(labels[-2:])
 
 
+def _known_site_for(fill_origins: list[str]) -> str | None:
+    """The built-in site whose check URL shares a site domain with `fill_origins`."""
+    domains = {
+        _site_domain(o.split("://", 1)[1].split(":", 1)[0]) for o in fill_origins
+    }
+    for known, url in DEFAULT_CHECK_URLS.items():
+        host = (urllib.parse.urlsplit(url).hostname or "").lower()
+        if _site_domain(host) in domains:
+            return known
+    return None
+
+
 def _default_cookie_hosts(fill_origins: list[str], check_url: str) -> list[str]:
     """Default cookie scope: the check page's site domain (the session usually lives
     on ``.site.tld`` / ``www.``, not on the login host) plus the fill-origin hosts,
@@ -174,6 +186,12 @@ def site_item_from_json(item: Mapping[str, Any], *, dev: bool = False) -> SiteIt
         fill_origins = parse_fill_origins(raw_origins, dev=dev)
     except ValueError as exc:
         return refused(f"bad agent_fill_origins: {exc}")
+    if not fields.get("agent_site") and site not in DEFAULT_CHECK_URLS:
+        # An item named e.g. "tutti.ch" still means the known site "tutti":
+        # match the built-in sites by the fill origins' site domain.
+        known = _known_site_for(fill_origins)
+        if known and site.startswith(known):
+            site = known
 
     names_raw = fields.get("agent_cookie_names", "").strip()
     cookie_names = _split_list(names_raw) or None

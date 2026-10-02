@@ -1674,3 +1674,14 @@ def test_install_has_reset_option() -> None:
         Path(__file__).resolve().parent.parent / "install" / "install.sh"
     ).read_text()
     assert "-r | --reset)" in script and "do_reset" in script
+
+
+def test_item_named_like_a_domain_maps_to_the_known_site() -> None:
+    raw = _item("tutti.ch", {"agent_fill_origins": "https://auth.tutti.ch"})
+    it = vault.site_item_from_json(raw)
+    assert it.site == "tutti" and not it.refused
+    assert it.check_url == recipes.DEFAULT_CHECK_URLS["tutti"]
+    explicit = _item(
+        "x", {"agent_fill_origins": "https://auth.tutti.ch", "agent_site": "mine"}
+    )
+    assert vault.site_item_from_json(explicit).site == "mine"
