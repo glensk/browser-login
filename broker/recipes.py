@@ -655,8 +655,9 @@ def cscs_login(
         raise LoginFailed("Keycloak login form not found")
     _guard(page, user, allowed, dev=dev)
     user.fill(secret.username)
-    _guard(page, pw_field, allowed, dev=dev)
-    pw_field.fill(secret.password)
+    # Same protected entry as the generic recipe: wait for the page to settle,
+    # verify the field KEPT the password, retry key by key, fail before submit.
+    pw_field = _fill_password(page, pw_field, secret, allowed, dev=dev)
     _guard(page, pw_field, allowed, dev=dev)
     click_keycloak_submit(page)
 
