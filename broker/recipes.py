@@ -377,8 +377,50 @@ def _wait_visible(page: Any, selector: str, timeout_s: float) -> Any:
     return None
 
 
-def _fill_otp(
-    page: Any, otp_field: Any, secret: Secret, allowed: list[str], *, dev: bool
+# Keycloak lists several OTP credentials as radios; labels are not secrets.
+_SELECT_OTP_JS = """(label) => {
+  const rs = [...document.querySelectorAll('input[name=selectedCredentialId]')];
+  if (rs.length < 2) return 'single';
+  const text = r => {
+    const l = document.querySelector('label[for="' + r.id + '"]');
+    return ((l && l.innerText) || (r.closest('label,div') || {}).innerText || '').trim();
+  };
+  if (!label) return 'ambiguous:' + rs.map(text).join('|');
+  const r = rs.find(x => text(x).toLowerCase().includes(label.toLowerCase()));
+  if (!r) return 'nomatch:' + rs.map(text).join('|');
+  const l = document.querySelector('label[for="' + r.id + '"]');
+  if (l) l.click();
+  r.checked = true;
+  r.dispatchEvent(new Event('change', {bubbles: true}));
+  return 'selected:' + text(r);
+}"""
+
+
+def _select_authenticator(page: Any, otp_label: str | None) -> None:
+    """Pick the item's authenticator when the account offers several."""
+    result = str(page.evaluate(_SELECT_OTP_JS, otp_label or ""))
+    if result.startswith("ambiguous:"):
+        raise NeedsHuman(
+            "the account has several authenticators ("
+            + result.split(":", 1)[1]
+            + "); set agent_otp_label on the item",
+            submitted=True,
+        )
+    if result.startswith("nomatch:"):
+        raise LoginFailed(
+            f"authenticator {otp_label!r} not offered ({result.split(':', 1)[1]})",
+            submitted=True,
+        )
+
+
+def _fill_otp(  # pylint: disable=too-many-arguments
+    page: Any,
+    otp_field: Any,
+    secret: Secret,
+    allowed: list[str],
+    *,
+    dev: bool,
+    otp_label: str | None = None,
 ) -> None:
     if not secret.totp_seed:
         raise NeedsHuman("otp required but the item has no TOTP seed", submitted=True)
@@ -388,6 +430,7 @@ def _fill_otp(
     otp_field = _visible(page, OTP_SELECTOR)  # re-query: the wait may have taken s
     if otp_field is None:
         raise LoginFailed("the OTP field disappeared", submitted=True)
+    _select_authenticator(page, otp_label)
     try:
         _guard(page, otp_field, allowed, dev=dev)
     except OriginViolation as exc:
@@ -531,7 +574,9 @@ def generic_login(
         _check_challenge(page, submitted=True)
         otp_field = None if otp_done else _visible(page, OTP_SELECTOR)
         if otp_field is not None:
-            _fill_otp(page, otp_field, secret, allowed, dev=dev)
+            _fill_otp(
+                page, otp_field, secret, allowed, dev=dev, otp_label=item.otp_label
+            )
             otp_done = True
             continue
         if _left_login(page, item, dev=dev):
@@ -625,7 +670,9 @@ def cscs_login(
         if not otp_done:
             otp_field = _visible(page, OTP_SELECTOR)
             if otp_field is not None:
-                _fill_otp(page, otp_field, secret, allowed, dev=dev)
+                _fill_otp(
+                    page, otp_field, secret, allowed, dev=dev, otp_label=item.otp_label
+                )
                 otp_done = True
     raise LoginFailed("login did not reach the CSCS portal", submitted=True)
 

@@ -64,6 +64,9 @@ class SiteItem:  # pylint: disable=too-many-instance-attributes
     login_url: str = ""
     check_url: str = ""
     logged_in_selector: str | None = None
+    # Which authenticator to answer when the account has several (Keycloak's
+    # "selectedCredentialId" choice): a substring of its label, e.g. "Mac m1".
+    otp_label: str | None = None
     refused: str | None = None
     item_id: str = ""
 
@@ -240,6 +243,7 @@ def site_item_from_json(item: Mapping[str, Any], *, dev: bool = False) -> SiteIt
         login_url=login_url,
         check_url=check_url,
         logged_in_selector=sentinel,
+        otp_label=fields.get("agent_otp_label", "").strip() or None,
         site=site,
         name=name,
         item_id=item_id,

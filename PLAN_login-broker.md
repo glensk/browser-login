@@ -240,9 +240,15 @@ the agent the portal session. Record as Albert's decision of 2026-10-01 in
 - [ ] 3.3 Remove uid-501 credential paths: delete `_op_creds` and the keychain read in
       `_cscs_creds`, `cscs-store-creds`/`store-creds` print a pointer to Bitwarden; delete any
       remaining keychain items; test asserts no credential-reading path remains for broker sites.
-- [ ] 3.4 Albert: rotate the CSCS password and re-enrol TOTP at CSCS, then put the item (with
+- [x] 3.4 Albert: rotate the CSCS password and re-enrol TOTP at CSCS, then put the item (with
       `agent_fill_origins`) into `agent-logins`. Same for any site whose password ever sat in a
       uid-501 store.
+      **Done 2026-10-02:** password changed, new authenticator "Mac m1" (seed in the Vaultwarden
+      item), item in `agent-login` (username `aglensk`, `agent_fill_origins` =
+      https://auth.cscs.ch). The old authenticator "work" cannot be deleted (CSCS console 500;
+      Service Desk ticket), so the CSCS login page offers TWO authenticators → new item field
+      `agent_otp_label` (= `Mac m1`) makes the broker pick the right one; without it the broker
+      stops with needs_human instead of guessing. Recorded in credplane R0.3 and tp#97.
 
 ### Phase 4 — close out
 

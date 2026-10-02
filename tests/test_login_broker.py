@@ -1743,3 +1743,34 @@ def test_fill_password_retries_when_value_is_dropped(monkeypatch) -> None:
         page, field, sec, ["https://login.example.de"], dev=False
     )
     assert used is field and field.input_value() == PASSWORD
+
+
+class _OtpChoicePage:
+    """Fake page answering the authenticator-selection script."""
+
+    def __init__(self, answer: str) -> None:
+        self.answer = answer
+        self.asked: list[str] = []
+
+    def evaluate(self, _js: str, label: str = "") -> str:
+        self.asked.append(label)
+        return self.answer
+
+
+def test_select_authenticator_rules() -> None:
+    recipes._select_authenticator(_OtpChoicePage("single"), None)
+    page = _OtpChoicePage("selected:Mac m1")
+    recipes._select_authenticator(page, "Mac m1")
+    assert page.asked == ["Mac m1"]
+    with pytest.raises(recipes.NeedsHuman):
+        recipes._select_authenticator(_OtpChoicePage("ambiguous:work|Mac m1"), None)
+    with pytest.raises(recipes.LoginFailed):
+        recipes._select_authenticator(_OtpChoicePage("nomatch:work|Mac m1"), "phone")
+
+
+def test_item_reads_agent_otp_label() -> None:
+    raw = _item(
+        "cscs",
+        {"agent_fill_origins": "https://auth.cscs.ch", "agent_otp_label": "Mac m1"},
+    )
+    assert vault.site_item_from_json(raw).otp_label == "Mac m1"
