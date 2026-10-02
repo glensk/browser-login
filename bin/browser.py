@@ -6545,6 +6545,7 @@ def _print_broker_diag(diag: object) -> None:
         ("buttons", "buttons"),
         ("frames", "frames"),
         ("screenshot", "screenshot"),
+        ("before_check", "page before the final check"),
     ):
         value = diag.get(key)
         if value:

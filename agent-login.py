@@ -52,7 +52,6 @@ TARGETS = (
     Target(
         "kleinanzeigen", "Kleinanzeigen", "https://login.kleinanzeigen.de", "two-step"
     ),
-    Target("toppreise", "Toppreise", "https://www.toppreise.ch", "one-page"),
     Target(
         "anibis",
         "anibis",

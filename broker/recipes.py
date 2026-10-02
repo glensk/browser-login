@@ -480,6 +480,11 @@ def generic_login(
             continue
         if _left_login(page, item, dev=dev):
             return
+    # Still on the login after the password: wrong password, an e-mail code, a
+    # captcha... Fail HERE so the failure report shows this page.
+    raise LoginFailed(
+        "still on the login page after submitting the password", submitted=True
+    )
 
 
 def _left_login(page: Any, item: SiteItem, *, dev: bool) -> bool:

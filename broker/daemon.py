@@ -202,9 +202,15 @@ class PlaywrightRunner:
                     except RecipeError:
                         self._record_failure(page, item, secret)
                         raise
+                    # Snapshot where the recipe ended — the check below navigates away.
+                    try:
+                        before = diagnose(page, secret)
+                    except Exception:  # pylint: disable=broad-exception-caught
+                        before = {}
                     # Positive proof after EVERY login, whatever the recipe saw.
                     if not self._profile_logged_in(page, item):
                         self._record_failure(page, item, secret)
+                        self.last_diag[item.site]["before_check"] = before
                         raise LoginFailed(
                             "login did not reach a logged-in state "
                             "(check URL / sentinel)",
