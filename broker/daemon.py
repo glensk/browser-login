@@ -51,6 +51,7 @@ from broker.recipes import (  # noqa: E402
     LoginFailed,
     RecipeError,
     check_logged_in,
+    diagnose,
     recipe_for,
 )
 from broker.vault import (  # noqa: E402
@@ -80,6 +81,9 @@ CHROME_UA = os.environ.get(
     "(KHTML, like Gecko) Chrome/141.0.0.0 Safari/537.36",
 )
 CHROME_ARGS = ["--use-mock-keychain", "--disable-blink-features=AutomationControlled"]
+_BLANK_PASSWORDS_JS = (
+    "() => document.querySelectorAll('input[type=password]').forEach(i => i.value = '')"
+)
 _STORAGE_JS = "keys => Object.fromEntries(keys.map(k => [k, localStorage.getItem(k)]))"
 
 # A login runner: (item, get_secret) -> bundle. Raises RecipeError on failure.
@@ -94,10 +98,16 @@ Runner = Callable[[SiteItem, Callable[[], Secret]], dict[str, Any]]
 class PlaywrightRunner:
     """Own headless Chromium per site: persistent profile, sandbox on, pipe CDP."""
 
-    def __init__(self, home: Path, *, dev: bool = False) -> None:
+    def __init__(
+        self, home: Path, *, dev: bool = False, diag_dir: Path | None = None
+    ) -> None:
         self.home = home
         self.dev = dev
         self.channel_fallback = False  # set when dev fell back to the default build
+        # Failure screenshots go where the agent user may read them (the socket
+        # dir); the broker home stays closed.
+        self.diag_dir = diag_dir or (home if dev else Path(DEFAULT_SOCKET).parent)
+        self.last_diag: dict[str, dict[str, Any]] = {}
 
     def profile_dir(self, site: str) -> Path:
         """The broker's own profile for `site`."""
@@ -127,6 +137,22 @@ class PlaywrightRunner:
             return check_logged_in(page, item, dev=self.dev, wait_s=5.0)
         except Exception:  # pylint: disable=broad-exception-caught
             return False
+
+    def _record_failure(self, page: Any, item: SiteItem, secret: Secret) -> None:
+        """Secret-free failure report + screenshot (password fields emptied first)."""
+        try:
+            diag = diagnose(page, secret)
+        except Exception:  # pylint: disable=broad-exception-caught
+            diag = {"error": "page could not be inspected"}
+        try:
+            page.evaluate(_BLANK_PASSWORDS_JS)
+            shot = self.diag_dir / f"last-failure-{item.site}.png"
+            page.screenshot(path=str(shot), full_page=False)
+            os.chmod(shot, 0o644)
+            diag["screenshot"] = str(shot)
+        except Exception:  # pylint: disable=broad-exception-caught
+            pass
+        self.last_diag[item.site] = diag
 
     def export_bundle(self, ctx: Any, item: SiteItem, via: str) -> dict[str, Any]:
         """Allowlisted cookies + named localStorage keys of the listed origins."""
@@ -171,9 +197,14 @@ class PlaywrightRunner:
                     via = "profile"
                 else:
                     secret = get_secret()
-                    recipe_for(item.site)(page, item, secret, dev=self.dev)
+                    try:
+                        recipe_for(item.site)(page, item, secret, dev=self.dev)
+                    except RecipeError:
+                        self._record_failure(page, item, secret)
+                        raise
                     # Positive proof after EVERY login, whatever the recipe saw.
                     if not self._profile_logged_in(page, item):
+                        self._record_failure(page, item, secret)
                         raise LoginFailed(
                             "login did not reach a logged-in state "
                             "(check URL / sentinel)",
@@ -366,7 +397,8 @@ class Broker:  # pylint: disable=too-many-instance-attributes  # deps + 4 locks/
             bundle = self.runner(item, get_secret)
         except RecipeError as exc:
             outcome = "unknown" if exc.submitted else "failed"
-            return _err(exc.code, exc.detail)
+            diag = getattr(self.runner, "last_diag", {}).pop(site, None)
+            return {**_err(exc.code, exc.detail), **({"diag": diag} if diag else {})}
         except VaultError as exc:
             outcome = "failed"
             return _err("vault_error", str(exc))
@@ -509,6 +541,9 @@ def main(argv: list[str] | None = None) -> int:
             print("❌ --reset needs root (or --dev)", file=sys.stderr)
             return 2
         limiter.reset(args.reset.strip().lower())
+        if os.geteuid() == 0:  # root rewrote the file: hand it back to the broker
+            owner = home.stat()
+            os.chown(limiter.state_path, owner.st_uid, owner.st_gid)
         print(f"✓ limiter reset for {args.reset}")
         return 0
     if not args.dev and os.geteuid() == args.allow_uid:

@@ -114,7 +114,7 @@ the agent the portal session. Record as Albert's decision of 2026-10-01 in
 > E2E tests against a local login page). Nothing is installed yet. Deviations from the text below:
 > socket dir `/var/db/login-broker-run`; install.sh runs as root only system binaries plus pinned,
 > sha256-checked downloads (uv 0.12.18, bw 2026.9.0 native arm64), installs only a clean tree whose
-> HEAD is on origin/main (`git archive`), logs commit + diffstat; limiter = 12 h cooldown after a
+> HEAD is on origin/main (`git archive`), logs commit + diffstat; limiter = 30 min cooldown (was 12 h) after a
 > post-submit failure, hard block (root reset) after 3 in a row.
 > **2026-10-02 (positive proof, two-step):** success needs a visible sentinel OR, on the item's
 > check URL (`agent_check_url`, else `DEFAULT_CHECK_URLS` in `broker/recipes.py`: kleinanzeigen,
@@ -143,6 +143,11 @@ the agent the portal session. Record as Albert's decision of 2026-10-01 in
 > `./agent-login.py -t kleinanzeigen` / `-t anibis` and verify on the account page (open
 > `https://www.kleinanzeigen.de/m-meine-anzeigen.html` in the shared browser — must NOT land on
 > `login.kleinanzeigen.de`). Shared Chromium runs headless.
+> **2026-10-02 12:30:** fix installed; `-t kleinanzeigen` now FAILS honestly (no false success),
+> cause unknown → added a secret-free failure report (`diag`: URL w/o query, title, visible
+> inputs, messages/buttons with username+password masked, iframe hosts, bot check) + screenshot
+> `/var/db/login-broker-run/last-failure-<site>.png` (password fields blanked first); cooldown 30 min;
+> `sudo install/install.sh -r SITE` clears a site's limiter.
 
 - [ ] 0.1 **Bot-defence spike, per candidate site** (ricardo, kleinanzeigen, geizhals, toppreise,
       cscs): headless Chrome for Testing as `_loginbroker` with no WindowServer, real login with

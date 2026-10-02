@@ -396,7 +396,7 @@ def test_limiter_cooldown_from_env(tmp_path, monkeypatch):
     lim.record_attempt("s", 0.0, "unknown")
     assert not lim.check("s", 100.0)[0] and lim.check("s", 121.0)[0]
     monkeypatch.setenv("LOGIN_BROKER_COOLDOWN_S", "nonsense")
-    assert _limiter(tmp_path / "x.json").cooldown_s == 12 * 3600
+    assert _limiter(tmp_path / "x.json").cooldown_s == 30 * 60
 
 
 def test_limiter_hourly_and_daily_caps(tmp_path):
@@ -1569,6 +1569,11 @@ def test_e2e_vanished_password_page_is_not_success(sockdir, tmp_path):
             resp = json.loads(_ask(path, {"op": "login", "site": "vanish"}))
     assert resp["ok"] is False and resp["error"] == "login_failed", resp
     assert "check URL" in resp["detail"] and "bundle" not in resp
+    # The failure report says where it stopped, never the secrets.
+    diag = resp.get("diag") or {}
+    assert diag.get("url", "").startswith(login), diag
+    assert PASSWORD not in json.dumps(diag)
+    assert Path(diag["screenshot"]).is_file()
 
 
 def test_install_role_account_uid_range_and_remnant_check() -> None:
@@ -1618,3 +1623,54 @@ def test_install_cleanliness_ignores_untracked_files() -> None:
         Path(__file__).resolve().parent.parent / "install" / "install.sh"
     ).read_text()
     assert "status --porcelain --untracked-files=no" in script
+
+
+class _DiagPage:
+    """Fake page for recipes.diagnose: echoes the username/password in its texts."""
+
+    url = "https://login.example.ch/u/login/password?state=SECRETSTATE#x"
+
+    def title(self) -> str:
+        return f"Hello {USERNAME_FOR_DIAG}"
+
+    def evaluate(self, _js: str) -> dict:
+        return {
+            "messages": [f"Wrong password {PASSWORD} for {USERNAME_FOR_DIAG}"],
+            "buttons": ["Continue"],
+            "inputs": ["email:username", "password:password"],
+            "frames": ["challenges.cloudflare.com"],
+        }
+
+    frames: list = []
+
+    def query_selector_all(self, _sel: str) -> list:
+        return []
+
+    def eval_on_selector_all(self, _sel: str, _js: str) -> list:
+        return []
+
+
+USERNAME_FOR_DIAG = "albert@example.ch"
+
+
+def test_diagnose_masks_secrets_and_query() -> None:
+    sec = vault.Secret(USERNAME_FOR_DIAG, PASSWORD, None)
+    diag = recipes.diagnose(_DiagPage(), sec)
+    flat = json.dumps(diag)
+    assert PASSWORD not in flat and USERNAME_FOR_DIAG not in flat
+    assert "SECRETSTATE" not in flat
+    assert diag["url"] == "https://login.example.ch/u/login/password"
+    assert diag["messages"] == ["Wrong password *** for ***"]
+    assert diag["inputs"] == ["email:username", "password:password"]
+
+
+def test_default_cooldown_is_30_minutes(monkeypatch) -> None:
+    monkeypatch.delenv("LOGIN_BROKER_COOLDOWN_S", raising=False)
+    assert limiter.default_cooldown_s() == 30 * 60
+
+
+def test_install_has_reset_option() -> None:
+    script = (
+        Path(__file__).resolve().parent.parent / "install" / "install.sh"
+    ).read_text()
+    assert "-r | --reset)" in script and "do_reset" in script

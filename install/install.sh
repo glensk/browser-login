@@ -53,10 +53,11 @@ REPO_DIR="$(cd "$(/usr/bin/dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 DRY=0
 PURGE=0
 MODE="install"
+RESET_SITE=""
 
 usage() {
 	/bin/cat <<'EOF'
-Usage: sudo install/install.sh [-n] [-U [-P]] [-e] [-h]
+Usage: sudo install/install.sh [-n] [-U [-P]] [-e] [-r SITE] [-h]
 
 Install (default), update, uninstall or enrol the login broker LaunchDaemon.
 Refuses unless the repo is clean and HEAD is contained in origin/main; installs
@@ -72,12 +73,15 @@ Options:
   -e, --enroll-bootstrap  prompt (hidden) for the broker's Bitwarden API key,
                           master password and collection id; write
                           /var/db/login-broker/bootstrap.json (0600 _loginbroker)
+  -r, --reset SITE        clear SITE's login limiter (cooldown / hard block after
+                          failed logins); runs the installed daemon's reset as root
   -h, --help              show this help and exit
 
 Examples:
   install/install.sh -n          # preview an install
   sudo install/install.sh        # install / update
   sudo install/install.sh -e     # one-time Bitwarden enrolment
+  sudo install/install.sh -r kleinanzeigen  # clear a site's login cooldown
   sudo install/install.sh -U     # uninstall, keep state
   sudo install/install.sh -U -P  # uninstall and purge state + role account
 EOF
@@ -119,6 +123,12 @@ while (($#)); do
 	-U | --uninstall) MODE="uninstall" ;;
 	-P | --purge) PURGE=1 ;;
 	-e | --enroll-bootstrap) MODE="enroll" ;;
+	-r | --reset)
+		MODE="reset"
+		RESET_SITE="${2:-}"
+		[[ "$RESET_SITE" =~ ^[a-z0-9][a-z0-9_-]*$ ]] || die "-r needs a site id (e.g. -r kleinanzeigen)"
+		shift
+		;;
 	*)
 		usage >&2
 		exit 2
@@ -534,8 +544,17 @@ with open(sys.argv[1], "w", encoding="utf-8") as fh:
 	echo "✓ wrote ${HOME_DIR}/bootstrap.json (0600 ${ROLE})"
 }
 
+# do_reset — clear one site's limiter state with the INSTALLED code (root-owned).
+do_reset() {
+	local py="${LIBEXEC}/current/venv/bin/python"
+	[[ -x "$py" ]] || die "install the broker first (no ${py})"
+	run "$py" "${LIBEXEC}/current/broker/daemon.py" -H "$HOME_DIR" -r "$RESET_SITE"
+	audit "limiter reset for ${RESET_SITE}"
+}
+
 case "$MODE" in
 install) do_install ;;
 uninstall) do_uninstall ;;
 enroll) do_enroll ;;
+reset) do_reset ;;
 esac

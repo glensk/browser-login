@@ -7,7 +7,7 @@ re-export from a still-logged-in broker profile is not one. Outcomes:
 * ``failed`` — gave up BEFORE the secret was submitted; counted against the
   interval and caps only;
 * ``unknown`` — any failure AFTER the secret was submitted (wrong password,
-  timeout, crash). It starts a COOLDOWN (default 12 h,
+  timeout, crash). It starts a COOLDOWN (default 30 min,
   ``LOGIN_BROKER_COOLDOWN_S``) after which one attempt is allowed again; the
   ``max_consecutive``-th (default 3) such failure in a row HARD-BLOCKS the site
   until ``reset(site)``, which only the root / ``--dev`` CLI (``daemon.py -r
@@ -31,12 +31,12 @@ from typing import Any
 OUTCOMES = frozenset({"ok", "failed", "unknown"})
 HOUR_S = 3600.0
 DAY_S = 86400.0
-DEFAULT_COOLDOWN_S = 12 * HOUR_S
+DEFAULT_COOLDOWN_S = 30 * 60
 DEFAULT_MAX_CONSECUTIVE = 3
 
 
 def default_cooldown_s() -> float:
-    """``$LOGIN_BROKER_COOLDOWN_S`` (seconds, > 0) or 12 h."""
+    """``$LOGIN_BROKER_COOLDOWN_S`` (seconds, > 0) or 30 min."""
     try:
         value = float(os.environ.get("LOGIN_BROKER_COOLDOWN_S", ""))
     except ValueError:

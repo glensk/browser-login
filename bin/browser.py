@@ -6533,6 +6533,25 @@ def _broker_socket() -> str:
     return os.environ.get("LOGIN_BROKER_SOCKET") or BROKER_SOCKET_DEFAULT
 
 
+def _print_broker_diag(diag: object) -> None:
+    """Print the broker's secret-free failure report (where the login stopped)."""
+    if not isinstance(diag, dict):
+        return
+    print("  broker stopped at:", diag.get("url", "?"), f"— {diag.get('title', '')!r}")
+    for key, label in (
+        ("challenge", "bot check"),
+        ("messages", "page says"),
+        ("inputs", "visible fields"),
+        ("buttons", "buttons"),
+        ("frames", "frames"),
+        ("screenshot", "screenshot"),
+    ):
+        value = diag.get(key)
+        if value:
+            shown = "; ".join(map(str, value)) if isinstance(value, list) else value
+            print(f"  {label}: {shown}")
+
+
 def _broker_request(op: str, *, timeout: float = BROKER_TIMEOUT_S, **kw: Any) -> dict:
     """One JSON request over the broker's Unix socket; the decoded reply.
 
@@ -6836,6 +6855,7 @@ def _broker_login(port: int, site: str) -> int:  # pylint: disable=too-many-retu
                 code = str(resp.get("error"))
                 detail = str(resp.get("detail") or "")
                 msg = f"{site}: {BROKER_ERRORS.get(code, code)}"
+                _print_broker_diag(resp.get("diag"))
                 return _broker_fail(
                     4 if code == "needs_human" else 2,
                     msg + (f" ({detail})" if detail else ""),
