@@ -3,14 +3,22 @@
 
 Without arguments: a health line for the broker, the logins agents can use right now,
 and the full list of logins we want to make work, each with its status and what is
-missing. Read-only: it asks the broker for its site list (never a secret) and logs into
-nothing unless you pass -t.
+missing. Read-only: it asks the broker for its site list (never a secret), reads the
+names and expiry dates (never values) of Safari's cookies, and logs into nothing unless
+you pass -t or -c.
+
+The marketplace sites (anibis, tutti, Ricardo, Kleinanzeigen) run on YOUR Safari
+session: you log in in Safari, `browser.py login SITE` copies that site's session
+cookies into the shared Chromium (Kleinanzeigen falls back to the broker).
 
 Examples:
   ./agent-login.py              # overview
-  ./agent-login.py -t kleinanzeigen   # real test: broker logs in, session lands in the
-                                      # shared Chromium, then the logged-in check
-  ./agent-login.py -m anibis    # guided manual login (sites with an 'are you human' box)
+  ./agent-login.py -t anibis    # real test: `browser.py login` (Safari session first,
+                                # then the broker), then the positive logged-in check
+  ./agent-login.py -c           # every usable site: logged in? if not, log in
+  ./agent-login.py -c -m        # the same, and mail Albert when a site stays logged out
+  ./agent-login.py -g anibis    # guided login typed by hand in the shared Chromium
+  ./agent-login.py -P           # print the daily LaunchAgent (-I installs, -U removes)
   ./agent-login.py -j           # the same overview as JSON
 """
 
@@ -19,6 +27,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import shutil
 import socket
 import subprocess
 import sys
@@ -27,8 +36,11 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))  # the repo's `broker` package
-# pylint: disable-next=wrong-import-position
+# pylint: disable=wrong-import-position
+from broker import safari_cookies  # noqa: E402
 from broker.recipes import DEFAULT_CHECK_URLS  # noqa: E402
+
+# pylint: enable=wrong-import-position
 
 SOCKET = os.environ.get("LOGIN_BROKER_SOCKET", "/var/db/login-broker-run/broker.sock")
 CODE_DIR = Path("/usr/local/libexec/login-broker/current")
@@ -37,6 +49,13 @@ VAULT_URL = "https://vaultwarden.dom42.space"
 
 # Login flows the broker's recipes can drive today.
 SUPPORTED_FLOWS = {"one-page", "two-step", "cscs"}
+# Albert's Safari session, copied by `browser.py login` (broker/safari_cookies.py).
+SAFARI_FLOW = "safari"
+MAIL_TO = "albert.glensk@gmail.com"
+LAUNCH_LABEL = "com.albert.agent-login-check"
+LAUNCH_PLIST = Path.home() / "Library" / "LaunchAgents" / f"{LAUNCH_LABEL}.plist"
+LAUNCH_LOG = Path.home() / "Library" / "Logs" / f"{LAUNCH_LABEL}.log"
+LAUNCH_HOUR, LAUNCH_MINUTE = 9, 15
 
 
 @dataclass(frozen=True)
@@ -46,35 +65,31 @@ class Target:
     site: str  # broker site id (agent_site field, else the item name as a slug)
     name: str
     fill_origin: str  # value for the item's agent_fill_origins field ("" = unknown yet)
-    flow: str  # one-page | two-step | cscs | manual | unknown
+    flow: str  # one-page | two-step | cscs | safari | manual | unknown
     note: str = ""
+    fallback: str = ""  # broker flow tried when the Safari session does not work
 
+
+_SAFARI_NOTE = "log in in Safari now and then; agents copy that session"
 
 TARGETS = (
     Target(
-        "kleinanzeigen", "Kleinanzeigen", "https://login.kleinanzeigen.de", "two-step"
+        "kleinanzeigen",
+        "Kleinanzeigen",
+        "https://login.kleinanzeigen.de",
+        SAFARI_FLOW,
+        _SAFARI_NOTE + " (broker logs in when Safari has none)",
+        fallback="two-step",
     ),
-    Target(
-        "anibis",
-        "anibis",
-        "https://auth.anibis.ch",
-        "manual",
-        "Cloudflare 'are you human' box at login: log in by hand now and then (-m)",
-    ),
+    Target("anibis", "anibis", "https://auth.anibis.ch", SAFARI_FLOW, _SAFARI_NOTE),
     Target(
         "ricardo",
         "Ricardo",
         "https://login.ricardo.ch",
-        "manual",
-        "Cloudflare 'are you human' box at login: log in by hand now and then (-m)",
+        SAFARI_FLOW,
+        "Cloudflare blocks automated browsers: agents work in your Safari directly",
     ),
-    Target(
-        "tutti",
-        "tutti",
-        "https://auth.tutti.ch",
-        "manual",
-        "Cloudflare 'are you human' box at login: log in by hand now and then (-m)",
-    ),
+    Target("tutti", "tutti", "https://auth.tutti.ch", SAFARI_FLOW, _SAFARI_NOTE),
     Target("geizhals", "geizhals", "", "unknown", "login address not known yet"),
     Target(
         "cscs",
@@ -88,6 +103,7 @@ TARGETS = (
 # status -> (icon, label); order = how the overview sorts
 STATUS = {
     "ready": ("✅", "ready"),
+    "safari": ("🧭", "via your Safari session"),
     "manual": ("👤", "agents use YOUR session"),
     "needs-flow": ("🛠 ", "broker can't do this login yet"),
     "refused": ("⚠️ ", "in Bitwarden but refused"),
@@ -154,8 +170,21 @@ def classify(
     entry = listed.get(target.site)
     if entry is None:
         return "missing", f"add agent_fill_origins = {target.fill_origin}"
-    if entry.get("refused"):
-        return "refused", str(entry.get("reason") or entry.get("refused"))
+    return _classify_listed(target, entry)
+
+
+def _classify_listed(target: Target, entry: dict) -> tuple[str, str]:
+    """`classify` for a target the broker lists."""
+    refused = entry.get("refused")
+    reason = str(entry.get("reason") or refused)
+    if target.flow == SAFARI_FLOW:
+        # Listed at all = Albert's consent for the Safari import; a refused item
+        # only rules out the broker fallback.
+        if refused:
+            return "safari", f"{target.note}; broker item refused: {reason}"
+        return "safari", target.note
+    if refused:
+        return "refused", reason
     if target.flow == "manual":
         status = "manual"
     else:
@@ -163,18 +192,62 @@ def classify(
     return status, target.note
 
 
+def safari_sessions(sites: list[str]) -> dict[str, dict]:
+    """Per site: does Safari hold usable cookies, and until when (names/expiry only).
+
+    ``{"safari": True/False/None, "safari_cookies": n, "safari_expires": "YYYY-MM-DD"
+    or None, "safari_error": ""}`` — ``None`` when Safari's cookie file is unreadable.
+    """
+    try:
+        jar = safari_cookies.read_binarycookies()
+    except (OSError, ValueError) as exc:
+        err = str(getattr(exc, "strerror", None) or exc)
+        return {
+            s: {
+                "safari": None,
+                "safari_cookies": 0,
+                "safari_expires": None,
+                "safari_error": err,
+            }
+            for s in sites
+        }
+    out = {}
+    for site in sites:
+        picked = safari_cookies.site_cookies(jar, site)
+        names = safari_cookies.SAFARI_SITES[site].session_cookies
+        if names:  # only the cookies that ARE the login count
+            picked = [c for c in picked if c.name in names]
+        latest = max((c.expires for c in picked), default=None)
+        out[site] = {
+            "safari": bool(picked),
+            "safari_cookies": len(picked),
+            "safari_expires": (
+                time.strftime("%Y-%m-%d", time.localtime(latest)) if latest else None
+            ),
+            "safari_error": "",
+        }
+    return out
+
+
 def overview() -> dict:
     """Everything the report shows, as data."""
     health, sites = broker_state()
     readable = health.startswith("running, Bitwarden")
     listed = {str(s.get("site")): s for s in sites}
+    safari = safari_sessions([t.site for t in TARGETS if t.flow == SAFARI_FLOW])
     rows = []
     for t in TARGETS:
         status, detail = classify(t, listed, readable=readable)
         entry = listed.get(t.site) or {}
         check = str(entry.get("check_url") or DEFAULT_CHECK_URLS.get(t.site, ""))
         rows.append(
-            {**asdict(t), "check_url": check, "status": status, "detail": detail}
+            {
+                **asdict(t),
+                "check_url": check,
+                "status": status,
+                "detail": detail,
+                **safari.get(t.site, {}),
+            }
         )
     planned = {t.site for t in TARGETS}
     for site, entry in sorted(listed.items()):
@@ -200,6 +273,17 @@ def overview() -> dict:
     }
 
 
+def safari_cell(row: dict) -> str:
+    """The overview's Safari column: session held, and its latest expiry."""
+    if row.get("flow") != SAFARI_FLOW:
+        return ""
+    if row.get("safari") is None:
+        return "Safari: unreadable"
+    if not row.get("safari"):
+        return "Safari: no session"
+    return f"Safari: until {row.get('safari_expires')}"
+
+
 def print_overview(data: dict) -> None:
     """The human report."""
     rows = data["rows"]
@@ -212,11 +296,21 @@ def print_overview(data: dict) -> None:
     )
     print(f"  broker: {'🟢' if ok else '🔴'} {data['broker']}\n")
 
-    ready = [r for r in rows if r["status"] in ("ready", "extra")]
+    ready = [
+        r
+        for r in rows
+        if r["status"] in ("ready", "extra")
+        or (r["status"] == "safari" and r.get("safari"))
+    ]
     print(_c("1", "Agents can use now"))
     if ready:
         for r in ready:
-            print(f"  ✅ {_c('1', r['name']):<24} {r['fill_origin']}")
+            where = (
+                f"Safari session until {r['safari_expires']}"
+                if r["status"] == "safari"
+                else r["fill_origin"]
+            )
+            print(f"  ✅ {_c('1', r['name']):<24} {where}")
         print(_c("2", "     test one for real:  ./agent-login.py -t <site>"))
     else:
         print(_c("2", "  none yet"))
@@ -228,7 +322,7 @@ def print_overview(data: dict) -> None:
     for r in sorted(rows, key=lambda r: (order.index(r["status"]), r["name"].lower())):
         icon, label = STATUS[r["status"]]
         name = r["name"].ljust(width)
-        line = f"  {icon} {_c('1', name)}  {label}"
+        line = f"  {icon} {_c('1', name)}  {safari_cell(r):<24}  {label}"
         if r["detail"]:
             line += _c("2", f" — {r['detail']}")
         print(line)
@@ -240,17 +334,27 @@ def print_overview(data: dict) -> None:
         )
     )
     print(_c("2", "     field agent_fill_origins with the address shown."))
+    errors = {r.get("safari_error") for r in rows if r.get("safari_error")}
+    for err in sorted(errors):
+        print(
+            _c("2", f"  🧭 Safari's cookies unreadable ({err}) — give the terminal ")
+            + _c("2", "Full Disk Access.")
+        )
 
 
 def run_test(site: str) -> int:
-    """Real end-to-end test: broker login → session in the shared Chromium → the
+    """Real end-to-end test: `browser.py login` (Safari session first for the
+    SAFARI_SITES, else the login broker) → session in the shared Chromium → the
     client's POSITIVE check (check URL / sentinel, in a background tab).
 
     The verdict is the positive check, never the login command's exit code
     alone: a login that "succeeded" while the check page still redirects to the
     login page is reported as NOT logged in.
     """
-    print(f"▶ browser.py login {site}  (the broker logs in; you see no password)")
+    print(
+        f"▶ browser.py login {site}  (Safari session or login broker; "
+        "you see no password)"
+    )
     login_rc = subprocess.run(
         [sys.executable, str(BROWSER_PY), "login", site], check=False
     ).returncode
@@ -329,26 +433,285 @@ def manual_login(site: str) -> int:
     return 0 if ok else 2
 
 
-def main() -> int:
-    """CLI entry point."""
+def ensure_logged_in(site: str) -> tuple[bool, str]:
+    """(logged in?, how) — positive check, else `browser.py login`, then re-check."""
+    if _browser("logged-in", site, quiet=True) == 0:
+        return True, "logged in"
+    res = subprocess.run(
+        [sys.executable, str(BROWSER_PY), "login", site],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    routes = [
+        line.split("route:", 1)[1].strip()
+        for line in res.stdout.splitlines()
+        if "route:" in line
+    ]
+    if _browser("logged-in", site, quiet=True) == 0:
+        return True, f"logged in again ({routes[-1] if routes else 'browser.py login'})"
+    return False, f"NOT logged in (browser.py login exit {res.returncode})"
+
+
+def gog_bin() -> str | None:
+    """gog: $GOG_BIN, then PATH, then the Homebrew default; None when absent."""
+    for cand in (
+        os.environ.get("GOG_BIN"),
+        shutil.which("gog"),
+        "/opt/homebrew/bin/gog",
+    ):
+        if cand and Path(cand).is_file():
+            return cand
+    return None
+
+
+def failure_mail(failed: list[tuple[str, str]]) -> tuple[str, str]:
+    """(subject, body) of the one mail for sites that stay logged out."""
+    subject = f"agent-login: {len(failed)} site(s) not logged in"
+    lines = [
+        "The daily agent-login check found sites the shared Chromium is NOT "
+        "logged into, even after `browser.py login`:",
+        "",
+    ]
+    lines += [f"- {site}: {how}" for site, how in failed]
+    lines += ["", "Fix, per site:"]
+    lines += [f"- {site}: {safari_fix(site)}" for site, _how in failed]
+    return subject, "\n".join(lines) + "\n"
+
+
+def safari_fix(site: str) -> str:
+    """What Albert does when `site` is logged out."""
+    return (
+        f"open the site in Safari and log in, then run ./agent-login.py -t {site} "
+        f"(in {Path(__file__).resolve().parent})"
+    )
+
+
+def send_mail(subject: str, body: str) -> bool:
+    """Mail Albert through gog's Gmail API; False (after a message) on failure."""
+    gog = gog_bin()
+    if gog is None:
+        print("❌ gog (gogcli) not found — set GOG_BIN or install gogcli; no mail sent")
+        return False
+    res = subprocess.run(
+        [
+            gog,
+            "gmail",
+            "send",
+            "-a",
+            MAIL_TO,
+            "--to",
+            MAIL_TO,
+            "--subject",
+            subject,
+            "--body-file",
+            "-",
+            "--no-input",
+        ],
+        input=body,
+        text=True,
+        check=False,
+        capture_output=True,
+    )
+    if res.returncode != 0:
+        print(f"❌ gog gmail send failed (exit {res.returncode}): {res.stderr.strip()}")
+        return False
+    print(f"✉️  mailed {MAIL_TO}: {subject}")
+    return True
+
+
+def check_all(*, mail: bool = False) -> int:
+    """Every usable site (Safari or broker): logged in? If not, log in. One line
+    per site; exit 1 if any stays logged out (and, with `mail`, ONE mail)."""
+    data = overview()
+    failed: list[tuple[str, str]] = []
+    if not data["broker_ok"]:
+        print(f"❌ login broker: {data['broker']}")
+        failed.append(("login broker", data["broker"]))
+    for row in data["rows"]:
+        if row["status"] not in ("ready", "extra", "safari"):
+            continue
+        rule = safari_cookies.SAFARI_SITES.get(row["site"])
+        if rule is not None and not rule.auto:
+            print(f"⏭  {row['site']}: not imported unattended (see SAFARI_SITES)")
+            continue
+        ok, how = ensure_logged_in(row["site"])
+        print(f"{'✅' if ok else '❌'} {row['site']}: {how}")
+        if not ok:
+            failed.append((row["site"], how))
+    if failed and mail:
+        send_mail(*failure_mail(failed))
+    return 1 if failed else 0
+
+
+def launchagent_plist() -> str:
+    """The daily LaunchAgent (`agent-login.py -c -m` at 09:15), as text. Pure."""
+    search_path = ":".join(
+        [
+            str(Path.home() / ".local" / "bin"),
+            "/opt/homebrew/bin",
+            "/usr/local/bin",
+            "/usr/bin",
+            "/bin",
+        ]
+    )
+    return f"""<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>{LAUNCH_LABEL}</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/usr/bin/env</string>
+        <string>python3</string>
+        <string>{Path(__file__).resolve()}</string>
+        <string>-c</string>
+        <string>-m</string>
+    </array>
+    <key>StartCalendarInterval</key>
+    <dict>
+        <key>Hour</key>
+        <integer>{LAUNCH_HOUR}</integer>
+        <key>Minute</key>
+        <integer>{LAUNCH_MINUTE}</integer>
+    </dict>
+    <key>StandardOutPath</key>
+    <string>{LAUNCH_LOG}</string>
+    <key>StandardErrorPath</key>
+    <string>{LAUNCH_LOG}</string>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>{search_path}</string>
+    </dict>
+    <key>RunAtLoad</key>
+    <false/>
+</dict>
+</plist>
+"""
+
+
+def _bootout() -> None:
+    subprocess.run(
+        ["launchctl", "bootout", f"gui/{os.getuid()}/{LAUNCH_LABEL}"],
+        check=False,
+        capture_output=True,
+    )
+
+
+def install_daily() -> int:
+    """Write + (re)load the LaunchAgent."""
+    LAUNCH_PLIST.parent.mkdir(parents=True, exist_ok=True)
+    LAUNCH_PLIST.write_text(launchagent_plist(), encoding="utf-8")
+    _bootout()
+    rc = subprocess.run(
+        ["launchctl", "bootstrap", f"gui/{os.getuid()}", str(LAUNCH_PLIST)],
+        check=False,
+    ).returncode
+    if rc != 0:
+        print(f"❌ launchctl bootstrap {LAUNCH_PLIST} failed (exit {rc})")
+        return 1
+    print(
+        f"✅ installed {LAUNCH_LABEL} (daily {LAUNCH_HOUR:02d}:{LAUNCH_MINUTE:02d}, "
+        f"-c -m; log {LAUNCH_LOG})"
+    )
+    return 0
+
+
+def uninstall_daily() -> int:
+    """Unload + remove the LaunchAgent."""
+    _bootout()
+    LAUNCH_PLIST.unlink(missing_ok=True)
+    print(f"removed {LAUNCH_LABEL}")
+    return 0
+
+
+def build_parser() -> argparse.ArgumentParser:
+    """The CLI."""
     ap = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
     )
     ap.add_argument("-t", "--test", metavar="SITE", help="real login test for SITE")
     ap.add_argument(
-        "-m",
-        "--manual",
+        "-g",
+        "--guided",
         metavar="SITE",
-        help="guided manual login in the shared Chromium (sites behind a human check)",
+        help="guided login typed by hand in the shared Chromium window",
+    )
+    ap.add_argument(
+        "-c",
+        "--check-all",
+        action="store_true",
+        help="every usable site: logged in? if not, `browser.py login`; one line "
+        "per site, exit 1 if any stays logged out",
+    )
+    ap.add_argument(
+        "-m",
+        "-M",
+        "--mail",
+        action="store_true",
+        help=f"with -c: mail {MAIL_TO} (gog) when a site stays logged out",
+    )
+    ap.add_argument(
+        "-I",
+        "--install-daily",
+        action="store_true",
+        help=f"install + load the LaunchAgent {LAUNCH_LABEL} "
+        f"(`-c -m` daily {LAUNCH_HOUR:02d}:{LAUNCH_MINUTE:02d})",
+    )
+    ap.add_argument(
+        "-U",
+        "--uninstall-daily",
+        action="store_true",
+        help="unload + remove that LaunchAgent",
+    )
+    ap.add_argument(
+        "-P",
+        "--print-plist",
+        action="store_true",
+        help="print the LaunchAgent plist (writes nothing)",
     )
     ap.add_argument(
         "-j", "--json", action="store_true", help="print the overview as JSON"
     )
-    args = ap.parse_args()
+    return ap
+
+
+def launch_action(args: argparse.Namespace) -> int | None:
+    """-P / -I / -U, or None when none was asked for."""
+    if args.print_plist:
+        print(launchagent_plist(), end="")
+        return 0
+    if args.install_daily:
+        return install_daily()
+    if args.uninstall_daily:
+        return uninstall_daily()
+    return None
+
+
+def login_action(args: argparse.Namespace) -> int | None:
+    """-t / -g / -c, or None when none was asked for."""
     if args.test:
         return run_test(args.test)
-    if args.manual:
-        return manual_login(args.manual)
+    if args.guided:
+        return manual_login(args.guided)
+    if args.check_all:
+        return check_all(mail=args.mail)
+    return None
+
+
+def main() -> int:
+    """CLI entry point."""
+    ap = build_parser()
+    args = ap.parse_args()
+    if args.mail and not args.check_all:
+        ap.error("-m/--mail only works together with -c/--check-all")
+    rc = launch_action(args)
+    if rc is None:
+        rc = login_action(args)
+    if rc is not None:
+        return rc
     data = overview()
     if args.json:
         print(json.dumps(data, indent=1))

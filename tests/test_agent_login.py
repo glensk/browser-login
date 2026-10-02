@@ -21,21 +21,23 @@ GEIZHALS = next(t for t in al.TARGETS if t.site == "geizhals")
 
 
 def test_ready_when_listed_and_flow_supported() -> None:
-    listed = {"kleinanzeigen": {"site": "kleinanzeigen", "refused": False}}
-    assert al.classify(KA, listed)[0] == "ready"
+    target = al.Target("shop", "Shop", "https://login.shop.example", "two-step")
+    listed = {"shop": {"site": "shop", "refused": False}}
+    assert al.classify(target, listed)[0] == "ready"
 
 
 def test_flows() -> None:
-    """Kleinanzeigen goes through the broker; the SMG sites (anibis, tutti, Ricardo)
-    show a Cloudflare 'are you human' box to headless logins -> manual sessions."""
+    """The marketplace sites (anibis, tutti, Ricardo, Kleinanzeigen) run on Albert's
+    Safari session (Cloudflare 'are you human' box at headless logins);
+    Kleinanzeigen keeps the broker as fallback."""
     assert "two-step" in al.SUPPORTED_FLOWS
-    listed = {KA.site: {"site": KA.site, "refused": False}}
-    assert KA.flow == "two-step" and al.classify(KA, listed)[0] == "ready"
-    for target in (ANIBIS, RICARDO, TUTTI):
-        assert target.flow == "manual", target.site
+    for target in (KA, ANIBIS, RICARDO, TUTTI):
+        assert target.flow == al.SAFARI_FLOW, target.site
         listed = {target.site: {"site": target.site, "refused": False}}
-        assert al.classify(target, listed)[0] == "manual", target.site
-        assert target.site in al.MANUAL_START
+        assert al.classify(target, listed)[0] == "safari", target.site
+    for target in (ANIBIS, RICARDO, TUTTI):
+        assert target.site in al.MANUAL_START  # guided login (-g) still possible
+    assert KA.fallback == "two-step"
     assert TUTTI.fill_origin == "https://auth.tutti.ch"
 
 
@@ -49,7 +51,7 @@ def test_refused_missing_unknown_unchecked() -> None:
     listed = {
         "kleinanzeigen": {"site": "kleinanzeigen", "refused": True, "reason": "x"}
     }
-    assert al.classify(KA, listed) == ("refused", "x")
+    assert al.classify(KA, listed)[0] == "safari"  # listed = consent for Safari
     assert al.classify(KA, {})[0] == "missing"
     assert al.classify(TUTTI, {})[0] == "missing"
     assert al.classify(GEIZHALS, {})[0] == "unknown"

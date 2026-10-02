@@ -161,6 +161,16 @@ the agent the portal session. Record as Albert's decision of 2026-10-01 in
 > humain"). Decision: no captcha bypass. These sites are "manual": Albert logs in once in the shared
 > Chromium (`./agent-login.py -m anibis` shows the window, waits for the positive check, hides it
 > again); agents use that session until it expires. Broker remains for Kleinanzeigen and CSCS.
+> **2026-10-02 15:30 — PRIMARY ROUTE = Safari sessions (Albert's go).** Albert logs in in Safari
+> (Bitwarden autofill passes Cloudflare); `browser.py import-safari SITE` copies only that site's
+> cookies (minus Cloudflare/Akamai bot cookies) from Safari's `Cookies.binarycookies` into the
+> shared Chromium, gated on the site being in the Bitwarden `agent-login` collection. Verified:
+> anibis + tutti logged in. Ricardo: Cloudflare challenges the automated browser on EVERY page →
+> agents drive Albert's Safari directly (saved search "portasplit ≤ CHF 850" set that way).
+> Kleinanzeigen: Safari holds an Auth0 refresh_token — import only manually, after a careful test
+> (rotation could log Safari out). Daily check `agent-login.py -c -m` (LaunchAgent
+> `com.albert.agent-login-check`, 09:15) re-imports anibis/tutti and mails only on failure.
+> Rejected after a test: headed Chrome on Xvfb from home still gets Turnstile's interactive box.
 
 - [ ] 0.1 **Bot-defence spike, per candidate site** (ricardo, kleinanzeigen, geizhals, toppreise,
       cscs): headless Chrome for Testing as `_loginbroker` with no WindowServer, real login with

@@ -77,6 +77,12 @@ the socket). Exit codes: 0 ok, 2 not logged in, 3 broker unavailable, 4 needs a
 human.
   broker-sites      List the broker's sites (id, fill origins, status).
   logout SITE       Drop the broker profile for SITE + delete its cookies here.
+  import-safari SITE [-n]
+                    Copy SITE's session cookies from Safari (sites in
+                    SAFARI_SITES the broker lists = Albert's consent); bot-check
+                    cookies stay behind; -n lists names/expiry only. `login SITE`
+                    for such a site tries Safari first, then the broker
+                    (kleinanzeigen only). $SAFARI_COOKIES overrides the file.
   login-cscs-assisted
                     Human-only pre-broker CSCS login (keychain / 1Password).
 
@@ -132,6 +138,7 @@ from typing import Any, NamedTuple
 # and identity-provider helpers; browser.py reuses them instead of copies.
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.realpath(__file__))))
 # pylint: disable=wrong-import-position
+from broker import safari_cookies as _safari  # noqa: E402
 from broker.bundle import IDP_HOSTS as BROKER_IDP_HOSTS  # noqa: E402
 from broker.bundle import IDP_LABELS as BROKER_IDP_LABELS  # noqa: E402
 from broker.recipes import click_keycloak_submit as _click_keycloak_submit  # noqa: E402
@@ -304,6 +311,8 @@ def parse_args() -> argparse.Namespace:
             "  ./browser.py broker-sites       # sites the login broker may log into\n"
             "  ./browser.py login ricardo      # broker site: session bundle, no password\n"
             "  ./browser.py logout ricardo     # drop that session again\n"
+            "  ./browser.py import-safari -n anibis  # Safari cookies (names only)\n"
+            "  ./browser.py import-safari anibis     # reuse your Safari session\n"
             "  ./browser.py down               # quit the shared browser\n"
         ),
     )
@@ -508,6 +517,21 @@ def parse_args() -> argparse.Namespace:
         "allowlisted cookies from the shared browser.",
     )
     plo.add_argument("site", help="Broker site to log out.")
+    pis = sub.add_parser(
+        "import-safari",
+        help="Copy SITE's session cookies from Safari into the shared browser "
+        "(sites in broker/safari_cookies.SAFARI_SITES that the broker lists; "
+        "bot-check cookies never travel; values are never printed).",
+    )
+    pis.add_argument(
+        "site", help=f"Site to import ({', '.join(_safari.SAFARI_SITES)})."
+    )
+    pis.add_argument(
+        "-n",
+        "--dry-run",
+        action="store_true",
+        help="only list the cookies that would be copied (names, never values)",
+    )
     sub.add_parser(
         "login-cscs-assisted",
         help="Human-only: the pre-broker CSCS login (keychain / 1Password), "
@@ -6754,6 +6778,11 @@ def _broker_logged_in(port: int, site: str) -> int:
     entry, rc = _broker_entry_or_rc(site)
     if entry is None:
         return rc
+    return _broker_check_entry(port, site, entry)
+
+
+def _broker_check_entry(port: int, site: str, entry: dict) -> int:
+    """`_broker_logged_in` for an entry already in hand (refused ones included)."""
     check_url = str(entry.get("check_url") or "")
     if not check_url and not entry.get("logged_in_selector"):
         return _broker_fail(
@@ -6961,6 +6990,203 @@ def cmd_broker_logout(port: int, site_name: str) -> int:
     return 0
 
 
+# ---------------------------------------------------------------------------
+# Safari session import (tp#733) — reuse Albert's own Safari login
+# ---------------------------------------------------------------------------
+#
+# Albert logs into some sites in Safari (Bitwarden autofill, passes Cloudflare's
+# "are you human" box); those sessions last for months. `import-safari SITE`
+# copies ONLY that site's cookies (minus the bot-management ones, which are bound
+# to Safari's user agent / IP) into the shared browser. Two gates: the site is in
+# `broker.safari_cookies.SAFARI_SITES`, and the broker lists it (the Bitwarden
+# agent-login item, refused or not, is Albert's consent). Values never print.
+
+SAFARI_FIX = "open the site in Safari and log in, then run ./agent-login.py -t {site}"
+
+
+def _safari_entry_or_rc(site: str) -> tuple[dict | None, int]:
+    """(broker entry, 0) when `site` may be imported from Safari, else (None, rc)."""
+    if site not in _safari.SAFARI_SITES:
+        known = ", ".join(_safari.SAFARI_SITES)
+        return None, _broker_fail(
+            2, f"{site}: no Safari import for this site (known: {known})."
+        )
+    try:
+        entry = _broker_site(site)
+    except BrokerUnavailable as exc:
+        return None, _broker_fail(
+            3,
+            f"{site}: refusing the Safari import — cannot confirm the site is "
+            f"whitelisted in Bitwarden agent-login ({exc}).",
+        )
+    if entry is None:
+        return None, _broker_fail(
+            2,
+            f"{site}: not listed in Bitwarden agent-login — move its item into "
+            "that collection to allow the Safari import.",
+        )
+    return entry, 0
+
+
+def _safari_site_cookies(site: str) -> tuple[list[_safari.Cookie], int]:
+    """(`site`'s usable cookies from Safari's jar, 0), or ([], 2) after a message."""
+    try:
+        cookies = _safari.read_binarycookies()
+    except OSError as exc:
+        return [], _broker_fail(
+            2,
+            f"cannot read Safari's cookies ({exc.strerror or exc}) — the calling "
+            "terminal needs Full Disk Access.",
+        )
+    except ValueError as exc:
+        return [], _broker_fail(2, f"Safari's cookie file: {exc}")
+    return _safari.site_cookies(cookies, site), 0
+
+
+def _safari_when(ts: float) -> str:
+    """Local ``YYYY-MM-DD HH:MM`` of a unix time ('?' when out of range)."""
+    try:
+        return time.strftime("%Y-%m-%d %H:%M", time.localtime(ts))
+    except (OverflowError, OSError, ValueError):
+        return "?"
+
+
+def _safari_print_table(cookies: Sequence[_safari.Cookie]) -> None:
+    """Domain, name, expiry and flags of `cookies` — NEVER a value."""
+    rows = [("DOMAIN", "NAME", "EXPIRES", "FLAGS")]
+    for c in sorted(cookies, key=lambda c: (c.domain, c.name, c.path)):
+        flags = [f for f, on in (("secure", c.secure), ("httponly", c.http_only)) if on]
+        rows.append((c.domain, c.name, _safari_when(c.expires), ",".join(flags) or "-"))
+    w0 = max(len(r[0]) for r in rows)
+    w1 = max(len(r[1]) for r in rows)
+    w2 = max(len(r[2]) for r in rows)
+    for r in rows:
+        print(f"{r[0]:<{w0}}  {r[1]:<{w1}}  {r[2]:<{w2}}  {r[3]}")
+
+
+def _safari_replace_cookies(
+    browser, site: str, cookies: Sequence[_safari.Cookie]
+) -> int:
+    """Delete the shared browser's cookies for `site`'s domains (bot-check ones
+    stay: they are Chromium's own), add `cookies`; return how many were added."""
+    rules = _safari.SAFARI_SITES[site]
+
+    def in_scope(domain: str, name: str) -> bool:
+        return any(
+            _safari.domain_matches(domain, r) for r in rules.domains
+        ) and not _safari.denied(name, rules)
+
+    ctx = browser.contexts[0] if browser.contexts else browser.new_context()
+    for ck in ctx.cookies():
+        if in_scope(str(ck.get("domain")), str(ck.get("name"))):
+            ctx.clear_cookies(name=ck["name"], domain=ck["domain"], path=ck["path"])
+    # Defence in depth: never inject a cookie outside the site's scope.
+    picked = [c.to_playwright() for c in cookies if in_scope(c.domain, c.name)]
+    if picked:
+        ctx.add_cookies(picked)
+    return len(picked)
+
+
+def _safari_inject(port: int, site: str, cookies: Sequence[_safari.Cookie]) -> int:
+    """Copy `cookies` into the shared browser under the interaction lease."""
+    pw, browser = _connect(port)
+    try:
+        with _interaction_lease(f"import-safari {site}"):
+            n = _safari_replace_cookies(browser, site, cookies)
+    finally:
+        browser.close()
+        pw.stop()
+    print(f"Copied {n} {site} cookie(s) from Safari (values not shown).")
+    return n
+
+
+def _safari_dry_run(site: str, cookies: Sequence[_safari.Cookie]) -> int:
+    """`import-safari -n`: the table (never a value); 0 if there is anything to copy."""
+    if not cookies:
+        print(f"Safari holds no usable {site} cookies.")
+        return 2
+    _safari_print_table(cookies)
+    print(f"{len(cookies)} cookie(s) would be copied (values not shown).")
+    return 0
+
+
+def cmd_import_safari(port: int, site_name: str, *, dry_run: bool = False) -> int:
+    """Copy SITE's Safari session into the shared browser, then the positive check.
+
+    Exit 0 logged in (dry run: cookies found), 2 not logged in / not allowed /
+    nothing in Safari, 3 broker unreachable (consent cannot be confirmed).
+    """
+    site = site_name.strip().lower()
+    entry, rc = _safari_entry_or_rc(site)
+    if entry is None:
+        return rc
+    cookies, rc = _safari_site_cookies(site)
+    if rc:
+        return rc
+    if dry_run:
+        return _safari_dry_run(site, cookies)
+    if not cookies:
+        return _broker_fail(
+            2,
+            f"{site}: Safari holds no usable session — {SAFARI_FIX.format(site=site)}",
+        )
+    _safari_inject(port, site, cookies)
+    rc = _broker_check_entry(port, site, entry)
+    if rc == 0:
+        _record_login_event(site, "safari")
+        print(f"✅ {site}: logged in with your Safari session.")
+        return 0
+    return _broker_fail(
+        rc,
+        f"{site}: Safari session copied but the site is NOT logged in — "
+        + SAFARI_FIX.format(site=site),
+    )
+
+
+def _safari_logged_in(port: int, site: str) -> int:
+    """`logged-in SITE` for a Safari-import site (refused broker items included)."""
+    entry, rc = _safari_entry_or_rc(site)
+    if entry is None:
+        return rc
+    return _broker_check_entry(port, site, entry)
+
+
+def _safari_try_import(port: int, site: str, entry: dict) -> bool:
+    """Copy Safari's session for `site` (if it holds one); True once logged in."""
+    cookies, _rc = _safari_site_cookies(site)
+    if not cookies:
+        print(f"Safari holds no usable {site} session.", file=sys.stderr)
+        return False
+    print(f"▶ route: Safari session ({len(cookies)} cookie(s))")
+    _safari_inject(port, site, cookies)
+    if _broker_check_entry(port, site, entry) != 0:
+        return False
+    _record_login_event(site, "safari")
+    print(f"✅ {site}: logged in — route: Safari session")
+    return True
+
+
+def _safari_login(port: int, site: str) -> int:
+    """`login SITE` for a Safari-import site: Safari session first, then — only
+    for sites with ``broker_fallback`` and a non-refused broker item — the broker.
+    Prints the route it used."""
+    entry, rc = _safari_entry_or_rc(site)
+    if entry is None:
+        return rc
+    if _broker_check_entry(port, site, entry) == 0:
+        print(f"route: already logged in ({site})")
+        return 0
+    if _safari_try_import(port, site, entry):
+        return 0
+    if _safari.SAFARI_SITES[site].broker_fallback and not entry.get("refused"):
+        print("▶ route: login broker (fallback)")
+        rc = _broker_login(port, site)
+        if rc == 0:
+            print(f"✅ {site}: logged in — route: login broker")
+        return rc
+    return _broker_fail(2, f"{site}: not logged in — {SAFARI_FIX.format(site=site)}")
+
+
 def cmd_login_cscs_assisted(port: int) -> int:
     """The pre-broker CSCS login (keychain / 1Password) — human-only."""
     if not sys.stdin.isatty():
@@ -7099,11 +7325,17 @@ def _resolve_site(name: str, *, for_login: bool = False) -> Site:
 
 def cmd_login(port: int, site_name: str) -> int:
     """Ensure SITE is logged in (automated or assisted, per the site)."""
+    key = site_name.strip().lower()
+    if key in _safari.SAFARI_SITES:
+        return _safari_login(port, key)
     return _resolve_site(site_name, for_login=True).login(port)
 
 
 def cmd_logged_in(port: int, site_name: str) -> int:
     """Exit 0 if SITE is logged in, 2 if not."""
+    key = site_name.strip().lower()
+    if key in _safari.SAFARI_SITES:
+        return _safari_logged_in(port, key)
     return _resolve_site(site_name).logged_in(port)
 
 
@@ -7192,6 +7424,8 @@ def _dispatch(args: argparse.Namespace, port: int) -> int:
         return cmd_broker_sites()
     if args.cmd == "logout":
         return cmd_broker_logout(port, args.site)
+    if args.cmd == "import-safari":
+        return cmd_import_safari(port, args.site, dry_run=args.dry_run)
     if args.cmd == "login-cscs-assisted":
         return cmd_login_cscs_assisted(port)
     # CSCS aliases (back-compat; cscs-api.py depends on these names).

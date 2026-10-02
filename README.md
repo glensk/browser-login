@@ -373,15 +373,20 @@ the `himalaya` helpers. The CDP endpoint is always `http://127.0.0.1:<port>` (ne
 
 agent-login.py — which of Albert's logins can agents use through the login broker?
 
-Without arguments: a health line for the broker, the logins agents can use right now, and the full list of logins we want to make work, each with its status and what is missing. Read-only: it asks the broker for its site list (never a secret) and logs into nothing unless you pass -t.
+Without arguments: a health line for the broker, the logins agents can use right now, and the full list of logins we want to make work, each with its status and what is missing. Read-only: it asks the broker for its site list (never a secret), reads the names and expiry dates (never values) of Safari's cookies, and logs into nothing unless you pass -t or -c.
+
+The marketplace sites (anibis, tutti, Ricardo, Kleinanzeigen) run on YOUR Safari session: you log in in Safari, `browser.py login SITE` copies that site's session cookies into the shared Chromium (Kleinanzeigen falls back to the broker).
 
 Examples:
 
 ```bash
 ./agent-login.py              # overview
-./agent-login.py -t kleinanzeigen   # real test: broker logs in, session lands in the
-                                    # shared Chromium, then the logged-in check
-./agent-login.py -m anibis    # guided manual login (sites with an 'are you human' box)
+./agent-login.py -t anibis    # real test: `browser.py login` (Safari session first,
+                              # then the broker), then the positive logged-in check
+./agent-login.py -c           # every usable site: logged in? if not, log in
+./agent-login.py -c -m        # the same, and mail Albert when a site stays logged out
+./agent-login.py -g anibis    # guided login typed by hand in the shared Chromium
+./agent-login.py -P           # print the daily LaunchAgent (-I installs, -U removes)
 ./agent-login.py -j           # the same overview as JSON
 ```
 
@@ -390,5 +395,10 @@ Examples:
 | Flag | Description |
 |------|-------------|
 | `-t`, `--test` `SITE` | real login test for SITE |
-| `-m`, `--manual` `SITE` | guided manual login in the shared Chromium (sites behind a human check) |
+| `-g`, `--guided` `SITE` | guided login typed by hand in the shared Chromium window |
+| `-c`, `--check-all` | every usable site: logged in? if not, `browser.py login`; one line per site, exit 1 if any stays logged out |
+| `-m`, `-M`, `--mail` | with -c: mail `albert.glensk@gmail.com` (gog) when a site stays logged out |
+| `-I`, `--install-daily` | install + load the LaunchAgent com.albert.agent-login-check (`-c -m` daily 09:15) |
+| `-U`, `--uninstall-daily` | unload + remove that LaunchAgent |
+| `-P`, `--print-plist` | print the LaunchAgent plist (writes nothing) |
 | `-j`, `--json` | print the overview as JSON |
