@@ -381,6 +381,7 @@ Examples:
 ./agent-login.py              # overview
 ./agent-login.py -t kleinanzeigen   # real test: broker logs in, session lands in the
                                     # shared Chromium, then the logged-in check
+./agent-login.py -m anibis    # guided manual login (sites with an 'are you human' box)
 ./agent-login.py -j           # the same overview as JSON
 ```
 
@@ -389,4 +390,5 @@ Examples:
 | Flag | Description |
 |------|-------------|
 | `-t`, `--test` `SITE` | real login test for SITE |
+| `-m`, `--manual` `SITE` | guided manual login in the shared Chromium (sites behind a human check) |
 | `-j`, `--json` | print the overview as JSON |

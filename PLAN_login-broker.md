@@ -156,6 +156,11 @@ the agent the portal session. Record as Albert's decision of 2026-10-01 in
 > are now detected (`BLOCKED_TEXT_RE` → needs_human). RULE: never submit dummy credentials to a
 > production login; one real attempt per site, then read the report. Retry Kleinanzeigen only
 > after the block lifts (hours), ideally from another network.
+> **2026-10-02 14:00:** anibis (and by platform tutti, Ricardo — all SMG) shows Cloudflare
+> Turnstile on the login; headless it does NOT auto-clear (turns into "Vérifiez que vous êtes
+> humain"). Decision: no captcha bypass. These sites are "manual": Albert logs in once in the shared
+> Chromium (`./agent-login.py -m anibis` shows the window, waits for the positive check, hides it
+> again); agents use that session until it expires. Broker remains for Kleinanzeigen and CSCS.
 
 - [ ] 0.1 **Bot-defence spike, per candidate site** (ricardo, kleinanzeigen, geizhals, toppreise,
       cscs): headless Chrome for Testing as `_loginbroker` with no WindowServer, real login with

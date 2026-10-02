@@ -25,14 +25,18 @@ def test_ready_when_listed_and_flow_supported() -> None:
     assert al.classify(KA, listed)[0] == "ready"
 
 
-def test_two_step_flows_are_supported() -> None:
+def test_flows() -> None:
+    """Kleinanzeigen goes through the broker; the SMG sites (anibis, tutti, Ricardo)
+    show a Cloudflare 'are you human' box to headless logins -> manual sessions."""
     assert "two-step" in al.SUPPORTED_FLOWS
-    for target in (KA, ANIBIS, RICARDO, TUTTI):
-        assert target.flow == "two-step", target.site
+    listed = {KA.site: {"site": KA.site, "refused": False}}
+    assert KA.flow == "two-step" and al.classify(KA, listed)[0] == "ready"
+    for target in (ANIBIS, RICARDO, TUTTI):
+        assert target.flow == "manual", target.site
         listed = {target.site: {"site": target.site, "refused": False}}
-        assert al.classify(target, listed)[0] == "ready", target.site
-    assert "Cloudflare check" in RICARDO.note
-    assert TUTTI.fill_origin == "https://auth.tutti.ch" and TUTTI.note == ""
+        assert al.classify(target, listed)[0] == "manual", target.site
+        assert target.site in al.MANUAL_START
+    assert TUTTI.fill_origin == "https://auth.tutti.ch"
 
 
 def test_unsupported_flow_needs_flow() -> None:

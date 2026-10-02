@@ -10,6 +10,7 @@ Examples:
   ./agent-login.py              # overview
   ./agent-login.py -t kleinanzeigen   # real test: broker logs in, session lands in the
                                       # shared Chromium, then the logged-in check
+  ./agent-login.py -m anibis    # guided manual login (sites with an 'are you human' box)
   ./agent-login.py -j           # the same overview as JSON
 """
 
@@ -21,6 +22,7 @@ import os
 import socket
 import subprocess
 import sys
+import time
 from dataclasses import asdict, dataclass
 from pathlib import Path
 
@@ -44,7 +46,7 @@ class Target:
     site: str  # broker site id (agent_site field, else the item name as a slug)
     name: str
     fill_origin: str  # value for the item's agent_fill_origins field ("" = unknown yet)
-    flow: str  # one-page | two-step | cscs | unknown
+    flow: str  # one-page | two-step | cscs | manual | unknown
     note: str = ""
 
 
@@ -56,17 +58,23 @@ TARGETS = (
         "anibis",
         "anibis",
         "https://auth.anibis.ch",
-        "two-step",
-        "email and password on separate pages",
+        "manual",
+        "Cloudflare 'are you human' box at login: log in by hand now and then (-m)",
     ),
     Target(
         "ricardo",
         "Ricardo",
         "https://login.ricardo.ch",
-        "two-step",
-        "two pages + Cloudflare check",
+        "manual",
+        "Cloudflare 'are you human' box at login: log in by hand now and then (-m)",
     ),
-    Target("tutti", "tutti", "https://auth.tutti.ch", "two-step"),
+    Target(
+        "tutti",
+        "tutti",
+        "https://auth.tutti.ch",
+        "manual",
+        "Cloudflare 'are you human' box at login: log in by hand now and then (-m)",
+    ),
     Target("geizhals", "geizhals", "", "unknown", "login address not known yet"),
     Target(
         "cscs",
@@ -80,6 +88,7 @@ TARGETS = (
 # status -> (icon, label); order = how the overview sorts
 STATUS = {
     "ready": ("✅", "ready"),
+    "manual": ("👤", "agents use YOUR session"),
     "needs-flow": ("🛠 ", "broker can't do this login yet"),
     "refused": ("⚠️ ", "in Bitwarden but refused"),
     "missing": ("➕", "not in Bitwarden agent-login yet"),
@@ -147,9 +156,11 @@ def classify(
         return "missing", f"add agent_fill_origins = {target.fill_origin}"
     if entry.get("refused"):
         return "refused", str(entry.get("reason") or entry.get("refused"))
-    if target.flow not in SUPPORTED_FLOWS:
-        return "needs-flow", target.note
-    return "ready", target.note
+    if target.flow == "manual":
+        status = "manual"
+    else:
+        status = "ready" if target.flow in SUPPORTED_FLOWS else "needs-flow"
+    return status, target.note
 
 
 def overview() -> dict:
@@ -258,6 +269,66 @@ def run_test(site: str) -> int:
     return rc or login_rc
 
 
+# Where a manual login starts (logged out, each redirects to its login page).
+MANUAL_START = {
+    "anibis": "https://www.anibis.ch/fr/user/searches",
+    "tutti": "https://www.tutti.ch/de/myads/active",
+    "ricardo": "https://www.ricardo.ch/de/my-ricardo/saved/articles/",
+}
+MANUAL_WAIT_S = 15 * 60
+
+
+def _browser(*args: str, quiet: bool = False) -> int:
+    """Run bin/browser.py with `args`; its exit code."""
+    out = subprocess.DEVNULL if quiet else None
+    return subprocess.run(
+        [sys.executable, str(BROWSER_PY), *args], check=False, stdout=out, stderr=out
+    ).returncode
+
+
+def manual_login(site: str) -> int:
+    """Guided manual login in the shared Chromium for sites behind a human check.
+
+    Shows the Chromium window, opens the site's login, waits (up to 15 min) until
+    the positive check passes, then hides the window again. You type the password
+    yourself (paste it from Bitwarden) — no agent sees it; agents then use the
+    session until the site expires it.
+    """
+    start = MANUAL_START.get(site)
+    if not start:
+        print(
+            f"❌ no manual login known for {site!r} (known: {', '.join(MANUAL_START)})"
+        )
+        return 2
+    if _browser("logged-in", site, quiet=True) == 0:
+        print(f"✅ {site}: the shared Chromium is already logged in — nothing to do")
+        return 0
+    print("▶ showing the shared Chromium window …")
+    if _browser("switch", "headed") != 0:
+        return 1
+    _browser("open", start, quiet=True)
+    print(
+        f"👤 In the Chromium window: tick 'I am human' if asked, enter your e-mail,\n"
+        f"   paste the password from Bitwarden, finish the login. Waiting up to "
+        f"{MANUAL_WAIT_S // 60} min …"
+    )
+    deadline = time.monotonic() + MANUAL_WAIT_S
+    ok = False
+    while time.monotonic() < deadline:
+        time.sleep(10)
+        if _browser("logged-in", site, quiet=True) == 0:
+            ok = True
+            break
+    print("▶ hiding the Chromium window again …")
+    _browser("switch", "headless", quiet=True)
+    print(
+        f"✅ {site}: logged in — agents can use this session"
+        if ok
+        else f"❌ {site}: still not logged in after {MANUAL_WAIT_S // 60} min"
+    )
+    return 0 if ok else 2
+
+
 def main() -> int:
     """CLI entry point."""
     ap = argparse.ArgumentParser(
@@ -265,11 +336,19 @@ def main() -> int:
     )
     ap.add_argument("-t", "--test", metavar="SITE", help="real login test for SITE")
     ap.add_argument(
+        "-m",
+        "--manual",
+        metavar="SITE",
+        help="guided manual login in the shared Chromium (sites behind a human check)",
+    )
+    ap.add_argument(
         "-j", "--json", action="store_true", help="print the overview as JSON"
     )
     args = ap.parse_args()
     if args.test:
         return run_test(args.test)
+    if args.manual:
+        return manual_login(args.manual)
     data = overview()
     if args.json:
         print(json.dumps(data, indent=1))
