@@ -96,7 +96,7 @@ TARGETS = (
         "CSCS",
         "https://auth.cscs.ch",
         "cscs",
-        "first rotate the CSCS password + 2FA",
+        "broker login (password + TOTP from Bitwarden; agent_otp_label picks the authenticator)",
     ),
 )
 
