@@ -148,7 +148,9 @@ check_repo() {
 	local head dirty
 	head="$(as_user /usr/bin/git -C "$REPO_DIR" rev-parse --verify HEAD)" ||
 		die "cannot read HEAD of ${REPO_DIR}"
-	dirty="$(as_user /usr/bin/git -C "$REPO_DIR" status --porcelain)"
+	# Untracked files cannot reach the install (it is `git archive HEAD`), so
+	# only changes to tracked files block.
+	dirty="$(as_user /usr/bin/git -C "$REPO_DIR" status --porcelain --untracked-files=no)"
 	if [[ -n "$dirty" ]]; then
 		((DRY)) || die "the repo working tree is not clean — commit or stash first"
 		echo "⚠ would refuse: the repo working tree is not clean" >&2

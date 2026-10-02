@@ -1610,3 +1610,11 @@ def test_default_cookie_hosts_keep_idp_out() -> None:
     spec = bundle.SiteBundleSpec(cookie_hosts=hosts, cookie_names=None, storage_keys={})
     assert bundle.cookie_in_scope("portal.cscs.ch", "sid", spec)
     assert not bundle.cookie_in_scope("auth.cscs.ch", "KEYCLOAK_SESSION", spec)
+
+
+def test_install_cleanliness_ignores_untracked_files() -> None:
+    """The install is `git archive HEAD`; a stray untracked file must not block it."""
+    script = (
+        Path(__file__).resolve().parent.parent / "install" / "install.sh"
+    ).read_text()
+    assert "status --porcelain --untracked-files=no" in script
