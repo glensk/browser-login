@@ -1840,3 +1840,12 @@ def test_token_key_discovery_only_for_cscs(tmp_path) -> None:
         runner._with_portal_token_keys(_PortalCtx([]), item, item.bundle_spec)
         == item.bundle_spec
     )
+
+
+def test_password_fingerprint_is_short_and_stable() -> None:
+    import hashlib
+
+    fp = daemon.password_fingerprint("correct horse battery staple")
+    want = hashlib.sha256(b"correct horse battery staple").hexdigest()[:4]
+    assert fp == f"len=28 sha256:{want}"
+    assert "horse" not in fp

@@ -26,6 +26,7 @@ from __future__ import annotations
 import argparse
 import contextlib
 import dataclasses
+import hashlib
 import json
 import os
 import shutil
@@ -151,6 +152,7 @@ class PlaywrightRunner:
             diag = diagnose(page, secret)
         except Exception:  # pylint: disable=broad-exception-caught
             diag = {"error": "page could not be inspected"}
+        diag["password_check"] = password_fingerprint(secret.password)
         try:
             page.evaluate(_BLANK_PASSWORDS_JS)
             shot = self.diag_dir / f"last-failure-{item.site}.png"
@@ -289,6 +291,14 @@ class _LazyBwVault:
     def secret(self, site: str) -> Secret:
         """See ``BwVault.secret``."""
         return self._vault().secret(site)
+
+
+def password_fingerprint(password: str) -> str:
+    """``len=<n> sha256:<first 4 hex>`` — lets Albert check the broker used the SAME
+    password as his vault (``printf %s "$PW" | shasum -a 256 | cut -c1-4``)
+    without revealing it: 16 bits of a hash of a 20+-char random password."""
+    digest = hashlib.sha256(password.encode("utf-8")).hexdigest()[:4]
+    return f"len={len(password)} sha256:{digest}"
 
 
 def _err(code: str, detail: str = "") -> dict[str, Any]:

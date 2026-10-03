@@ -6568,6 +6568,7 @@ def _print_broker_diag(diag: object) -> None:
         ("inputs", "visible fields"),
         ("buttons", "buttons"),
         ("frames", "frames"),
+        ("password_check", "password used (compare with your vault copy)"),
         ("screenshot", "screenshot"),
         ("before_check", "page before the final check"),
     ):
