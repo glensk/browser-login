@@ -255,6 +255,11 @@ the agent the portal session. Record as Albert's decision of 2026-10-01 in
       not CSCS's current one, or the field lost the value (CSCS recipe now uses the same
       verified `_fill_password` as the generic one). Next: Albert confirms the item's password
       logs in by hand; reinstall; ONE retry.
+      **2026-10-03:** retry → broker login SUCCEEDED (its own check on the portal passed), but
+      the shared browser still bounced to Keycloak: the portal's Waldur token lives in
+      localStorage and was not exported (no `agent_storage_keys`). Fix: for cscs the broker adds
+      the portal localStorage key(s) whose value is a 40-hex Waldur token (key found by value
+      shape; `_with_portal_token_keys`). Needs reinstall, then `./agent-login.py -t cscs`.
 
 ### Phase 4 — close out
 

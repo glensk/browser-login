@@ -1774,3 +1774,69 @@ def test_item_reads_agent_otp_label() -> None:
         {"agent_fill_origins": "https://auth.cscs.ch", "agent_otp_label": "Mac m1"},
     )
     assert vault.site_item_from_json(raw).otp_label == "Mac m1"
+
+
+class _PortalPage:
+    """Fake portal page for the CSCS token-key discovery."""
+
+    url = "https://portal.cscs.ch/"
+
+    def __init__(self, keys: list) -> None:
+        self.keys = keys
+
+    def goto(self, *_a, **_k) -> None:
+        return None
+
+    def wait_for_timeout(self, _ms: float) -> None:
+        return None
+
+    def evaluate(self, _js: str):
+        return self.keys
+
+    def close(self) -> None:
+        return None
+
+
+class _PortalCtx:
+    def __init__(self, keys: list) -> None:
+        self.keys = keys
+
+    def new_page(self) -> _PortalPage:
+        return _PortalPage(self.keys)
+
+
+def _cscs_item() -> vault.SiteItem:
+    return vault.site_item_from_json(
+        _item("cscs", {"agent_fill_origins": "https://auth.cscs.ch"})
+    )
+
+
+def test_cscs_export_adds_the_portal_token_key(tmp_path) -> None:
+    runner = daemon.PlaywrightRunner(tmp_path, dev=False)
+    item = _cscs_item()
+    spec = runner._with_portal_token_keys(
+        _PortalCtx(["waldur/auth/token"]), item, item.bundle_spec
+    )
+    assert spec.storage_keys == {"https://portal.cscs.ch": ["waldur/auth/token"]}
+
+
+def test_token_key_discovery_only_for_cscs(tmp_path) -> None:
+    runner = daemon.PlaywrightRunner(tmp_path, dev=False)
+    other = vault.site_item_from_json(
+        _item(
+            "x",
+            {
+                "agent_fill_origins": "https://login.x.example",
+                "agent_check_url": "https://www.x.example/me",
+            },
+        )
+    )
+    assert (
+        runner._with_portal_token_keys(_PortalCtx(["k"]), other, other.bundle_spec)
+        == other.bundle_spec
+    )
+    item = _cscs_item()
+    assert (
+        runner._with_portal_token_keys(_PortalCtx([]), item, item.bundle_spec)
+        == item.bundle_spec
+    )

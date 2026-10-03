@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import dataclasses
 import json
 import os
 import shutil
@@ -43,7 +44,7 @@ if __package__ in (None, ""):  # run as a script: make `broker` importable
     sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 # pylint: disable=wrong-import-position
-from broker.bundle import filter_cookies, filter_storage  # noqa: E402
+from broker.bundle import SiteBundleSpec, filter_cookies, filter_storage  # noqa: E402
 from broker.limiter import Limiter  # noqa: E402
 from broker.origins import origin_allowed  # noqa: E402
 from broker.peercred import peer_uid  # noqa: E402
@@ -83,6 +84,12 @@ CHROME_UA = os.environ.get(
 CHROME_ARGS = ["--use-mock-keychain", "--disable-blink-features=AutomationControlled"]
 _BLANK_PASSWORDS_JS = (
     "() => document.querySelectorAll('input[type=password]').forEach(i => i.value = '')"
+)
+CSCS_PORTAL_ORIGIN = "https://portal.cscs.ch"
+# localStorage keys whose value looks like a Waldur DRF token (40 hex chars).
+_TOKEN_KEYS_JS = (
+    "() => Object.keys(localStorage).filter(k => "
+    "/^\\s*\"?[0-9a-f]{40}\"?\\s*$/.test(localStorage.getItem(k) || ''))"
 )
 _STORAGE_JS = "keys => Object.fromEntries(keys.map(k => [k, localStorage.getItem(k)]))"
 
@@ -154,9 +161,37 @@ class PlaywrightRunner:
             pass
         self.last_diag[item.site] = diag
 
+    def _with_portal_token_keys(
+        self, ctx: Any, item: SiteItem, spec: SiteBundleSpec
+    ) -> SiteBundleSpec:
+        """CSCS: add the portal's Waldur token key(s) to the export.
+
+        HomePort keeps its 40-hex DRF token in localStorage under a key its bundle
+        builds at run time, so the key is found by the VALUE's shape on the portal
+        origin (what browser.py's ``_scan_token`` reads); nothing else is added.
+        """
+        if item.site != "cscs" or CSCS_PORTAL_ORIGIN in spec.storage_keys:
+            return spec
+        page = ctx.new_page()
+        try:
+            page.goto(CSCS_PORTAL_ORIGIN + "/", wait_until="domcontentloaded")
+            page.wait_for_timeout(2000)
+            if not origin_allowed(page.url, [CSCS_PORTAL_ORIGIN], dev=self.dev):
+                return spec
+            keys = page.evaluate(_TOKEN_KEYS_JS)
+        except Exception:  # pylint: disable=broad-exception-caught
+            return spec
+        finally:
+            with contextlib.suppress(Exception):
+                page.close()
+        if not isinstance(keys, list) or not keys:
+            return spec
+        storage = {**spec.storage_keys, CSCS_PORTAL_ORIGIN: [str(k) for k in keys]}
+        return dataclasses.replace(spec, storage_keys=storage)
+
     def export_bundle(self, ctx: Any, item: SiteItem, via: str) -> dict[str, Any]:
         """Allowlisted cookies + named localStorage keys of the listed origins."""
-        spec = item.bundle_spec
+        spec = self._with_portal_token_keys(ctx, item, item.bundle_spec)
         cookies = filter_cookies(ctx.cookies(), spec)
         raw: dict[str, dict[str, Any]] = {}
         for origin, keys in spec.storage_keys.items():
