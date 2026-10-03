@@ -250,7 +250,7 @@ the agent the portal session. Record as Albert's decision of 2026-10-01 in
       `agent_otp_label` (= `Mac m1`) makes the broker pick the right one; without it the broker
       stops with needs_human instead of guessing. Recorded in credplane R0.3 and tp#97.
       Old-OTP deletion tracked in t.py (SDSC Zoho #275, linked to CSCS SD-71369, waiting until
-      12.10.26) — 2026-10-03: "work" deleted by Albert, #275 closed. First broker test 2026-10-02 19:40: CSCS answered "Invalid username or
+      12.10.26) — 2026-10-02: "work" deleted by CSCS (SD-71369), #275 closed. First broker test 2026-10-02 19:40: CSCS answered "Invalid username or
       password" (username aglensk entered correctly) → either the Vaultwarden item's password is
       not CSCS's current one, or the field lost the value (CSCS recipe now uses the same
       verified `_fill_password` as the generic one). Next: Albert confirms the item's password
