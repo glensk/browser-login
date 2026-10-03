@@ -395,6 +395,7 @@ Examples:
 | Flag | Description |
 |------|-------------|
 | `-t`, `--test` `SITE` | real login test for SITE |
+| `-f`, `--fingerprint` `SITE` | length + 4 hex of the SHA-256 of the broker's password for SITE (no login) |
 | `-g`, `--guided` `SITE` | guided login typed by hand in the shared Chromium window |
 | `-c`, `--check-all` | every usable site: logged in? if not, `browser.py login`; one line per site, exit 1 if any stays logged out |
 | `-m`, `-M`, `--mail` | with -c: mail `albert.glensk@gmail.com` (gog) when a site stays logged out |

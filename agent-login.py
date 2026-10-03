@@ -662,6 +662,12 @@ def build_parser() -> argparse.ArgumentParser:
     )
     ap.add_argument("-t", "--test", metavar="SITE", help="real login test for SITE")
     ap.add_argument(
+        "-f",
+        "--fingerprint",
+        metavar="SITE",
+        help="length + 4 hex of the SHA-256 of the broker's password for SITE (no login)",
+    )
+    ap.add_argument(
         "-g",
         "--guided",
         metavar="SITE",
@@ -722,6 +728,16 @@ def login_action(args: argparse.Namespace) -> int | None:
     """-t / -g / -c, or None when none was asked for."""
     if args.test:
         return run_test(args.test)
+    if args.fingerprint:
+        resp = broker_request("fingerprint", site=args.fingerprint)
+        if not resp.get("ok"):
+            print(f"❌ {resp.get('error')}: {resp.get('detail', '')}")
+            return 1
+        print(f"broker's {args.fingerprint} password: {resp['password_check']}")
+        print(
+            'compare: printf %s "<password from Bitwarden>" | shasum -a 256 | cut -c1-4'
+        )
+        return 0
     if args.guided:
         return manual_login(args.guided)
     if args.check_all:

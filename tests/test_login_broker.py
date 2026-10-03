@@ -1849,3 +1849,14 @@ def test_password_fingerprint_is_short_and_stable() -> None:
     want = hashlib.sha256(b"correct horse battery staple").hexdigest()[:4]
     assert fp == f"len=28 sha256:{want}"
     assert "horse" not in fp
+
+
+def test_fingerprint_op_returns_only_the_check(sockdir, tmp_path) -> None:
+    def runner(_item, _get_secret) -> dict:  # never called by this op
+        return {}
+
+    with running(sockdir, tmp_path, runner) as (_brk, path):
+        resp = json.loads(_ask(path, {"op": "fingerprint", "site": "ricardo"}))
+    assert resp["ok"] is True
+    assert resp["password_check"] == daemon.password_fingerprint(PASSWORD)
+    assert PASSWORD not in json.dumps(resp)

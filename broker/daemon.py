@@ -10,6 +10,7 @@ LOCAL_PEERCRED. One JSON request per connection, newline-terminated, at most
                                   sentinel — never secrets
   {"op": "login", "site": "X"}    -> {"ok": true, "bundle": {...}}
   {"op": "logout", "site": "X"}   delete the broker's own profile for X
+  {"op": "fingerprint", "site": "X"}  len + 4 hex of the password's SHA-256
 
 Errors: {"ok": false, "error": "needs_human" | "origin_violation" |
 "rate_limited" | "login_failed" | "unknown_site" | "refused" | "vault_error" |
@@ -369,11 +370,13 @@ class Broker:  # pylint: disable=too-many-instance-attributes  # deps + 4 locks/
                 resp = {"ok": True, "pong": True}
             elif op == "sites":
                 resp = self._sites()
-            elif op in ("login", "logout"):
+            elif op in ("login", "logout", "fingerprint"):
                 if not site or not SITE_ID_RE.match(site):
                     resp = _err("bad_request", "missing or invalid site id")
                 elif op == "login":
                     resp = self._login(site)
+                elif op == "fingerprint":
+                    resp = self._fingerprint(site)
                 else:
                     resp = self._logout(site)
             else:
@@ -389,6 +392,15 @@ class Broker:  # pylint: disable=too-many-instance-attributes  # deps + 4 locks/
         except VaultError as exc:
             return _err("vault_error", str(exc))
         return {"ok": True, "sites": [it.public() for it in items]}
+
+    def _fingerprint(self, site: str) -> dict[str, Any]:
+        """Length + 4 hex of the SHA-256 of the password the vault holds for `site`
+        — to compare with Albert's copy without a login attempt or the value."""
+        try:
+            secret = self.vault.secret(site)
+        except VaultError as exc:
+            return _err("vault_error", str(exc))
+        return {"ok": True, "password_check": password_fingerprint(secret.password)}
 
     def _logout(self, site: str) -> dict[str, Any]:
         with self._site_lock(site):
