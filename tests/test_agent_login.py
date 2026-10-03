@@ -76,3 +76,28 @@ def test_overview_rows_carry_check_url(monkeypatch) -> None:
     assert rows["extra"]["check_url"] == "https://e.example/me"
     assert rows["kleinanzeigen"]["check_url"] == al.DEFAULT_CHECK_URLS["kleinanzeigen"]
     assert rows["geizhals"]["check_url"] == ""
+
+
+def test_wait_for_network_gives_up_quietly(monkeypatch) -> None:
+    def no_dns(*_a, **_k):
+        raise OSError("no network")
+
+    monkeypatch.setattr(al.socket, "getaddrinfo", no_dns)
+    now = [0.0]
+    slept: list[float] = []
+
+    def fake_sleep(s: float) -> None:
+        slept.append(s)
+        now[0] += s
+
+    assert not al.wait_for_network(
+        "x.invalid", 60, sleep=fake_sleep, clock=lambda: now[0]
+    )
+    assert slept and sum(slept) >= 60
+
+
+def test_check_all_offline_is_quiet(monkeypatch) -> None:
+    monkeypatch.setattr(al, "wait_for_network", lambda: False)
+    sent: list = []
+    monkeypatch.setattr(al, "send_mail", lambda *a: sent.append(a))
+    assert al.check_all(mail=True) == 0 and not sent

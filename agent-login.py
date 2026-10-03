@@ -520,9 +520,37 @@ def send_mail(subject: str, body: str) -> bool:
     return True
 
 
+# The daily run fires right after the Mac wakes, often before the network is up.
+NETWORK_HOST = "vaultwarden.dom42.space"
+NETWORK_WAIT_S = 300
+
+
+def wait_for_network(
+    host: str = NETWORK_HOST,
+    timeout_s: float = NETWORK_WAIT_S,
+    *,
+    sleep=time.sleep,
+    clock=time.monotonic,
+) -> bool:
+    """True once `host` resolves (polled every 15 s), False after `timeout_s`."""
+    deadline = clock() + timeout_s
+    while True:
+        try:
+            socket.getaddrinfo(host, 443)
+            return True
+        except OSError:
+            if clock() >= deadline:
+                return False
+            sleep(15)
+
+
 def check_all(*, mail: bool = False) -> int:
     """Every usable site (Safari or broker): logged in? If not, log in. One line
-    per site; exit 1 if any stays logged out (and, with `mail`, ONE mail)."""
+    per site; exit 1 if any stays logged out (and, with `mail`, ONE mail).
+    Waits for the network first; still offline after 5 min = skip quietly."""
+    if not wait_for_network():
+        print(f"⏸  no network ({NETWORK_HOST} does not resolve) — skipped, no mail")
+        return 0
     data = overview()
     failed: list[tuple[str, str]] = []
     if not data["broker_ok"]:
