@@ -284,6 +284,40 @@ def safari_cell(row: dict) -> str:
     return f"Safari: until {row.get('safari_expires')}"
 
 
+LAST_CHECK_FILE = Path.home() / ".local/state/agent-login/last-check.json"
+
+
+def record_check(site: str, ok: bool, how: str, path: Path | None = None) -> None:
+    """Remember a site's latest REAL check (what the overview shows)."""
+    path = path or LAST_CHECK_FILE
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        data = {}
+    data[site] = {"ok": ok, "how": how, "at": time.strftime("%Y-%m-%d %H:%M")}
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(".tmp")
+    tmp.write_text(json.dumps(data, indent=1), encoding="utf-8")
+    tmp.replace(path)
+
+
+def last_checks(path: Path | None = None) -> dict[str, dict]:
+    """``{site: {"ok", "how", "at"}}`` from the last check runs (empty if none)."""
+    try:
+        data = json.loads((path or LAST_CHECK_FILE).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def check_cell(site: str, checks: dict[str, dict]) -> str:
+    """'✅ 2026-10-04 21:15' / '❌ …' / 'not checked yet'."""
+    c = checks.get(site)
+    if not c:
+        return "not checked yet"
+    return f"{'✅' if c.get('ok') else '❌'} {c.get('at', '?')}"
+
+
 def print_overview(data: dict) -> None:
     """The human report."""
     rows = data["rows"]
@@ -302,7 +336,11 @@ def print_overview(data: dict) -> None:
         if r["status"] in ("ready", "extra")
         or (r["status"] == "safari" and r.get("safari"))
     ]
-    print(_c("1", "Agents can use now"))
+    checks = last_checks()
+    print(
+        _c("1", "Set up for agents")
+        + _c("2", "   (last real check: ./agent-login.py -c)")
+    )
     if ready:
         for r in ready:
             where = (
@@ -310,8 +348,14 @@ def print_overview(data: dict) -> None:
                 if r["status"] == "safari"
                 else r["fill_origin"]
             )
-            print(f"  ✅ {_c('1', r['name']):<24} {where}")
-        print(_c("2", "     test one for real:  ./agent-login.py -t <site>"))
+            last = check_cell(r["site"], checks)
+            print(f"  {_c('1', r['name']):<24} {last:<20} {where}")
+        print(
+            _c(
+                "2",
+                "     re-check all now: ./agent-login.py -c   ·   one site: -t <site>",
+            )
+        )
     else:
         print(_c("2", "  none yet"))
     print()
@@ -565,6 +609,7 @@ def check_all(*, mail: bool = False) -> int:
             continue
         ok, how = ensure_logged_in(row["site"])
         print(f"{'✅' if ok else '❌'} {row['site']}: {how}")
+        record_check(row["site"], ok, how)
         if not ok:
             failed.append((row["site"], how))
     if failed and mail:

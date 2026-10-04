@@ -101,3 +101,13 @@ def test_check_all_offline_is_quiet(monkeypatch) -> None:
     sent: list = []
     monkeypatch.setattr(al, "send_mail", lambda *a: sent.append(a))
     assert al.check_all(mail=True) == 0 and not sent
+
+
+def test_last_check_roundtrip(tmp_path) -> None:
+    f = tmp_path / "last.json"
+    al.record_check("anibis", True, "logged in", f)
+    al.record_check("tutti", False, "NOT logged in", f)
+    checks = al.last_checks(f)
+    assert al.check_cell("anibis", checks).startswith("✅ ")
+    assert al.check_cell("tutti", checks).startswith("❌ ")
+    assert al.check_cell("cscs", checks) == "not checked yet"
