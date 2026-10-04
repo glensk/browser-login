@@ -265,6 +265,15 @@ the agent the portal session. Record as Albert's decision of 2026-10-01 in
       2026-10-02). Cause: the broker account's permission on `agent-login` is "Can view, except
       passwords" (Bitwarden then hands items over without the password). Fix: Albert sets "Can
       view"; the broker now refuses an empty password with that hint (no login attempt).
+      After the permission fix (`-f cscs` → len=28, matches Albert's copy) the broker LOGS IN, but
+      the portal (Waldur 8.x) re-runs OIDC against auth.cscs.ch and the shared browser has no
+      Keycloak session (IdP cookies excluded by design) → bounce. Albert wants CSCS SSO for
+      agents (portal + support.cscs.ch/Jira) → explicit opt-in on the item:
+      `agent_cookie_hosts = cscs.ch, auth.cscs.ch` (filter allows an IdP host only when named).
+      2026-10-04 21:20: anibis + tutti now Cloudflare-challenge the shared Chromium even with the
+      Safari session (403/"Just a moment" since 10-03, likely after heavy probing) — re-check;
+      if it persists they become Safari-direct like Ricardo. agent-login.py overview now shows
+      each site's last REAL check (state ~/.local/state/agent-login/last-check.json).
 
 ### Phase 4 — close out
 
