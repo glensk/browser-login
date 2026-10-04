@@ -260,6 +260,11 @@ the agent the portal session. Record as Albert's decision of 2026-10-01 in
       localStorage and was not exported (no `agent_storage_keys`). Fix: for cscs the broker adds
       the portal localStorage key(s) whose value is a 40-hex Waldur token (key found by value
       shape; `_with_portal_token_keys`). Needs reinstall, then `./agent-login.py -t cscs`.
+      **2026-10-04 ROOT CAUSE:** `agent-login.py -f cscs` → `len=0` — the broker received an
+      EMPTY password from Bitwarden (also explains Kleinanzeigen's "Das ist ein Pflichtfeld" on
+      2026-10-02). Cause: the broker account's permission on `agent-login` is "Can view, except
+      passwords" (Bitwarden then hands items over without the password). Fix: Albert sets "Can
+      view"; the broker now refuses an empty password with that hint (no login attempt).
 
 ### Phase 4 — close out
 

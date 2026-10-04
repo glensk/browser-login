@@ -1860,3 +1860,11 @@ def test_fingerprint_op_returns_only_the_check(sockdir, tmp_path) -> None:
     assert resp["ok"] is True
     assert resp["password_check"] == daemon.password_fingerprint(PASSWORD)
     assert PASSWORD not in json.dumps(resp)
+
+
+def test_empty_password_is_refused_before_any_login() -> None:
+    """2026-10-04: a 'Can view, except passwords' collection hands the broker an
+    item with an EMPTY password; typing it failed CSCS + Kleinanzeigen logins."""
+    raw = _item("cscs", {"agent_fill_origins": "https://auth.cscs.ch"}, password="")
+    with pytest.raises(vault.VaultError, match="Can view"):
+        vault.secret_from_json(raw)

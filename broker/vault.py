@@ -276,9 +276,20 @@ def secret_from_json(item: Mapping[str, Any]) -> Secret:
     if not isinstance(login, Mapping):
         login = {}
     totp = login.get("totp")
+    password = str(login.get("password") or "")
+    if not password:
+        # Typing an empty password only produces "invalid username or password"
+        # at the site (and counts as a failed login). Bitwarden hands an item over
+        # WITHOUT its password when the broker account's collection permission is
+        # "Can view, except passwords".
+        raise VaultError(
+            "the item has no password for the broker — set the broker account's "
+            "permission on the agent-login collection to 'Can view' "
+            "(not 'Can view, except passwords')"
+        )
     return Secret(
         username=str(login.get("username") or ""),
-        password=str(login.get("password") or ""),
+        password=password,
         totp_seed=str(totp) if totp else None,
     )
 
