@@ -437,8 +437,8 @@ def test_agent_login_overview_safari_column(jar, monkeypatch) -> None:
     assert rows["ricardo"]["safari"] is False
     assert al.safari_cell(rows["anibis"]).startswith("Safari: until ")
     assert al.safari_cell(rows["ricardo"]) == "Safari: no session"
-    assert al.safari_cell(rows["geizhals"]) == ""
-    assert "safari" not in rows["geizhals"]
+    assert al.safari_cell(rows["cscs"]) == ""
+    assert "safari" not in rows["cscs"]
 
 
 def test_agent_login_overview_unreadable_jar(tmp_path, monkeypatch) -> None:

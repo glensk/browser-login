@@ -40,6 +40,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))  # the repo's `broker` package
 # pylint: disable=wrong-import-position
+import agent_login_keychain  # noqa: E402
 from agent_login_claude import (  # noqa: E402
     CLAUDE_ACCOUNTS,
     SITE_INSTANCE,
@@ -118,7 +119,6 @@ TARGETS = (
         "Cloudflare blocks automated browsers: agents work in your Safari directly",
     ),
     Target("tutti", "tutti", "https://auth.tutti.ch", SAFARI_FLOW, _SAFARI_NOTE),
-    Target("geizhals", "geizhals", "", "unknown", "no Vaultwarden item yet"),
     Target(
         "cscs",
         "CSCS",
@@ -418,8 +418,9 @@ def agent_summary(data: dict, checks: dict[str, dict]) -> str:
             inst = SITE_INSTANCE.get(row["site"])
             if inst:
                 how += (
-                    f" — its own browser: prefix browser.py with "
-                    f"CLAUDE_BROWSER_INSTANCE={inst} (CDP 127.0.0.1:9223)"
+                    f" — its own browser (CDP 127.0.0.1:9223), stopped when idle: "
+                    f"`CLAUDE_BROWSER_INSTANCE={inst} browser.py up -H` first, "
+                    "`… down` when done; every browser.py call needs that prefix"
                 )
             ok_lines.append(
                 f"- ✅ {row['name']} (`{browser_site(row['site'])}`): {how}"
@@ -878,6 +879,13 @@ def build_parser() -> argparse.ArgumentParser:
         "(LaunchAgent, every 10 min)",
     )
     ap.add_argument(
+        "-K",
+        "--keychain",
+        action="store_true",
+        help="rescan the login keychain (~15 s) and list every item (names only) "
+        "with whether agents can read it",
+    )
+    ap.add_argument(
         "-A",
         "--agents",
         action="store_true",
@@ -955,6 +963,7 @@ def main() -> int:
     if args.snapshot:
         data = overview(fresh=True)
         write_agent_summary(data)
+        agent_login_keychain.refresh(_state_path("keychain.json"))
         return 0 if data["broker_ok"] else 1
     rc = login_action(args)
     if rc is not None:
@@ -965,10 +974,16 @@ def main() -> int:
     if args.agents:
         print(agent_summary(data, last_checks()), end="")
         return 0
+    if args.keychain:
+        agent_login_keychain.refresh(_state_path("keychain.json"), force=True)
+        agent_login_keychain.print_list(_state_path("keychain.json"), _c, full=True)
+        return 0
     if args.json:
         print(json.dumps(data, indent=1))
     else:
         print_overview(data)
+        print()
+        agent_login_keychain.print_list(_state_path("keychain.json"), _c)
     return 0 if data["broker_ok"] else 1
 
 

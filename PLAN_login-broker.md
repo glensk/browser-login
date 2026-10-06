@@ -304,6 +304,12 @@ the agent the portal session. Record as Albert's decision of 2026-10-01 in
       the agent-login collection WITH the field; the assisted sites need no Bitwarden item).
       geizhals: Albert has no Vaultwarden item. Security review → tp#785 (login-keychain items
       readable by agents via the security CLI; CSCS copies of 3.3 still present).
+      **2026-10-06 (late):** CSCS keychain copies DELETED (`cscs-forget-creds`; 3.3's keychain
+      part done). Private claude.ai ✅; its instance is started per use and stopped again (the
+      session persists in the profile). geizhals dropped (no account). Overview gains a
+      login-keychain list (`agent_login_keychain.py`, names only; 🔓 = an agent can print it
+      without a prompt; `-K` rescans; `-S` rescans hourly). 8 items carry a SECRET as their
+      service name → masked in the list, logged under tp#97.
 
 ### Phase 4 — close out
 

@@ -18,7 +18,7 @@ KA = next(t for t in al.TARGETS if t.site == "kleinanzeigen")
 ANIBIS = next(t for t in al.TARGETS if t.site == "anibis")
 RICARDO = next(t for t in al.TARGETS if t.site == "ricardo")
 TUTTI = next(t for t in al.TARGETS if t.site == "tutti")
-GEIZHALS = next(t for t in al.TARGETS if t.site == "geizhals")
+GEIZHALS = al.Target("geizhals", "geizhals", "", "unknown")
 
 
 def test_ready_when_listed_and_flow_supported() -> None:
@@ -81,7 +81,6 @@ def test_overview_rows_carry_check_url(monkeypatch) -> None:
     assert rows["ricardo"]["check_url"] == "https://r.example/me"  # broker wins
     assert rows["extra"]["check_url"] == "https://e.example/me"
     assert rows["kleinanzeigen"]["check_url"] == al.DEFAULT_CHECK_URLS["kleinanzeigen"]
-    assert rows["geizhals"]["check_url"] == ""
 
 
 def test_wait_for_network_gives_up_quietly(monkeypatch) -> None:
@@ -229,3 +228,34 @@ def test_smartsheet_is_a_broker_site() -> None:
     assert al.classify(target, {})[0] == "missing"
     listed = {"smartsheet": {"site": "smartsheet", "refused": False}}
     assert al.classify(target, listed)[0] == "ready"
+
+
+def test_keychain_parse_names_only() -> None:
+    """Readable = decrypt trusts the security CLI and apple-tool: may read;
+    secret-looking names are masked."""
+    import agent_login_keychain as kc  # pylint: disable=import-outside-toplevel
+
+    def item(svce: str, apps: str, partition: str = "apple-tool:") -> str:
+        return (
+            'keychain: "/x/login.keychain-db"\nclass: "genp"\nattributes:\n'
+            f'    "acct"<blob>="albert"\n    "svce"<blob>="{svce}"\n'
+            "access: 3 entries\n    entry 0:\n"
+            "        authorizations (6): decrypt derive export_clear\n"
+            f"        applications{apps}\n"
+            "    entry 1:\n        authorizations (1): partition_id\n"
+            f"        description: {partition}\n        applications: <null>\n"
+        )
+
+    text = (
+        item("EPFL_VPN_PASSWORD", " (1):\n            0: /usr/bin/security (OK)")
+        + item("prompting-item", " (0):")
+        + item("other-team", ": <null>", "teamid:ABC")
+        + item("Xq7#pL9vT2", " (1):\n            0: /usr/bin/security (OK)")
+    )
+    got = {i["service"]: i["readable"] for i in kc.parse_dump(text)}
+    assert got == {
+        "EPFL_VPN_PASSWORD": True,
+        kc.MASKED: True,
+        "prompting-item": False,
+        "other-team": False,
+    }

@@ -37,15 +37,23 @@ CLAUDE_LOGIN_WAIT_S = 15 * 60
 
 @contextlib.contextmanager
 def site_instance(site: str) -> Iterator[None]:
-    """Point every browser.py call inside at `site`'s browser instance."""
+    """Point every browser.py call inside at `site`'s browser instance.
+
+    A named instance that is down is started headless for the duration and
+    stopped again afterwards: its sessions live in its profile on disk, so it
+    needs to run only while something uses it.
+    """
     inst = SITE_INSTANCE.get(site, "")
     old = os.environ.get("CLAUDE_BROWSER_INSTANCE")
     os.environ["CLAUDE_BROWSER_INSTANCE"] = inst
+    started = False
     try:
-        if inst and browser_mode() is None:  # started lazily, headless
-            _browser("up", "-H", quiet=True)
+        if inst and browser_mode() is None:
+            started = _browser("up", "-H", quiet=True) == 0
         yield
     finally:
+        if started:
+            _browser("down", quiet=True)
         if old is None:
             os.environ.pop("CLAUDE_BROWSER_INSTANCE", None)
         else:

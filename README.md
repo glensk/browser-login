@@ -403,6 +403,7 @@ Examples:
 | `-m`, `-M`, `--mail` | with -c: mail `albert.glensk@gmail.com` (gog) when a site stays logged out |
 | `-r`, `--refresh` | ask the broker now (re-reads Bitwarden, ~40 s) instead of the snapshot |
 | `-S`, `--snapshot` | refresh the site-list snapshot and the agents file, print nothing (LaunchAgent, every 10 min) |
+| `-K`, `--keychain` | rescan the login keychain (~15 s) and list every item (names only) with whether agents can read it |
 | `-A`, `--agents` | print the summary agent sessions get at start (the agents file) |
 | `-I`, `--install-daily` | install + load the LaunchAgents com.albert.agent-login-check (`-c -m` daily 09:15) and com.albert.agent-login-snapshot (`-S` every 10 min) |
 | `-U`, `--uninstall-daily` | unload + remove both LaunchAgents |
