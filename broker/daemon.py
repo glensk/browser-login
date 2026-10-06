@@ -54,6 +54,7 @@ from broker.recipes import (  # noqa: E402
     LoginFailed,
     RecipeError,
     check_logged_in,
+    cscs_portal_ready,
     diagnose,
     recipe_for,
 )
@@ -91,7 +92,7 @@ CSCS_PORTAL_ORIGIN = "https://portal.cscs.ch"
 # localStorage keys whose value looks like a Waldur DRF token (40 hex chars).
 _TOKEN_KEYS_JS = (
     "() => Object.keys(localStorage).filter(k => "
-    "/^\\s*\"?[0-9a-f]{40}\"?\\s*$/.test(localStorage.getItem(k) || ''))"
+    "/\\b[0-9a-f]{40}\\b/.test(localStorage.getItem(k) || ''))"
 )
 _STORAGE_JS = "keys => Object.fromEntries(keys.map(k => [k, localStorage.getItem(k)]))"
 
@@ -178,7 +179,7 @@ class PlaywrightRunner:
         page = ctx.new_page()
         try:
             page.goto(CSCS_PORTAL_ORIGIN + "/", wait_until="domcontentloaded")
-            page.wait_for_timeout(2000)
+            cscs_portal_ready(page, wait_s=10.0)  # the token may land late
             if not origin_allowed(page.url, [CSCS_PORTAL_ORIGIN], dev=self.dev):
                 return spec
             keys = page.evaluate(_TOKEN_KEYS_JS)

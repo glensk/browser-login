@@ -62,7 +62,10 @@ def test_overview_broker_down(monkeypatch) -> None:
     monkeypatch.setattr(al, "broker_state", lambda: ("not installed", []))
     data = al.overview()
     assert not data["broker_ok"]
-    assert {r["status"] for r in data["rows"]} <= {"unchecked", "unknown"}
+    statuses = {r["site"]: r["status"] for r in data["rows"]}
+    for site, status in statuses.items():  # built-in assisted sites need no broker
+        want = {"assisted"} if site in al.ASSISTED_SITES else {"unchecked", "unknown"}
+        assert status in want, site
 
 
 def test_overview_rows_carry_check_url(monkeypatch) -> None:
@@ -111,3 +114,33 @@ def test_last_check_roundtrip(tmp_path) -> None:
     assert al.check_cell("anibis", checks).startswith("✅ ")
     assert al.check_cell("tutti", checks).startswith("❌ ")
     assert al.check_cell("cscs", checks) == "not checked yet"
+
+
+def _row(site: str, status: str, **kw) -> dict:
+    return {"site": site, "name": site, "status": status, "detail": "", **kw}
+
+
+def test_verdict_one_answer_per_login() -> None:
+    """✅ only with a complete setup AND a passing last real check."""
+    ok = {"cscs": {"ok": True, "at": "t", "how": "logged in"}}
+    bad = {"cscs": {"ok": False, "at": "t", "how": "NOT logged in"}}
+    assert al.verdict(_row("cscs", "ready"), ok) == (True, "checked t, login broker")
+    works, why = al.verdict(_row("cscs", "ready"), bad)
+    assert not works and "NOT logged in" in why
+    works, why = al.verdict(_row("cscs", "ready"), {})
+    assert not works and "-t cscs" in why
+    # a setup problem wins over an old passing check
+    assert not al.verdict(_row("cscs", "missing"), ok)[0]
+    assert al.verdict(_row("x", "unknown"), {}) == (False, "login address unknown")
+    row = _row("tutti", "safari", safari=False, fallback="")
+    assert "Safari" in al.verdict(row, {"tutti": {"ok": True, "at": "t"}})[1]
+
+
+def test_assisted_sites_and_resolve() -> None:
+    assert {"anthropic", "openai", "slack", "switch"} <= al.ASSISTED_SITES
+    sw = next(t for t in al.TARGETS if t.site == "switch")
+    assert al.classify(sw, {}, readable=False)[0] == "assisted"
+    assert al.resolve_site("https://auth.cscs.ch") == "cscs"
+    assert al.resolve_site("https://auth.cscs.ch/") == "cscs"
+    assert al.resolve_site("CSCS") == "cscs"
+    assert al.resolve_site("nope") == "nope"

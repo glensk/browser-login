@@ -1,15 +1,17 @@
 #!/usr/bin/env python3
 """agent-login.py — which of Albert's logins can agents use through the login broker?
 
-Without arguments: a health line for the broker, the logins agents can use right now,
-and the full list of logins we want to make work, each with its status and what is
-missing. Read-only: it asks the broker for its site list (never a secret), reads the
-names and expiry dates (never values) of Safari's cookies, and logs into nothing unless
-you pass -t or -c.
+Without arguments: a health line for the broker, then every login we want agents to
+use, once: ✅ when it works for agents (setup complete AND the latest real check, -c/-t,
+passed) or ❌ with the reason. Read-only: it asks the broker for its site list (never a
+secret), reads the names and expiry dates (never values) of Safari's cookies, and logs
+into nothing unless you pass -t, -g or -c.
 
 The marketplace sites (anibis, tutti, Ricardo, Kleinanzeigen) run on YOUR Safari
 session: you log in in Safari, `browser.py login SITE` copies that site's session
-cookies into the shared Chromium (Kleinanzeigen falls back to the broker).
+cookies into the shared Chromium (Kleinanzeigen falls back to the broker). CSCS logs in
+through the broker. Anthropic, OpenAI, Slack and SWITCH Cloud need you once (email
+code / SSO): `-g SITE` shows the window and waits; -t and -c only check them.
 
 Examples:
   ./agent-login.py              # overview
@@ -17,7 +19,9 @@ Examples:
                                 # then the broker), then the positive logged-in check
   ./agent-login.py -c           # every usable site: logged in? if not, log in
   ./agent-login.py -c -m        # the same, and mail Albert when a site stays logged out
+  ./agent-login.py -t https://auth.cscs.ch   # SITE may also be a name or login address
   ./agent-login.py -g anibis    # guided login typed by hand in the shared Chromium
+  ./agent-login.py -g anthropic # your login (email code) in the shown shared Chromium
   ./agent-login.py -P           # print the daily LaunchAgent (-I installs, -U removes)
   ./agent-login.py -j           # the same overview as JSON
 """
@@ -51,6 +55,9 @@ VAULT_URL = "https://vaultwarden.dom42.space"
 SUPPORTED_FLOWS = {"one-page", "two-step", "cscs"}
 # Albert's Safari session, copied by `browser.py login` (broker/safari_cookies.py).
 SAFARI_FLOW = "safari"
+# Built-in browser.py sites whose login needs Albert (email code, SSO click): agents
+# use the session he leaves in the shared Chromium; the check never logs in.
+ASSISTED_FLOW = "assisted"
 MAIL_TO = "albert.glensk@gmail.com"
 LAUNCH_LABEL = "com.albert.agent-login-check"
 LAUNCH_PLIST = Path.home() / "Library" / "LaunchAgents" / f"{LAUNCH_LABEL}.plist"
@@ -65,7 +72,7 @@ class Target:
     site: str  # broker site id (agent_site field, else the item name as a slug)
     name: str
     fill_origin: str  # value for the item's agent_fill_origins field ("" = unknown yet)
-    flow: str  # one-page | two-step | cscs | safari | manual | unknown
+    flow: str  # one-page | two-step | cscs | safari | assisted | manual | unknown
     note: str = ""
     fallback: str = ""  # broker flow tried when the Safari session does not work
 
@@ -98,12 +105,41 @@ TARGETS = (
         "cscs",
         "broker login (password + TOTP from Bitwarden; agent_otp_label picks the authenticator)",
     ),
+    Target(
+        "anthropic",
+        "Anthropic",
+        "https://claude.ai",
+        ASSISTED_FLOW,
+        "claude.ai Team admin: log in with ./agent-login.py -g anthropic (email code)",
+    ),
+    Target(
+        "openai",
+        "OpenAI",
+        "https://chatgpt.com",
+        ASSISTED_FLOW,
+        "chatgpt.com Business admin: log in with ./agent-login.py -g openai (Google SSO)",
+    ),
+    Target(
+        "slack",
+        "Slack",
+        "https://app.slack.com",
+        ASSISTED_FLOW,
+        "SDSC Slack: log in with ./agent-login.py -g slack",
+    ),
+    Target(
+        "switch",
+        "SWITCH Cloud",
+        "https://cloud.switch.ch",
+        ASSISTED_FLOW,
+        "Switch Cloud Portal (edu-ID): log in with ./agent-login.py -g switch",
+    ),
 )
 
 # status -> (icon, label); order = how the overview sorts
 STATUS = {
     "ready": ("✅", "ready"),
     "safari": ("🧭", "via your Safari session"),
+    "assisted": ("👤", "your login in the shared Chromium"),
     "manual": ("👤", "agents use YOUR session"),
     "needs-flow": ("🛠 ", "broker can't do this login yet"),
     "refused": ("⚠️ ", "in Bitwarden but refused"),
@@ -165,6 +201,8 @@ def classify(
     """(status key, detail) for a planned target."""
     if not target.fill_origin:
         return "unknown", ""
+    if target.flow == ASSISTED_FLOW:  # browser.py built-in, no broker involved
+        return "assisted", target.note
     if not readable:
         return "unchecked", ""
     entry = listed.get(target.site)
@@ -318,8 +356,50 @@ def check_cell(site: str, checks: dict[str, dict]) -> str:
     return f"{'✅' if c.get('ok') else '❌'} {c.get('at', '?')}"
 
 
+# Setup problems: the site cannot work for agents whatever the last check said.
+_SETUP_REASON = {
+    "unknown": "login address unknown",
+    "missing": "not in the Bitwarden agent-login collection",
+    "refused": "Bitwarden item refused",
+    "needs-flow": "the broker cannot do this login flow yet",
+    "unchecked": "broker cannot read Bitwarden",
+}
+
+
+def verdict(row: dict, checks: dict[str, dict]) -> tuple[bool, str]:
+    """(works for agents?, reason/detail) — one answer per login.
+
+    ✅ only when the setup is complete AND the latest REAL check (``-c``/``-t``)
+    passed; everything else is ❌ with the first thing that is wrong.
+    """
+    status, site = row["status"], row["site"]
+    if status in _SETUP_REASON:
+        reason = _SETUP_REASON[status]
+        if row.get("detail"):
+            reason += f" ({row['detail']})"
+        return False, reason
+    if status == "safari" and row.get("safari") is None:
+        return False, "Safari's cookies unreadable (terminal needs Full Disk Access)"
+    if status == "safari" and not row.get("safari") and not row.get("fallback"):
+        return False, f"no Safari session — log in to {row['name']} in Safari"
+    c = checks.get(site)
+    if not c:
+        return False, f"not checked yet — ./agent-login.py -t {site}"
+    when = c.get("at", "?")
+    if not c.get("ok"):
+        return False, f"last check {when}: {c.get('how', 'failed')}"
+    how = f"checked {when}"
+    if status == "safari" and row.get("safari"):
+        how += f", Safari session until {row.get('safari_expires')}"
+    elif row.get("flow") == ASSISTED_FLOW:
+        how += ", your session in the shared Chromium"
+    else:
+        how += ", login broker"
+    return True, how
+
+
 def print_overview(data: dict) -> None:
-    """The human report."""
+    """The human report: every login once, ✅ works for agents / ❌ + why."""
     rows = data["rows"]
     ok = data["broker_ok"]
     print(
@@ -329,61 +409,37 @@ def print_overview(data: dict) -> None:
         + ")"
     )
     print(f"  broker: {'🟢' if ok else '🔴'} {data['broker']}\n")
-
-    ready = [
-        r
-        for r in rows
-        if r["status"] in ("ready", "extra")
-        or (r["status"] == "safari" and r.get("safari"))
-    ]
     checks = last_checks()
-    print(
-        _c("1", "Set up for agents")
-        + _c("2", "   (last real check: ./agent-login.py -c)")
-    )
-    if ready:
-        for r in ready:
-            where = (
-                f"Safari session until {r['safari_expires']}"
-                if r["status"] == "safari"
-                else r["fill_origin"]
-            )
-            last = check_cell(r["site"], checks)
-            print(f"  {_c('1', r['name']):<24} {last:<20} {where}")
-        print(
-            _c(
-                "2",
-                "     re-check all now: ./agent-login.py -c   ·   one site: -t <site>",
-            )
-        )
-    else:
-        print(_c("2", "  none yet"))
-    print()
-
-    order = list(STATUS)
-    print(_c("1", "All planned logins"))
+    judged = [(r, *verdict(r, checks)) for r in rows]
+    judged.sort(key=lambda x: (not x[1], x[0]["name"].lower()))
     width = max(len(r["name"]) for r in rows)
-    for r in sorted(rows, key=lambda r: (order.index(r["status"]), r["name"].lower())):
-        icon, label = STATUS[r["status"]]
-        name = r["name"].ljust(width)
-        line = f"  {icon} {_c('1', name)}  {safari_cell(r):<24}  {label}"
-        if r["detail"]:
-            line += _c("2", f" — {r['detail']}")
-        print(line)
+    for r, works, why in judged:
+        line = f"  {'✅' if works else '❌'} {_c('1', r['name'].ljust(width))}  "
+        print(line + (_c("2", why) if works else why))
     print()
     print(
         _c(
             "2",
-            "  ➕ add: move the item into the agent-login collection and add a custom text",
+            "  re-check all: ./agent-login.py -c  ·  one site: -t <site>  ·  "
+            "your own login: -g <site>",
         )
     )
-    print(_c("2", "     field agent_fill_origins with the address shown."))
-    errors = {r.get("safari_error") for r in rows if r.get("safari_error")}
-    for err in sorted(errors):
-        print(
-            _c("2", f"  🧭 Safari's cookies unreadable ({err}) — give the terminal ")
-            + _c("2", "Full Disk Access.")
+    print(
+        _c(
+            "2",
+            "  add a site: move its item into the agent-login collection and add a "
+            "custom text field agent_fill_origins",
         )
+    )
+
+
+def resolve_site(arg: str) -> str:
+    """A site id from an id, a display name or a login address (``https://…``)."""
+    key = arg.strip().lower().rstrip("/")
+    for t in TARGETS:
+        if key in (t.site, t.name.lower(), t.fill_origin.lower()):
+            return t.site
+    return arg
 
 
 def run_test(site: str) -> int:
@@ -393,21 +449,33 @@ def run_test(site: str) -> int:
 
     The verdict is the positive check, never the login command's exit code
     alone: a login that "succeeded" while the check page still redirects to the
-    login page is reported as NOT logged in.
+    login page is reported as NOT logged in. The result is recorded for the overview.
     """
-    print(
-        f"▶ browser.py login {site}  (Safari session or login broker; "
-        "you see no password)"
-    )
-    login_rc = subprocess.run(
-        [sys.executable, str(BROWSER_PY), "login", site], check=False
-    ).returncode
+    site = resolve_site(site)
+    login_rc = 0
+    if site in ASSISTED_SITES:  # its login needs you: -g; -t only checks
+        print(f"▶ {site}: your own login (./agent-login.py -g {site}); checking only")
+    else:
+        print(
+            f"▶ browser.py login {site}  (Safari session or login broker; "
+            "you see no password)"
+        )
+        login_rc = subprocess.run(
+            [sys.executable, str(BROWSER_PY), "login", site], check=False
+        ).returncode
     if login_rc != 0:
         print(f"❌ login {site} failed (exit {login_rc})")
     print(f"▶ browser.py logged-in {site}  (positive check on the check URL)")
     rc = subprocess.run(
         [sys.executable, str(BROWSER_PY), "logged-in", site], check=False
     ).returncode
+    if rc == 0:
+        how = "logged in"
+    elif site in ASSISTED_SITES:
+        how = f"NOT logged in — log in once: ./agent-login.py -g {site}"
+    else:
+        how = f"NOT logged in (browser.py login exit {login_rc}, check exit {rc})"
+    record_check(site, rc == 0, how)
     print(
         ("✅ " if rc == 0 else "❌ ")
         + f"{site}: shared Chromium is "
@@ -442,11 +510,13 @@ def manual_login(site: str) -> int:
     yourself (paste it from Bitwarden) — no agent sees it; agents then use the
     session until the site expires it.
     """
+    site = resolve_site(site)
+    if site in ASSISTED_SITES:
+        return assisted_login(site)
     start = MANUAL_START.get(site)
     if not start:
-        print(
-            f"❌ no manual login known for {site!r} (known: {', '.join(MANUAL_START)})"
-        )
+        known = ", ".join([*MANUAL_START, *sorted(ASSISTED_SITES)])
+        print(f"❌ no guided login known for {site!r} (known: {known})")
         return 2
     if _browser("logged-in", site, quiet=True) == 0:
         print(f"✅ {site}: the shared Chromium is already logged in — nothing to do")
@@ -474,6 +544,30 @@ def manual_login(site: str) -> int:
         if ok
         else f"❌ {site}: still not logged in after {MANUAL_WAIT_S // 60} min"
     )
+    return 0 if ok else 2
+
+
+ASSISTED_SITES = {t.site for t in TARGETS if t.flow == ASSISTED_FLOW}
+
+
+def assisted_login(site: str) -> int:
+    """`browser.py login SITE` with the shared Chromium window shown: the site's
+    own assisted flow (email code / SSO click) waits until you finish it."""
+    if _browser("logged-in", site, quiet=True) == 0:
+        print(f"✅ {site}: the shared Chromium is already logged in — nothing to do")
+        record_check(site, True, "logged in")
+        return 0
+    print("▶ showing the shared Chromium window …")
+    if _browser("switch", "headed") != 0:
+        return 1
+    try:
+        _browser("login", site)
+    finally:
+        print("▶ hiding the Chromium window again …")
+        _browser("switch", "headless", quiet=True)
+    ok = _browser("logged-in", site, quiet=True) == 0
+    record_check(site, ok, "logged in" if ok else "NOT logged in after -g")
+    print(f"{'✅' if ok else '❌'} {site}: {'logged in' if ok else 'NOT logged in'}")
     return 0 if ok else 2
 
 
@@ -524,11 +618,17 @@ def failure_mail(failed: list[tuple[str, str]]) -> tuple[str, str]:
 
 
 def safari_fix(site: str) -> str:
-    """What Albert does when `site` is logged out."""
-    return (
-        f"open the site in Safari and log in, then run ./agent-login.py -t {site} "
-        f"(in {Path(__file__).resolve().parent})"
-    )
+    """What Albert does when `site` is logged out (depends on its login flow)."""
+    here = Path(__file__).resolve().parent
+    flow = next((t.flow for t in TARGETS if t.site == site), "")
+    if flow == ASSISTED_FLOW:
+        return f"run ./agent-login.py -g {site} and finish the login (in {here})"
+    if flow == SAFARI_FLOW:
+        return (
+            f"open the site in Safari and log in, then run ./agent-login.py -t {site} "
+            f"(in {here})"
+        )
+    return f"run ./agent-login.py -t {site} and read its error (in {here})"
 
 
 def send_mail(subject: str, body: str) -> bool:
@@ -601,6 +701,18 @@ def check_all(*, mail: bool = False) -> int:
         print(f"❌ login broker: {data['broker']}")
         failed.append(("login broker", data["broker"]))
     for row in data["rows"]:
+        if row["status"] == "assisted":
+            ok = _browser("logged-in", row["site"], quiet=True) == 0
+            how = (
+                "logged in"
+                if ok
+                else f"NOT logged in — log in once: ./agent-login.py -g {row['site']}"
+            )
+            print(f"{'✅' if ok else '❌'} {row['site']}: {how}")
+            record_check(row["site"], ok, how)
+            if not ok:
+                failed.append((row["site"], how))
+            continue
         if row["status"] not in ("ready", "extra", "safari"):
             continue
         rule = safari_cookies.SAFARI_SITES.get(row["site"])

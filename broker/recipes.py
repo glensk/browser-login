@@ -314,9 +314,9 @@ def check_logged_in(
         page.wait_for_load_state("load", timeout=10_000)
     except Exception:  # pylint: disable=broad-exception-caught
         pass
-    page.wait_for_timeout(1500 if item.site == "cscs" else 1000)
     if item.site == "cscs":
-        return cscs_on_portal(page.url)
+        return cscs_portal_ready(page, wait_s=max(wait_s, 8.0))
+    page.wait_for_timeout(1000)
     status = getattr(resp, "status", None) if resp is not None else None
     if isinstance(status, int) and status >= 400:
         return False
@@ -613,6 +613,40 @@ def cscs_on_portal(url: str) -> bool:
     )
 
 
+# HomePort keeps its 40-hex DRF token somewhere in localStorage (same regex as
+# browser.py ``_scan_token``: anywhere in the value, not only the whole value).
+CSCS_HAS_TOKEN_JS = (
+    "() => { const re=/\\b[0-9a-f]{40}\\b/;"
+    "for (let i=0;i<localStorage.length;i++)"
+    "{const v=localStorage.getItem(localStorage.key(i));"
+    "if (v && re.test(v)) return true;} return false; }"
+)
+
+
+def cscs_portal_ready(page: Any, *, wait_s: float = 8.0) -> bool:
+    """The CSCS positive check: the portal app holds its Waldur token.
+
+    Being on ``portal.cscs.ch`` proves nothing: the SPA renders there first and
+    only then redirects a token-less session to Keycloak. So poll (up to
+    ``wait_s``) until the token is in localStorage while still on the portal;
+    a move to Keycloak or anywhere else is "not logged in".
+    """
+    deadline = time.monotonic() + wait_s
+    while True:
+        if not cscs_on_portal(page.url):
+            if not page.url.startswith(CSCS_PORTAL_ORIGIN + "/"):
+                return False  # redirected off the portal (Keycloak login)
+        else:
+            try:
+                if page.evaluate(CSCS_HAS_TOKEN_JS):
+                    return True
+            except Exception:  # pylint: disable=broad-exception-caught
+                pass  # navigating mid-evaluate: try again
+        if time.monotonic() >= deadline:
+            return False
+        page.wait_for_timeout(500)
+
+
 def click_keycloak_submit(page: Any) -> None:
     for sel in (
         "#kc-login",
@@ -645,9 +679,8 @@ def cscs_login(
     if not allowed:
         raise OriginViolation("the cscs item does not list https://auth.cscs.ch")
     page.goto(item.login_url or CSCS_LOGIN_URL, wait_until="domcontentloaded")
-    page.wait_for_timeout(1500)
-    if cscs_on_portal(page.url):
-        return
+    if cscs_portal_ready(page, wait_s=8.0):
+        return  # the profile's session still holds a token
     _check_challenge(page, submitted=False)
     user = _wait_visible(page, "#username", STEP_TIMEOUT_S)
     pw_field = _visible(page, "#password")

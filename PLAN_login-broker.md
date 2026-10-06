@@ -274,6 +274,19 @@ the agent the portal session. Record as Albert's decision of 2026-10-01 in
       Safari session (403/"Just a moment" since 10-03, likely after heavy probing) — re-check;
       if it persists they become Safari-direct like Ricardo. agent-login.py overview now shows
       each site's last REAL check (state ~/.local/state/agent-login/last-check.json).
+      **2026-10-06 ROOT CAUSE 2:** the broker's CSCS check was "URL is on portal.cscs.ch 1.5 s
+      after load" — the HomePort SPA renders there first and only then sends a token-less
+      session to Keycloak, so the broker's STALE profile passed: it skipped the login
+      (`via: profile`), exported only `sessionid`, 0 storage keys → the shared browser bounced
+      to Keycloak. Fix (code, needs `sudo install/install.sh`): `cscs_portal_ready` = still on
+      the portal AND a 40-hex token in localStorage (browser.py `_scan_token`'s rule; Waldur 8
+      still keeps it there — the keychain login cached one 2026-10-04); `_TOKEN_KEYS_JS` matches
+      the token anywhere in the value. Then `./agent-login.py -t cscs`. If it still bounces,
+      Albert sets `agent_cookie_hosts = cscs.ch, auth.cscs.ch` on the item (today: unset →
+      `cscs.ch` only, auth.cscs.ch cookies filtered as IdP).
+      agent-login.py overview is now ONE list (✅ works for agents / ❌ + reason) and includes the
+      built-in assisted sites anthropic, openai, slack, switch (`-g SITE` = your login in the
+      shown window; `-t`/`-c` only check them, never start an email-code/SSO flow).
 
 ### Phase 4 — close out
 

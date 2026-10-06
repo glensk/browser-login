@@ -373,9 +373,9 @@ the `himalaya` helpers. The CDP endpoint is always `http://127.0.0.1:<port>` (ne
 
 agent-login.py — which of Albert's logins can agents use through the login broker?
 
-Without arguments: a health line for the broker, the logins agents can use right now, and the full list of logins we want to make work, each with its status and what is missing. Read-only: it asks the broker for its site list (never a secret), reads the names and expiry dates (never values) of Safari's cookies, and logs into nothing unless you pass -t or -c.
+Without arguments: a health line for the broker, then every login we want agents to use, once: ✅ when it works for agents (setup complete AND the latest real check, -c/-t, passed) or ❌ with the reason. Read-only: it asks the broker for its site list (never a secret), reads the names and expiry dates (never values) of Safari's cookies, and logs into nothing unless you pass -t, -g or -c.
 
-The marketplace sites (anibis, tutti, Ricardo, Kleinanzeigen) run on YOUR Safari session: you log in in Safari, `browser.py login SITE` copies that site's session cookies into the shared Chromium (Kleinanzeigen falls back to the broker).
+The marketplace sites (anibis, tutti, Ricardo, Kleinanzeigen) run on YOUR Safari session: you log in in Safari, `browser.py login SITE` copies that site's session cookies into the shared Chromium (Kleinanzeigen falls back to the broker). CSCS logs in through the broker. Anthropic, OpenAI, Slack and SWITCH Cloud need you once (email code / SSO): `-g SITE` shows the window and waits; -t and -c only check them.
 
 Examples:
 
@@ -385,7 +385,9 @@ Examples:
                               # then the broker), then the positive logged-in check
 ./agent-login.py -c           # every usable site: logged in? if not, log in
 ./agent-login.py -c -m        # the same, and mail Albert when a site stays logged out
+./agent-login.py -t https://auth.cscs.ch   # SITE may also be a name or login address
 ./agent-login.py -g anibis    # guided login typed by hand in the shared Chromium
+./agent-login.py -g anthropic # your login (email code) in the shown shared Chromium
 ./agent-login.py -P           # print the daily LaunchAgent (-I installs, -U removes)
 ./agent-login.py -j           # the same overview as JSON
 ```

@@ -645,6 +645,33 @@ def test_cscs_on_portal_exact():
     assert not recipes.cscs_on_portal("https://evil.example/?portal.cscs.ch")
     assert not recipes.cscs_on_portal("https://portal.cscs.ch/api-auth/keycloak/x")
     assert not recipes.cscs_on_portal("https://portal.cscs.ch/x?code=1")
+
+
+class _SpaPage:
+    """The HomePort SPA: renders on the portal, then (no token) moves to Keycloak."""
+
+    def __init__(self, urls: list[str], tokens: list[bool]) -> None:
+        self._urls, self._tokens = urls, tokens
+        self.url = urls[0]
+
+    def evaluate(self, _js: str) -> bool:
+        return self._tokens.pop(0) if self._tokens else False
+
+    def wait_for_timeout(self, _ms: float) -> None:
+        if len(self._urls) > 1:
+            self._urls.pop(0)
+        self.url = self._urls[0]
+
+
+def test_cscs_portal_ready_needs_the_token():
+    """On the portal without a token is NOT logged in (the SPA redirects later)."""
+    kc = "https://auth.cscs.ch/auth/realms/cscs/protocol/openid-connect/auth"
+    stale = _SpaPage(["https://portal.cscs.ch/profile/", kc], [False])
+    assert not recipes.cscs_portal_ready(stale, wait_s=5)
+    late = _SpaPage(["https://portal.cscs.ch/profile/"] * 3, [False, False, True])
+    assert recipes.cscs_portal_ready(late, wait_s=5)
+    never = _SpaPage(["https://portal.cscs.ch/profile/"], [])
+    assert not recipes.cscs_portal_ready(never, wait_s=0)
     assert recipes.recipe_for("cscs") is recipes.cscs_login
     assert recipes.recipe_for("ricardo") is recipes.generic_login
 
