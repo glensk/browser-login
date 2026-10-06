@@ -42,8 +42,17 @@ Generic lifecycle:
             they lose their connection); a stale lifecycle record with no
             browser behind it is cleared without waiting.
   open URL  Open/navigate a tab to URL in the shared browser.
+            [-N|--new] always a NEW background tab over raw CDP; prints
+            `target=<id>` — the id this caller owns (tp#786).
   eval JS   Run a JS expression in the active (or --url-matched) tab; print JSON.
             [-t|--timeout SECONDS] hard deadline (default 60), attach included.
+            [-T|--target TID] evaluates in exactly that target over raw CDP
+            (JSON-serialisable results only); exit 1 if it is gone.
+  close     Close tabs you own: -i/--id TID… (ids `open -N` printed), or for
+            manual cleanup URL… (exact match sans query/fragment, http(s)
+            only). Takes the interaction lease, re-checks each tab right before
+            closing it, never closes the last tab; -n dry run, -w lease wait,
+            -d overall deadline.
 
 Every Playwright attach gives up after $CLAUDE_BROWSER_CONNECT_TIMEOUT_S (default
 30) and names the tab that blocked it (see `status -p` / `close-hung`).
@@ -284,6 +293,9 @@ LOGIN_LOG_DIR = CACHE_DIR / "login-log"
 
 # `eval`'s default hard deadline (seconds), attach included — see cmd_eval.
 EVAL_TIMEOUT_S = 60.0
+# `close`: default lease wait and overall deadline (seconds) — see cmd_close.
+CLOSE_WAIT_S = 30.0
+CLOSE_DEADLINE_S = 20.0
 
 
 def _positive_seconds(raw: str) -> float:
@@ -295,6 +307,125 @@ def _positive_seconds(raw: str) -> float:
     if not 0 < value < float("inf"):
         raise argparse.ArgumentTypeError(f"must be > 0 seconds: {raw!r}")
     return value
+
+
+def _add_open_eval_parsers(sub: Any) -> None:
+    """The `open` and `eval` subparsers (kept out of `parse_args` for size)."""
+    po = sub.add_parser("open", help="Open/navigate a tab to URL.")
+    po.add_argument("url", help="URL to open.")
+    pog = po.add_mutually_exclusive_group()
+    pog.add_argument(
+        "-r",
+        "--reuse",
+        action="store_true",
+        help=(
+            "Navigate an existing tab already on this URL (compared without "
+            "query/fragment) instead of opening a new tab. Picks the oldest "
+            "match — the same tab `eval --url` targets. Mutually exclusive "
+            "with -N."
+        ),
+    )
+    pog.add_argument(
+        "-N",
+        "--new",
+        action="store_true",
+        help=(
+            "Always create a NEW background tab (raw CDP Target.createTarget, "
+            "no Playwright attach; never reuses a tab) and print `target=<id>` "
+            "on its own line after the ✓ line. That id is the caller's tab: "
+            "pass it to `eval -T` and `close -i`. Mutually exclusive with -r."
+        ),
+    )
+    pe = sub.add_parser("eval", help="Eval a JS expression in a tab; print JSON.")
+    pe.add_argument("js", help="JavaScript expression to evaluate.")
+    peg = pe.add_mutually_exclusive_group()
+    peg.add_argument(
+        "--url",
+        default=None,
+        help="Substring to pick the target tab (default: first/active tab). "
+        "Exits 1 when no tab matches — never evaluates in another tab.",
+    )
+    peg.add_argument(
+        "-T",
+        "--target",
+        default=None,
+        metavar="TID",
+        help="Evaluate in exactly the tab with this CDP target id (the id "
+        "`open -N` printed), over raw CDP on that tab's own websocket — no "
+        "Playwright attach, so another tab cannot slow it down. Exits 1 when "
+        "the target is gone. Trade-off: the result is returned by value, so "
+        "only JSON-serialisable values survive (undefined prints null), not "
+        "Playwright's richer serialisation. Mutually exclusive with --url.",
+    )
+    pe.add_argument(
+        "-t",
+        "--timeout",
+        type=_positive_seconds,
+        default=EVAL_TIMEOUT_S,
+        metavar="SECONDS",
+        help=f"hard deadline for the whole eval, attach included (default "
+        f"{EVAL_TIMEOUT_S:g}). On expiry: a ❌ line and exit 1. JS already "
+        "running in the page is NOT stopped.",
+    )
+
+
+def _add_close_parser(sub: Any) -> argparse.ArgumentParser:
+    """The `close` subparser; returned so `parse_args` can reject bad mixes."""
+    pcl: argparse.ArgumentParser = sub.add_parser(
+        "close",
+        help="Close tabs you own: by CDP target id (-i, the ids `open -N` "
+        "printed), or — manual cleanup only — by exact URL. Takes the "
+        "interaction lease, re-checks each tab right before closing it, and "
+        "never closes the last tab (opens a blank keep-alive first). Exit 0 "
+        "when every requested tab is closed or already gone (also: no match, "
+        "browser down); 1 on a refused URL, lease timeout, unreadable tab list, "
+        "deadline hit, failed close or failed keep-alive.",
+    )
+    pcl.add_argument(
+        "urls",
+        nargs="*",
+        metavar="URL",
+        help="close every tab whose URL equals one of these, compared without "
+        "query, fragment and trailing slash. http(s) URLs only. For cleaning up "
+        "leftover tabs by hand; tools close by -i.",
+    )
+    pcl.add_argument(
+        "-i",
+        "--id",
+        nargs="+",
+        dest="ids",
+        default=None,
+        metavar="TID",
+        help="close the tabs with these CDP target ids (from `open -N`). A "
+        "missing id counts as already gone.",
+    )
+    pcl.add_argument(
+        "-n",
+        "--dry-run",
+        action="store_true",
+        help="only print `would close:` per matching tab; close nothing.",
+    )
+    pcl.add_argument(
+        "-w",
+        "--wait",
+        type=_positive_seconds,
+        default=CLOSE_WAIT_S,
+        metavar="SECONDS",
+        help=f"how long to wait for the interaction lease (default "
+        f"{CLOSE_WAIT_S:g}, capped by what is left of -d). On timeout: exit 1, "
+        "nothing closed.",
+    )
+    pcl.add_argument(
+        "-d",
+        "--deadline",
+        type=_positive_seconds,
+        default=CLOSE_DEADLINE_S,
+        metavar="SECONDS",
+        help=f"one overall deadline for the whole command (default "
+        f"{CLOSE_DEADLINE_S:g}): the lease wait, every re-list and every close "
+        "get only what is left. Tabs not reached in time: ❌, exit 1.",
+    )
+    return pcl
 
 
 def parse_args() -> argparse.Namespace:
@@ -316,6 +447,10 @@ def parse_args() -> argparse.Namespace:
             "  ./browser.py doctor             # full health check (disposable tab)\n"
             "  ./browser.py open https://portal.cscs.ch/profile/\n"
             "  ./browser.py eval -t 20 'document.title'\n"
+            "  ./browser.py open -N https://example.org/   # own tab → target=<id>\n"
+            "  ./browser.py eval -T <id> 'location.host'   # eval in exactly that tab\n"
+            "  ./browser.py close -i <id>      # close the tab you opened\n"
+            "  ./browser.py close -n https://app.example.com/login  # dry run, by URL\n"
             "  ./browser.py status -p          # + mark tabs that answer no CDP\n"
             "  ./browser.py close-hung         # close such tabs (asks first)\n"
             "  ./browser.py token              # cache the CSCS portal token\n"
@@ -383,6 +518,7 @@ def parse_args() -> argparse.Namespace:
         help="close without asking (default: list the candidates and ask; no TTY "
         "without -y closes nothing and exits 1).",
     )
+    pcl = _add_close_parser(sub)
     psw = sub.add_parser(
         "switch",
         help="Transactional mode switch: stop the browser and relaunch it in MODE "
@@ -437,36 +573,7 @@ def parse_args() -> argparse.Namespace:
         help="Stop even while registered CDP clients (e.g. the Playwright MCP "
         "server) are attached — they lose their connection.",
     )
-    po = sub.add_parser("open", help="Open/navigate a tab to URL.")
-    po.add_argument("url", help="URL to open.")
-    po.add_argument(
-        "-r",
-        "--reuse",
-        action="store_true",
-        help=(
-            "Navigate an existing tab already on this URL (compared without "
-            "query/fragment) instead of opening a new tab. Picks the oldest "
-            "match — the same tab `eval --url` targets."
-        ),
-    )
-    pe = sub.add_parser("eval", help="Eval a JS expression in a tab; print JSON.")
-    pe.add_argument("js", help="JavaScript expression to evaluate.")
-    pe.add_argument(
-        "--url",
-        default=None,
-        help="Substring to pick the target tab (default: first/active tab). "
-        "Exits 1 when no tab matches — never evaluates in another tab.",
-    )
-    pe.add_argument(
-        "-t",
-        "--timeout",
-        type=_positive_seconds,
-        default=EVAL_TIMEOUT_S,
-        metavar="SECONDS",
-        help=f"hard deadline for the whole eval, attach included (default "
-        f"{EVAL_TIMEOUT_S:g}). On expiry: a ❌ line and exit 1. JS already "
-        "running in the page is NOT stopped.",
-    )
+    _add_open_eval_parsers(sub)
     sub.add_parser("token", help="Cache the CSCS portal token from the portal tab.")
     sub.add_parser(
         "slack-session",
@@ -552,7 +659,19 @@ def parse_args() -> argparse.Namespace:
         help="Human-only: the pre-broker CSCS login (keychain / 1Password), "
         "refused without a terminal.",
     )
-    return p.parse_args()
+    args = p.parse_args()
+    if args.cmd == "close":
+        _check_close_args(pcl, args)
+    return args
+
+
+def _check_close_args(pcl: argparse.ArgumentParser, args: argparse.Namespace) -> None:
+    """`close` needs URLs XOR ids; exits 2 (argparse) otherwise."""
+    if bool(args.urls) == bool(args.ids):
+        pcl.error("give either URL… or -i/--id TID…, not both and not neither")
+    if any("/" in tid for tid in args.ids or []):
+        # `-i` is nargs="+": a URL after the ids would be read as an id.
+        pcl.error("-i/--id takes CDP target ids, not URLs")
 
 
 def ensure_deps():  # literal "def ensure_deps():" required by pre-commit hook
@@ -833,16 +952,23 @@ def _cdp_ws_exchange(
         out.status, out.error = "transport-error", _exc_line(exc)
 
 
-def _browser_ws_url(port: int) -> str | None:
+def _browser_ws_url(port: int, timeout: float = 2.0) -> str | None:
     """The browser-level ``webSocketDebuggerUrl`` from ``/json/version``."""
-    ver = _cdp_get(port, "/json/version")
+    ver = _cdp_get(port, "/json/version", timeout=timeout)
     url = ver.get("webSocketDebuggerUrl") if isinstance(ver, dict) else None
     return url if isinstance(url, str) and url else None
 
 
-def _cdp_close_target(port: int, target_id: str, budget_s: float = 5.0) -> bool:
-    """Close ONE target by id over the browser-level websocket; True on success."""
-    ws_url = _browser_ws_url(port)
+def _cdp_close_target(
+    port: int, target_id: str, budget_s: float = 5.0, ws_url: str | None = None
+) -> bool:
+    """Close ONE target by id over the browser-level websocket; True on success.
+
+    ``ws_url`` is the browser websocket when the caller already resolved it
+    (`close` resolves it once, under its own deadline); None reads it here.
+    """
+    if ws_url is None:
+        ws_url = _browser_ws_url(port)
     if ws_url is None:
         return False
     res = _cdp_ws_call(ws_url, "Target.closeTarget", {"targetId": target_id}, budget_s)
@@ -851,6 +977,40 @@ def _cdp_close_target(port: int, target_id: str, budget_s: float = 5.0) -> bool:
         and not res.error
         and bool((res.result or {}).get("success", True))
     )
+
+
+def _cdp_create_background_target(
+    ws_url: str, url: str, budget_s: float = 5.0
+) -> str | None:
+    """Create a tab over the browser websocket WITHOUT focusing it; its target id.
+
+    ``Target.createTarget`` with ``background: true`` — the raw counterpart of
+    `_open_background_tab`, so no Playwright attach (which waits for every
+    page target, tp#693/tp#786) is involved. None on any failure.
+    """
+    res = _cdp_ws_call(
+        ws_url, "Target.createTarget", {"url": url, "background": True}, budget_s
+    )
+    if res.status != "ok" or res.error:
+        return None
+    tid = (res.result or {}).get("targetId")
+    return tid if isinstance(tid, str) and tid else None
+
+
+def _target_label(url: object, title: object, tid: object) -> str:
+    """Origin-only, fail-closed human name of a target: ``title → origin [id8]``.
+
+    Title through `_tab_title`, URL through `_tab_hint` — never a raw URL. A
+    non-printable id (ids can come from the command line) renders as ``?``.
+    """
+    url_s = url if isinstance(url, str) else ""
+    return f"{_tab_title(title, url_s)}  →  {_tab_hint(url_s)}  {_id8(tid)}"
+
+
+def _id8(tid: object) -> str:
+    """``[id <first 8 chars>]``; a non-printable id renders as ``[id ?]``."""
+    tid_s = str(tid or "")[:8]
+    return f"[id {tid_s if tid_s.isprintable() else '?'}]"
 
 
 @dataclass
@@ -871,10 +1031,7 @@ class TargetProbe:
 
     def label(self) -> str:
         """Origin-only, fail-closed human name: ``title → origin [id8]``."""
-        return (
-            f"{_tab_title(self.title, self.url)}  →  {_tab_hint(self.url)}  "
-            f"[id {self.target_id[:8]}]"
-        )
+        return _target_label(self.url, self.title, self.target_id)
 
 
 @dataclass
@@ -1872,7 +2029,9 @@ def _describe_client(rec: dict) -> str:
     )
 
 
-def _registry_register(tool: str, purpose: str, port: int) -> Callable[[], None]:
+def _registry_register(
+    tool: str, purpose: str, port: int, wait_s: float = REGISTRY_SH_WAIT_S
+) -> Callable[[], None]:
     """Register this process as an attached CDP client; return its ``release()``.
 
     Two locks are taken and held until release: the gate SHARED (so `switch`
@@ -1883,17 +2042,18 @@ def _registry_register(tool: str, purpose: str, port: int) -> Callable[[], None]
     window in which a concurrent reaper could mistake it for debris is as small
     as an open() syscall.
 
-    Fails loud (exit) when the gate cannot be shared within
-    REGISTRY_SH_WAIT_S: that means a mode switch or a shutdown is mid-flight,
-    and attaching anyway is exactly the race this layer exists to prevent.
+    Fails loud (exit) when the gate cannot be shared within `wait_s`
+    (default REGISTRY_SH_WAIT_S; `close` passes what is left of its deadline):
+    that means a mode switch or a shutdown is mid-flight, and attaching anyway
+    is exactly the race this layer exists to prevent.
     """
     CLIENTS_DIR.mkdir(parents=True, exist_ok=True)
     gate_fd = os.open(str(REGISTRY_GATE), os.O_RDWR | os.O_CREAT, 0o600)
-    if not _flock_wait(gate_fd, fcntl.LOCK_SH, REGISTRY_SH_WAIT_S):
+    if not _flock_wait(gate_fd, fcntl.LOCK_SH, wait_s):
         os.close(gate_fd)
         sys.exit(
             "❌ Cannot attach to the shared browser: it is being switched or "
-            f"stopped right now (waited {REGISTRY_SH_WAIT_S:.0f}s for the client "
+            f"stopped right now (waited {wait_s:.0f}s for the client "
             "gate).\n   Retry in a moment; `browser.py status` shows the "
             "lifecycle state."
         )
@@ -2499,6 +2659,203 @@ def _close_approved(port: int, cands: list[TargetProbe]) -> int:
     return 1 if failed else 0
 
 
+# ---------------------------------------------------------------------------
+# close — a caller closes the tabs it OWNS (tp#786)
+# ---------------------------------------------------------------------------
+# `close-hung` picks its victims by heuristic, so they may belong to anyone:
+# three probes plus a confirmation. `close -i` closes only target ids the
+# caller was handed by `open -N` — proof of ownership, not a heuristic. The URL
+# mode (exact match sans query/fragment, http(s) only) exists for cleaning up
+# legacy litter by hand; tools never use it. Both re-read the tab list under
+# the interaction lease right before each close, never close the last page
+# (tp#317), and run under ONE monotonic deadline over raw CDP, so a wedged
+# foreign tab cannot stall them. Unregistered clients take no lease, so the
+# re-check is best-effort against them.
+
+
+def _close_refusal(url: str) -> str | None:
+    """Why `close URL` refuses `url` (non-http(s), no hostname), or None."""
+    try:
+        parts = urllib.parse.urlsplit(url)
+        host = parts.hostname
+    except ValueError:
+        return "unparseable URL"
+    if parts.scheme not in ("http", "https"):
+        return "not an http(s) URL"
+    if not host:
+        return "no hostname"
+    return None
+
+
+def _close_matches(pages: Sequence[dict], urls: Sequence[str]) -> list[dict]:
+    """The page targets whose URL equals one of `urls` after `_strip_query`."""
+    wanted = {_strip_query(u) for u in urls}
+    return [
+        t
+        for t in pages
+        if t.get("type") == "page"
+        and isinstance(t.get("url"), str)
+        and _strip_query(t["url"]) in wanted
+    ]
+
+
+def _close_list_pages(port: int, left: Callable[[], float]) -> list[dict] | None:
+    """The current page targets, read within what is left; None if unreadable."""
+    listing = _cdp_get(port, "/json/list", timeout=max(0.01, min(2.0, left())))
+    if not isinstance(listing, list):
+        return None
+    return [t for t in listing if isinstance(t, dict) and t.get("type") == "page"]
+
+
+# One parameter per `close` flag; bundling them would only move the list.
+def cmd_close(  # pylint: disable=too-many-arguments
+    port: int,
+    urls: Sequence[str] | None,
+    ids: Sequence[str] | None,
+    *,
+    dry_run: bool = False,
+    wait_s: float = CLOSE_WAIT_S,
+    deadline_s: float = CLOSE_DEADLINE_S,
+) -> int:
+    """Close the tabs named by target id (`ids`) or by exact URL (`urls`).
+
+    Order: validate the URLs, then the registration, then the interaction
+    lease (gate → lease, the existing lock order), all under one monotonic
+    deadline (`deadline_s`); the lease wait is ``min(wait_s, left)``. A lease
+    timeout exits 1 with nothing closed (`_interaction_lease` raises
+    SystemExit; the registration is released in the ``finally``). Exit codes:
+    see the `close` help.
+    """
+    deadline = time.monotonic() + deadline_s
+
+    def left() -> float:
+        return max(0.0, deadline - time.monotonic())
+
+    urls, ids = list(urls or []), list(ids or [])
+    for u in urls:
+        why = _close_refusal(u)
+        if why:
+            return _fail(
+                f"refusing to close by URL {_tab_hint(u)}: {why} — closed nothing."
+            )
+    if not _is_up(port):
+        print("✓ Shared browser is down — nothing to close.")
+        return 0
+    release = _registry_register("browser.py", _purpose(), port, wait_s=left())
+    try:
+        with _interaction_lease("close", wait_s=min(wait_s, left())):
+            return _close_locked(port, urls, ids, dry_run, left)
+    finally:
+        release()
+
+
+def _close_candidates(
+    pages: list[dict], urls: list[str], ids: list[str]
+) -> tuple[list[dict], list[str]]:
+    """``(candidates, missing ids)`` from the first listing."""
+    if urls:
+        return _close_matches(pages, urls), []
+    by_id = {t.get("id"): t for t in pages}
+    cands: list[dict] = []
+    missing: list[str] = []
+    for tid in dict.fromkeys(ids):  # dedupe, keep order
+        if tid in by_id:
+            cands.append(by_id[tid])
+        else:
+            missing.append(tid)
+    return cands, missing
+
+
+def _label_of(t: dict) -> str:
+    """`_target_label` of a ``/json/list`` entry."""
+    return _target_label(t.get("url"), t.get("title"), t.get("id"))
+
+
+def _close_locked(
+    port: int,
+    urls: list[str],
+    ids: list[str],
+    dry_run: bool,
+    left: Callable[[], float],
+) -> int:
+    """`close` body; the caller holds the registration and the lease."""
+    ws_url = _browser_ws_url(port, timeout=max(0.01, min(2.0, left())))
+    if ws_url is None:
+        return _fail("could not read the browser endpoint — closed nothing.")
+    pages = _close_list_pages(port, left)
+    if pages is None:
+        return _fail("could not read the tab list — closed nothing.")
+    cands, missing = _close_candidates(pages, urls, ids)
+    for tid in missing:
+        print(f"- gone: {_id8(tid)}")
+    if not cands and urls:
+        print("✓ No matching tab — nothing to close.")
+    if dry_run or not cands:
+        for t in cands:
+            print(f"would close: {_label_of(t)}")
+        return 0
+    run = _CloseRun(port, ws_url, {_strip_query(u) for u in urls} if urls else None)
+    rc = 0
+    for i, t in enumerate(cands):
+        now = _close_list_pages(port, left) if left() > 0 else None
+        if now is None:
+            why = "deadline" if left() <= 0 else "tab list unreadable"
+            for rest in cands[i:]:
+                print(f"❌ failed ({why}): {_label_of(rest)}", file=sys.stderr)
+            return 1
+        rc |= _close_one(run, t, now, left)
+    return rc
+
+
+@dataclass
+class _CloseRun:
+    """What every `_close_one` of one `close` run shares.
+
+    ``wanted`` is the set of `_strip_query`'d URLs in URL mode, None in id mode.
+    """
+
+    port: int
+    ws_url: str
+    wanted: set[str] | None
+
+
+def _close_one(
+    run: _CloseRun, t: dict, now: list[dict], left: Callable[[], float]
+) -> int:
+    """Re-check candidate `t` against the fresh listing `now`; close it. 0/1.
+
+    Gone → ``- gone``; URL mode (``run.wanted`` set) and the URL no longer matches →
+    ``skipped (changed)``; the only page left → a blank keep-alive first
+    (tp#317: zero tabs break every `connect_over_cdp`), and if that fails the
+    tab stays open.
+    """
+    tid = str(t.get("id") or "")
+    label = _label_of(t)
+    cur = next((p for p in now if p.get("id") == tid), None)
+    if cur is None:
+        print(f"- gone: {label}")
+        return 0
+    cur_url = cur.get("url")
+    if run.wanted is not None and not (
+        isinstance(cur_url, str) and _strip_query(cur_url) in run.wanted
+    ):
+        print(f"skipped (changed): {label}")
+        return 0
+    if len(now) <= 1 and not _cdp_create_background_target(
+        run.ws_url, "about:blank", min(5.0, left())
+    ):
+        print(
+            f"❌ failed (could not open a keep-alive tab; left open): {label}",
+            file=sys.stderr,
+        )
+        return 1
+    if _cdp_close_target(run.port, tid, left(), ws_url=run.ws_url):
+        print(f"✓ closed: {label}")
+        return 0
+    print(f"❌ failed: {label}", file=sys.stderr)
+    return 1
+
+
 def cmd_clients(port: int) -> int:
     """Show who is attached over CDP: the registered clients and the unknown ones.
 
@@ -2788,6 +3145,25 @@ def _is_blank(url: str) -> bool:
     return not url or url == "about:blank" or url.startswith("chrome://")
 
 
+def _await_target_load(port: int, tid: str, timeout_s: float = 15.0) -> dict:
+    """Poll ``/json/list`` until target `tid` left the blank page; its listing.
+
+    Returns the last listing seen for `tid` (``{}`` if it never appeared).
+    """
+    info: dict = {}
+    deadline = time.time() + timeout_s
+    while time.time() < deadline:
+        targets = _cdp_get(port, "/json/list")
+        for t in targets if isinstance(targets, list) else []:
+            if isinstance(t, dict) and t.get("id") == tid:
+                info = t
+                break
+        if info.get("url") not in (None, "", "about:blank"):
+            break
+        time.sleep(0.25)
+    return info
+
+
 def _open_background_tab(port: int, browser, url: str) -> dict:
     """Open URL in a NEW tab WITHOUT focusing it; return {url, title, id}.
 
@@ -2928,8 +3304,34 @@ def _tab_line(target: dict[str, object], full_urls: bool = False) -> str:
     return f"   - {title}  →  {hint}"
 
 
-def cmd_open(port: int, url: str, reuse: bool = False) -> int:
-    """Open/navigate a tab to URL."""
+def _open_new_raw(port: int, url: str) -> int:
+    """`open -N`: a NEW background tab over raw CDP; prints ``target=<id>``.
+
+    No Playwright attach (it waits for every page target, so one heavy or
+    wedged foreign tab would slow this down — tp#786). Registers like `open`;
+    takes no lease. Exit 1 when the tab cannot be created.
+    """
+    if not _is_up(port):
+        sys.exit("Shared browser is down. Run: browser.py up")
+    _ensure_page_target(port)  # zero tabs: createTarget may open a window
+    release = _registry_register("browser.py", _purpose(), port)
+    try:
+        ws_url = _browser_ws_url(port)
+        tid = _cdp_create_background_target(ws_url, url) if ws_url else None
+        if tid is None:
+            return _fail("could not create a background tab (Target.createTarget).")
+        info = _await_target_load(port, tid)
+        print(f"✓ Opened: {info.get('url', url)}  (title: {info.get('title', '')!r})")
+        print(f"target={tid}")
+        return 0
+    finally:
+        release()
+
+
+def cmd_open(port: int, url: str, reuse: bool = False, new: bool = False) -> int:
+    """Open/navigate a tab to URL (`new`: always a new tab, see `_open_new_raw`)."""
+    if new:
+        return _open_new_raw(port, url)
     pw, browser = _connect(port)
     try:
         ctx = browser.contexts[0] if browser.contexts else browser.new_context()
@@ -2971,7 +3373,11 @@ def _eval_watchdog_fire(timeout_s: float) -> None:
 
 
 def cmd_eval(
-    port: int, js: str, url_substr: str | None, timeout_s: float = EVAL_TIMEOUT_S
+    port: int,
+    js: str,
+    url_substr: str | None,
+    timeout_s: float = EVAL_TIMEOUT_S,
+    target: str | None = None,
 ) -> int:
     """Eval a JS expression in a tab and print the JSON result.
 
@@ -2984,9 +3390,78 @@ def cmd_eval(
     watchdog.daemon = True
     watchdog.start()
     try:
+        if target is not None:
+            return _eval_target_raw(port, target, js, timeout_s)
         return _eval_attached(port, js, url_substr)
     finally:
         watchdog.cancel()
+
+
+def _cdp_exception_line(details: object) -> str:
+    """One printable line (≤200 chars) from a CDP ``exceptionDetails``."""
+    text = ""
+    if isinstance(details, dict):
+        exc = details.get("exception")
+        desc = exc.get("description") if isinstance(exc, dict) else None
+        text = desc if isinstance(desc, str) and desc else str(details.get("text", ""))
+    line = (text.splitlines() or ["JS exception"])[0]
+    line = "".join(ch if ch.isprintable() else "?" for ch in line)
+    return line[:200] or "JS exception"
+
+
+def _eval_target_raw(port: int, tid: str, js: str, budget_s: float) -> int:
+    """`eval -T`: ``Runtime.evaluate`` on target `tid`'s own websocket; print JSON.
+
+    Registers (no lease), finds `tid` in ``/json/list`` and sends ONE
+    ``Runtime.evaluate`` with ``awaitPromise`` and ``returnByValue`` under what
+    is left of `budget_s`. A JS exception, a missing target or a timeout is a
+    ❌ line and exit 1. ``undefined`` prints ``null``; a value JSON cannot hold
+    (NaN, Infinity, -0, a BigInt) prints as its JS spelling in a string.
+    """
+    deadline = time.monotonic() + budget_s
+
+    def left() -> float:
+        return max(0.0, deadline - time.monotonic())
+
+    if not _is_up(port):
+        sys.exit("Shared browser is down. Run: browser.py up")
+    release = _registry_register("browser.py", _purpose(), port)
+    try:
+        listing = _cdp_get(port, "/json/list", timeout=max(0.01, min(2.0, left())))
+        if not isinstance(listing, list):
+            return _fail("could not read the tab list — nothing evaluated.")
+        found = next(
+            (t for t in listing if isinstance(t, dict) and t.get("id") == tid), None
+        )
+        ws_url = found.get("webSocketDebuggerUrl") if found else None
+        if not isinstance(ws_url, str) or not ws_url:
+            return _fail(
+                f"no tab with target id {_id8(tid)} (closed, or not attachable) — "
+                "nothing evaluated."
+            )
+        res = _cdp_ws_call(
+            ws_url,
+            "Runtime.evaluate",
+            {"expression": f"({js})", "awaitPromise": True, "returnByValue": True},
+            left(),
+        )
+        if res.status == "timeout":
+            return _fail(
+                f"eval: no result after {budget_s:g}s (tab unresponsive or "
+                "expression never settled)"
+            )
+        if res.status != "ok" or res.error:
+            return _fail(f"eval -T {_id8(tid)}: {res.error or res.status}")
+        out = res.result or {}
+        if out.get("exceptionDetails"):
+            return _fail(f"eval -T: {_cdp_exception_line(out['exceptionDetails'])}")
+        remote = out.get("result")
+        remote = remote if isinstance(remote, dict) else {}
+        value = remote.get("value", remote.get("unserializableValue"))
+        print(json.dumps(value, indent=2, default=str))
+        return 0
+    finally:
+        release()
 
 
 def _eval_attached(port: int, js: str, url_substr: str | None) -> int:
@@ -4371,7 +4846,8 @@ def _fresh_totp(
     Called at fill time (see ``CscsCreds``) so a code is never stale by the
     time Keycloak checks it (tp#491 D2).
     """
-    return _broker_fresh_totp(seed_or_uri, clock=clock, sleep=sleep)
+    code: str | None = _broker_fresh_totp(seed_or_uri, clock=clock, sleep=sleep)
+    return code
 
 
 class CscsCreds(NamedTuple):
@@ -6796,7 +7272,8 @@ def _broker_probe(page, entry: dict) -> bool:
 
     page.wait_for_timeout(1000)
     if entry.get("site") == "cscs":
-        return _broker_cscs_on_portal(page.url)
+        on_portal: bool = _broker_cscs_on_portal(page.url)
+        return on_portal
     sentinel = entry.get("logged_in_selector")
     if sentinel:
         try:
@@ -7438,6 +7915,15 @@ def _dispatch(args: argparse.Namespace, port: int) -> int:
         return cmd_status(port, args.full_urls)
     if args.cmd == "close-hung":
         return cmd_close_hung(port, assume_yes=args.yes)
+    if args.cmd == "close":
+        return cmd_close(
+            port,
+            args.urls,
+            args.ids,
+            dry_run=args.dry_run,
+            wait_s=args.wait,
+            deadline_s=args.deadline,
+        )
     if args.cmd == "switch":
         return cmd_switch(port, args.mode, args.force)
     if args.cmd == "clients":
@@ -7449,9 +7935,11 @@ def _dispatch(args: argparse.Namespace, port: int) -> int:
     if args.cmd == "down":
         return cmd_down(port, args.force)
     if args.cmd == "open":
-        return cmd_open(port, args.url, reuse=args.reuse)
+        return cmd_open(port, args.url, reuse=args.reuse, new=args.new)
     if args.cmd == "eval":
-        return cmd_eval(port, args.js, args.url, timeout_s=args.timeout)
+        return cmd_eval(
+            port, args.js, args.url, timeout_s=args.timeout, target=args.target
+        )
     if args.cmd == "token":
         return cmd_token(port)
     if args.cmd == "slack-session":

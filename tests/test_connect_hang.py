@@ -32,6 +32,8 @@ from __future__ import annotations
 # pylint: disable=protected-access,missing-function-docstring,import-error
 # pylint: disable=redefined-outer-name,unused-argument,too-many-instance-attributes
 # pylint: disable=missing-class-docstring,too-few-public-methods
+# One module on purpose: every test here shares the FakeCdp endpoint above.
+# pylint: disable=too-many-lines
 import base64
 import hashlib
 import importlib.util
@@ -42,7 +44,7 @@ import subprocess
 import sys
 import threading
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
@@ -85,6 +87,11 @@ class FakeTarget:
     mode: str = "ok"
     recover_after: int = 0
     connections: int = 0
+    # What an answered ``Runtime.evaluate`` returns as ``result.value`` (and,
+    # when set, the exception it throws instead); every command it received.
+    eval_value: object = 1
+    eval_exception: str | None = None
+    received: list = field(default_factory=list)
 
 
 def _ws_accept(key: str) -> str:
@@ -128,6 +135,11 @@ class FakeCdp:
         self.targets: dict[str, FakeTarget] = {}
         self.browser_mode = "ok"  # or "silent"
         self.list_fail = False
+        # Runs on every /json and /json/list read, before the listing is built.
+        self.list_hook = None
+        self.list_reads = 0
+        self.create_fail = False  # Target.createTarget answers with a CDP error
+        self.created: list[str] = []
         self.browser_log: list[dict] = []
         self.closed: list[str] = []
         self._stop = threading.Event()
@@ -149,6 +161,10 @@ class FakeCdp:
                         "webSocketDebuggerUrl": f"{fake.ws_base}/devtools/browser/b",
                     }
                 elif path in ("/json", "/json/list"):
+                    with fake._lock:
+                        fake.list_reads += 1
+                    if fake.list_hook is not None:
+                        fake.list_hook(fake)
                     if fake.list_fail:
                         self.send_error(500)
                         return
@@ -232,14 +248,27 @@ class FakeCdp:
                 threading.Thread(target=self._spam, args=(conn,), daemon=True).start()
             for raw in conn:
                 msg = json.loads(raw)
+                target.received.append(msg)
                 if mode == "ok":
                     conn.send(
-                        json.dumps(
-                            {"id": msg["id"], "result": {"result": {"value": 1}}}
-                        )
+                        json.dumps({"id": msg["id"], "result": self._eval(target)})
                     )
         except ConnectionClosed:
             pass
+
+    @staticmethod
+    def _eval(target: FakeTarget) -> dict:
+        if target.eval_exception is not None:
+            return {
+                "result": {"type": "object", "subtype": "error"},
+                "exceptionDetails": {
+                    "text": "Uncaught",
+                    "exception": {"description": target.eval_exception},
+                },
+            }
+        if target.eval_value is None:
+            return {"result": {"type": "undefined"}}
+        return {"result": {"type": "object", "value": target.eval_value}}
 
     def _spam(self, conn) -> None:
         try:
@@ -283,6 +312,22 @@ class FakeCdp:
                     self.closed.append(tid)
                     self.targets.pop(tid, None)
                     result = {"success": True}
+                elif method == "Target.createTarget":
+                    if self.create_fail:
+                        conn.send(
+                            json.dumps(
+                                {
+                                    "id": msg["id"],
+                                    "error": {"code": -32000, "message": "nope"},
+                                }
+                            )
+                        )
+                        continue
+                    with self._lock:
+                        tid = f"NEW{len(self.created):05d}"
+                        self.created.append(tid)
+                    self.add(tid, str(params.get("url") or "about:blank"))
+                    result = {"targetId": tid}
                 conn.send(json.dumps({"id": msg["id"], "result": result}))
                 if method == "Target.setAutoAttach":
                     for n, t in enumerate(list(self.targets.values())):
@@ -711,3 +756,311 @@ def test_doctor_stalled_reattach_is_a_fail_line_and_the_probe_tab_is_closed_by_i
     assert "❌ attach: attach timed out" in out
     assert fake.closed == ["PROBE0001"]  # closed by id, over raw CDP
     assert windows.calls == 2
+
+
+# --- open -N / eval -T / close (tp#786) ----------------------------------------
+# A caller owns its tab by CDP target id: `open -N` creates it over raw CDP and
+# prints the id, `eval -T` evaluates in exactly that target, `close -i` closes
+# exactly that id — under the lease, re-checked right before the close, never
+# the last page, inside one deadline.
+
+
+def _hold_lease(cache: Path) -> int:
+    import fcntl  # pylint: disable=import-outside-toplevel
+
+    fd = os.open(str(cache / "interaction.lock"), os.O_RDWR | os.O_CREAT, 0o600)
+    fcntl.flock(fd, fcntl.LOCK_EX)
+    return fd
+
+
+def _lease_is_held(cache: Path) -> bool:
+    import fcntl  # pylint: disable=import-outside-toplevel
+
+    fd = os.open(str(cache / "interaction.lock"), os.O_RDWR | os.O_CREAT, 0o600)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        return True
+    finally:
+        os.close(fd)
+    return False
+
+
+def test_close_id_leaves_same_url_foreign_tab_open(fake, cache, capsys):
+    url = "https://app.smartsheet.com/sheets/X?tok=LEAKTOKEN"
+    fake.add("FOREIGN1", url, "Sheet")
+    fake.add("OURS0001", url, "Sheet")
+    rc = browser.cmd_close(fake.port, None, ["OURS0001"])
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert fake.closed == ["OURS0001"]
+    assert "FOREIGN1" in fake.targets
+    assert "✓ closed:" in out and "[id OURS0001]" in out
+    assert "LEAKTOKEN" not in out and "/sheets/" not in out
+
+
+def test_close_id_missing_is_gone_and_rc0(fake, cache, capsys):
+    fake.add("OTHER001", "https://ok.example/", "ok")
+    assert browser.cmd_close(fake.port, None, ["NOPE0001"]) == 0
+    assert "- gone: [id NOPE0001]" in capsys.readouterr().out
+    assert not fake.closed
+
+
+def test_close_url_mode_skips_tab_that_navigated_between_list_and_close(
+    fake, cache, capsys
+):
+    fake.add("LITTER01", "https://app.example.com/login?next=x", "Login")
+    fake.add("OTHER001", "https://ok.example/", "ok")
+
+    def navigate_after_first_listing(f: FakeCdp) -> None:
+        if f.list_reads >= 2:
+            f.targets["LITTER01"].url = "https://app.example.com/home"
+
+    fake.list_hook = navigate_after_first_listing
+    rc = browser.cmd_close(fake.port, ["https://app.example.com/login"], None)
+    assert rc == 0
+    assert not fake.closed
+    assert "skipped (changed)" in capsys.readouterr().out
+
+
+def test_close_url_mode_matches_exact_base_url_only(fake, cache, capsys):
+    fake.add("LITTER01", "https://app.example.com/login/?next=a#f", "Login")
+    fake.add("LITTER02", "https://app.example.com/login?next=b", "Login")
+    fake.add("KEEP0001", "https://app.example.com/login/other", "Other")
+    rc = browser.cmd_close(fake.port, ["https://app.example.com/login"], None)
+    assert rc == 0
+    assert sorted(fake.closed) == ["LITTER01", "LITTER02"]
+    assert "KEEP0001" in fake.targets
+    assert "next=" not in capsys.readouterr().out
+
+
+def test_close_url_mode_dry_run_closes_nothing(fake, cache, capsys):
+    fake.add("LITTER01", "https://app.example.com/login?next=a", "Login")
+    fake.add("OTHER001", "https://ok.example/", "ok")
+    rc = browser.cmd_close(
+        fake.port, ["https://app.example.com/login"], None, dry_run=True
+    )
+    out = capsys.readouterr().out
+    assert rc == 0 and not fake.closed
+    assert "would close:" in out and "[id LITTER01]" in out
+
+
+def test_close_url_mode_refuses_non_http_url(fake, cache, capsys):
+    fake.add("BLANK001", "about:blank")
+    assert browser.cmd_close(fake.port, ["chrome://settings"], None) == 1
+    assert not fake.closed
+    assert "refusing" in capsys.readouterr().err
+
+
+def test_close_creates_keepalive_when_list_changes_to_last_tab(fake, cache):
+    fake.add("OURS0001", "https://ok.example/a", "ours")
+    fake.add("OTHER001", "https://ok.example/b", "other")
+
+    def drop_other_after_first_listing(f: FakeCdp) -> None:
+        if f.list_reads >= 2:
+            f.targets.pop("OTHER001", None)
+
+    fake.list_hook = drop_other_after_first_listing
+    rc = browser.cmd_close(fake.port, None, ["OURS0001"])
+    assert rc == 0
+    methods = [m.get("method") for m in fake.browser_log]
+    assert "Target.createTarget" in methods
+    assert methods.index("Target.createTarget") < methods.index("Target.closeTarget")
+    assert fake.closed == ["OURS0001"]
+    assert [t.url for t in fake.targets.values()] == ["about:blank"]
+
+
+def test_close_keepalive_failure_keeps_tab_rc1(fake, cache, capsys):
+    fake.add("OURS0001", "https://ok.example/a", "ours")
+    fake.create_fail = True
+    rc = browser.cmd_close(fake.port, None, ["OURS0001"])
+    assert rc == 1
+    assert not fake.closed and "OURS0001" in fake.targets
+    assert "keep-alive" in capsys.readouterr().err
+
+
+def test_close_lease_timeout_closes_nothing(fake, cache):
+    fake.add("OURS0001", "https://ok.example/a", "ours")
+    fake.add("OTHER001", "https://ok.example/b", "other")
+    fd = _hold_lease(cache)
+    try:
+        t0 = time.monotonic()
+        with pytest.raises(SystemExit) as exc:
+            browser.cmd_close(fake.port, None, ["OURS0001"], wait_s=0.5)
+        assert time.monotonic() - t0 < 3
+    finally:
+        os.close(fd)
+    assert "holds the lease" in str(exc.value.code)
+    assert not fake.closed
+    assert browser._registry_live_clients() == []  # released in the finally
+
+
+def test_close_deadline_bounds_silent_browser(fake, cache, capsys):
+    fake.browser_mode = "silent"
+    fake.add("OURS0001", "https://ok.example/a", "ours")
+    fake.add("OTHER001", "https://ok.example/b", "other")
+    t0 = time.monotonic()
+    rc = browser.cmd_close(fake.port, None, ["OURS0001"], deadline_s=1.0)
+    took = time.monotonic() - t0
+    assert rc == 1
+    assert took < 2.5, took
+    assert "❌ failed" in capsys.readouterr().err
+
+
+def test_close_works_while_another_tab_is_silent(fake, cache):
+    fake.add("SILENT01", HUNG_URL, HUNG_TITLE, mode="silent")
+    fake.add("OURS0001", "https://ok.example/a", "ours")
+    t0 = time.monotonic()
+    assert browser.cmd_close(fake.port, None, ["OURS0001"]) == 0
+    assert time.monotonic() - t0 < 3
+    assert fake.closed == ["OURS0001"]
+
+
+def test_close_unreadable_list_closes_nothing(fake, cache, capsys):
+    fake.add("OURS0001", "https://ok.example/a", "ours")
+    fake.add("OTHER001", "https://ok.example/b", "other")
+    fake.list_fail = True
+    assert browser.cmd_close(fake.port, None, ["OURS0001"]) == 1
+    assert not fake.closed
+    assert "closed nothing" in capsys.readouterr().err
+
+
+def test_close_unreadable_relist_closes_nothing(fake, cache, capsys):
+    fake.add("OURS0001", "https://ok.example/a", "ours")
+    fake.add("OTHER001", "https://ok.example/b", "other")
+
+    def fail_after_first_listing(f: FakeCdp) -> None:
+        f.list_fail = f.list_reads >= 2
+
+    fake.list_hook = fail_after_first_listing
+    assert browser.cmd_close(fake.port, None, ["OURS0001"]) == 1
+    assert not fake.closed
+    assert "tab list unreadable" in capsys.readouterr().err
+
+
+def test_close_registers_and_releases(fake, cache):
+    fake.add("OURS0001", "https://ok.example/a", "ours")
+    fake.add("OTHER001", "https://ok.example/b", "other")
+    seen: list[tuple[int, bool]] = []
+
+    def snapshot(f: FakeCdp) -> None:
+        seen.append((len(browser._registry_live_clients()), _lease_is_held(cache)))
+
+    fake.list_hook = snapshot
+    assert browser.cmd_close(fake.port, None, ["OURS0001"]) == 0
+    assert seen and all(s == (1, True) for s in seen), seen
+    assert browser._registry_live_clients() == []
+    assert not _lease_is_held(cache)
+
+
+def test_close_browser_down_is_rc0(cache, capsys):
+    with socket.socket() as s:
+        s.bind(("127.0.0.1", 0))
+        dead = s.getsockname()[1]
+    assert browser.cmd_close(dead, None, ["OURS0001"]) == 0
+    assert "down" in capsys.readouterr().out
+
+
+def test_open_new_twice_gives_distinct_targets(fake, cache, capsys):
+    fake.add("EXIST001", "https://ok.example/", "ok")
+    url = "https://app.example.com/sheets/X"
+    rcs: list[int] = []
+    threads = [
+        threading.Thread(
+            target=lambda: rcs.append(browser.cmd_open(fake.port, url, new=True))
+        )
+        for _ in range(2)
+    ]
+    for th in threads:
+        th.start()
+    for th in threads:
+        th.join(timeout=20)
+    out = capsys.readouterr().out
+    ids = [ln.split("=", 1)[1] for ln in out.splitlines() if ln.startswith("target=")]
+    assert rcs == [0, 0]
+    assert len(ids) == 2 and len(set(ids)) == 2
+    assert set(ids) == set(fake.created)
+    creates = [m for m in fake.browser_log if m.get("method") == "Target.createTarget"]
+    assert all(m["params"] == {"url": url, "background": True} for m in creates)
+    assert "EXIST001" in fake.targets  # never reused, never navigated
+
+
+def test_open_new_create_failure_rc1(fake, cache, capsys):
+    fake.add("EXIST001", "https://ok.example/", "ok")
+    fake.create_fail = True
+    assert browser.cmd_open(fake.port, "https://x.example/", new=True) == 1
+    assert "target=" not in capsys.readouterr().out
+
+
+def test_eval_target_hits_named_target(fake, cache, capsys):
+    fake.add("TAB00001", "https://a.example/", "a").eval_value = "from-A"
+    fake.add("TAB00002", "https://b.example/", "b").eval_value = {"k": "from-B"}
+    rc = browser.cmd_eval(
+        fake.port, "location.host", None, timeout_s=5, target="TAB00002"
+    )
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert json.loads(out) == {"k": "from-B"}
+    sent = fake.targets["TAB00002"].received
+    assert [m["method"] for m in sent] == ["Runtime.evaluate"]
+    assert sent[0]["params"] == {
+        "expression": "(location.host)",
+        "awaitPromise": True,
+        "returnByValue": True,
+    }
+    assert not fake.targets["TAB00001"].received
+    rc = browser.cmd_eval(fake.port, "1", None, timeout_s=5, target="UNKNOWN1")
+    assert rc == 1
+    assert "no tab with target id [id UNKNOWN1]" in capsys.readouterr().err
+
+
+def test_eval_target_undefined_prints_null_and_exception_is_rc1(fake, cache, capsys):
+    tab = fake.add("TAB00001", "https://a.example/", "a")
+    tab.eval_value = None
+    assert (
+        browser.cmd_eval(fake.port, "void 0", None, timeout_s=5, target="TAB00001") == 0
+    )
+    assert capsys.readouterr().out.strip() == "null"
+    tab.eval_exception = "ReferenceError: nope is not defined\n    at <anonymous>:1:1"
+    assert (
+        browser.cmd_eval(fake.port, "nope", None, timeout_s=5, target="TAB00001") == 1
+    )
+    err = capsys.readouterr().err
+    assert "ReferenceError: nope is not defined" in err and "<anonymous>" not in err
+
+
+def test_eval_target_times_out_on_silent_tab(fake, cache, monkeypatch, capsys):
+    # The raw budget expires first; the watchdog (here: never) is the backstop.
+    monkeypatch.setattr(browser, "_eval_watchdog_fire", lambda _t: None)
+    fake.add("SILENT01", HUNG_URL, HUNG_TITLE, mode="silent")
+    t0 = time.monotonic()
+    assert browser.cmd_eval(fake.port, "1", None, timeout_s=1, target="SILENT01") == 1
+    assert time.monotonic() - t0 < 2.5
+    assert "no result after 1s" in capsys.readouterr().err
+
+
+def test_cli_open_new_then_close_id(fake, tmp_path):
+    fake.add("EXIST001", "https://ok.example/", "ok")
+    proc, _took = _run_cli(
+        fake, tmp_path, "open", "-N", "https://example.org/", env={}, deadline=60
+    )
+    assert proc.returncode == 0, proc.stderr
+    ids = [ln[7:] for ln in proc.stdout.splitlines() if ln.startswith("target=")]
+    assert len(ids) == 1 and ids[0] in fake.targets
+    proc, _took = _run_cli(fake, tmp_path, "close", "-i", ids[0], env={}, deadline=60)
+    assert proc.returncode == 0, proc.stderr
+    assert "✓ closed:" in proc.stdout
+    assert fake.closed == ids
+    assert "EXIST001" in fake.targets
+
+
+def test_cli_close_rejects_ids_and_urls_together(tmp_path):
+    proc = subprocess.run(
+        [sys.executable, str(_BROWSER_PY), "close", "https://a.example/", "-i", "T1"],
+        capture_output=True,
+        text=True,
+        timeout=30,
+        check=False,
+    )
+    assert proc.returncode == 2
+    assert "not both" in proc.stderr

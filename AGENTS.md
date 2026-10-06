@@ -33,6 +33,10 @@ framework. It is a **provider**: other repos depend on it, not the reverse. See
 ## Conventions
 
 - Every subcommand supports `-h/--help`; every CLI flag has a short and long form.
+- **Consumers own tabs by target id** (tp#786): `open -N URL` → `eval -T <id>` →
+  `close -i <id>` (in a `finally`). Never navigate "the oldest tab on this URL"
+  or pick a tab by URL substring in new code — a redirect or a user's own tab on
+  the same URL defeats URL matching; the target id cannot be impersonated.
 - This repo declares **no** `EXTERNAL_DEPS` registry (extdeps package) — it is a
   provider, not a consumer. Its own external tools (`op`, `himalaya`, `security`, Playwright) are
   **optional** and degrade gracefully (assisted fallback); they are documented in
@@ -58,9 +62,17 @@ framework. It is a **provider**: other repos depend on it, not the reverse. See
   cleanup) uses the raw CDP helper `_cdp_ws_call` (one websocket, one command,
   one monotonic deadline) — never Playwright. The raw helpers are
   registration-free (shutdown calls them while holding the gate exclusively);
-  the COMMANDS built on them register a client and, for `close-hung`, take the
-  interaction lease. Nothing closes a real tab without `close-hung`'s
-  three-probe + confirmation contract.
+  the COMMANDS built on them register a client and, for `close-hung` and
+  `close`, take the interaction lease. Nothing closes a real tab without
+  `close-hung`'s three-probe + confirmation contract — with ONE exception
+  (tp#786): `close -i TID…` closes target ids the caller was handed by
+  `open -N`, which is proof of ownership, not a heuristic. Its URL mode
+  (`close URL…`, exact match sans query/fragment, http(s) only) is manual
+  cleanup of leftover tabs only; no tool uses it. Both modes re-read
+  `/json/list` under the lease right before each `Target.closeTarget`, never
+  close the last page (a blank keep-alive first, tp#317), and run over raw CDP
+  under one deadline. `open -N` and `eval -T` are raw CDP too (no Playwright
+  attach).
 - **`security` (keychain) calls go through `_security_run` only**: new session, no
   timeout, never `kill`/`terminate` — killing a client mid-dialog crashed
   `securityd` (tp#504). Writes are delete-then-add pinned to the default keychain,

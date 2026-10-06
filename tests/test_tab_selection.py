@@ -272,3 +272,55 @@ def test_eval_matching_still_uses_the_full_url():
     br = _Browser(["https://x.test/sites/foo/a", "https://x.test/other"])
     _ctx, page = browser._pick_page(br, "/sites/foo", require_match=True)
     assert page is not None and page.url.endswith("/a")
+
+
+# --- close URL mode (tp#786): exact base-URL match, http(s) only -------------
+
+
+def _pages(*urls: str) -> list[dict]:
+    return [{"id": f"T{i}", "type": "page", "url": u} for i, u in enumerate(urls)]
+
+
+def test_close_matches_ignores_query_fragment_and_trailing_slash():
+    pages = _pages(
+        "https://app.example.com/login?next=x",
+        "https://app.example.com/login#frag",
+        "https://app.example.com/login/",
+        "https://app.example.com/login",
+    )
+    got = browser._close_matches(pages, ["https://app.example.com/login"])
+    assert [t["id"] for t in got] == ["T0", "T1", "T2", "T3"]
+
+
+def test_close_matches_never_matches_a_different_path_or_non_page():
+    pages = _pages(
+        "https://app.example.com/login/other",
+        "https://app.example.com/log",
+        "https://other.example.com/login",
+    )
+    pages.append(
+        {"id": "W", "type": "service_worker", "url": "https://app.example.com/login"}
+    )
+    assert browser._close_matches(pages, ["https://app.example.com/login"]) == []
+
+
+def test_close_refusal_refuses_non_http_and_hostless_urls():
+    for bad in (
+        "chrome://settings",
+        "about:blank",
+        "data:text/html,<p>x</p>",
+        "file:///etc/hosts",
+        "https:///nohost",
+        "http://[::1",  # unparseable
+    ):
+        assert browser._close_refusal(bad), bad
+    assert browser._close_refusal("https://app.example.com/login?x=1") is None
+    assert browser._close_refusal("http://127.0.0.1:8080/") is None
+
+
+def test_target_label_is_origin_only_and_fail_closed():
+    label = browser._target_label(
+        "https://a.example/reset?tok=SECRET", "Reset", "ABCDEF0123456789"
+    )
+    assert label == "Reset  →  https://a.example  [id ABCDEF01]"
+    assert browser._id8("bad\nid") == "[id ?]"

@@ -73,6 +73,15 @@ browser.py doctor             # full health check on a disposable tab (never tou
 browser.py open https://…     # navigate a tab (opens in the BACKGROUND — no focus steal)
 browser.py open -r https://…  # --reuse: navigate an existing same-URL tab (no duplicate tabs;
                               #   matches sans query/fragment, oldest first = eval's pick)
+browser.py open -N https://…  # --new: ALWAYS a new background tab (raw CDP, no Playwright
+                              #   attach); prints `target=<id>` — the tab you own (tp#786)
+browser.py eval -T <id> 'location.host'  # --target: eval in exactly that tab over raw CDP;
+                              #   exit 1 if it is gone; JSON-serialisable results only
+                              #   (returnByValue — undefined prints null)
+browser.py close -i <id>…     # close the tab(s) you opened (lease, re-check, never the last tab)
+browser.py close [-n] URL…    # manual cleanup of leftover tabs by exact URL (query/fragment and
+                              #   trailing slash ignored; http(s) only); -n = dry run;
+                              #   -w lease wait (30 s), -d overall deadline (20 s)
 browser.py eval 'document.title' [--url SUBSTR]   # run JS in the active/matched tab → JSON
                               #   --url with no matching tab exits 1 (it never falls back to
                               #   another tab; the error names the open tabs by origin only —
@@ -177,9 +186,9 @@ state — so two layers coordinate everyone (all under `~/.cache/claude-browser/
 2. **Interaction lease (who is driving).** Anything that types, clicks for a
    login, or otherwise owns the user-visible interaction takes the exclusive
    `interaction.lock` flock (owner nonce + pid start time, 10 s heartbeat,
-   compare-before-release). The assisted/unattended `login` flows take it;
-   read-only probes (`logged-in`, `eval`, `open`, `token`, `slack-session`)
-   do not. A parent that already holds the lock and shells
+   compare-before-release). The assisted/unattended `login` flows take it,
+   and so do `close-hung` and `close`; read-only probes (`logged-in`, `eval`
+   incl. `-T`, `open` incl. `-N`, `token`, `slack-session`) do not. A parent that already holds the lock and shells
    `browser.py login …` exports `CLAUDE_BROWSER_LEASE_HELD=1` so the child
    doesn't deadlock against it.
 
@@ -195,6 +204,21 @@ Rules for anything that drives this browser:
   window can freeze rendering and an unbounded wait hangs forever.
 - **Hold the interaction lease** around interactive flows; register if you
   hold a long-lived CDP connection.
+- **Close what you open (tp#786).** A tool that needs a tab of its own opens
+  it with `open -N URL`, reads the `target=<id>` line, evaluates with
+  `eval -T <id>`, and closes it with `close -i <id>` in a `finally`. Leftover
+  tabs are not harmless: every Playwright attach waits for every page target,
+  so a few heavy tabs (Smartsheet's desktop app) slow down EVERY consumer of
+  the browser. `close` registers, takes the interaction lease (bounded by
+  `-w`, inside one `-d` deadline; on a lease timeout it exits 1 and closes
+  nothing), re-reads the tab list right before each close (id mode: the tab
+  must still exist; URL mode: its URL must still match), and opens a blank
+  keep-alive first when the tab is the last one. Exit 0 when every requested
+  tab is closed or already gone, when nothing matches, or when the browser is
+  down — so a retry is always safe. **Unregistered clients** (anything that
+  drives the browser without `browser.py`) take no lease, so the re-check is
+  best-effort against them: they can still navigate a tab in the
+  milliseconds between the re-list and the close.
 
 ## Multi-site login
 
@@ -286,6 +310,17 @@ reloading or closing it by hand in the window works too. The Playwright MCP
 server (`browser_*` tools) attaches the same way and stalls on the same tab;
 `close-hung` is the shared remedy. `doctor` probes tab responsiveness first and
 skips its Playwright probe (❌) while such a tab exists.
+
+**Every `open`/`eval` is slow (seconds to tens of seconds) and `status` lists
+many tabs a tool left behind.** Each extra page target slows every Playwright
+attach (tp#786). Tools that follow the consumer contract close their own tabs;
+leftovers from older versions need a one-time cleanup by exact URL (query,
+fragment and trailing slash are ignored; output is origin-only):
+
+```commands
+browser.py close -n https://app.smartsheet.com/login https://app.smartsheet.com/folders/personal   # dry run
+browser.py close https://app.smartsheet.com/login https://app.smartsheet.com/folders/personal      # close them
+```
 
 ## How other tools consume it
 
