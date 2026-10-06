@@ -48,6 +48,7 @@ SETTLE_TIMEOUT_S = 30.0
 CSCS_AUTH_ORIGIN = "https://auth.cscs.ch"
 CSCS_PORTAL_ORIGIN = "https://portal.cscs.ch"
 CSCS_LOGIN_URL = CSCS_PORTAL_ORIGIN + "/profile/"
+SMARTSHEET_ORIGIN = "https://app.smartsheet.com"
 SUBMIT_CHANGE_S = 3.0
 
 # Built-in check URLs: a page that needs the login and, when logged out,
@@ -61,6 +62,16 @@ DEFAULT_CHECK_URLS = {
     "ricardo": "https://www.ricardo.ch/de/my-ricardo/saved/articles/",
     "tutti": "https://www.tutti.ch/de/myads/active",
     "cscs": CSCS_LOGIN_URL,
+    "smartsheet": SMARTSHEET_ORIGIN + "/b/home",
+}
+
+# Built-in logged-in sentinels, for sites whose check page stays ON the fill
+# origin when logged in (so "left the fill origins" can never prove a login).
+# An item's `agent_logged_in_selector` overrides. Smartsheet: the home
+# desktop and the left rail's "Home" label, rendered only for a signed-in user
+# (its data-testid attributes are missing in some sessions, verified 2026-10-06).
+DEFAULT_LOGGED_IN_SELECTORS = {
+    "smartsheet": "#desktopHome, #home-label",
 }
 
 # Effective action of the form around an input: the default submit button's
@@ -711,12 +722,115 @@ def cscs_login(
     raise LoginFailed("login did not reach the CSCS portal", submitted=True)
 
 
+# Smartsheet's login wizard (verified 2026-10-06): e-mail + Continue, then
+# /login/providers offering Microsoft / Google / Apple and either "Sign in with
+# email and password" directly or behind "More sign-in options" (a fresh
+# profile; older variant: "Try another way"), then
+# a password field with NO <form> and a type=button "Sign in". Every step is on
+# https://app.smartsheet.com; a fresh profile shows the e-mail step, a profile
+# that remembers the address starts at the providers page.
+SMARTSHEET_EMAIL_SELECTOR = "#loginEmail, input[type=email], input[name=email]"
+SMARTSHEET_SIGN_IN = "#signInControl"
+# Wizard buttons towards the password field, the furthest-along first.
+SMARTSHEET_STEPS = (
+    "#emailPasswordOption",
+    "text='More sign-in options'",
+    "text='Try another way'",
+)
+
+
+def _click_on_fill_origin(
+    page: Any, element: Any, allowed: list[str], *, dev: bool
+) -> None:
+    """Click a wizard button (no secret involved) only while on a fill origin."""
+    if not origin_allowed(page.url, allowed, dev=dev):
+        raise OriginViolation("page is not on a fill origin")
+    element.click()
+
+
+def _smartsheet_password_field(
+    page: Any, secret: Secret, allowed: list[str], *, dev: bool
+) -> Any:
+    """Walk the wizard up to the visible password field; None after the timeout."""
+    email_done = False
+    deadline = time.monotonic() + 2 * STEP_TIMEOUT_S
+    while time.monotonic() < deadline:
+        _check_challenge(page, submitted=False)
+        pw_field = _visible(page, PASSWORD_SELECTOR)
+        if pw_field is not None:
+            return pw_field
+        option = next(
+            (el for sel in SMARTSHEET_STEPS if (el := _visible(page, sel))), None
+        )
+        if option is not None:
+            _click_on_fill_origin(page, option, allowed, dev=dev)
+            page.wait_for_timeout(1000)
+            continue
+        email = None if email_done else _visible(page, SMARTSHEET_EMAIL_SELECTOR)
+        if email is not None:
+            _guard(page, email, allowed, dev=dev)
+            email.fill(secret.username)
+            _guard(page, email, allowed, dev=dev)
+            _submit_identifier(page, email, allowed, dev=dev)
+            email_done = True
+            continue
+        page.wait_for_timeout(250)
+    return None
+
+
+def smartsheet_login(
+    page: Any,
+    item: SiteItem,
+    secret: Secret,
+    *,
+    dev: bool = False,
+    settle_s: float = SETTLE_TIMEOUT_S,
+) -> None:
+    """Smartsheet e-mail/password login through its multi-step wizard.
+
+    Secrets are typed only on the item's fill origins (``_guard`` before each
+    fill); wizard buttons are clicked only while the page is on one. Returns
+    once the sentinel shows or the page left the login; the caller's
+    ``check_logged_in`` is the proof.
+    """
+    allowed = list(item.fill_origins)
+    sentinel = item.logged_in_selector or DEFAULT_LOGGED_IN_SELECTORS["smartsheet"]
+    page.goto(item.login_url, wait_until="domcontentloaded")
+    if _wait_visible(page, sentinel, 5.0) is not None:
+        return  # the profile's session is still valid
+    pw_field = _smartsheet_password_field(page, secret, allowed, dev=dev)
+    if pw_field is None:
+        _check_challenge(page, submitted=False)
+        raise LoginFailed("no password field after the Smartsheet login steps")
+    pw_field = _fill_password(page, pw_field, secret, allowed, dev=dev)
+    _guard(page, pw_field, allowed, dev=dev)
+    button = _visible(page, SMARTSHEET_SIGN_IN)
+    if button is not None:
+        _click_on_fill_origin(page, button, allowed, dev=dev)
+    else:
+        pw_field.press("Enter")
+
+    deadline = time.monotonic() + settle_s
+    while time.monotonic() < deadline:
+        page.wait_for_timeout(500)
+        _check_challenge(page, submitted=True)
+        if _visible(page, sentinel) is not None:
+            return
+        if off_fill_origins(page.url, allowed, dev=dev) and (
+            _visible(page, PASSWORD_SELECTOR) is None
+        ):
+            return
+    raise LoginFailed(
+        "still on the Smartsheet login after submitting the password", submitted=True
+    )
+
+
 Recipe = Callable[..., None]
 
 
 def recipe_for(site: str) -> Recipe:
     """The recipe for a site id (recipes are code: changing one needs sudo)."""
-    return cscs_login if site == "cscs" else generic_login
+    return {"cscs": cscs_login, "smartsheet": smartsheet_login}.get(site, generic_login)
 
 
 # What a failure report lists: visible message-like elements and buttons.

@@ -221,3 +221,11 @@ def test_private_claude_lives_in_its_own_instance(monkeypatch) -> None:
         seen.append(os.environ["CLAUDE_BROWSER_INSTANCE"])
     assert seen == ["private", ""]
     assert "CLAUDE_BROWSER_INSTANCE" not in os.environ
+
+
+def test_smartsheet_is_a_broker_site() -> None:
+    target = next(t for t in al.TARGETS if t.site == "smartsheet")
+    assert target.fill_origin == "https://app.smartsheet.com"
+    assert al.classify(target, {})[0] == "missing"
+    listed = {"smartsheet": {"site": "smartsheet", "refused": False}}
+    assert al.classify(target, listed)[0] == "ready"

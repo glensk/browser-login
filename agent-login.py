@@ -9,9 +9,9 @@ into nothing unless you pass -t, -g or -c.
 
 The marketplace sites (anibis, tutti, Ricardo, Kleinanzeigen) run on YOUR Safari
 session: you log in in Safari, `browser.py login SITE` copies that site's session
-cookies into the shared Chromium (Kleinanzeigen falls back to the broker). CSCS logs in
-through the broker. Anthropic, OpenAI, Slack and SWITCH Cloud need you once (email
-code / SSO): `-g SITE` shows the window and waits; -t and -c only check them.
+cookies into the shared Chromium (Kleinanzeigen falls back to the broker). CSCS and
+Smartsheet log in through the broker. Anthropic, OpenAI, Slack and SWITCH Cloud need
+you once (email code / SSO): `-g SITE` shows the window and waits; -t and -c only check them.
 
 Examples:
   ./agent-login.py              # overview
@@ -78,7 +78,7 @@ BROWSER_PY = Path(__file__).resolve().parent / "bin" / "browser.py"
 VAULT_URL = "https://vaultwarden.dom42.space"
 
 # Login flows the broker's recipes can drive today.
-SUPPORTED_FLOWS = {"one-page", "two-step", "cscs"}
+SUPPORTED_FLOWS = {"one-page", "two-step", "cscs", "smartsheet"}
 # Albert's Safari session, copied by `browser.py login` (broker/safari_cookies.py).
 SAFARI_FLOW = "safari"
 # Built-in browser.py sites whose login needs Albert (email code, SSO click): agents
@@ -93,7 +93,7 @@ class Target:
     site: str  # broker site id (agent_site field, else the item name as a slug)
     name: str
     fill_origin: str  # value for the item's agent_fill_origins field ("" = unknown yet)
-    flow: str  # one-page | two-step | cscs | safari | assisted | manual | unknown
+    flow: str  # one-page | two-step | cscs | smartsheet | safari | assisted | manual | unknown
     note: str = ""
     fallback: str = ""  # broker flow tried when the Safari session does not work
 
@@ -125,6 +125,14 @@ TARGETS = (
         "https://auth.cscs.ch",
         "cscs",
         "broker login (password + TOTP from Bitwarden; agent_otp_label picks the authenticator)",
+    ),
+    Target(
+        "smartsheet",
+        "Smartsheet",
+        "https://app.smartsheet.com",
+        "smartsheet",
+        "broker login (e-mail + password wizard from Bitwarden; consumer: "
+        "sdsc/smartsheet-api)",
     ),
     Target(
         "anthropic",

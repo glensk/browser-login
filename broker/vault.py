@@ -29,7 +29,7 @@ from typing import Any, Protocol
 
 from broker.bundle import SiteBundleSpec, is_idp_host
 from broker.origins import parse_fill_origins
-from broker.recipes import DEFAULT_CHECK_URLS
+from broker.recipes import DEFAULT_CHECK_URLS, DEFAULT_LOGGED_IN_SELECTORS
 
 SITE_ID_RE = re.compile(r"^[a-z0-9][a-z0-9._-]{0,63}$")
 BW_TIMEOUT_S = 120.0
@@ -218,7 +218,11 @@ def site_item_from_json(item: Mapping[str, Any], *, dev: bool = False) -> SiteIt
     if check_url and not _page_url_ok(check_url, dev=dev):
         return refused("bad agent_check_url")
     check_url = check_url or DEFAULT_CHECK_URLS.get(site, "")
-    sentinel = fields.get("agent_logged_in_selector", "").strip() or None
+    sentinel = (
+        fields.get("agent_logged_in_selector", "").strip()
+        or DEFAULT_LOGGED_IN_SELECTORS.get(site)
+        or None
+    )
     if not check_url and not sentinel:
         return refused("needs agent_check_url (or agent_logged_in_selector)")
     hosts_raw = fields.get("agent_cookie_hosts", "").strip()

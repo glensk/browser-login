@@ -1923,3 +1923,23 @@ def test_sites_cached_until_fresh(tmp_path):
     now[0] += daemon.SITES_TTL_S + 1
     brk.handle({"op": "sites"}, os.getuid())
     assert len(reads) == 3
+
+
+def test_smartsheet_item_gets_built_in_check_and_sentinel() -> None:
+    """Smartsheet's check page stays on the fill origin when logged in, so the
+    item needs a sentinel; the built-in one applies unless the item sets one."""
+    raw = _item("Smartsheet", {"agent_fill_origins": "https://app.smartsheet.com"})
+    it = vault.site_item_from_json(raw)
+    assert it.site == "smartsheet" and not it.refused
+    assert it.check_url == "https://app.smartsheet.com/b/home"
+    assert it.logged_in_selector == recipes.DEFAULT_LOGGED_IN_SELECTORS["smartsheet"]
+    assert it.cookie_hosts == ["smartsheet.com", "app.smartsheet.com"]
+    assert recipes.recipe_for("smartsheet") is recipes.smartsheet_login
+    own = _item(
+        "Smartsheet",
+        {
+            "agent_fill_origins": "https://app.smartsheet.com",
+            "agent_logged_in_selector": "#mine",
+        },
+    )
+    assert vault.site_item_from_json(own).logged_in_selector == "#mine"

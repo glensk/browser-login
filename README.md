@@ -375,7 +375,7 @@ agent-login.py — which of Albert's logins can agents use through the login bro
 
 Without arguments: a health line for the broker, then every login we want agents to use, once: ✅ when it works for agents (setup complete AND the latest real check, -c/-t, passed) or ❌ with the reason. Read-only: it asks the broker for its site list (never a secret), reads the names and expiry dates (never values) of Safari's cookies, and logs into nothing unless you pass -t, -g or -c.
 
-The marketplace sites (anibis, tutti, Ricardo, Kleinanzeigen) run on YOUR Safari session: you log in in Safari, `browser.py login SITE` copies that site's session cookies into the shared Chromium (Kleinanzeigen falls back to the broker). CSCS logs in through the broker. Anthropic, OpenAI, Slack and SWITCH Cloud need you once (email code / SSO): `-g SITE` shows the window and waits; -t and -c only check them.
+The marketplace sites (anibis, tutti, Ricardo, Kleinanzeigen) run on YOUR Safari session: you log in in Safari, `browser.py login SITE` copies that site's session cookies into the shared Chromium (Kleinanzeigen falls back to the broker). CSCS and Smartsheet log in through the broker. Anthropic, OpenAI, Slack and SWITCH Cloud need you once (email code / SSO): `-g SITE` shows the window and waits; -t and -c only check them.
 
 Examples:
 
