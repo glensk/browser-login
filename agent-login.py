@@ -325,9 +325,15 @@ def safari_cell(row: dict) -> str:
 LAST_CHECK_FILE = Path.home() / ".local/state/agent-login/last-check.json"
 
 
+def _state_file() -> Path:
+    """LAST_CHECK_FILE, or $AGENT_LOGIN_STATE_FILE (tests point it at a temp dir)."""
+    env = os.environ.get("AGENT_LOGIN_STATE_FILE")
+    return Path(env) if env else LAST_CHECK_FILE
+
+
 def record_check(site: str, ok: bool, how: str, path: Path | None = None) -> None:
     """Remember a site's latest REAL check (what the overview shows)."""
-    path = path or LAST_CHECK_FILE
+    path = path or _state_file()
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, ValueError):
@@ -342,7 +348,7 @@ def record_check(site: str, ok: bool, how: str, path: Path | None = None) -> Non
 def last_checks(path: Path | None = None) -> dict[str, dict]:
     """``{site: {"ok", "how", "at"}}`` from the last check runs (empty if none)."""
     try:
-        data = json.loads((path or LAST_CHECK_FILE).read_text(encoding="utf-8"))
+        data = json.loads((path or _state_file()).read_text(encoding="utf-8"))
     except (OSError, ValueError):
         return {}
     return data if isinstance(data, dict) else {}

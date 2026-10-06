@@ -181,3 +181,9 @@ def security_op(argv) -> str:
         "default-keychain": "default",
     }
     return str(names.get(argv[1], argv[1]))
+
+
+@pytest.fixture(autouse=True)
+def _agent_login_state(tmp_path, monkeypatch):
+    """agent-login.py's last-check state goes to a temp file, never the real one."""
+    monkeypatch.setenv("AGENT_LOGIN_STATE_FILE", str(tmp_path / "last-check.json"))
