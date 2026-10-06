@@ -4819,8 +4819,8 @@ def cmd_cscs_forget_creds() -> int:
     if left:
         return _fail(f"Could not remove keychain item(s): {', '.join(left)}.")
     print(
-        "✓ Removed CSCS keychain credentials. `cscs-login` will fall back to "
-        "1Password (Touch ID) again."
+        "✓ Removed CSCS keychain credentials. `browser.py login cscs` uses the "
+        "login broker (Bitwarden)."
     )
     return 0
 
