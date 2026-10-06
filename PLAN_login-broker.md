@@ -287,6 +287,17 @@ the agent the portal session. Record as Albert's decision of 2026-10-01 in
       agent-login.py overview is now ONE list (✅ works for agents / ❌ + reason) and includes the
       built-in assisted sites anthropic, openai, slack, switch (`-g SITE` = your login in the
       shown window; `-t`/`-c` only check them, never start an email-code/SSO flow).
+      **2026-10-06 (later):** CSCS ✅ after the reinstall (1 cookie + 1 storage key, token
+      verified). Headless shared Chromium announced `HeadlessChrome/151` → Cloudflare "Just a
+      moment" on claude.ai/chatgpt.com: headless launches now pass a plain Chrome UA
+      (`_headless_user_agent`, version from Info.plist; mode detection also reads the root
+      process's `--headless`). Anthropic = two lines (work/private) decided by the claude.ai
+      account email (`/api/account`); one profile holds one claude.ai session. Speed: the
+      broker caches its site list `SITES_TTL_S`=600 (`"fresh": true` bypasses; NEEDS REINSTALL),
+      agent-login reads a snapshot (`-S`, LaunchAgent com.albert.agent-login-snapshot every 10
+      min; `-r` asks live) → overview 41 s → 0.1 s. Agents: `-S` also writes
+      ~/.local/state/agent-login/agents.md, which a SessionStart hook (mydotfiles
+      settings.json) prints into every Claude Code session; `-A` shows it.
 
 ### Phase 4 — close out
 

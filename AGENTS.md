@@ -68,6 +68,14 @@ framework. It is a **provider**: other repos depend on it, not the reverse. See
 - The shared browser is LIVE infrastructure with the user's real sessions:
   never `down`/`switch`/`login` it casually, and never edit `bin/browser.py`
   in place from a subagent while consumers may exec it — use a worktree.
+- **Headless = plain Chrome UA**: `--headless=new` says `HeadlessChrome`, which
+  Cloudflare challenges (claude.ai, chatgpt.com); headless launches pass
+  `--user-agent` from `_headless_user_agent`, so `_browser_mode` also reads the
+  root process's `--headless` flag. Keep both in sync.
+- **What agents can use** = `agent-login.py -A` (the file
+  `~/.local/state/agent-login/agents.md`, refreshed by `-S` every 10 min and by
+  every `agent-login.py` run; a SessionStart hook in mydotfiles' Claude
+  settings prints it into each session).
 - **No secrets, ever** — this is a public repo. Configuration is env vars + keychain
   *labels* only. gitleaks must stay clean.
 

@@ -7,7 +7,8 @@ LOCAL_PEERCRED. One JSON request per connection, newline-terminated, at most
 
   {"op": "ping"}
   {"op": "sites"}                 ids, fill origins, cookie scope, check URL and
-                                  sentinel — never secrets
+                                  sentinel — never secrets; cached SITES_TTL_S,
+                                  "fresh": true re-reads Bitwarden
   {"op": "login", "site": "X"}    -> {"ok": true, "bundle": {...}}
   {"op": "logout", "site": "X"}   delete the broker's own profile for X
   {"op": "fingerprint", "site": "X"}  len + 4 hex of the password's SHA-256
@@ -307,6 +308,12 @@ def _err(code: str, detail: str = "") -> dict[str, Any]:
     return {"ok": False, "error": code, "detail": detail}
 
 
+# The site list (ids, origins, check URLs — no secrets) is kept this long: each
+# Bitwarden read is an unlock + sync + list + lock of ~30-40 s. Secrets are
+# always read fresh.
+SITES_TTL_S = 600.0
+
+
 class Broker:  # pylint: disable=too-many-instance-attributes  # deps + 4 locks/maps
     """Protocol logic, independent of the socket (unit-testable)."""
 
@@ -328,6 +335,19 @@ class Broker:  # pylint: disable=too-many-instance-attributes  # deps + 4 locks/
         self._site_locks: dict[str, threading.Lock] = {}
         self._flights: dict[str, _Flight] = {}
         self._audit_lock = threading.Lock()
+        self._items_lock = threading.Lock()
+        self._items_cache: tuple[float, list[SiteItem]] | None = None
+
+    def _items(self, *, fresh: bool = False) -> list[SiteItem]:
+        """The vault's site items, cached SITES_TTL_S (raises VaultError)."""
+        with self._items_lock:
+            now = self.clock()
+            cached = self._items_cache
+            if not fresh and cached and now - cached[0] < SITES_TTL_S:
+                return cached[1]
+            items = self.vault.items()
+            self._items_cache = (now, items)
+            return items
 
     # -- audit ---------------------------------------------------------------
     def audit(self, op: str, site: str | None, result: str, uid: int | None) -> None:
@@ -370,7 +390,7 @@ class Broker:  # pylint: disable=too-many-instance-attributes  # deps + 4 locks/
             if op == "ping":
                 resp = {"ok": True, "pong": True}
             elif op == "sites":
-                resp = self._sites()
+                resp = self._sites(fresh=req.get("fresh") in (True, "1", "true"))
             elif op in ("login", "logout", "fingerprint"):
                 if not site or not SITE_ID_RE.match(site):
                     resp = _err("bad_request", "missing or invalid site id")
@@ -387,9 +407,9 @@ class Broker:  # pylint: disable=too-many-instance-attributes  # deps + 4 locks/
         self.audit(op, site, "ok" if resp.get("ok") else str(resp.get("error")), uid)
         return resp
 
-    def _sites(self) -> dict[str, Any]:
+    def _sites(self, *, fresh: bool = False) -> dict[str, Any]:
         try:
-            items = self.vault.items()
+            items = self._items(fresh=fresh)
         except VaultError as exc:
             return _err("vault_error", str(exc))
         return {"ok": True, "sites": [it.public() for it in items]}
@@ -437,10 +457,13 @@ class Broker:  # pylint: disable=too-many-instance-attributes  # deps + 4 locks/
     # One return per protocol error code, in the order they are checked.
     def _do_login(self, site: str) -> dict[str, Any]:  # pylint: disable=too-many-return-statements
         try:
-            items = self.vault.items()
+            items = self._items()
+            item = next((it for it in items if it.site == site), None)
+            if item is None:  # added since the cache was filled?
+                items = self._items(fresh=True)
+                item = next((it for it in items if it.site == site), None)
         except VaultError as exc:
             return _err("vault_error", str(exc))
-        item = next((it for it in items if it.site == site), None)
         if item is None:
             return _err("unknown_site", f"{site!r} is not in agent-logins")
         if item.refused:

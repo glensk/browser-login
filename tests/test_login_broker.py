@@ -1895,3 +1895,31 @@ def test_empty_password_is_refused_before_any_login() -> None:
     raw = _item("cscs", {"agent_fill_origins": "https://auth.cscs.ch"}, password="")
     with pytest.raises(vault.VaultError, match="Can view"):
         vault.secret_from_json(raw)
+
+
+def test_sites_cached_until_fresh(tmp_path):
+    """The site list is read from the vault once per SITES_TTL_S; `fresh` re-reads."""
+    fixture = tmp_path / "items.json"
+    fixture.write_text(json.dumps(FIXTURE_ITEMS))
+    reads: list[int] = []
+    fv = vault.FixtureVault(fixture, dev=True)
+    real_items = fv.items
+
+    def counting_items():
+        reads.append(1)
+        return real_items()
+
+    fv.items = counting_items  # type: ignore[method-assign]
+    now = [1000.0]
+    lim = limiter.Limiter(tmp_path / "limiter.json", 0, 100, 100)
+    brk = daemon.Broker(
+        fv, lim, tmp_path / "home", runner=lambda *_a: {}, clock=lambda: now[0]
+    )
+    assert brk.handle({"op": "sites"}, os.getuid())["ok"]
+    assert brk.handle({"op": "sites"}, os.getuid())["ok"]
+    assert len(reads) == 1
+    brk.handle({"op": "sites", "fresh": True}, os.getuid())
+    assert len(reads) == 2
+    now[0] += daemon.SITES_TTL_S + 1
+    brk.handle({"op": "sites"}, os.getuid())
+    assert len(reads) == 3

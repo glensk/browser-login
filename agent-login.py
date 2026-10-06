@@ -31,7 +31,6 @@ from __future__ import annotations
 import argparse
 import json
 import os
-import shutil
 import socket
 import subprocess
 import sys
@@ -41,6 +40,25 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))  # the repo's `broker` package
 # pylint: disable=wrong-import-position
+from agent_login_jobs import (  # noqa: E402
+    LAUNCH_HOUR,
+    LAUNCH_LABEL,
+    LAUNCH_MINUTE,
+    MAIL_TO,
+    NETWORK_HOST,
+    SNAPSHOT_INTERVAL_S,
+    SNAPSHOT_LABEL,
+    _browser,
+    install_daily,
+    launchagent_plist,
+    restore_mode,
+    safari_sessions,
+    send_mail,
+    show_window,
+    snapshot_plist,
+    uninstall_daily,
+    wait_for_network,
+)
 from broker import safari_cookies  # noqa: E402
 from broker.recipes import DEFAULT_CHECK_URLS  # noqa: E402
 
@@ -58,11 +76,6 @@ SAFARI_FLOW = "safari"
 # Built-in browser.py sites whose login needs Albert (email code, SSO click): agents
 # use the session he leaves in the shared Chromium; the check never logs in.
 ASSISTED_FLOW = "assisted"
-MAIL_TO = "albert.glensk@gmail.com"
-LAUNCH_LABEL = "com.albert.agent-login-check"
-LAUNCH_PLIST = Path.home() / "Library" / "LaunchAgents" / f"{LAUNCH_LABEL}.plist"
-LAUNCH_LOG = Path.home() / "Library" / "Logs" / f"{LAUNCH_LABEL}.log"
-LAUNCH_HOUR, LAUNCH_MINUTE = 9, 15
 
 
 @dataclass(frozen=True)
@@ -107,10 +120,17 @@ TARGETS = (
     ),
     Target(
         "anthropic",
-        "Anthropic",
+        "Anthropic work",
         "https://claude.ai",
         ASSISTED_FLOW,
-        "claude.ai Team admin: log in with ./agent-login.py -g anthropic (email code)",
+        "claude.ai work account (SDSC Team admin): ./agent-login.py -g anthropic",
+    ),
+    Target(
+        "anthropic-private",
+        "Anthropic private",
+        "https://claude.ai",
+        ASSISTED_FLOW,
+        "claude.ai private account: ./agent-login.py -g anthropic-private",
     ),
     Target(
         "openai",
@@ -179,14 +199,53 @@ def broker_request(op: str, timeout: float = 120.0, **kw: str) -> dict:
     return data
 
 
-def broker_state() -> tuple[str, list[dict]]:
+STATE_DIR = Path.home() / ".local/state/agent-login"
+SITES_SNAPSHOT_MAX_AGE_S = 30 * 60  # the snapshot job refreshes every 10 min
+
+
+def _state_path(name: str) -> Path:
+    """A file in the state dir ($AGENT_LOGIN_STATE_FILE's dir in tests)."""
+    env = os.environ.get("AGENT_LOGIN_STATE_FILE")
+    return (Path(env).parent if env else STATE_DIR) / name
+
+
+def _write_json_atomic(path: Path, data: object) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(".tmp")
+    tmp.write_text(json.dumps(data, indent=1), encoding="utf-8")
+    tmp.replace(path)
+
+
+def broker_state(*, fresh: bool = False) -> tuple[str, list[dict]]:
+    """(health message, broker site list) — from the snapshot when it is recent.
+
+    The broker's `sites` answer costs a Bitwarden unlock (~30-40 s when its own
+    cache is cold), so the overview reads the snapshot that `-S` (every 10 min,
+    LaunchAgent) writes; `fresh` asks the broker and re-reads Bitwarden.
+    """
+    snap = _state_path("sites.json")
+    if not fresh:
+        try:
+            data = json.loads(snap.read_text(encoding="utf-8"))
+            age = time.time() - float(data["at"])
+            if 0 <= age < SITES_SNAPSHOT_MAX_AGE_S and os.path.exists(SOCKET):
+                return str(data["health"]), list(data["sites"])
+        except (OSError, ValueError, KeyError, TypeError):
+            pass
+    health, sites = _broker_state_live(fresh=fresh)
+    if health.startswith("running, Bitwarden"):
+        _write_json_atomic(snap, {"at": time.time(), "health": health, "sites": sites})
+    return health, sites
+
+
+def _broker_state_live(*, fresh: bool) -> tuple[str, list[dict]]:
     """(health message, broker site list); the list is empty when the broker is down."""
     if not CODE_DIR.exists():
         return "not installed — run: sudo install/install.sh", []
     if not os.path.exists(SOCKET):
         return f"installed but not running (no socket {SOCKET})", []
     try:
-        resp = broker_request("sites")
+        resp = broker_request("sites", fresh="1") if fresh else broker_request("sites")
     except (OSError, ValueError) as exc:
         return f"not reachable: {exc}", []
     if not resp.get("ok"):
@@ -230,49 +289,34 @@ def _classify_listed(target: Target, entry: dict) -> tuple[str, str]:
     return status, target.note
 
 
-def safari_sessions(sites: list[str]) -> dict[str, dict]:
-    """Per site: does Safari hold usable cookies, and until when (names/expiry only).
+def safari_state(sites: list[str]) -> dict[str, dict]:
+    """`safari_sessions`, falling back to the last readable state.
 
-    ``{"safari": True/False/None, "safari_cookies": n, "safari_expires": "YYYY-MM-DD"
-    or None, "safari_error": ""}`` — ``None`` when Safari's cookie file is unreadable.
+    The 10-min LaunchAgent has no Full Disk Access, so Safari's cookie file is
+    unreadable there; the names/expiry dates an interactive run read stay valid
+    (the verdict checks the expiry date itself).
     """
+    snap = _state_path("safari.json")
+    now = safari_sessions(sites)
+    if all(v.get("safari") is not None for v in now.values()):
+        _write_json_atomic(snap, now)
+        return now
     try:
-        jar = safari_cookies.read_binarycookies()
-    except (OSError, ValueError) as exc:
-        err = str(getattr(exc, "strerror", None) or exc)
-        return {
-            s: {
-                "safari": None,
-                "safari_cookies": 0,
-                "safari_expires": None,
-                "safari_error": err,
-            }
-            for s in sites
-        }
-    out = {}
-    for site in sites:
-        picked = safari_cookies.site_cookies(jar, site)
-        names = safari_cookies.SAFARI_SITES[site].session_cookies
-        if names:  # only the cookies that ARE the login count
-            picked = [c for c in picked if c.name in names]
-        latest = max((c.expires for c in picked), default=None)
-        out[site] = {
-            "safari": bool(picked),
-            "safari_cookies": len(picked),
-            "safari_expires": (
-                time.strftime("%Y-%m-%d", time.localtime(latest)) if latest else None
-            ),
-            "safari_error": "",
-        }
-    return out
+        old = json.loads(snap.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return now
+    return {
+        s: old[s] if v.get("safari") is None and isinstance(old.get(s), dict) else v
+        for s, v in now.items()
+    }
 
 
-def overview() -> dict:
+def overview(*, fresh: bool = False) -> dict:
     """Everything the report shows, as data."""
-    health, sites = broker_state()
+    health, sites = broker_state(fresh=fresh)
     readable = health.startswith("running, Bitwarden")
     listed = {str(s.get("site")): s for s in sites}
-    safari = safari_sessions([t.site for t in TARGETS if t.flow == SAFARI_FLOW])
+    safari = safari_state([t.site for t in TARGETS if t.flow == SAFARI_FLOW])
     rows = []
     for t in TARGETS:
         status, detail = classify(t, listed, readable=readable)
@@ -331,6 +375,63 @@ def _state_file() -> Path:
     return Path(env) if env else LAST_CHECK_FILE
 
 
+AGENTS_FILE_NAME = "agents.md"
+# How each kind of login is used by an agent (the summary's ✅ lines).
+_HOW_TO_USE = {
+    "safari": "Albert's Safari session",
+    "ready": "login broker",
+    "extra": "login broker",
+    "assisted": "Albert's session in the shared Chromium",
+}
+
+
+def agent_summary(data: dict, checks: dict[str, dict]) -> str:
+    """The short Markdown every agent session gets at start (SessionStart hook)."""
+    ok_lines, bad_lines = [], []
+    for row in sorted(data["rows"], key=lambda r: r["name"].lower()):
+        works, why = verdict(row, checks)
+        if works:
+            how = _HOW_TO_USE.get(row["status"], row["status"])
+            detail = str((checks.get(row["site"]) or {}).get("how") or "")
+            if detail.startswith("logged in as"):
+                how += f", {detail[len('logged in as ') :]}"
+            ok_lines.append(
+                f"- ✅ {row['name']} (`{browser_site(row['site'])}`): {how}"
+            )
+        else:
+            bad_lines.append(f"- ❌ {row['name']}: {why}")
+    here = Path(__file__).resolve().parent
+    out = [
+        f"## Web logins agents can use (agent-login.py, {time.strftime('%Y-%m-%d %H:%M')})",
+        "",
+        "The shared logged-in Chromium (CDP http://127.0.0.1:9222; `browser.py`, "
+        "Playwright MCP `browser_*` tools) holds these sessions. Before using a "
+        "site: `browser.py logged-in <site>`. If it fails: for broker/Safari sites "
+        "run `browser.py login <site>` (never asks for a password); for sites on "
+        "Albert's session do NOT start a login — ask Albert to run "
+        "`agent-login.py -g <site>`. Never ask Albert for passwords.",
+        "",
+        *ok_lines,
+        *bad_lines,
+        "",
+        f"Full status: `{here}/agent-login.py` (❌ items need Albert unless noted).",
+    ]
+    if not data.get("broker_ok"):
+        out.insert(2, f"⚠️ login broker: {data.get('broker')}\n")
+    return "\n".join(out) + "\n"
+
+
+def write_agent_summary(data: dict | None = None) -> Path:
+    """(Re)write the agents file from the overview (the snapshot, no logins)."""
+    data = data or overview()
+    path = _state_path(AGENTS_FILE_NAME)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(".tmp")
+    tmp.write_text(agent_summary(data, last_checks()), encoding="utf-8")
+    tmp.replace(path)
+    return path
+
+
 def record_check(site: str, ok: bool, how: str, path: Path | None = None) -> None:
     """Remember a site's latest REAL check (what the overview shows)."""
     path = path or _state_file()
@@ -372,33 +473,45 @@ _SETUP_REASON = {
 }
 
 
+def _setup_problem(row: dict) -> str | None:
+    """Why a login cannot work whatever its last check said, or None."""
+    status = row["status"]
+    if status in _SETUP_REASON:
+        detail = f" ({row['detail']})" if row.get("detail") else ""
+        return _SETUP_REASON[status] + detail
+    if status != "safari" or row.get("fallback"):
+        return None
+    expires = row.get("safari_expires")
+    problem = None
+    if row.get("safari") is None:
+        problem = "Safari's cookies unreadable (terminal needs Full Disk Access)"
+    elif not row.get("safari"):
+        problem = f"no Safari session — log in to {row['name']} in Safari"
+    elif expires and expires < time.strftime("%Y-%m-%d"):
+        problem = f"Safari session expired {expires} — log in in Safari"
+    return problem
+
+
 def verdict(row: dict, checks: dict[str, dict]) -> tuple[bool, str]:
     """(works for agents?, reason/detail) — one answer per login.
 
     ✅ only when the setup is complete AND the latest REAL check (``-c``/``-t``)
     passed; everything else is ❌ with the first thing that is wrong.
     """
-    status, site = row["status"], row["site"]
-    if status in _SETUP_REASON:
-        reason = _SETUP_REASON[status]
-        if row.get("detail"):
-            reason += f" ({row['detail']})"
-        return False, reason
-    if status == "safari" and row.get("safari") is None:
-        return False, "Safari's cookies unreadable (terminal needs Full Disk Access)"
-    if status == "safari" and not row.get("safari") and not row.get("fallback"):
-        return False, f"no Safari session — log in to {row['name']} in Safari"
-    c = checks.get(site)
-    if not c:
-        return False, f"not checked yet — ./agent-login.py -t {site}"
-    when = c.get("at", "?")
-    if not c.get("ok"):
-        return False, f"last check {when}: {c.get('how', 'failed')}"
-    how = f"checked {when}"
-    if status == "safari" and row.get("safari"):
+    problem = _setup_problem(row)
+    c = checks.get(row["site"])
+    if problem or not c or not c.get("ok"):
+        if problem:
+            return False, problem
+        if not c:
+            return False, f"not checked yet — ./agent-login.py -t {row['site']}"
+        return False, f"last check {c.get('at', '?')}: {c.get('how', 'failed')}"
+    how = f"checked {c.get('at', '?')}"
+    if row["status"] == "safari" and row.get("safari"):
         how += f", Safari session until {row.get('safari_expires')}"
     elif row.get("flow") == ASSISTED_FLOW:
-        how += ", your session in the shared Chromium"
+        detail = str(c.get("how") or "")
+        how += f", {detail}" if detail.startswith("logged in as") else ", your session"
     else:
         how += ", login broker"
     return True, how
@@ -458,17 +571,19 @@ def run_test(site: str) -> int:
     login page is reported as NOT logged in. The result is recorded for the overview.
     """
     site = resolve_site(site)
-    login_rc = 0
     if site in ASSISTED_SITES:  # its login needs you: -g; -t only checks
         print(f"▶ {site}: your own login (./agent-login.py -g {site}); checking only")
-    else:
-        print(
-            f"▶ browser.py login {site}  (Safari session or login broker; "
-            "you see no password)"
-        )
-        login_rc = subprocess.run(
-            [sys.executable, str(BROWSER_PY), "login", site], check=False
-        ).returncode
+        ok, how = assisted_check(site)
+        record_check(site, ok, how)
+        print(f"{'✅' if ok else '❌'} {site}: {how}")
+        return 0 if ok else 2
+    print(
+        f"▶ browser.py login {site}  (Safari session or login broker; "
+        "you see no password)"
+    )
+    login_rc = subprocess.run(
+        [sys.executable, str(BROWSER_PY), "login", site], check=False
+    ).returncode
     if login_rc != 0:
         print(f"❌ login {site} failed (exit {login_rc})")
     print(f"▶ browser.py logged-in {site}  (positive check on the check URL)")
@@ -477,8 +592,6 @@ def run_test(site: str) -> int:
     ).returncode
     if rc == 0:
         how = "logged in"
-    elif site in ASSISTED_SITES:
-        how = f"NOT logged in — log in once: ./agent-login.py -g {site}"
     else:
         how = f"NOT logged in (browser.py login exit {login_rc}, check exit {rc})"
     record_check(site, rc == 0, how)
@@ -500,14 +613,6 @@ MANUAL_START = {
 MANUAL_WAIT_S = 15 * 60
 
 
-def _browser(*args: str, quiet: bool = False) -> int:
-    """Run bin/browser.py with `args`; its exit code."""
-    out = subprocess.DEVNULL if quiet else None
-    return subprocess.run(
-        [sys.executable, str(BROWSER_PY), *args], check=False, stdout=out, stderr=out
-    ).returncode
-
-
 def manual_login(site: str) -> int:
     """Guided manual login in the shared Chromium for sites behind a human check.
 
@@ -527,8 +632,9 @@ def manual_login(site: str) -> int:
     if _browser("logged-in", site, quiet=True) == 0:
         print(f"✅ {site}: the shared Chromium is already logged in — nothing to do")
         return 0
-    print("▶ showing the shared Chromium window …")
-    if _browser("switch", "headed") != 0:
+    try:
+        before = show_window()
+    except RuntimeError:
         return 1
     _browser("open", start, quiet=True)
     print(
@@ -543,8 +649,7 @@ def manual_login(site: str) -> int:
         if _browser("logged-in", site, quiet=True) == 0:
             ok = True
             break
-    print("▶ hiding the Chromium window again …")
-    _browser("switch", "headless", quiet=True)
+    restore_mode(before)
     print(
         f"✅ {site}: logged in — agents can use this session"
         if ok
@@ -554,26 +659,93 @@ def manual_login(site: str) -> int:
 
 
 ASSISTED_SITES = {t.site for t in TARGETS if t.flow == ASSISTED_FLOW}
+# The claude.ai accounts: one browser profile holds ONE claude.ai session, so the
+# logged-in account's email decides which line is ✅.
+CLAUDE_ACCOUNTS = {
+    "anthropic": os.environ.get("ANTHROPIC_WORK_EMAIL", "albert.glensk@epfl.ch"),
+    "anthropic-private": os.environ.get(
+        "ANTHROPIC_PRIVATE_EMAIL", "albert.glensk@gmail.com"
+    ),
+}
+_CLAUDE_ACCOUNT_JS = (
+    'fetch("/api/account").then(r => r.ok ? r.json() : {})'
+    ".then(a => a.email_address || '')"
+)
+
+
+def browser_site(site: str) -> str:
+    """The browser.py site name for an agent-login site id."""
+    return "anthropic" if site in CLAUDE_ACCOUNTS else site
+
+
+def claude_account_email() -> str | None:
+    """Email of the claude.ai account the shared Chromium is logged into, or None."""
+    for attempt in range(2):
+        res = subprocess.run(
+            [sys.executable, str(BROWSER_PY), "eval", "--url", "claude.ai", "-t", "30"]
+            + [_CLAUDE_ACCOUNT_JS],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        if res.returncode == 0:
+            lines = res.stdout.strip().splitlines()
+            try:
+                email = json.loads(lines[-1]) if lines else ""
+            except ValueError:
+                email = ""
+            return str(email).lower() or None
+        if attempt == 0:  # no claude.ai tab yet
+            _browser("open", "https://claude.ai/", quiet=True)
+            time.sleep(5)
+    return None
+
+
+def assisted_check(site: str) -> tuple[bool, str]:
+    """(works?, how) for a site you log into yourself; never starts a login."""
+    hint = f"log in once: ./agent-login.py -g {site}"
+    if site not in CLAUDE_ACCOUNTS:
+        if _browser("logged-in", site, quiet=True) == 0:
+            return True, "logged in"
+        return False, f"NOT logged in — {hint}"
+    email = claude_account_email()
+    want = CLAUDE_ACCOUNTS[site].lower()
+    if not email:
+        return False, f"NOT logged in to claude.ai — {hint}"
+    if email != want:
+        return False, (
+            f"the shared Chromium holds {email} — one claude.ai session per "
+            "browser profile"
+        )
+    if site == "anthropic" and _browser("logged-in", "anthropic", quiet=True) != 0:
+        return False, f"{email} logged in, but the Team admin billing page fails"
+    return True, f"logged in as {email}"
 
 
 def assisted_login(site: str) -> int:
     """`browser.py login SITE` with the shared Chromium window shown: the site's
     own assisted flow (email code / SSO click) waits until you finish it."""
-    if _browser("logged-in", site, quiet=True) == 0:
-        print(f"✅ {site}: the shared Chromium is already logged in — nothing to do")
-        record_check(site, True, "logged in")
+    ok, how = assisted_check(site)
+    if ok:
+        print(f"✅ {site}: {how} — nothing to do")
+        record_check(site, True, how)
         return 0
-    print("▶ showing the shared Chromium window …")
-    if _browser("switch", "headed") != 0:
+    if "one claude.ai session per browser profile" in how:
+        # Logging in here would replace the other account's session.
+        print(f"❌ {site}: {how}; log that account out first (claude.ai → Log out)")
+        record_check(site, False, how)
+        return 2
+    try:
+        before = show_window()
+    except RuntimeError:
         return 1
     try:
-        _browser("login", site)
+        _browser("login", browser_site(site))
     finally:
-        print("▶ hiding the Chromium window again …")
-        _browser("switch", "headless", quiet=True)
-    ok = _browser("logged-in", site, quiet=True) == 0
-    record_check(site, ok, "logged in" if ok else "NOT logged in after -g")
-    print(f"{'✅' if ok else '❌'} {site}: {'logged in' if ok else 'NOT logged in'}")
+        restore_mode(before)
+    ok, how = assisted_check(site)
+    record_check(site, ok, how)
+    print(f"{'✅' if ok else '❌'} {site}: {how}")
     return 0 if ok else 2
 
 
@@ -595,18 +767,6 @@ def ensure_logged_in(site: str) -> tuple[bool, str]:
     if _browser("logged-in", site, quiet=True) == 0:
         return True, f"logged in again ({routes[-1] if routes else 'browser.py login'})"
     return False, f"NOT logged in (browser.py login exit {res.returncode})"
-
-
-def gog_bin() -> str | None:
-    """gog: $GOG_BIN, then PATH, then the Homebrew default; None when absent."""
-    for cand in (
-        os.environ.get("GOG_BIN"),
-        shutil.which("gog"),
-        "/opt/homebrew/bin/gog",
-    ):
-        if cand and Path(cand).is_file():
-            return cand
-    return None
 
 
 def failure_mail(failed: list[tuple[str, str]]) -> tuple[str, str]:
@@ -637,63 +797,6 @@ def safari_fix(site: str) -> str:
     return f"run ./agent-login.py -t {site} and read its error (in {here})"
 
 
-def send_mail(subject: str, body: str) -> bool:
-    """Mail Albert through gog's Gmail API; False (after a message) on failure."""
-    gog = gog_bin()
-    if gog is None:
-        print("❌ gog (gogcli) not found — set GOG_BIN or install gogcli; no mail sent")
-        return False
-    res = subprocess.run(
-        [
-            gog,
-            "gmail",
-            "send",
-            "-a",
-            MAIL_TO,
-            "--to",
-            MAIL_TO,
-            "--subject",
-            subject,
-            "--body-file",
-            "-",
-            "--no-input",
-        ],
-        input=body,
-        text=True,
-        check=False,
-        capture_output=True,
-    )
-    if res.returncode != 0:
-        print(f"❌ gog gmail send failed (exit {res.returncode}): {res.stderr.strip()}")
-        return False
-    print(f"✉️  mailed {MAIL_TO}: {subject}")
-    return True
-
-
-# The daily run fires right after the Mac wakes, often before the network is up.
-NETWORK_HOST = "vaultwarden.dom42.space"
-NETWORK_WAIT_S = 300
-
-
-def wait_for_network(
-    host: str = NETWORK_HOST,
-    timeout_s: float = NETWORK_WAIT_S,
-    *,
-    sleep=time.sleep,
-    clock=time.monotonic,
-) -> bool:
-    """True once `host` resolves (polled every 15 s), False after `timeout_s`."""
-    deadline = clock() + timeout_s
-    while True:
-        try:
-            socket.getaddrinfo(host, 443)
-            return True
-        except OSError:
-            if clock() >= deadline:
-                return False
-            sleep(15)
-
-
 def check_all(*, mail: bool = False) -> int:
     """Every usable site (Safari or broker): logged in? If not, log in. One line
     per site; exit 1 if any stays logged out (and, with `mail`, ONE mail).
@@ -708,12 +811,7 @@ def check_all(*, mail: bool = False) -> int:
         failed.append(("login broker", data["broker"]))
     for row in data["rows"]:
         if row["status"] == "assisted":
-            ok = _browser("logged-in", row["site"], quiet=True) == 0
-            how = (
-                "logged in"
-                if ok
-                else f"NOT logged in — log in once: ./agent-login.py -g {row['site']}"
-            )
+            ok, how = assisted_check(row["site"])
             print(f"{'✅' if ok else '❌'} {row['site']}: {how}")
             record_check(row["site"], ok, how)
             if not ok:
@@ -733,89 +831,6 @@ def check_all(*, mail: bool = False) -> int:
     if failed and mail:
         send_mail(*failure_mail(failed))
     return 1 if failed else 0
-
-
-def launchagent_plist() -> str:
-    """The daily LaunchAgent (`agent-login.py -c -m` at 09:15), as text. Pure."""
-    search_path = ":".join(
-        [
-            str(Path.home() / ".local" / "bin"),
-            "/opt/homebrew/bin",
-            "/usr/local/bin",
-            "/usr/bin",
-            "/bin",
-        ]
-    )
-    return f"""<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-    <key>Label</key>
-    <string>{LAUNCH_LABEL}</string>
-    <key>ProgramArguments</key>
-    <array>
-        <string>/usr/bin/env</string>
-        <string>python3</string>
-        <string>{Path(__file__).resolve()}</string>
-        <string>-c</string>
-        <string>-m</string>
-    </array>
-    <key>StartCalendarInterval</key>
-    <dict>
-        <key>Hour</key>
-        <integer>{LAUNCH_HOUR}</integer>
-        <key>Minute</key>
-        <integer>{LAUNCH_MINUTE}</integer>
-    </dict>
-    <key>StandardOutPath</key>
-    <string>{LAUNCH_LOG}</string>
-    <key>StandardErrorPath</key>
-    <string>{LAUNCH_LOG}</string>
-    <key>EnvironmentVariables</key>
-    <dict>
-        <key>PATH</key>
-        <string>{search_path}</string>
-    </dict>
-    <key>RunAtLoad</key>
-    <false/>
-</dict>
-</plist>
-"""
-
-
-def _bootout() -> None:
-    subprocess.run(
-        ["launchctl", "bootout", f"gui/{os.getuid()}/{LAUNCH_LABEL}"],
-        check=False,
-        capture_output=True,
-    )
-
-
-def install_daily() -> int:
-    """Write + (re)load the LaunchAgent."""
-    LAUNCH_PLIST.parent.mkdir(parents=True, exist_ok=True)
-    LAUNCH_PLIST.write_text(launchagent_plist(), encoding="utf-8")
-    _bootout()
-    rc = subprocess.run(
-        ["launchctl", "bootstrap", f"gui/{os.getuid()}", str(LAUNCH_PLIST)],
-        check=False,
-    ).returncode
-    if rc != 0:
-        print(f"❌ launchctl bootstrap {LAUNCH_PLIST} failed (exit {rc})")
-        return 1
-    print(
-        f"✅ installed {LAUNCH_LABEL} (daily {LAUNCH_HOUR:02d}:{LAUNCH_MINUTE:02d}, "
-        f"-c -m; log {LAUNCH_LOG})"
-    )
-    return 0
-
-
-def uninstall_daily() -> int:
-    """Unload + remove the LaunchAgent."""
-    _bootout()
-    LAUNCH_PLIST.unlink(missing_ok=True)
-    print(f"removed {LAUNCH_LABEL}")
-    return 0
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -851,23 +866,43 @@ def build_parser() -> argparse.ArgumentParser:
         help=f"with -c: mail {MAIL_TO} (gog) when a site stays logged out",
     )
     ap.add_argument(
+        "-r",
+        "--refresh",
+        action="store_true",
+        help="ask the broker now (re-reads Bitwarden, ~40 s) instead of the snapshot",
+    )
+    ap.add_argument(
+        "-S",
+        "--snapshot",
+        action="store_true",
+        help="refresh the site-list snapshot and the agents file, print nothing "
+        "(LaunchAgent, every 10 min)",
+    )
+    ap.add_argument(
+        "-A",
+        "--agents",
+        action="store_true",
+        help="print the summary agent sessions get at start (the agents file)",
+    )
+    ap.add_argument(
         "-I",
         "--install-daily",
         action="store_true",
-        help=f"install + load the LaunchAgent {LAUNCH_LABEL} "
-        f"(`-c -m` daily {LAUNCH_HOUR:02d}:{LAUNCH_MINUTE:02d})",
+        help=f"install + load the LaunchAgents {LAUNCH_LABEL} "
+        f"(`-c -m` daily {LAUNCH_HOUR:02d}:{LAUNCH_MINUTE:02d}) and {SNAPSHOT_LABEL} "
+        f"(`-S` every {SNAPSHOT_INTERVAL_S // 60} min)",
     )
     ap.add_argument(
         "-U",
         "--uninstall-daily",
         action="store_true",
-        help="unload + remove that LaunchAgent",
+        help="unload + remove both LaunchAgents",
     )
     ap.add_argument(
         "-P",
         "--print-plist",
         action="store_true",
-        help="print the LaunchAgent plist (writes nothing)",
+        help="print both LaunchAgent plists (writes nothing)",
     )
     ap.add_argument(
         "-j", "--json", action="store_true", help="print the overview as JSON"
@@ -879,6 +914,7 @@ def launch_action(args: argparse.Namespace) -> int | None:
     """-P / -I / -U, or None when none was asked for."""
     if args.print_plist:
         print(launchagent_plist(), end="")
+        print(snapshot_plist(), end="")
         return 0
     if args.install_daily:
         return install_daily()
@@ -915,11 +951,21 @@ def main() -> int:
     if args.mail and not args.check_all:
         ap.error("-m/--mail only works together with -c/--check-all")
     rc = launch_action(args)
-    if rc is None:
-        rc = login_action(args)
     if rc is not None:
         return rc
-    data = overview()
+    if args.snapshot:
+        data = overview(fresh=True)
+        write_agent_summary(data)
+        return 0 if data["broker_ok"] else 1
+    rc = login_action(args)
+    if rc is not None:
+        write_agent_summary()  # a check changed what agents can use
+        return rc
+    data = overview(fresh=args.refresh)
+    write_agent_summary(data)
+    if args.agents:
+        print(agent_summary(data, last_checks()), end="")
+        return 0
     if args.json:
         print(json.dumps(data, indent=1))
     else:

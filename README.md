@@ -401,7 +401,10 @@ Examples:
 | `-g`, `--guided` `SITE` | guided login typed by hand in the shared Chromium window |
 | `-c`, `--check-all` | every usable site: logged in? if not, `browser.py login`; one line per site, exit 1 if any stays logged out |
 | `-m`, `-M`, `--mail` | with -c: mail `albert.glensk@gmail.com` (gog) when a site stays logged out |
-| `-I`, `--install-daily` | install + load the LaunchAgent com.albert.agent-login-check (`-c -m` daily 09:15) |
-| `-U`, `--uninstall-daily` | unload + remove that LaunchAgent |
-| `-P`, `--print-plist` | print the LaunchAgent plist (writes nothing) |
+| `-r`, `--refresh` | ask the broker now (re-reads Bitwarden, ~40 s) instead of the snapshot |
+| `-S`, `--snapshot` | refresh the site-list snapshot and the agents file, print nothing (LaunchAgent, every 10 min) |
+| `-A`, `--agents` | print the summary agent sessions get at start (the agents file) |
+| `-I`, `--install-daily` | install + load the LaunchAgents com.albert.agent-login-check (`-c -m` daily 09:15) and com.albert.agent-login-snapshot (`-S` every 10 min) |
+| `-U`, `--uninstall-daily` | unload + remove both LaunchAgents |
+| `-P`, `--print-plist` | print both LaunchAgent plists (writes nothing) |
 | `-j`, `--json` | print the overview as JSON |

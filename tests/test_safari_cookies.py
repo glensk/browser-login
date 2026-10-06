@@ -426,7 +426,9 @@ def test_agent_login_overview_safari_column(jar, monkeypatch) -> None:
         dataclasses.replace(sc.SAFARI_SITES["anibis"], session_cookies=("session",)),
     )
     sites = [{"site": "anibis"}, {"site": "tutti"}, {"site": "ricardo"}]
-    monkeypatch.setattr(al, "broker_state", lambda: ("running, Bitwarden ok", sites))
+    monkeypatch.setattr(
+        al, "broker_state", lambda **_k: ("running, Bitwarden ok", sites)
+    )
     rows = {r["site"]: r for r in al.overview()["rows"]}
     assert rows["anibis"]["safari"] is True
     assert rows["anibis"]["safari_expires"] == time.strftime(
@@ -441,7 +443,7 @@ def test_agent_login_overview_safari_column(jar, monkeypatch) -> None:
 
 def test_agent_login_overview_unreadable_jar(tmp_path, monkeypatch) -> None:
     monkeypatch.setenv("SAFARI_COOKIES", str(tmp_path / "absent"))
-    monkeypatch.setattr(al, "broker_state", lambda: ("not installed", []))
+    monkeypatch.setattr(al, "broker_state", lambda **_k: ("not installed", []))
     rows = {r["site"]: r for r in al.overview()["rows"]}
     assert rows["anibis"]["safari"] is None
     assert al.safari_cell(rows["anibis"]) == "Safari: unreadable"

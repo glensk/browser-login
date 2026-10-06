@@ -59,7 +59,7 @@ def test_refused_missing_unknown_unchecked() -> None:
 
 
 def test_overview_broker_down(monkeypatch) -> None:
-    monkeypatch.setattr(al, "broker_state", lambda: ("not installed", []))
+    monkeypatch.setattr(al, "broker_state", lambda **_k: ("not installed", []))
     data = al.overview()
     assert not data["broker_ok"]
     statuses = {r["site"]: r["status"] for r in data["rows"]}
@@ -73,7 +73,9 @@ def test_overview_rows_carry_check_url(monkeypatch) -> None:
         {"site": "ricardo", "refused": False, "check_url": "https://r.example/me"},
         {"site": "extra", "refused": False, "check_url": "https://e.example/me"},
     ]
-    monkeypatch.setattr(al, "broker_state", lambda: ("running, Bitwarden ok", sites))
+    monkeypatch.setattr(
+        al, "broker_state", lambda **_k: ("running, Bitwarden ok", sites)
+    )
     rows = {r["site"]: r for r in al.overview()["rows"]}
     assert rows["ricardo"]["check_url"] == "https://r.example/me"  # broker wins
     assert rows["extra"]["check_url"] == "https://e.example/me"
@@ -144,3 +146,59 @@ def test_assisted_sites_and_resolve() -> None:
     assert al.resolve_site("https://auth.cscs.ch/") == "cscs"
     assert al.resolve_site("CSCS") == "cscs"
     assert al.resolve_site("nope") == "nope"
+
+
+def test_broker_state_uses_recent_snapshot(monkeypatch, tmp_path) -> None:
+    """The overview reads the snapshot; only `fresh` (or none/stale) asks the broker."""
+    calls: list[bool] = []
+
+    def live(*, fresh):
+        calls.append(fresh)
+        return "running, Bitwarden readable", [{"site": "cscs"}]
+
+    monkeypatch.setattr(al, "_broker_state_live", live)
+    monkeypatch.setattr(al, "SOCKET", str(tmp_path))  # "exists"
+    assert al.broker_state()[1] == [{"site": "cscs"}]  # no snapshot yet → live
+    assert al.broker_state()[1] == [{"site": "cscs"}]  # snapshot
+    assert calls == [False]
+    al.broker_state(fresh=True)
+    assert calls == [False, True]
+
+
+def test_agent_summary_lists_both_sides() -> None:
+    rows = [
+        _row("cscs", "ready", flow="cscs"),
+        _row("anthropic", "assisted", flow=al.ASSISTED_FLOW),
+        _row("geizhals", "unknown"),
+    ]
+    checks = {
+        "cscs": {"ok": True, "at": "t", "how": "logged in"},
+        "anthropic": {"ok": True, "at": "t", "how": "logged in as a@b.ch"},
+    }
+    text = al.agent_summary({"rows": rows, "broker_ok": True}, checks)
+    assert "- ✅ cscs (`cscs`): login broker" in text
+    assert "a@b.ch" in text
+    assert "- ❌ geizhals: login address unknown" in text
+    assert "browser.py login <site>" in text
+
+
+def test_snapshot_plist() -> None:
+    plist = al.snapshot_plist()
+    assert "<string>com.albert.agent-login-snapshot</string>" in plist
+    assert "<string>-S</string>" in plist
+    assert "<key>StartInterval</key>" in plist and "<true/>" in plist
+
+
+def test_safari_state_keeps_last_readable(monkeypatch) -> None:
+    good = {"anibis": {"safari": True, "safari_expires": "2099-01-01"}}
+    monkeypatch.setattr(al, "safari_sessions", lambda sites: good)
+    assert al.safari_state(["anibis"]) == good
+    bad = {"anibis": {"safari": None, "safari_error": "no access"}}
+    monkeypatch.setattr(al, "safari_sessions", lambda sites: bad)
+    assert al.safari_state(["anibis"]) == good  # the last readable state
+
+
+def test_expired_safari_session_fails() -> None:
+    row = _row("tutti", "safari", safari=True, safari_expires="2001-01-01")
+    works, why = al.verdict(row, {"tutti": {"ok": True, "at": "t"}})
+    assert not works and "expired" in why
