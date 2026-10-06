@@ -259,3 +259,12 @@ def test_keychain_parse_names_only() -> None:
         "prompting-item": False,
         "other-team": False,
     }
+
+
+def test_keychain_names_without_broker_are_strict(monkeypatch) -> None:
+    """No secret broker: only ENV_STYLE / colon names survive."""
+    import agent_login_keychain as kc  # pylint: disable=import-outside-toplevel
+
+    monkeypatch.setattr(kc, "_scrub_client", lambda: None)
+    got = kc.mask_known_secrets(["EPFL_VPN_PASSWORD", "gh:github.com", "plainword"])
+    assert got == ["EPFL_VPN_PASSWORD", "gh:github.com", kc.MASKED]

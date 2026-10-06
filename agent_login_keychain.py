@@ -10,7 +10,9 @@ partition list admits ``apple-tool:``. Values are never read here.
 from __future__ import annotations
 
 import json
+import os
 import re
+import shutil
 import subprocess
 import time
 from collections.abc import Callable
@@ -32,9 +34,50 @@ _NAME_OK = re.compile(r"[A-Z][A-Z0-9_]*|[A-Za-z]+|.*[:./ @-].*")
 MASKED = "‹name looks like a secret value — not shown›"
 
 
+# Without the secret broker only these shapes are shown: ENV_STYLE or a
+# structured name with a colon ("gh:github.com", "biopol-wifi: email").
+_NAME_STRICT = re.compile(r"[A-Z][A-Z0-9_]*|.*:.*")
+
+
 def safe_name(name: str) -> str:
-    """`name`, or MASKED when it could be a credential itself."""
+    """`name`, or MASKED when its shape could be a credential itself."""
     return name if _NAME_OK.fullmatch(name) else MASKED
+
+
+def _scrub_client() -> str | None:
+    """mydotfiles' secret-broker client (the leak detector the hooks use)."""
+    for cand in (
+        os.environ.get("SECRET_BROKER_CLIENT"),
+        shutil.which("secret-broker-client.py"),
+        str(
+            Path.home() / "obsidian/42-Git/home/mydotfiles/bin/secret-broker-client.py"
+        ),
+    ):
+        if cand and os.access(cand, os.X_OK):
+            return cand
+    return None
+
+
+def mask_known_secrets(names: list[str]) -> list[str]:
+    """Each name, or MASKED when the secret broker knows it as a secret value.
+
+    A shape check is not enough: a real password can look like a plain word.
+    Without the broker (absent / exit 3) the strict shape rule decides.
+    """
+    client = _scrub_client()
+    res = None
+    if client and names:
+        res = subprocess.run(
+            [client, "scrub"],
+            input="\n".join(n.replace("\n", " ") for n in names) + "\n",
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+    lines = res.stdout.split("\n") if res is not None and res.returncode == 0 else []
+    if len(lines) < len(names):
+        return [n if _NAME_STRICT.fullmatch(n) else MASKED for n in names]
+    return [n if n == line else MASKED for n, line in zip(names, lines)]
 
 
 def _attr(block: str, name: str) -> str:
@@ -94,7 +137,14 @@ def scan() -> list[dict]:
         text=True,
         errors="replace",
     )
-    return parse_dump(res.stdout) if res.returncode == 0 else []
+    if res.returncode != 0:
+        return []
+    items = parse_dump(res.stdout)
+    flat = [x for i in items for x in (i["service"], i["account"])]
+    masked = mask_known_secrets(flat)
+    for n, item in enumerate(items):
+        item["service"], item["account"] = masked[2 * n], masked[2 * n + 1]
+    return items
 
 
 def cached(path: Path) -> tuple[float, list[dict]]:
@@ -118,6 +168,7 @@ def refresh(path: Path, *, force: bool = False) -> tuple[float, list[dict]]:
     tmp = path.with_suffix(".tmp")
     now = time.time()
     tmp.write_text(json.dumps({"at": now, "items": items}), "utf-8")
+    tmp.chmod(0o600)
     tmp.replace(path)
     return now, items
 
