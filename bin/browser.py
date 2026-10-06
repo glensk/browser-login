@@ -150,7 +150,19 @@ from broker.recipes import off_fill_origins as _broker_off_fill_origins  # noqa:
 from broker.recipes import parse_totp as _parse_totp  # noqa: E402
 
 # pylint: enable=wrong-import-position
-DEFAULT_CDP_PORT = int(os.environ.get("CLAUDE_BROWSER_CDP_PORT", "9222"))
+# Named instances: a second shared browser with its OWN profile, port and
+# coordination files (e.g. "private" for Albert's private claude.ai account — one
+# profile holds one claude.ai session). Unset = the default shared browser.
+INSTANCE_PORTS = {"": 9222, "private": 9223}
+INSTANCE = os.environ.get("CLAUDE_BROWSER_INSTANCE", "").strip().lower()
+if INSTANCE not in INSTANCE_PORTS:
+    sys.exit(
+        f"❌ CLAUDE_BROWSER_INSTANCE={INSTANCE!r} is unknown "
+        f"(known: {', '.join(k for k in INSTANCE_PORTS if k)})"
+    )
+DEFAULT_CDP_PORT = int(
+    os.environ.get("CLAUDE_BROWSER_CDP_PORT", str(INSTANCE_PORTS[INSTANCE]))
+)
 
 
 def _connect_timeout_s(raw: str | None, default: float = 30.0) -> float:
@@ -173,7 +185,9 @@ CONNECT_TIMEOUT_S = _connect_timeout_s(
 CACHE_DIR = (
     Path(os.environ["CLAUDE_BROWSER_CACHE_DIR"])
     if os.environ.get("CLAUDE_BROWSER_CACHE_DIR")
-    else Path.home() / ".cache" / "claude-browser"
+    else Path.home()
+    / ".cache"
+    / ("claude-browser" + (f"-{INSTANCE}" if INSTANCE else ""))
 )
 PROFILE_DIR = CACHE_DIR / "profile"
 PID_FILE = CACHE_DIR / "browser.pid"
