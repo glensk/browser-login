@@ -298,6 +298,12 @@ the agent the portal session. Record as Albert's decision of 2026-10-01 in
       min; `-r` asks live) → overview 41 s → 0.1 s. Agents: `-S` also writes
       ~/.local/state/agent-login/agents.md, which a SessionStart hook (mydotfiles
       settings.json) prints into every Claude Code session; `-A` shows it.
+      **2026-10-06 (evening):** reinstall done; SWITCH (-g) and Ricardo (-t) ✅. Private
+      claude.ai = browser.py instance `private` (CDP 9223, own profile), `-g anthropic-private`
+      waits for the account email. Overview column `agent_fill_origins` (True = the item is in
+      the agent-login collection WITH the field; the assisted sites need no Bitwarden item).
+      geizhals: Albert has no Vaultwarden item. Security review → tp#785 (login-keychain items
+      readable by agents via the security CLI; CSCS copies of 3.3 still present).
 
 ### Phase 4 — close out
 

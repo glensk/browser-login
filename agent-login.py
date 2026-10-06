@@ -40,6 +40,14 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))  # the repo's `broker` package
 # pylint: disable=wrong-import-position
+from agent_login_claude import (  # noqa: E402
+    CLAUDE_ACCOUNTS,
+    SITE_INSTANCE,
+    browser_site,
+    claude_account_email,
+    claude_login_by_hand,
+    site_instance,
+)
 from agent_login_jobs import (  # noqa: E402
     LAUNCH_HOUR,
     LAUNCH_LABEL,
@@ -110,7 +118,7 @@ TARGETS = (
         "Cloudflare blocks automated browsers: agents work in your Safari directly",
     ),
     Target("tutti", "tutti", "https://auth.tutti.ch", SAFARI_FLOW, _SAFARI_NOTE),
-    Target("geizhals", "geizhals", "", "unknown", "login address not known yet"),
+    Target("geizhals", "geizhals", "", "unknown", "no Vaultwarden item yet"),
     Target(
         "cscs",
         "CSCS",
@@ -130,7 +138,9 @@ TARGETS = (
         "Anthropic private",
         "https://claude.ai",
         ASSISTED_FLOW,
-        "claude.ai private account: ./agent-login.py -g anthropic-private",
+        "claude.ai private account, own browser instance "
+        "(CLAUDE_BROWSER_INSTANCE=private, CDP 9223): ./agent-login.py -g "
+        "anthropic-private",
     ),
     Target(
         "openai",
@@ -328,6 +338,7 @@ def overview(*, fresh: bool = False) -> dict:
                 "check_url": check,
                 "status": status,
                 "detail": detail,
+                "in_bitwarden": bool(entry.get("fill_origins")),
                 **safari.get(t.site, {}),
             }
         )
@@ -346,6 +357,7 @@ def overview(*, fresh: bool = False) -> dict:
                 "check_url": str(entry.get("check_url") or ""),
                 "status": "refused" if refused else "extra",
                 "detail": str(entry.get("reason") or "") if refused else "",
+                "in_bitwarden": bool(entry.get("fill_origins")),
             }
         )
     return {
@@ -395,6 +407,12 @@ def agent_summary(data: dict, checks: dict[str, dict]) -> str:
             detail = str((checks.get(row["site"]) or {}).get("how") or "")
             if detail.startswith("logged in as"):
                 how += f", {detail[len('logged in as ') :]}"
+            inst = SITE_INSTANCE.get(row["site"])
+            if inst:
+                how += (
+                    f" — its own browser: prefix browser.py with "
+                    f"CLAUDE_BROWSER_INSTANCE={inst} (CDP 127.0.0.1:9223)"
+                )
             ok_lines.append(
                 f"- ✅ {row['name']} (`{browser_site(row['site'])}`): {how}"
             )
@@ -465,7 +483,7 @@ def check_cell(site: str, checks: dict[str, dict]) -> str:
 
 # Setup problems: the site cannot work for agents whatever the last check said.
 _SETUP_REASON = {
-    "unknown": "login address unknown",
+    "unknown": "no Vaultwarden item / login address yet",
     "missing": "not in the Bitwarden agent-login collection",
     "refused": "Bitwarden item refused",
     "needs-flow": "the broker cannot do this login flow yet",
@@ -532,8 +550,11 @@ def print_overview(data: dict) -> None:
     judged = [(r, *verdict(r, checks)) for r in rows]
     judged.sort(key=lambda x: (not x[1], x[0]["name"].lower()))
     width = max(len(r["name"]) for r in rows)
+    col = "agent_fill_origins"
+    print(_c("2", f"     {'login'.ljust(width)}  {col}  status"))
     for r, works, why in judged:
-        line = f"  {'✅' if works else '❌'} {_c('1', r['name'].ljust(width))}  "
+        bw = str(bool(r.get("in_bitwarden"))).ljust(len(col))
+        line = f"  {'✅' if works else '❌'} {_c('1', r['name'].ljust(width))}  {bw}  "
         print(line + (_c("2", why) if works else why))
     print()
     print(
@@ -659,50 +680,15 @@ def manual_login(site: str) -> int:
 
 
 ASSISTED_SITES = {t.site for t in TARGETS if t.flow == ASSISTED_FLOW}
-# The claude.ai accounts: one browser profile holds ONE claude.ai session, so the
-# logged-in account's email decides which line is ✅.
-CLAUDE_ACCOUNTS = {
-    "anthropic": os.environ.get("ANTHROPIC_WORK_EMAIL", "albert.glensk@epfl.ch"),
-    "anthropic-private": os.environ.get(
-        "ANTHROPIC_PRIVATE_EMAIL", "albert.glensk@gmail.com"
-    ),
-}
-_CLAUDE_ACCOUNT_JS = (
-    'fetch("/api/account").then(r => r.ok ? r.json() : {})'
-    ".then(a => a.email_address || '')"
-)
-
-
-def browser_site(site: str) -> str:
-    """The browser.py site name for an agent-login site id."""
-    return "anthropic" if site in CLAUDE_ACCOUNTS else site
-
-
-def claude_account_email() -> str | None:
-    """Email of the claude.ai account the shared Chromium is logged into, or None."""
-    for attempt in range(2):
-        res = subprocess.run(
-            [sys.executable, str(BROWSER_PY), "eval", "--url", "claude.ai", "-t", "30"]
-            + [_CLAUDE_ACCOUNT_JS],
-            check=False,
-            capture_output=True,
-            text=True,
-        )
-        if res.returncode == 0:
-            lines = res.stdout.strip().splitlines()
-            try:
-                email = json.loads(lines[-1]) if lines else ""
-            except ValueError:
-                email = ""
-            return str(email).lower() or None
-        if attempt == 0:  # no claude.ai tab yet
-            _browser("open", "https://claude.ai/", quiet=True)
-            time.sleep(5)
-    return None
 
 
 def assisted_check(site: str) -> tuple[bool, str]:
     """(works?, how) for a site you log into yourself; never starts a login."""
+    with site_instance(site):
+        return _assisted_check(site)
+
+
+def _assisted_check(site: str) -> tuple[bool, str]:
     hint = f"log in once: ./agent-login.py -g {site}"
     if site not in CLAUDE_ACCOUNTS:
         if _browser("logged-in", site, quiet=True) == 0:
@@ -713,9 +699,10 @@ def assisted_check(site: str) -> tuple[bool, str]:
     if not email:
         return False, f"NOT logged in to claude.ai — {hint}"
     if email != want:
+        where = SITE_INSTANCE.get(site, "default")
         return False, (
-            f"the shared Chromium holds {email} — one claude.ai session per "
-            "browser profile"
+            f"the {where} browser instance holds {email} — one claude.ai session "
+            "per browser profile"
         )
     if site == "anthropic" and _browser("logged-in", "anthropic", quiet=True) != 0:
         return False, f"{email} logged in, but the Team admin billing page fails"
@@ -735,14 +722,18 @@ def assisted_login(site: str) -> int:
         print(f"❌ {site}: {how}; log that account out first (claude.ai → Log out)")
         record_check(site, False, how)
         return 2
-    try:
-        before = show_window()
-    except RuntimeError:
-        return 1
-    try:
-        _browser("login", browser_site(site))
-    finally:
-        restore_mode(before)
+    with site_instance(site):
+        try:
+            before = show_window()
+        except RuntimeError:
+            return 1
+        try:
+            if site in SITE_INSTANCE and site in CLAUDE_ACCOUNTS:
+                claude_login_by_hand(site)
+            else:
+                _browser("login", browser_site(site))
+        finally:
+            restore_mode(before)
     ok, how = assisted_check(site)
     record_check(site, ok, how)
     print(f"{'✅' if ok else '❌'} {site}: {how}")

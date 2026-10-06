@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import importlib.util
+import os
 import sys
 from pathlib import Path
 
@@ -133,7 +134,10 @@ def test_verdict_one_answer_per_login() -> None:
     assert not works and "-t cscs" in why
     # a setup problem wins over an old passing check
     assert not al.verdict(_row("cscs", "missing"), ok)[0]
-    assert al.verdict(_row("x", "unknown"), {}) == (False, "login address unknown")
+    assert al.verdict(_row("x", "unknown"), {}) == (
+        False,
+        "no Vaultwarden item / login address yet",
+    )
     row = _row("tutti", "safari", safari=False, fallback="")
     assert "Safari" in al.verdict(row, {"tutti": {"ok": True, "at": "t"}})[1]
 
@@ -178,7 +182,7 @@ def test_agent_summary_lists_both_sides() -> None:
     text = al.agent_summary({"rows": rows, "broker_ok": True}, checks)
     assert "- ✅ cscs (`cscs`): login broker" in text
     assert "a@b.ch" in text
-    assert "- ❌ geizhals: login address unknown" in text
+    assert "- ❌ geizhals: no Vaultwarden item / login address yet" in text
     assert "browser.py login <site>" in text
 
 
@@ -202,3 +206,18 @@ def test_expired_safari_session_fails() -> None:
     row = _row("tutti", "safari", safari=True, safari_expires="2001-01-01")
     works, why = al.verdict(row, {"tutti": {"ok": True, "at": "t"}})
     assert not works and "expired" in why
+
+
+def test_private_claude_lives_in_its_own_instance(monkeypatch) -> None:
+    """anthropic-private runs every browser.py call in the `private` instance."""
+    seen: list[str] = []
+    monkeypatch.setattr(
+        sys.modules["agent_login_claude"], "browser_mode", lambda: "headless"
+    )
+    monkeypatch.delenv("CLAUDE_BROWSER_INSTANCE", raising=False)
+    with al.site_instance("anthropic-private"):
+        seen.append(os.environ["CLAUDE_BROWSER_INSTANCE"])
+    with al.site_instance("anthropic"):
+        seen.append(os.environ["CLAUDE_BROWSER_INSTANCE"])
+    assert seen == ["private", ""]
+    assert "CLAUDE_BROWSER_INSTANCE" not in os.environ

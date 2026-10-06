@@ -72,6 +72,10 @@ framework. It is a **provider**: other repos depend on it, not the reverse. See
   Cloudflare challenges (claude.ai, chatgpt.com); headless launches pass
   `--user-agent` from `_headless_user_agent`, so `_browser_mode` also reads the
   root process's `--headless` flag. Keep both in sync.
+- **Instances**: `CLAUDE_BROWSER_INSTANCE=private` runs a second shared browser
+  (own profile `~/.cache/claude-browser-private`, CDP 9223, own coordination
+  files) — for Albert's private claude.ai account, since one profile holds one
+  claude.ai session. Known instances: `INSTANCE_PORTS` in `bin/browser.py`.
 - **What agents can use** = `agent-login.py -A` (the file
   `~/.local/state/agent-login/agents.md`, refreshed by `-S` every 10 min and by
   every `agent-login.py` run; a SessionStart hook in mydotfiles' Claude
