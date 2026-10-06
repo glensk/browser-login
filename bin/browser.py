@@ -117,6 +117,7 @@ import functools
 import glob
 import json
 import os
+import plistlib
 import re
 import shutil
 import signal
@@ -972,6 +973,29 @@ def _mark_gone(port: int, failed: list[TargetProbe]) -> None:
             p.outcome = "gone"
 
 
+def _headless_user_agent(binary: str) -> str | None:
+    """A plain desktop-Chrome User-Agent for the headless browser, or None.
+
+    ``--headless=new`` announces itself as ``HeadlessChrome/<v>`` and Cloudflare
+    answers that with its "Just a moment…" page (claude.ai, 2026-10-06; the same
+    page with the normal UA loads). The version comes from the app's Info.plist
+    so the UA matches the real engine; unknown version → no override.
+    """
+    plist = Path(binary).parent.parent / "Info.plist"
+    try:
+        with plist.open("rb") as fh:
+            version = str(plistlib.load(fh).get("CFBundleShortVersionString") or "")
+    except (OSError, ValueError, plistlib.InvalidFileException):
+        return None
+    major = version.split(".", 1)[0]
+    if not major.isdigit():
+        return None
+    return (
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
+        f"(KHTML, like Gecko) Chrome/{major}.0.0.0 Safari/537.36"
+    )
+
+
 def _browser_mode(port: int) -> str | None:
     """Mode of the RUNNING browser: ``"headless"``, ``"headed"``, or None if down.
 
@@ -980,7 +1004,9 @@ def _browser_mode(port: int) -> str | None:
     Chrome for Testing 151 reports a plain ``Browser`` and only the ``User-Agent``
     says ``HeadlessChrome`` (verified 2026-08-20). Check both. The mode is read off
     the live browser instead of remembered from launch — correct even for a
-    browser this process didn't start.
+    browser this process didn't start. A headless browser launched with a plain
+    User-Agent (`_headless_user_agent`) shows neither marker, so the root
+    process's own ``--headless`` flag counts too.
     """
     ver = _cdp_get(port, "/json/version")
     if not isinstance(ver, dict):
@@ -988,6 +1014,10 @@ def _browser_mode(port: int) -> str | None:
     headless = str(ver.get("Browser", "")).startswith("Headless") or (
         "HeadlessChrome" in str(ver.get("User-Agent", ""))
     )
+    if not headless:
+        headless = any(
+            "--headless" in (_proc_command(pid) or "") for pid in _find_root_pids(port)
+        )
     return "headless" if headless else "headed"
 
 
@@ -1664,6 +1694,9 @@ def _launch_and_record(port: int, headless: bool) -> int:
         # profile, same logins). The anti-throttling flags above are kept — with
         # no window they're moot, but harmless, and one mode difference less.
         flags.append("--headless=new")
+        user_agent = _headless_user_agent(binary)
+        if user_agent:
+            flags.append(f"--user-agent={user_agent}")
     rec = _lifecycle_write("starting", want, port=port)
     # Launch in the background so it never steals focus (see _launch_browser).
     pid = _launch_browser(binary, flags, headless=headless)
