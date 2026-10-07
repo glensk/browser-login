@@ -35,23 +35,59 @@ FIELD_DESCRIBE_JS = """e => {
   };
 }"""
 
+# Effective action of the form around an input: the default submit button's
+# `formaction` overrides the form's `action`. `null` = no form.
+FORM_ACTION_JS = """e => {
+  const f = e.form;
+  if (!f) return {form: false, action: null};
+  const b = f.querySelector('button[type=submit], input[type=submit], button:not([type])');
+  return {form: true, action: (b && b.getAttribute('formaction')) || f.getAttribute('action')};
+}"""
+
+# The visible submit button of the form around an input (first in DOM order).
+SUBMIT_BUTTON_JS = """e => {
+  const scope = e.form || document;
+  const vis = el => !!(el.offsetWidth || el.offsetHeight || el.getClientRects().length);
+  return Array.from(scope.querySelectorAll(
+      'button[type=submit], input[type=submit], button:not([type])')).find(vis) || null;
+}"""
+
 # Username field for the chosen password input: an autocomplete=username input
 # in the SAME form (no form: the document), else the nearest preceding visible
 # text/email input there — never one of a registration form beside it.
+# Fallback when that finds nothing (Home Assistant, 2026-10-08: each input sits
+# in its own web component's shadow root, so it has no form and
+# document.querySelectorAll never reaches it): the same two rules over every
+# input of the password's frame, open shadow roots included, skipping inputs
+# that belong to ANOTHER form than the password's (a register or search form).
 USERNAME_JS = """pw => {
-  const scope = pw.form || document;
   const vis = el => !!(el.offsetWidth || el.offsetHeight || el.getClientRects().length);
-  const inputs = Array.from(scope.querySelectorAll('input'));
-  const tagged = inputs.find(i => (i.getAttribute('autocomplete') || '').split(/\\s+/)
-      .includes('username') && vis(i));
-  if (tagged) return tagged;
-  let best = null;
-  for (const i of inputs) {
-    if (i === pw) break;
-    const t = (i.getAttribute('type') || 'text').toLowerCase();
-    if ((t === 'text' || t === 'email') && vis(i)) best = i;
-  }
-  return best;
+  const isUser = i => (i.getAttribute('autocomplete') || '').split(/\\s+/)
+      .includes('username');
+  const isText = i => ['text', 'email'].includes(
+      (i.getAttribute('type') || 'text').toLowerCase());
+  const pick = inputs => {
+    const tagged = inputs.find(i => i !== pw && isUser(i) && vis(i));
+    if (tagged) return tagged;
+    let best = null;
+    for (const i of inputs) {
+      if (i === pw) break;
+      if (isText(i) && vis(i)) best = i;
+    }
+    return best;
+  };
+  const scope = pw.form || document;
+  const found = pick(Array.from(scope.querySelectorAll('input')));
+  if (found) return found;
+  const deep = [];
+  const walk = root => {
+    for (const el of root.querySelectorAll('*')) {
+      if (el.tagName === 'INPUT') deep.push(el);
+      if (el.shadowRoot) walk(el.shadowRoot);
+    }
+  };
+  walk(pw.ownerDocument);
+  return pick(deep.filter(i => !i.form || i.form === pw.form));
 }"""
 
 

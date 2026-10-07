@@ -26,6 +26,8 @@ from collections.abc import Callable
 from typing import TYPE_CHECKING, Any
 
 from broker.login_form import (
+    FORM_ACTION_JS,
+    SUBMIT_BUTTON_JS,
     USERNAME_JS,
     pick_login_password,
     pick_login_username,
@@ -99,23 +101,6 @@ DEFAULT_CHECK_URLS = {
 DEFAULT_LOGGED_IN_SELECTORS = {
     "smartsheet": "#desktopHome, #home-label",
 }
-
-# Effective action of the form around an input: the default submit button's
-# `formaction` overrides the form's `action`. `null` = no form.
-_FORM_ACTION_JS = """e => {
-  const f = e.form;
-  if (!f) return {form: false, action: null};
-  const b = f.querySelector('button[type=submit], input[type=submit], button:not([type])');
-  return {form: true, action: (b && b.getAttribute('formaction')) || f.getAttribute('action')};
-}"""
-
-# The visible submit button of the form around an input (first in DOM order).
-_SUBMIT_BUTTON_JS = """e => {
-  const scope = e.form || document;
-  const vis = el => !!(el.offsetWidth || el.offsetHeight || el.getClientRects().length);
-  return Array.from(scope.querySelectorAll(
-      'button[type=submit], input[type=submit], button:not([type])')).find(vis) || null;
-}"""
 
 
 class RecipeError(Exception):
@@ -261,6 +246,15 @@ def challenge_reason(page: Any) -> str | None:
     return None
 
 
+def _frame_url(handle: Any) -> str:
+    """URL of the frame `handle` lives in; "" when it cannot be determined."""
+    try:
+        frame = handle.owner_frame()
+        return frame.url if frame is not None else ""
+    except Exception:  # pylint: disable=broad-exception-caught
+        return ""
+
+
 def _guard(page: Any, field_handle: Any, allowed: list[str], *, dev: bool) -> None:
     """Raise OriginViolation unless the top page, the field's OWN frame and the
     form action (resolved against that frame's URL) are all on a fill origin.
@@ -271,14 +265,10 @@ def _guard(page: Any, field_handle: Any, allowed: list[str], *, dev: bool) -> No
     """
     if not origin_allowed(page.url, allowed, dev=dev):
         raise OriginViolation("page is not on a fill origin")
-    try:
-        frame = field_handle.owner_frame()
-        frame_url = frame.url if frame is not None else ""
-    except Exception:  # pylint: disable=broad-exception-caught
-        frame_url = ""
+    frame_url = _frame_url(field_handle)
     if not origin_allowed(frame_url, allowed, dev=dev):
         raise OriginViolation("the field's frame is not on a fill origin")
-    info = field_handle.evaluate(_FORM_ACTION_JS)
+    info = field_handle.evaluate(FORM_ACTION_JS)
     action = info.get("action") if isinstance(info, dict) else None
     if not form_action_allowed(frame_url, action, allowed, dev=dev):
         raise OriginViolation("form action is not on a fill origin")
@@ -561,6 +551,26 @@ def _password_choice(page: Any) -> Any:
     return None
 
 
+def _pre_click(page: Any, selector: str, allowed: list[str], *, dev: bool) -> bool:
+    """``agent_pre_click``: click `selector` ONCE as soon as it is visible —
+    unless the login password field shows first, or nothing shows within
+    ``STEP_TIMEOUT_S``. The click (no secret involved) happens only while the
+    page AND the element's own frame are on a fill origin. True iff clicked."""
+    deadline = time.monotonic() + STEP_TIMEOUT_S
+    while time.monotonic() < deadline:
+        _check_challenge(page, submitted=False)
+        el = _visible(page, selector)
+        if el is not None:
+            if not origin_allowed(_frame_url(el), allowed, dev=dev):
+                raise OriginViolation("the pre-click element is not on a fill origin")
+            _click_on_fill_origin(page, el, allowed, dev=dev)
+            return True
+        if _login_password(page) is not None:
+            return False
+        page.wait_for_timeout(250)
+    return False
+
+
 def _password_after_identifier(page: Any, allowed: list[str], *, dev: bool) -> Any:
     """The visible password field after the username step, or None.
 
@@ -610,16 +620,12 @@ def _submit_identifier(
             or _login_password(page) is not None
         ):
             return
-    handle = user_field.evaluate_handle(_SUBMIT_BUTTON_JS)
+    handle = user_field.evaluate_handle(SUBMIT_BUTTON_JS)
     button = handle.as_element() if handle is not None else None
     if button is None:
         return
     _guard(page, user_field, allowed, dev=dev)
-    try:
-        frame = button.owner_frame()
-        frame_url = frame.url if frame is not None else ""
-    except Exception:  # pylint: disable=broad-exception-caught
-        frame_url = ""
+    frame_url = _frame_url(button)
     own_action = button.get_attribute("formaction")
     if own_action and not form_action_allowed(frame_url, own_action, allowed, dev=dev):
         raise OriginViolation("submit button posts off the fill origins")
@@ -650,7 +656,9 @@ def generic_login(
     """Username/password(/TOTP) form login, one-page or identifier-first.
 
     Starts at the login URL (= the check URL when the item sets no
-    ``agent_login_url``: an Auth0 login needs the ``state`` the site creates).
+    ``agent_login_url``: an Auth0 login needs the ``state`` the site creates);
+    an item's ``agent_pre_click`` element is clicked once before the login
+    fields are looked for (``_pre_click``).
     Returns once the page left the login (sentinel visible / off the fill
     origins) or `settle_s` passed; the caller then runs the POSITIVE check
     ``check_logged_in`` — this function's return alone proves nothing.
@@ -658,6 +666,8 @@ def generic_login(
     allowed = list(item.fill_origins)
     page.goto(item.login_url, wait_until="domcontentloaded")
     _check_challenge(page, submitted=False)
+    if item.pre_click:
+        _pre_click(page, item.pre_click, allowed, dev=dev)
     user_field, pw_field = _wait_login_fields(page, STEP_TIMEOUT_S)
     if user_field is None and pw_field is None:
         _check_challenge(page, submitted=False)

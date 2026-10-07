@@ -99,6 +99,10 @@ class SiteItem:  # pylint: disable=too-many-instance-attributes
     # the identity provider again and its session-only SSO cookie is created in
     # THIS run (and exported, when `cookie_hosts` names the IdP host).
     fresh_login: bool = False
+    # `agent_pre_click`: CSS of an element clicked ONCE (if it shows, and only
+    # while page and element are on a fill origin) before the login fields are
+    # looked for — e.g. Jellyfin's "Manual login" button behind its user picker.
+    pre_click: str | None = None
     refused: str | None = None
     item_id: str = ""
 
@@ -124,6 +128,7 @@ class SiteItem:  # pylint: disable=too-many-instance-attributes
             "check_url": self.check_url,
             "logged_in_selector": self.logged_in_selector,
             "fresh_login": self.fresh_login,
+            "pre_click": self.pre_click,
             "refused": self.refused is not None,
             "reason": self.refused or "",
         }
@@ -461,6 +466,11 @@ def _parse_flag(raw: str) -> bool | None:
     return None
 
 
+def _selector_ok(selector: str) -> bool:
+    """One CSS selector on one line, at most 512 characters."""
+    return len(selector) <= 512 and "\n" not in selector and "\r" not in selector
+
+
 def _split_list(raw: str) -> list[str]:
     return [p.strip() for p in re.split(r"[,\n]", raw) if p.strip()]
 
@@ -577,6 +587,9 @@ def site_item_from_json(item: Mapping[str, Any], *, dev: bool = False) -> SiteIt
     fresh_login = _parse_flag(fields.get("agent_fresh_login", ""))
     if fresh_login is None:
         return refused("bad agent_fresh_login (true or false)")
+    pre_click = fields.get("agent_pre_click", "").strip() or None
+    if pre_click is not None and not _selector_ok(pre_click):
+        return refused("bad agent_pre_click (one CSS selector, one line, ≤512 chars)")
     return SiteItem(
         fill_origins=fill_origins,
         cookie_hosts=cookie_hosts,
@@ -587,6 +600,7 @@ def site_item_from_json(item: Mapping[str, Any], *, dev: bool = False) -> SiteIt
         logged_in_selector=sentinel,
         otp_label=fields.get("agent_otp_label", "").strip() or None,
         fresh_login=fresh_login,
+        pre_click=pre_click,
         site=site,
         name=name,
         item_id=item_id,
