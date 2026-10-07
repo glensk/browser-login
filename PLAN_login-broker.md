@@ -121,7 +121,9 @@ the agent the portal session. Record as Albert's decision of 2026-10-01 in
 > anibis, ricardo, tutti, cscs), a final page off every fill origin with no visible password
 > field — checked by the broker after every login and by the client in a background tab; items
 > with neither are refused. Without `agent_login_url` the flow starts at the check URL (Auth0
-> `state`). The generic recipe handles identifier-first (Auth0) two-step forms; ricardo still
+> `state`). The generic recipe handles identifier-first (Auth0) two-step forms and login pages
+> that also carry a register form (WeLib: it fills the `current-password` / non-registration
+> password field and the username of that same form, `broker/login_form.py`); ricardo still
 > faces Cloudflare Turnstile. Default cookie scope = the check page's site domain
 > (`kleinanzeigen.de`) + fill-origin hosts, IdP hosts still dropped. Toppreise logs in inline on
 > www.toppreise.ch — it needs `agent_logged_in_selector`. geizhals: one-page overlay

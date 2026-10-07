@@ -25,6 +25,12 @@ import urllib.parse
 from collections.abc import Callable
 from typing import TYPE_CHECKING, Any
 
+from broker.login_form import (
+    USERNAME_JS,
+    pick_login_password,
+    pick_login_username,
+    pick_visible,
+)
 from broker.origins import form_action_allowed, origin_allowed, url_origin
 from broker.otp_detect import OTP_CANDIDATE_SELECTOR, OTP_DESCRIBE_JS, otp_field_like
 
@@ -109,24 +115,6 @@ _SUBMIT_BUTTON_JS = """e => {
   const vis = el => !!(el.offsetWidth || el.offsetHeight || el.getClientRects().length);
   return Array.from(scope.querySelectorAll(
       'button[type=submit], input[type=submit], button:not([type])')).find(vis) || null;
-}"""
-
-# Username field for a password input: an autocomplete=username input in the
-# same form (or document), else the nearest preceding visible text/email input.
-_USERNAME_JS = """pw => {
-  const scope = pw.form || document;
-  const vis = el => !!(el.offsetWidth || el.offsetHeight || el.getClientRects().length);
-  const inputs = Array.from(scope.querySelectorAll('input'));
-  const tagged = inputs.find(i => (i.getAttribute('autocomplete') || '').split(/\\s+/)
-      .includes('username') && vis(i));
-  if (tagged) return tagged;
-  let best = null;
-  for (const i of inputs) {
-    if (i === pw) break;
-    const t = (i.getAttribute('type') || 'text').toLowerCase();
-    if ((t === 'text' || t === 'email') && vis(i)) best = i;
-  }
-  return best;
 }"""
 
 
@@ -307,6 +295,16 @@ def _visible(page: Any, selector: str) -> Any:
     return None
 
 
+def _login_password(page: Any) -> Any:
+    """The visible LOGIN password field (never a registration one), or None."""
+    return pick_visible(page, PASSWORD_SELECTOR, pick_login_password)
+
+
+def _login_username(page: Any) -> Any:
+    """The first visible username field outside a registration form, or None."""
+    return pick_visible(page, USERNAME_SELECTOR, pick_login_username)
+
+
 def off_fill_origins(url: str, fill_origins: list[str], *, dev: bool) -> bool:
     """True iff `url` is a real http(s) page (http only for the dev loopback)
     whose origin is NOT one of `fill_origins` — the "left the login" half of
@@ -390,13 +388,13 @@ def _fill_password(
     """
     page.wait_for_timeout(HYDRATE_S * 1000)
     _check_challenge(page, submitted=False)
-    pw_field = _visible(page, PASSWORD_SELECTOR) or pw_field
+    pw_field = _login_password(page) or pw_field
     _guard(page, pw_field, allowed, dev=dev)
     pw_field.fill(secret.password)
     page.wait_for_timeout(500)
     if _field_value(pw_field) == secret.password:
         return pw_field
-    pw_field = _visible(page, PASSWORD_SELECTOR) or pw_field
+    pw_field = _login_password(page) or pw_field
     _guard(page, pw_field, allowed, dev=dev)
     pw_field.fill("")
     pw_field.press_sequentially(secret.password, delay=60)
@@ -520,12 +518,13 @@ def _wait_login_fields(page: Any, timeout_s: float) -> tuple[Any, Any]:
     """(visible username field, visible password field) once either shows up.
 
     Visibility is what counts: Auth0's identifier page carries a HIDDEN
-    password input. Both None after `timeout_s`.
+    password input. Registration fields never count (``_login_password`` /
+    ``_login_username``). Both None after `timeout_s`.
     """
     deadline = time.monotonic() + timeout_s
     while True:
-        pw_field = _visible(page, PASSWORD_SELECTOR)
-        user_field = _visible(page, USERNAME_SELECTOR)
+        pw_field = _login_password(page)
+        user_field = _login_username(page)
         if pw_field is not None or user_field is not None:
             return user_field, pw_field
         if time.monotonic() >= deadline:
@@ -572,7 +571,7 @@ def _password_after_identifier(page: Any, allowed: list[str], *, dev: bool) -> A
     deadline = start + STEP_TIMEOUT_S
     clicked = False
     while time.monotonic() < deadline:
-        el = _visible(page, PASSWORD_SELECTOR)
+        el = _login_password(page)
         if el is not None:
             return el
         _check_challenge(page, submitted=False)
@@ -608,7 +607,7 @@ def _submit_identifier(
         if (
             page.url != before
             or not _still_there(user_field)
-            or _visible(page, PASSWORD_SELECTOR) is not None
+            or _login_password(page) is not None
         ):
             return
     handle = user_field.evaluate_handle(_SUBMIT_BUTTON_JS)
@@ -672,7 +671,7 @@ def generic_login(
         if pw_field is None:
             _check_challenge(page, submitted=False)
             raise LoginFailed("no visible password field after the username step")
-    user_handle = pw_field.evaluate_handle(_USERNAME_JS)
+    user_handle = pw_field.evaluate_handle(USERNAME_JS)
     user_field = user_handle.as_element() if user_handle is not None else None
     if user_field is not None and secret.username:
         if _needs_fill(user_field, secret.username):
