@@ -10,8 +10,10 @@ into nothing unless you pass -t, -g or -c.
 The marketplace sites (anibis, tutti, Ricardo, Kleinanzeigen) run on YOUR Safari
 session: you log in in Safari, `browser.py login SITE` copies that site's session
 cookies into the shared Chromium (Kleinanzeigen falls back to the broker). CSCS and
-Smartsheet log in through the broker. Anthropic, OpenAI, Slack and SWITCH Cloud need
-you once (email code / SSO): `-g SITE` shows the window and waits; -t and -c only check them.
+Smartsheet log in through the broker. SWITCH Cloud logs in with the broker's edu-ID
+session plus the portal's SSO click (no window; your own login only when the broker has
+no usable `eduid` item). Anthropic, OpenAI and Slack need you once (email code / SSO):
+`-g SITE` shows the window and waits; -t and -c only check them.
 
 Examples:
   ./agent-login.py              # overview
@@ -28,6 +30,9 @@ Examples:
 
 from __future__ import annotations
 
+# One CLI over the whole login table (status, tests, guided logins, jobs);
+# helpers already live in the agent_login_* modules.
+# pylint: disable=too-many-lines
 import argparse
 import json
 import os
@@ -80,7 +85,11 @@ BROWSER_PY = Path(__file__).resolve().parent / "bin" / "browser.py"
 VAULT_URL = "https://vaultwarden.dom42.space"
 
 # Login flows the broker's recipes can drive today.
-SUPPORTED_FLOWS = {"one-page", "two-step", "cscs", "smartsheet"}
+SUPPORTED_FLOWS = {"one-page", "two-step", "cscs", "smartsheet", "eduid-sso"}
+# browser.py site whose login is the broker's `eduid` item (an edu-ID IdP session)
+# followed by the site's own SSO click in a background tab — no window needed.
+# Without a usable broker `eduid` item it is an ASSISTED login (your session).
+EDUID_SSO_FLOW = "eduid-sso"
 # Albert's Safari session, copied by `browser.py login` (broker/safari_cookies.py).
 SAFARI_FLOW = "safari"
 # Built-in browser.py sites whose login needs Albert (email code, SSO click): agents
@@ -95,9 +104,12 @@ class Target:
     site: str  # broker site id (agent_site field, else the item name as a slug)
     name: str
     fill_origin: str  # value for the item's agent_fill_origins field ("" = unknown yet)
-    flow: str  # one-page | two-step | cscs | smartsheet | safari | assisted | manual | unknown
+    # one-page | two-step | cscs | smartsheet | eduid-sso | safari | assisted | manual
+    # | unknown
+    flow: str
     note: str = ""
     fallback: str = ""  # broker flow tried when the Safari session does not work
+    broker_site: str = ""  # broker item the login runs through when it is not `site`
 
 
 _SAFARI_NOTE = "log in in Safari now and then; agents copy that session"
@@ -169,8 +181,10 @@ TARGETS = (
         "switch",
         "SWITCH Cloud",
         "https://cloud.switch.ch",
-        ASSISTED_FLOW,
-        "Switch Cloud Portal (edu-ID): log in with ./agent-login.py -g switch",
+        EDUID_SSO_FLOW,
+        "Switch Cloud Portal: broker edu-ID session + SSO click (no window); "
+        "your own login: ./agent-login.py -g switch",
+        broker_site="eduid",
     ),
 )
 
@@ -281,12 +295,28 @@ def classify(
         return "unknown", ""
     if target.flow == ASSISTED_FLOW:  # browser.py built-in, no broker involved
         return "assisted", target.note
+    if target.flow == EDUID_SSO_FLOW:
+        return _classify_eduid_sso(target, listed, readable=readable)
     if not readable:
         return "unchecked", ""
     entry = listed.get(target.site)
     if entry is None:
         return "missing", f"add agent_fill_origins = {target.fill_origin}"
     return _classify_listed(target, entry)
+
+
+def _classify_eduid_sso(
+    target: Target, listed: dict[str, dict], *, readable: bool
+) -> tuple[str, str]:
+    """`classify` for an eduid-sso target: ready with a usable broker item,
+    else assisted (`browser.py login` falls back to the window flow)."""
+    entry = listed.get(target.broker_site) if readable else None
+    if entry is None or entry.get("refused"):
+        return "assisted", (
+            f"no usable broker item {target.broker_site!r} — your own login: "
+            f"./agent-login.py -g {target.site}"
+        )
+    return "ready", target.note
 
 
 def _classify_listed(target: Target, entry: dict) -> tuple[str, str]:
@@ -341,6 +371,8 @@ def overview(*, fresh: bool = False) -> dict:
         status, detail = classify(t, listed, readable=readable)
         entry = listed.get(t.site) or {}
         check = str(entry.get("check_url") or DEFAULT_CHECK_URLS.get(t.site, ""))
+        if t.broker_site:  # Bitwarden holds the broker item, not the site
+            entry = listed.get(t.broker_site) or {}
         rows.append(
             {
                 **asdict(t),
@@ -540,7 +572,7 @@ def verdict(row: dict, checks: dict[str, dict]) -> tuple[bool, str]:
     how = f"checked {c.get('at', '?')}"
     if row["status"] == "safari" and row.get("safari"):
         how += f", Safari session until {row.get('safari_expires')}"
-    elif row.get("flow") == ASSISTED_FLOW:
+    elif row.get("flow") == ASSISTED_FLOW or row["status"] == "assisted":
         detail = str(c.get("how") or "")
         how += f", {detail}" if detail.startswith("logged in as") else ", your session"
     else:
@@ -595,6 +627,18 @@ def resolve_site(arg: str) -> str:
     return arg
 
 
+def _eduid_sso_assisted(site: str) -> bool:
+    """True for an eduid-sso site the broker cannot log in right now (its broker
+    item missing, refused or Bitwarden unreadable): `-t` then only checks."""
+    target = next((t for t in TARGETS if t.site == site), None)
+    if target is None or target.flow != EDUID_SSO_FLOW:
+        return False
+    health, sites = broker_state()
+    listed = {str(s.get("site")): s for s in sites}
+    readable = health.startswith("running, Bitwarden")
+    return classify(target, listed, readable=readable)[0] == "assisted"
+
+
 def run_test(site: str) -> int:
     """Real end-to-end test: `browser.py login` (Safari session first for the
     SAFARI_SITES, else the login broker) → session in the shared Chromium → the
@@ -605,7 +649,8 @@ def run_test(site: str) -> int:
     login page is reported as NOT logged in. The result is recorded for the overview.
     """
     site = resolve_site(site)
-    if site in ASSISTED_SITES:  # its login needs you: -g; -t only checks
+    if site in ASSISTED_SITES or _eduid_sso_assisted(site):
+        # its login needs you: -g; -t only checks
         print(f"▶ {site}: your own login (./agent-login.py -g {site}); checking only")
         ok, how = assisted_check(site)
         record_check(site, ok, how)
@@ -656,11 +701,11 @@ def manual_login(site: str) -> int:
     session until the site expires it.
     """
     site = resolve_site(site)
-    if site in ASSISTED_SITES:
+    if site in ASSISTED_SITES or site in EDUID_SSO_SITES:
         return assisted_login(site)
     start = MANUAL_START.get(site)
     if not start:
-        known = ", ".join([*MANUAL_START, *sorted(ASSISTED_SITES)])
+        known = ", ".join([*MANUAL_START, *sorted(ASSISTED_SITES | EDUID_SSO_SITES)])
         print(f"❌ no guided login known for {site!r} (known: {known})")
         return 2
     if _browser("logged-in", site, quiet=True) == 0:
@@ -693,6 +738,8 @@ def manual_login(site: str) -> int:
 
 
 ASSISTED_SITES = {t.site for t in TARGETS if t.flow == ASSISTED_FLOW}
+# -g works for these too: `browser.py login` with the window shown.
+EDUID_SSO_SITES = {t.site for t in TARGETS if t.flow == EDUID_SSO_FLOW}
 
 
 def assisted_check(site: str) -> tuple[bool, str]:
@@ -793,6 +840,11 @@ def safari_fix(site: str) -> str:
     flow = next((t.flow for t in TARGETS if t.site == site), "")
     if flow == ASSISTED_FLOW:
         return f"run ./agent-login.py -g {site} and finish the login (in {here})"
+    if flow == EDUID_SSO_FLOW:
+        return (
+            f"run ./agent-login.py -t {site}; if it stays logged out, "
+            f"./agent-login.py -g {site} and finish the edu-ID login (in {here})"
+        )
     if flow == SAFARI_FLOW:
         return (
             f"open the site in Safari and log in, then run ./agent-login.py -t {site} "

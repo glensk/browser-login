@@ -152,7 +152,7 @@ from broker import safari_cookies as _safari  # noqa: E402
 from broker.bundle import IDP_HOSTS as BROKER_IDP_HOSTS  # noqa: E402
 from broker.bundle import IDP_LABELS as BROKER_IDP_LABELS  # noqa: E402
 from broker.recipes import click_keycloak_submit as _click_keycloak_submit  # noqa: E402
-from broker.recipes import cscs_on_portal as _broker_cscs_on_portal  # noqa: E402
+from broker.recipes import cscs_portal_ready as _broker_cscs_portal_ready  # noqa: E402
 from broker.recipes import fresh_totp as _broker_fresh_totp  # noqa: E402
 from broker.recipes import interstitial_title as _broker_interstitial  # noqa: E402
 from broker.recipes import off_fill_origins as _broker_off_fill_origins  # noqa: E402
@@ -6848,23 +6848,101 @@ def cmd_switch_logged_in(port: int) -> int:
     return 2
 
 
+def _switch_eduid_broker_listed() -> bool:
+    """True when the login broker lists a usable (not refused) ``eduid`` item.
+
+    Read-only (the broker's ``sites`` list); an unreachable broker is False —
+    the caller then takes the window-based flow as before.
+    """
+    try:
+        entry = _broker_site("eduid")
+    except BrokerUnavailable:
+        return False
+    return entry is not None and not entry.get("refused")
+
+
+def _switch_sso_click_background(port: int) -> bool:
+    """The edu-ID SSO click in a BACKGROUND tab; True iff it ends logged in.
+
+    Needs no visible window (the IdP session already lives in the profile, so
+    the click completes without typing). Proof is `_switch_page_verdict` on
+    that same tab, polled by `_switch_wait_for_login`. Held under the
+    interaction lease like the window flow, so no other tool clicks meanwhile.
+    """
+    from playwright.sync_api import Error as PlaywrightError
+
+    def click(page) -> bool:
+        # No form = already logged in or mid-flow: the verdict decides.
+        with contextlib.suppress(PlaywrightError):
+            page.click(SWITCH_SIGN_IN_BUTTON_SELECTOR, timeout=10_000)
+        return _switch_wait_for_login(page, timeout_s=20)
+
+    with _interaction_lease("login switch"):
+        return bool(
+            _with_background_page(port, SWITCH_ORIGIN + SWITCH_LOGIN_PATH, click)
+        )
+
+
+def _switch_login_via_eduid_broker(port: int) -> bool:
+    """Chain the broker's ``eduid`` login into the portal's SSO click.
+
+    Returns True when the portal ends logged in (event ``broker-sso`` recorded);
+    False — after a ⚠️ line saying why — when the broker has no ``eduid``, its
+    login fails, or the click does not complete; the caller then falls back to
+    the window-based flow.
+    """
+    if not _switch_eduid_broker_listed():
+        return False
+    print("▶ edu-ID session from the login broker, then the SSO click (background).")
+    rc = _broker_login(port, "eduid")
+    if rc != 0:
+        print(
+            f"⚠️ broker login eduid failed (exit {rc}) — falling back to the "
+            "window flow.",
+            file=sys.stderr,
+        )
+        return False
+    if _switch_sso_click_background(port):
+        print("✅ Logged into Switch Cloud Portal (broker edu-ID session + SSO click).")
+        _record_login_event("switch", "broker-sso")
+        return True
+    print(
+        "⚠️ SSO click with the broker's edu-ID session did not log in — falling "
+        "back to the window flow.",
+        file=sys.stderr,
+    )
+    return False
+
+
+def _switch_warm_or_via_broker(port: int) -> bool:
+    """True when the portal is already logged in, or gets logged in through the
+    broker's edu-ID session — the two window-free ways `cmd_switch_login` tries
+    before the window flow."""
+    if _switch_probe(port)[0] == "logged-in":
+        print("✓ Already logged into Switch Cloud Portal (cloud.switch.ch).")
+        return True
+    return _switch_login_via_eduid_broker(port)
+
+
 def cmd_switch_login(port: int) -> int:
     """Ensure the Switch Cloud Portal is logged in. Idempotent (a warm session
     just returns 0).
 
     A cold session is one click: the /auth/login page's single edu-ID button
     completes the login with NO password while the browser's edu-ID IdP session
-    is alive (mode ``sso``). Otherwise the click lands on login.eduid.ch and the
-    run becomes ASSISTED — you finish the edu-ID login once in the shared
-    window. The interactive part is held under the INTERACTION lease, so no
-    other tool clicks in the meantime.
+    is alive. When the login broker lists ``eduid``, that IdP session is first
+    obtained from the broker and the click runs in a BACKGROUND tab — no window
+    needed, headless works (mode ``broker-sso``, `_switch_login_via_eduid_broker`).
+    Otherwise (or if that fails) the click runs in the shared window (mode
+    ``sso``), and when it lands on login.eduid.ch the run becomes ASSISTED — you
+    finish the edu-ID login once there. The interactive part is held under the
+    INTERACTION lease, so no other tool clicks in the meantime.
     """
     from playwright.sync_api import Error as PlaywrightError
 
     # Warm probe + headless guard FIRST, outside the lease (both are read-only,
     # exactly what `logged-in` does lease-free).
-    if _switch_probe(port)[0] == "logged-in":
-        print("✓ Already logged into Switch Cloud Portal (cloud.switch.ch).")
+    if _switch_warm_or_via_broker(port):
         return 0
     if not _require_headed_for_assisted(port, "Switch Cloud Portal"):
         return 2
@@ -7055,6 +7133,9 @@ def cmd_login_log(site_name: str | None) -> int:
 BROKER_SOCKET_DEFAULT = "/var/db/login-broker-run/broker.sock"
 BROKER_TIMEOUT_S = 180.0
 BROKER_MAX_RESPONSE = 16 * 1024 * 1024
+# How long the cscs check polls the portal for its token (broker/recipes.py
+# ``cscs_portal_ready``, the broker's own positive check, uses the same 8 s).
+CSCS_PROBE_WAIT_S = 8.0
 BROKER_ERRORS = {
     "needs_human": "the site wants a human (captcha / bot check / second factor)",
     "origin_violation": "the login page left the item's agent_fill_origins — "
@@ -7199,13 +7280,40 @@ def _with_background_page(port: int, url: str, fn: Callable[[Any], Any]) -> Any:
     ``background: true``, reconnect so Playwright adopts it, find it by target
     id, call `fn`, close. Returns ``fn``'s result, or None when anything fails.
     """
+    return _background_page_run(port, url, None, fn)
+
+
+def _with_prepared_background_page(
+    port: int,
+    url: str,
+    prepare: Callable[[Any], None],
+    fn: Callable[[Any], Any],
+) -> Any:
+    """`_with_background_page`, but ``prepare(page)`` runs BEFORE `url` loads.
+
+    The tab is created on ``about:blank``; `prepare` gets the adopted page (e.g.
+    to ``add_init_script``), only then the tab navigates to `url`. For state a
+    site must find at its very first script — a SPA that redirects a session
+    without it away before any post-load ``evaluate`` could run.
+    """
+    return _background_page_run(port, url, prepare, fn)
+
+
+def _background_page_run(
+    port: int,
+    url: str,
+    prepare: Callable[[Any], None] | None,
+    fn: Callable[[Any], Any],
+) -> Any:
+    """Shared body of the two background-page helpers (None on any failure)."""
     from playwright.sync_api import Error as PlaywrightError
 
     pw, browser = _connect(port)
     tid = ""
+    start = "about:blank" if prepare is not None else url
     try:
         created = browser.new_browser_cdp_session().send(
-            "Target.createTarget", {"url": url, "background": True}
+            "Target.createTarget", {"url": start, "background": True}
         )
         tid = str(created.get("targetId") or "")
     except PlaywrightError:
@@ -7221,7 +7329,11 @@ def _with_background_page(port: int, url: str, fn: Callable[[Any], Any]) -> Any:
         page = _switch_page_by_target(browser, tid)
         if page is None:
             return None
-        page.wait_for_load_state("domcontentloaded", timeout=15_000)
+        if prepare is not None:
+            prepare(page)
+            page.goto(url, wait_until="domcontentloaded", timeout=15_000)
+        else:
+            page.wait_for_load_state("domcontentloaded", timeout=15_000)
         with contextlib.suppress(PlaywrightError):
             page.wait_for_load_state("load", timeout=10_000)
         return fn(page)
@@ -7265,15 +7377,18 @@ def _broker_probe(page, entry: dict) -> bool:
 
     Logged in iff the item's sentinel is visible, or — the item has a check
     URL — the page ended OFF every fill origin (https only), shows no bot
-    challenge and no visible password field. CSCS: the settled portal app.
+    challenge and no visible password field. CSCS: the portal app holds its
+    token (polled up to ``CSCS_PROBE_WAIT_S`` while on the portal).
     "No password field" alone proves nothing (page 2 of an Auth0 login).
     """
     from playwright.sync_api import Error as PlaywrightError
 
-    page.wait_for_timeout(1000)
     if entry.get("site") == "cscs":
-        on_portal: bool = _broker_cscs_on_portal(page.url)
-        return on_portal
+        # The SPA renders on the portal first and only then sends a token-less
+        # session to Keycloak: poll for the token while still on the portal.
+        ready: bool = _broker_cscs_portal_ready(page, wait_s=CSCS_PROBE_WAIT_S)
+        return ready
+    page.wait_for_timeout(1000)
     sentinel = entry.get("logged_in_selector")
     if sentinel:
         try:
@@ -7349,8 +7464,38 @@ def _broker_replace_cookies(browser, bundle: dict) -> int:
     return len(cookies)
 
 
+# The init script _broker_write_storage installs: it sets the bundle's keys at
+# document start, and only on the bundle's own origin (a redirect, an iframe
+# or a later navigation elsewhere gets nothing). Placeholders are JSON literals.
+_BROKER_STORAGE_INIT_JS = (
+    "(() => { const origin = __ORIGIN__; const kv = __KV__;"
+    " if (location.origin !== origin) return;"
+    " try { for (const [k, v] of Object.entries(kv)) localStorage.setItem(k, v); }"
+    " catch (e) {} })();"
+)
+# Read-back proof: every key holds exactly the bundle's value (names in, bool out).
+_BROKER_STORAGE_CHECK_JS = (
+    "kv => Object.entries(kv).every(([k, v]) => localStorage.getItem(k) === v)"
+)
+
+
+def _broker_storage_init_script(origin: str, kv: dict[str, str]) -> str:
+    """The `_BROKER_STORAGE_INIT_JS` source for one origin's keys (never logged)."""
+    return _BROKER_STORAGE_INIT_JS.replace("__ORIGIN__", json.dumps(origin)).replace(
+        "__KV__", json.dumps(kv)
+    )
+
+
 def _broker_write_storage(port: int, bundle: dict) -> int:
-    """``localStorage.setItem`` of the bundle's keys, one background tab per origin."""
+    """Write the bundle's localStorage keys, one background tab per origin.
+
+    A SPA may redirect a session without its token away right after ``load``
+    (the CSCS portal sends it to Keycloak), so a post-load ``setItem`` loses the
+    race. Instead the tab starts on ``about:blank``, gets an init script that
+    sets the keys at document start when ``location.origin`` is the bundle's
+    origin, then navigates there; the keys are read back on that page as the
+    proof. Values never reach a log line — only key counts and origins.
+    """
     written = 0
     storage = bundle.get("storage") or {}
     for origin, kv in storage.items() if isinstance(storage, dict) else []:
@@ -7358,21 +7503,23 @@ def _broker_write_storage(port: int, bundle: dict) -> int:
             continue
         if not str(origin).startswith("https://"):
             continue
+        values = {str(k): str(v) for k, v in kv.items()}
 
-        def write(page, origin=origin, kv=kv) -> bool:
-            if _url_origin(page.url) != origin:  # redirected elsewhere: write nothing
+        def prepare(page, origin=origin, values=values) -> None:
+            page.add_init_script(script=_broker_storage_init_script(origin, values))
+
+        def verify(page, origin=origin, values=values) -> bool:
+            if _url_origin(page.url) != origin:  # redirected elsewhere: no proof
                 return False
-            page.evaluate(
-                "kv => { for (const [k, v] of Object.entries(kv)) "
-                "localStorage.setItem(k, v); return true; }",
-                {str(k): str(v) for k, v in kv.items()},
-            )
-            return True
+            return bool(page.evaluate(_BROKER_STORAGE_CHECK_JS, values))
 
-        if _with_background_page(port, origin + "/", write):
-            written += len(kv)
+        if _with_prepared_background_page(port, origin + "/", prepare, verify):
+            written += len(values)
         else:
-            print(f"⚠ could not write localStorage on {origin}", file=sys.stderr)
+            print(
+                f"⚠️ could not write {len(values)} localStorage key(s) on {origin}",
+                file=sys.stderr,
+            )
     return written
 
 

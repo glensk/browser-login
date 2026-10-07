@@ -64,8 +64,10 @@ def test_overview_broker_down(monkeypatch) -> None:
     data = al.overview()
     assert not data["broker_ok"]
     statuses = {r["site"]: r["status"] for r in data["rows"]}
-    for site, status in statuses.items():  # built-in assisted sites need no broker
-        want = {"assisted"} if site in al.ASSISTED_SITES else {"unchecked", "unknown"}
+    # built-in assisted sites need no broker; eduid-sso sites fall back to assisted
+    no_broker = al.ASSISTED_SITES | al.EDUID_SSO_SITES
+    for site, status in statuses.items():
+        want = {"assisted"} if site in no_broker else {"unchecked", "unknown"}
         assert status in want, site
 
 
@@ -142,7 +144,8 @@ def test_verdict_one_answer_per_login() -> None:
 
 
 def test_assisted_sites_and_resolve() -> None:
-    assert {"anthropic", "openai", "slack", "switch"} <= al.ASSISTED_SITES
+    assert {"anthropic", "openai", "slack"} <= al.ASSISTED_SITES
+    assert "switch" not in al.ASSISTED_SITES  # tp#821: the broker logs it in
     sw = next(t for t in al.TARGETS if t.site == "switch")
     assert al.classify(sw, {}, readable=False)[0] == "assisted"
     assert al.resolve_site("https://auth.cscs.ch") == "cscs"
@@ -322,3 +325,80 @@ def test_secret_rows_are_sanitised_again() -> None:
     )
     assert rows == [{"id": "item-1", "fields": ["ok", "field-2"], "has_totp": True}]
     assert al.agent_login_secrets.summary_lines([]) == []
+
+
+SWITCH = next(t for t in al.TARGETS if t.site == "switch")
+_READABLE = "running, Bitwarden readable"
+
+
+def test_switch_is_eduid_sso_through_the_broker() -> None:
+    """tp#821: switch logs in via the broker's `eduid` item + the SSO click."""
+    assert SWITCH.flow == al.EDUID_SSO_FLOW and SWITCH.broker_site == "eduid"
+    assert al.EDUID_SSO_FLOW in al.SUPPORTED_FLOWS
+    eduid = {"eduid": {"site": "eduid", "refused": False}}
+    assert al.classify(SWITCH, eduid)[0] == "ready"
+    # no / refused eduid item: the window flow, i.e. your own session
+    assert al.classify(SWITCH, {})[0] == "assisted"
+    refused = {"eduid": {"site": "eduid", "refused": True, "reason": "x"}}
+    status, detail = al.classify(SWITCH, refused)
+    assert status == "assisted" and "-g switch" in detail
+    assert al.classify(SWITCH, eduid, readable=False)[0] == "assisted"
+
+
+def test_overview_switch_row_reads_the_eduid_item(monkeypatch) -> None:
+    sites = [{"site": "eduid", "refused": False, "fill_origins": ["https://x"]}]
+    monkeypatch.setattr(al, "broker_state", lambda **_k: (_READABLE, sites))
+    row = {r["site"]: r for r in al.overview()["rows"]}["switch"]
+    assert row["status"] == "ready" and row["in_bitwarden"]
+    assert row["check_url"] == al.DEFAULT_CHECK_URLS.get("switch", "")
+
+
+def _fake_run(calls: list):
+    class _Res:
+        returncode = 0
+
+    def run(cmd, **_kw):
+        calls.append(cmd[2:])
+        return _Res()
+
+    return run
+
+
+def _no_assisted_check(site: str):
+    raise AssertionError(f"assisted_check({site}) must not run")
+
+
+def test_run_test_switch_logs_in_when_the_broker_has_eduid(
+    monkeypatch, tmp_path
+) -> None:
+    monkeypatch.setenv("AGENT_LOGIN_STATE_FILE", str(tmp_path / "last.json"))
+    sites = [{"site": "eduid", "refused": False}]
+    monkeypatch.setattr(al, "broker_state", lambda **_k: (_READABLE, sites))
+    calls: list = []
+    monkeypatch.setattr(al.subprocess, "run", _fake_run(calls))
+    monkeypatch.setattr(al, "assisted_check", _no_assisted_check)
+    assert al.run_test("switch") == 0
+    assert calls == [["login", "switch"], ["logged-in", "switch"]]
+    assert al.last_checks(tmp_path / "last.json")["switch"]["ok"]
+
+
+def test_run_test_switch_only_checks_without_eduid(monkeypatch, tmp_path) -> None:
+    monkeypatch.setenv("AGENT_LOGIN_STATE_FILE", str(tmp_path / "last.json"))
+    monkeypatch.setattr(al, "broker_state", lambda **_k: (_READABLE, []))
+    calls: list = []
+    monkeypatch.setattr(al.subprocess, "run", _fake_run(calls))
+    monkeypatch.setattr(al, "assisted_check", lambda s: (False, "NOT logged in"))
+    assert al.run_test("switch") == 2
+    assert not calls  # no `browser.py login`: it would wait for a human
+
+
+def test_guided_switch_is_the_window_login(monkeypatch) -> None:
+    seen: list[str] = []
+
+    def fake_assisted_login(site: str) -> int:
+        seen.append(site)
+        return 0
+
+    monkeypatch.setattr(al, "assisted_login", fake_assisted_login)
+    assert al.manual_login("switch") == 0 and seen == ["switch"]
+    assert "-g switch" in al.safari_fix("switch")
