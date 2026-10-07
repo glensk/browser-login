@@ -1418,6 +1418,53 @@ def test_e2e_dev_foreign_form_action_refused(sockdir, tmp_path):
     assert not _LoginApp.posts
 
 
+# Static GET pages of `_TwoStepApp`, by path prefix.
+_TWO_STEP_PAGES = (
+    # no password field, no session
+    ("/landing", "<html><body><p>Thanks!</p></body></html>"),
+    (
+        "/u/login/password",
+        "<html><head><title>Password</title></head><body>"
+        "<form method=post action=/u/login/password?state=s1>"
+        f"<input type=email name=username value={E2E_EMAIL} readonly "
+        "autocomplete=username>"
+        "<input type=password name=password>"
+        "<button type=submit>Log in</button></form></body></html>",
+    ),
+    (  # SWITCH edu-ID-like identifier page
+        "/eduid/identifier",
+        "<html><head><title>edu-ID</title></head><body>"
+        "<form method=post action=/eduid/identifier>"
+        "<input type=email name=username autocomplete=email>"
+        "<button type=submit>Continue</button></form></body></html>",
+    ),
+    # No password field until "Use password" is pressed; the passkey button
+    # (first in DOM order) reports any press to the server.
+    (
+        "/eduid/choose",
+        "<html><head><title>edu-ID</title></head><body>"
+        "<form method=post action=/u/login/password?state=s1>"
+        f"<input type=email name=username value={E2E_EMAIL} readonly "
+        "autocomplete=username>"
+        "<button type=button id=pk onclick=\"fetch('/eduid/passkey',"
+        "{method:'POST'})\">Use a passkey</button>"
+        '<button type=button id=usepw onclick="document.getElementById('
+        "'pwbox').style.display='block';this.style.display='none'\">"
+        "Use password</button>"
+        "<div id=pwbox style='display:none'>"
+        "<input type=password name=password>"
+        "<button type=submit>Log in</button></div>"
+        "</form></body></html>",
+    ),
+    (  # one-page form that "vanishes"
+        "/login2",
+        "<html><body><form method=post action=/login2>"
+        "<input type=text name=user><input type=password name=pw>"
+        "<button type=submit>Go</button></form></body></html>",
+    ),
+)
+
+
 class _TwoStepApp(http.server.BaseHTTPRequestHandler):
     """An Auth0-like identifier-first login on one origin (the fill origin)
     and the site with its check page on another (same host, other port)."""
@@ -1425,6 +1472,7 @@ class _TwoStepApp(http.server.BaseHTTPRequestHandler):
     login_origin = ""
     site_origin = ""
     password_page_users: list[str] = []  # usernames posted on page 2
+    passkey_clicks: list[str] = []  # edu-ID-like page: passkey button presses
 
     def log_message(self, *args):
         return
@@ -1453,9 +1501,6 @@ class _TwoStepApp(http.server.BaseHTTPRequestHandler):
                 loc = cls.login_origin + "/u/login/identifier?state=s1"
                 self._send(302, headers=[("Location", loc)])
             return
-        if self.path.startswith("/landing"):  # no password field, no session
-            self._send(200, "<html><body><p>Thanks!</p></body></html>")
-            return
         if self.path.startswith("/u/login/identifier"):
             if "state=s1" not in self.path:  # Auth0 needs the site's state
                 self._send(400, "<html><body>missing state</body></html>")
@@ -1469,25 +1514,10 @@ class _TwoStepApp(http.server.BaseHTTPRequestHandler):
                 "<button type=submit>Continue</button></form></body></html>",
             )
             return
-        if self.path.startswith("/u/login/password"):
-            self._send(
-                200,
-                "<html><head><title>Password</title></head><body>"
-                "<form method=post action=/u/login/password?state=s1>"
-                f"<input type=email name=username value={E2E_EMAIL} readonly "
-                "autocomplete=username>"
-                "<input type=password name=password>"
-                "<button type=submit>Log in</button></form></body></html>",
-            )
-            return
-        if self.path.startswith("/login2"):  # one-page form that "vanishes"
-            self._send(
-                200,
-                "<html><body><form method=post action=/login2>"
-                "<input type=text name=user><input type=password name=pw>"
-                "<button type=submit>Go</button></form></body></html>",
-            )
-            return
+        for prefix, body in _TWO_STEP_PAGES:
+            if self.path.startswith(prefix):
+                self._send(200, body)
+                return
         self._send(404, "nope")
 
     def do_POST(self):  # noqa: N802
@@ -1499,6 +1529,15 @@ class _TwoStepApp(http.server.BaseHTTPRequestHandler):
             else:
                 loc = "/u/login/identifier?state=s1&err=1"
             self._send(302, headers=[("Location", loc)])
+            return
+        if self.path.startswith("/eduid/identifier"):
+            ok = q.get("username") == [E2E_EMAIL]
+            loc = "/eduid/choose" if ok else "/eduid/identifier?err=1"
+            self._send(302, headers=[("Location", loc)])
+            return
+        if self.path.startswith("/eduid/passkey"):
+            cls.passkey_clicks.append(self.path)
+            self._send(204)
             return
         if self.path.startswith("/u/login/password"):
             cls.password_page_users.append((q.get("username") or [""])[0])
@@ -1530,6 +1569,7 @@ def _two_step_servers():
     login, site = (f"http://127.0.0.1:{srv.server_address[1]}" for srv in servers)
     _TwoStepApp.login_origin, _TwoStepApp.site_origin = login, site
     _TwoStepApp.password_page_users = []
+    _TwoStepApp.passkey_clicks = []
     try:
         yield login, site
     finally:
@@ -1568,6 +1608,69 @@ def test_e2e_two_step_login_from_check_url(sockdir, tmp_path):
     # the read-only identifier on page 2 was submitted as shown, not refilled
     assert _TwoStepApp.password_page_users == [E2E_EMAIL]
     assert second["ok"] and second["bundle"]["via"] == "profile"
+
+
+@pytest.mark.browser
+@pytest.mark.skipif(
+    os.environ.get("LOGIN_BROKER_E2E") != "1", reason="set LOGIN_BROKER_E2E=1"
+)
+def test_e2e_identifier_first_use_password_choice(sockdir, tmp_path):
+    """Regression (2026-10-07, SWITCH edu-ID with a passkey): after the e-mail
+    step the page offers "Use a passkey" / "Use password" and no password
+    field. The recipe presses "Use password" and never the passkey button."""
+    with _two_step_servers() as (login, site):
+        items = [
+            _item(
+                "EduId",
+                {
+                    "agent_site": "eduidlike",
+                    "agent_fill_origins": login,
+                    "agent_login_url": login + "/eduid/identifier",
+                    "agent_check_url": site + "/account",
+                },
+                user=E2E_EMAIL,
+                totp=None,
+            )
+        ]
+        runner = daemon.PlaywrightRunner(tmp_path / "home", dev=True)
+        with running(sockdir, tmp_path, runner, items=items) as (_brk, path):
+            resp = json.loads(_ask(path, {"op": "login", "site": "eduidlike"}))
+        passkey_clicks = list(_TwoStepApp.passkey_clicks)
+    assert resp["ok"], resp
+    assert resp["bundle"]["via"] == "login"
+    assert _TwoStepApp.password_page_users == [E2E_EMAIL]
+    assert not passkey_clicks
+    assert PASSWORD not in json.dumps(resp)
+
+
+@pytest.mark.parametrize(
+    ("name", "ok"),
+    [
+        ("Use password", True),
+        ("  use   password ", True),
+        ("Password", True),
+        ("Sign in with password", True),
+        ("Log in with your password", True),
+        ("With password", True),
+        ("Passwort verwenden", True),
+        ("Mit Passwort anmelden", True),
+        ("Passwort", True),
+        ("Utiliser le mot de passe", True),
+        ("Utiliser un mot de passe", True),
+        ("Mot de passe", True),
+        ("Use a passkey", False),
+        ("Passkey verwenden", False),
+        ("Utiliser une clé d'accès", False),
+        ("Use a security key", False),
+        ("Forgot password?", False),
+        ("Reset password", False),
+        ("Password forgotten", False),
+        ("Use password or passkey", False),
+        ("Sign in with WebAuthn", False),
+    ],
+)
+def test_password_choice_name(name, ok):
+    assert recipes.password_choice_name(name) is ok
 
 
 @pytest.mark.browser

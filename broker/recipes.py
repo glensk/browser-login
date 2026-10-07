@@ -43,6 +43,25 @@ CHALLENGE_SRC_RE = re.compile(
 )
 CHALLENGE_TITLES = ("nur einen moment", "just a moment")
 STEP_TIMEOUT_S = 20.0
+# Identifier-first logins that offer a passkey (SWITCH edu-ID, verified
+# 2026-10-07) show "Use password" / "Use a passkey" buttons instead of the
+# password field after the e-mail step. The password choice is clicked once,
+# after this grace, while no password field is visible; a passkey / WebAuthn
+# option never is.
+PASSWORD_CHOICE_GRACE_S = 2.0
+PASSWORD_CHOICE_RE = re.compile(
+    r"^\s*(?:"
+    r"(?:(?:use|with|sign\s+in\s+with|log\s+in\s+with)\s+(?:a\s+|the\s+|your\s+)?)?"
+    r"password"
+    r"|(?:mit\s+)?passwort(?:\s+(?:verwenden|benutzen|anmelden))?"
+    r"|(?:utiliser\s+(?:le\s+|un\s+|votre\s+)?|avec\s+(?:le\s+|un\s+)?)?mot\s+de\s+passe"
+    r")\s*$",
+    re.IGNORECASE,
+)
+PASSKEY_RE = re.compile(
+    r"passkey|webauthn|security\s*key|fido|cl[eé]\s+d.acc[eè]s|sicherheitsschl",
+    re.IGNORECASE,
+)
 SETTLE_TIMEOUT_S = 30.0
 
 CSCS_AUTH_ORIGIN = "https://auth.cscs.ch"
@@ -470,14 +489,54 @@ def _wait_login_fields(page: Any, timeout_s: float) -> tuple[Any, Any]:
         page.wait_for_timeout(250)
 
 
-def _wait_password(page: Any, timeout_s: float) -> Any:
-    """The visible password field of step 2, or None; bot checks abort early."""
-    deadline = time.monotonic() + timeout_s
+def password_choice_name(name: str) -> bool:
+    """True iff `name` (an accessible name) is a "use password" choice and
+    mentions no passkey / WebAuthn option."""
+    return bool(PASSWORD_CHOICE_RE.match(name)) and not PASSKEY_RE.search(name)
+
+
+def _password_choice(page: Any) -> Any:
+    """The first visible button or link whose accessible name is a "use
+    password" choice (never a passkey option), or None."""
+    for role in ("button", "link"):
+        try:
+            loc = page.get_by_role(role, name=PASSWORD_CHOICE_RE)
+            for i in range(loc.count()):
+                el = loc.nth(i)
+                if not el.is_visible():
+                    continue
+                label = " ".join(
+                    str(v or "")
+                    for v in (el.get_attribute("aria-label"), el.inner_text())
+                )
+                if PASSKEY_RE.search(label):
+                    continue
+                return el
+        except Exception:  # pylint: disable=broad-exception-caught
+            continue
+    return None
+
+
+def _password_after_identifier(page: Any, allowed: list[str], *, dev: bool) -> Any:
+    """The visible password field after the username step, or None.
+
+    When none shows within ``PASSWORD_CHOICE_GRACE_S`` but a "use password"
+    choice does, click it ONCE (only while on a fill origin) and wait a fresh
+    ``STEP_TIMEOUT_S`` for the field."""
+    start = time.monotonic()
+    deadline = start + STEP_TIMEOUT_S
+    clicked = False
     while time.monotonic() < deadline:
         el = _visible(page, PASSWORD_SELECTOR)
         if el is not None:
             return el
         _check_challenge(page, submitted=False)
+        if not clicked and time.monotonic() - start >= PASSWORD_CHOICE_GRACE_S:
+            choice = _password_choice(page)
+            if choice is not None:
+                _click_on_fill_origin(page, choice, allowed, dev=dev)
+                clicked = True
+                deadline = time.monotonic() + STEP_TIMEOUT_S
         page.wait_for_timeout(250)
     return None
 
@@ -564,7 +623,7 @@ def generic_login(
         user_field.fill(secret.username)
         _guard(page, user_field, allowed, dev=dev)
         _submit_identifier(page, user_field, allowed, dev=dev)
-        pw_field = _wait_password(page, STEP_TIMEOUT_S)
+        pw_field = _password_after_identifier(page, allowed, dev=dev)
         if pw_field is None:
             _check_challenge(page, submitted=False)
             raise LoginFailed("no visible password field after the username step")
