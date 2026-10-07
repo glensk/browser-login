@@ -13,14 +13,34 @@ LOCAL_PEERCRED. One JSON request per connection, newline-terminated, at most
   {"op": "logout", "site": "X"}   delete the broker's own profile for X
   {"op": "fingerprint", "site": "X"}  len + 4 hex of the password's SHA-256
 
+Secrets for agents (``secret-run``; the secrets collection of the bootstrap,
+peer uid ``--allow-uid`` only — anything else is ``forbidden`` before any
+vault read):
+
+  {"op": "secrets"}               ids, exposed field NAMES, has_totp, short
+  {"op": "secret", "items": [{"item": "x", "field": "password"}],
+   "env": ["X"], "argv0": "kubectl"}
+                                  -> {"ok": true, "values": [...], "nonce": "...",
+                                      "variants_policy": N} — the ONLY response
+                                  that carries a value; every value is first
+                                  registered with the secretkeeper
+  {"op": "totp", "item": "x"}     -> {"ok": true, "code": "123456", "valid_s": N}
+  {"op": "secret_done", "nonce": "...", "exit": 0, "masked": 2}
+                                  closes the run row (once)
+  {"op": "audit", "n": 50}        the last N audit lines (secret-free)
+  {"op": "invalidate"}            drop cached values (also SIGHUP)
+
 Errors: {"ok": false, "error": "needs_human" | "origin_violation" |
-"rate_limited" | "login_failed" | "unknown_site" | "refused" | "vault_error" |
+"rate_limited" | "login_failed" | "unknown_site" | "unknown_item" |
+"unknown_field" | "refused" | "vault_error" | "leakcheck_unavailable" |
 "forbidden" | "bad_request" | "internal", "detail": "..."} — never a secret.
 
 Examples:
   daemon.py                                   # production (as _loginbroker)
-  daemon.py -d -f items.json -H /tmp/lb -s /tmp/lb/broker.sock -u 501
+  daemon.py -d -f items.json -H /tmp/lb -s /tmp/lb/broker.sock -u 501 -L
+  daemon.py -C -H /var/db/login-broker        # list visible collections (IDs)
   sudo daemon.py -r ricardo                   # reset the limiter for one site
+  sudo daemon.py -r secret:github             # reset a secret item's limiter
 """
 
 from __future__ import annotations
@@ -31,6 +51,7 @@ import dataclasses
 import hashlib
 import json
 import os
+import re
 import shutil
 import signal
 import socketserver
@@ -49,6 +70,16 @@ if __package__ in (None, ""):  # run as a script: make `broker` importable
 
 # pylint: disable=wrong-import-position
 from broker.bundle import SiteBundleSpec, filter_cookies, filter_storage  # noqa: E402
+from broker.leakcheck import (  # noqa: E402
+    DEFAULT_SOCKET as SECRETKEEPER_SOCKET,
+)
+from broker.leakcheck import (  # noqa: E402
+    REPUSH_INTERVAL_S,
+    DisabledLeakCheck,
+    LeakCheck,
+    Registrar,
+    UnconfiguredLeakCheck,
+)
 from broker.limiter import Limiter  # noqa: E402
 from broker.origins import origin_allowed  # noqa: E402
 from broker.peercred import peer_uid  # noqa: E402
@@ -60,14 +91,24 @@ from broker.recipes import (  # noqa: E402
     diagnose,
     recipe_for,
 )
+from broker.runs import RunTable  # noqa: E402
+from broker.secret_ops import (  # noqa: E402
+    LIMITER_KEY_RE,
+    SECRET_OPS,
+    SecretOps,
+    build_secret_limiter,
+)
 from broker.vault import (  # noqa: E402
     SITE_ID_RE,
     BwBootstrap,
     BwVault,
     FixtureVault,
     Secret,
+    SecretItem,
+    SecretValues,
     SiteItem,
     Vault,
+    VaultCache,
     VaultError,
 )
 
@@ -334,14 +375,29 @@ class _Flight:
 
 
 class _LazyBwVault:
-    """BwVault whose bootstrap is read per call — the daemon starts before enrolment."""
+    """BwVault whose bootstrap is read per call — the daemon starts before
+    enrolment, and ``install.sh -C``/``-X`` rewrite it at run time. The value
+    cache outlives the per-call BwVault (it is keyed by the collection IDs)."""
 
     def __init__(self, home: Path) -> None:
         self.home = home
+        self.cache = VaultCache()
 
     def _vault(self) -> BwVault:
         boot = BwBootstrap.load(self.home / "bootstrap.json")
-        return BwVault(boot, self.home / "bw")
+        return BwVault(boot, self.home / "bw", cache=self.cache)
+
+    def secret_items(self) -> list[SecretItem]:
+        """See ``BwVault.secret_items``."""
+        return self._vault().secret_items()
+
+    def secret_values(self, secret_id: str) -> SecretValues:
+        """See ``BwVault.secret_values``."""
+        return self._vault().secret_values(secret_id)
+
+    def invalidate(self) -> int:
+        """Bump the cache generation (no bootstrap read needed)."""
+        return self.cache.bump()
 
     def items(self) -> list[SiteItem]:
         """See ``BwVault.items``."""
@@ -370,8 +426,13 @@ def _err(code: str, detail: str = "") -> dict[str, Any]:
 SITES_TTL_S = 600.0
 
 
-class Broker:  # pylint: disable=too-many-instance-attributes  # deps + 4 locks/maps
-    """Protocol logic, independent of the socket (unit-testable)."""
+class Broker(SecretOps):  # pylint: disable=too-many-instance-attributes  # deps + 4 locks/maps
+    """Protocol logic, independent of the socket (unit-testable).
+
+    The secret ops answer only `allow_uid` (None = nobody). `leakcheck`
+    defaults to a backend that always fails, so a broker wired without one
+    fails closed (``leakcheck_unavailable``).
+    """
 
     def __init__(  # pylint: disable=too-many-arguments
         self,
@@ -381,12 +442,24 @@ class Broker:  # pylint: disable=too-many-instance-attributes  # deps + 4 locks/
         *,
         runner: Runner,
         clock: Callable[[], float] = time.time,
+        allow_uid: int | None = None,
+        secret_limiter: Limiter | None = None,
+        runs: RunTable | None = None,
+        leakcheck: Registrar | None = None,
     ) -> None:
         self.vault = vault
         self.limiter = limiter
         self.home = home
         self.runner = runner
         self.clock = clock
+        self.allow_uid = allow_uid
+        self.secret_limiter = (
+            secret_limiter if secret_limiter is not None else build_secret_limiter(home)
+        )
+        self.runs = runs if runs is not None else RunTable(home / "secret-runs.json")
+        self.leakcheck: Registrar = (
+            leakcheck if leakcheck is not None else UnconfiguredLeakCheck()
+        )
         self._guard = threading.Lock()
         self._site_locks: dict[str, threading.Lock] = {}
         self._flights: dict[str, _Flight] = {}
@@ -406,15 +479,29 @@ class Broker:  # pylint: disable=too-many-instance-attributes  # deps + 4 locks/
             return items
 
     # -- audit ---------------------------------------------------------------
-    def audit(self, op: str, site: str | None, result: str, uid: int | None) -> None:
-        """One JSON line per request: never a secret, never a cookie value."""
-        rec = {
-            "ts": round(self.clock(), 3),
-            "op": op,
-            "site": site,
-            "result": result,
-            "uid": uid,
-        }
+    def audit(  # pylint: disable=too-many-arguments
+        self,
+        op: str,
+        site: str | None,
+        result: str,
+        uid: int | None,
+        extra: dict[str, Any] | None = None,
+    ) -> None:
+        """One JSON line per request: never a secret, never a cookie value.
+
+        `extra` (secret ops): item/field NAMES, env NAMES, the command's
+        basename, exit, masked count, nonce prefix — never a value or argv.
+        """
+        rec: dict[str, Any] = dict(extra or {})
+        rec.update(
+            {
+                "ts": round(self.clock(), 3),
+                "op": op,
+                "site": site,
+                "result": result,
+                "uid": uid,
+            }
+        )
         line = json.dumps(rec, sort_keys=True) + "\n"
         with self._audit_lock:
             self.home.mkdir(parents=True, exist_ok=True)
@@ -442,8 +529,12 @@ class Broker:  # pylint: disable=too-many-instance-attributes  # deps + 4 locks/
         op = req["op"]
         site = req.get("site")
         site = site.strip().lower() if isinstance(site, str) else None
+        extra: dict[str, Any] = {}
         try:
-            if op == "ping":
+            if op in SECRET_OPS:
+                site = None
+                resp = self._secret_op(op, req, uid, extra)
+            elif op == "ping":
                 resp = {"ok": True, "pong": True}
             elif op == "sites":
                 resp = self._sites(fresh=req.get("fresh") in (True, "1", "true"))
@@ -460,7 +551,8 @@ class Broker:  # pylint: disable=too-many-instance-attributes  # deps + 4 locks/
                 resp = _err("bad_request", f"unknown op {op!r}")
         except Exception:  # pylint: disable=broad-exception-caught
             resp = _err("internal", "unexpected broker error")
-        self.audit(op, site, "ok" if resp.get("ok") else str(resp.get("error")), uid)
+        result = "ok" if resp.get("ok") else str(resp.get("error"))
+        self.audit(op, site, result, uid, extra or None)
         return resp
 
     def _sites(self, *, fresh: bool = False) -> dict[str, Any]:
@@ -640,7 +732,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
             "Examples:\n"
             "  daemon.py                          # production, as _loginbroker\n"
             "  daemon.py -d -f items.json -H ./lb -s ./lb/broker.sock\n"
+            "  daemon.py -d -f items.json -H ./lb -s ./lb/broker.sock -L  # no secretkeeper\n"
+            "  daemon.py -C                       # visible collections, as _loginbroker\n"
             "  sudo daemon.py -r ricardo          # reset the limiter for one site\n"
+            "  sudo daemon.py -r totp:github      # reset a TOTP item's limiter\n"
         ),
     )
     p.add_argument("-s", "--socket", default=DEFAULT_SOCKET, help="socket path")
@@ -653,7 +748,32 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     p.add_argument("-f", "--fixture-vault", metavar="PATH", help="fixture items (dev)")
     p.add_argument(
-        "-r", "--reset", metavar="SITE", help="reset the limiter for SITE and exit"
+        "-r",
+        "--reset",
+        metavar="KEY",
+        help="reset the limiter for a site, or for secret:ITEM / totp:ITEM / "
+        "secret:* (the secret limiter), and exit",
+    )
+    p.add_argument(
+        "-C",
+        "--collections",
+        action="store_true",
+        help="print the broker account's visible collections as "
+        "org_id<TAB>org_name<TAB>collection_id<TAB>collection_name and exit",
+    )
+    p.add_argument(
+        "-L",
+        "--no-leakcheck",
+        action="store_true",
+        help="do not register issued values with the secretkeeper (dev only; "
+        "the secret op otherwise fails closed when it cannot)",
+    )
+    p.add_argument(
+        "-K",
+        "--leakcheck-socket",
+        default=SECRETKEEPER_SOCKET,
+        metavar="PATH",
+        help=f"secretkeeper socket (default {SECRETKEEPER_SOCKET})",
     )
     p.add_argument(
         "-u",
@@ -670,7 +790,50 @@ def build_limiter(home: Path) -> Limiter:
     return Limiter(home / "limiter.json", MIN_INTERVAL_S, PER_HOUR, PER_DAY)
 
 
-def main(argv: list[str] | None = None) -> int:
+def _tsv_cell(text: str) -> str:
+    return re.sub(r"[\t\r\n\x00-\x1f\x7f]", " ", text)
+
+
+def print_collections(vault: FixtureVault | BwVault) -> int:
+    """``daemon.py -C``: one TSV line per visible collection, no item data."""
+    try:
+        rows = vault.collections()
+    except VaultError as exc:
+        print(f"❌ {exc}", file=sys.stderr)
+        return 1
+    for row in rows:
+        print("\t".join(_tsv_cell(c) for c in row))
+    return 0
+
+
+def _reset(args: argparse.Namespace, home: Path) -> int:
+    if os.geteuid() != 0 and not args.dev:
+        print("❌ --reset needs root (or --dev)", file=sys.stderr)
+        return 2
+    key = args.reset.strip().lower()
+    if ":" in key:
+        if not LIMITER_KEY_RE.match(key):
+            print(f"❌ not a secret limiter key: {key!r}", file=sys.stderr)
+            return 2
+        limiter = build_secret_limiter(home)
+    else:
+        limiter = build_limiter(home)
+    limiter.reset(key)
+    if os.geteuid() == 0:  # root rewrote the file: hand it back to the broker
+        owner = home.stat()
+        os.chown(limiter.state_path, owner.st_uid, owner.st_gid)
+    print(f"✅ limiter reset for {key}")
+    return 0
+
+
+def _leakcheck_loop(broker: Broker, stop: threading.Event) -> None:
+    while not stop.wait(REPUSH_INTERVAL_S):
+        with contextlib.suppress(Exception):
+            broker.refresh_leakcheck()
+
+
+# One early exit per CLI mode / guard.
+def main(argv: list[str] | None = None) -> int:  # pylint: disable=too-many-return-statements
     """Run the daemon (or the limiter reset)."""
     args = parse_args(argv)
     os.umask(0o077)
@@ -678,17 +841,18 @@ def main(argv: list[str] | None = None) -> int:
     if args.fixture_vault and not args.dev:
         print("❌ --fixture-vault requires --dev", file=sys.stderr)
         return 2
-    limiter = build_limiter(home)
     if args.reset:
-        if os.geteuid() != 0 and not args.dev:
-            print("❌ --reset needs root (or --dev)", file=sys.stderr)
-            return 2
-        limiter.reset(args.reset.strip().lower())
-        if os.geteuid() == 0:  # root rewrote the file: hand it back to the broker
-            owner = home.stat()
-            os.chown(limiter.state_path, owner.st_uid, owner.st_gid)
-        print(f"✓ limiter reset for {args.reset}")
-        return 0
+        return _reset(args, home)
+    if args.collections:
+        if args.fixture_vault:
+            return print_collections(FixtureVault(args.fixture_vault, dev=True))
+        try:
+            boot = BwBootstrap.load(home / "bootstrap.json")
+        except VaultError as exc:
+            print(f"❌ {exc}", file=sys.stderr)
+            return 1
+        return print_collections(BwVault(boot, home / "bw"))
+    limiter = build_limiter(home)
     if not args.dev and os.geteuid() == args.allow_uid:
         print(
             f"❌ refusing to serve uid {args.allow_uid} while running AS uid "
@@ -702,18 +866,48 @@ def main(argv: list[str] | None = None) -> int:
     else:
         vault = _LazyBwVault(home)
     home.mkdir(mode=0o700, parents=True, exist_ok=True)
-    broker = Broker(vault, limiter, home, runner=PlaywrightRunner(home, dev=args.dev))
+    leakcheck: Registrar
+    if args.no_leakcheck:
+        print(
+            "⚠️ --no-leakcheck: issued values are NOT registered with the secretkeeper",
+            file=sys.stderr,
+            flush=True,
+        )
+        leakcheck = DisabledLeakCheck()
+    else:
+        leakcheck = LeakCheck(args.leakcheck_socket, home / "leakcheck-labels.json")
+    broker = Broker(
+        vault,
+        limiter,
+        home,
+        runner=PlaywrightRunner(home, dev=args.dev),
+        allow_uid=args.allow_uid,
+        leakcheck=leakcheck,
+    )
     server = make_server(args.socket, broker, args.allow_uid)
 
     def _stop(_sig: int, _frm: Any) -> None:
         threading.Thread(target=server.shutdown, daemon=True).start()
 
+    def _reload(_sig: int, _frm: Any) -> None:
+        def run() -> None:
+            generation = broker.invalidate()
+            broker.audit("sighup", None, "ok", None, {"generation": generation})
+
+        threading.Thread(target=run, daemon=True).start()
+
     signal.signal(signal.SIGTERM, _stop)
     signal.signal(signal.SIGINT, _stop)
+    signal.signal(signal.SIGHUP, _reload)
+    stop_refresh = threading.Event()
+    threading.Thread(
+        target=_leakcheck_loop, args=(broker, stop_refresh), daemon=True
+    ).start()
     print(f"login-broker listening on {args.socket} (uid {args.allow_uid})", flush=True)
     try:
         server.serve_forever()
     finally:
+        stop_refresh.set()
         server.server_close()
         with contextlib.suppress(OSError):
             os.unlink(args.socket)

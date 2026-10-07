@@ -12,6 +12,16 @@ module except as a ``Secret`` handed to a recipe; ``Secret`` has a redacting
 argv): the API key logs the broker's own Vaultwarden user in, the master
 password unlocks (``--passwordenv``), the session key lives in memory and is
 passed as ``BW_SESSION``, and the vault is locked again after every call.
+Every ``bw`` read (unlock + sync + list + lock) runs under ONE process-wide
+lock, ``BW_LOCK``: the CLI's appdata dir is shared state, and concurrent misses
+of the secret cache wait for the read in flight and reuse its result.
+
+Secrets for agents (``secret-run``) come from a SECOND collection,
+``secrets_collection_id`` in the bootstrap: ``SecretItem`` is the metadata
+(id, exposed field names, TOTP present) and ``SecretValues`` the values, kept in
+``VaultCache`` for ``SECRET_TTL_S``. A cache entry from an older generation
+(bumped by every ``bw sync`` and by ``invalidate``) is never served. Python
+cannot zero ``str``/JSON copies: dropping a cache entry does not erase memory.
 """
 
 from __future__ import annotations
@@ -20,6 +30,7 @@ import json
 import os
 import re
 import subprocess
+import threading
 import urllib.parse
 from collections.abc import Iterator, Mapping
 from contextlib import contextmanager
@@ -30,13 +41,29 @@ from typing import Any, Protocol
 from broker.bundle import SiteBundleSpec, is_idp_host
 from broker.origins import parse_fill_origins
 from broker.recipes import DEFAULT_CHECK_URLS, DEFAULT_LOGGED_IN_SELECTORS
+from broker.vault_cache import (
+    VaultCache,
+)
 
 SITE_ID_RE = re.compile(r"^[a-z0-9][a-z0-9._-]{0,63}$")
+SAFE_NAME_RE = re.compile(r"^[A-Za-z0-9._ -]{1,64}$")
 BW_TIMEOUT_S = 120.0
+# A value shorter than this is refused unless the item sets
+# agent_secret_allow_short=true (then it is masked raw-only).
+SHORT_BELOW_BYTES = 8
+MIN_SECRET_BYTES = 6
+NO_SECRETS_COLLECTION = "no secrets collection configured"
+# Every `bw` CLI read of this process (one appdata dir) is serialised here.
+# Re-entrant: a secret-cache fill holds it across its own `bw` read.
+BW_LOCK = threading.RLock()
 
 
 class VaultError(RuntimeError):
     """The vault could not be read. The message never carries a secret."""
+
+
+class SecretsNotConfigured(VaultError):
+    """The bootstrap names no secrets collection (``secret``/``totp`` refuse)."""
 
 
 @dataclass(frozen=True)
@@ -110,6 +137,293 @@ class Vault(Protocol):
 
     def secret(self, site: str) -> Secret:
         """The secret of a non-refused site (VaultError otherwise)."""
+
+    def secret_items(self) -> list[SecretItem]:
+        """Items of the secrets collection (SecretsNotConfigured without one)."""
+
+    def secret_values(self, secret_id: str) -> SecretValues:
+        """The exposed values of one secrets item (VaultError when unknown)."""
+
+    def invalidate(self) -> int:
+        """Drop every cached value; returns the new cache generation."""
+
+
+def safe_name(text: str, n: int, *, prefix: str = "item") -> str:
+    """`text` when it matches ``SAFE_NAME_RE``, else ``<prefix>-<n>``: names that
+    reach a response, an audit line or ``agents.md`` can never carry a value
+    somebody stored AS a name."""
+    return text if SAFE_NAME_RE.match(text) else f"{prefix}-{n}"
+
+
+@dataclass(frozen=True)
+class SecretValues:
+    """The exposed values of one secrets item. ``repr`` is redacted on purpose."""
+
+    fields: Mapping[str, str] = field(default_factory=dict, repr=False)
+    totp_seed: str | None = field(default=None, repr=False)
+
+    def __repr__(self) -> str:
+        return "SecretValues(<redacted>)"
+
+    def nbytes(self) -> int:
+        """Approximate size, for the cache's byte cap."""
+        size = sum(
+            len(k) + len(v.encode("utf-8", "surrogateescape"))
+            for k, v in self.fields.items()
+        )
+        return size + len(self.totp_seed or "")
+
+
+@dataclass(frozen=True)
+class SecretItem:  # pylint: disable=too-many-instance-attributes
+    """One item of the secrets collection as agents may see it — no values.
+
+    `listed` = the field names an agent may request (``password`` + the item's
+    ``agent_secret_fields``); `fields` = those of them that hold a value.
+    """
+
+    secret_id: str
+    name: str
+    fields: tuple[str, ...] = ()
+    listed: tuple[str, ...] = ()
+    has_totp: bool = False
+    allow_short: bool = False
+    short: bool = False
+    refused: str | None = None
+    item_id: str = ""
+
+    def public(self) -> dict[str, Any]:
+        """The ``secrets`` view: ids and field NAMES — never a value or seed."""
+        return {
+            "id": self.secret_id,
+            "name": self.name,
+            "fields": list(self.fields),
+            "has_totp": self.has_totp,
+            "short": self.short,
+            "refused": self.refused is not None,
+            "reason": self.refused or "",
+        }
+
+
+_BUILTIN_FIELDS = ("password", "username", "notes")
+
+
+def _custom_field_counts(item: Mapping[str, Any]) -> dict[str, int]:
+    counts: dict[str, int] = {}
+    for f in item.get("fields") or []:
+        if isinstance(f, Mapping) and f.get("name"):
+            name = str(f["name"])
+            counts[name] = counts.get(name, 0) + 1
+    return counts
+
+
+def _builtin_value(item: Mapping[str, Any], name: str) -> str:
+    login = item.get("login") or {}
+    if not isinstance(login, Mapping):
+        login = {}
+    if name == "notes":
+        raw = item.get("notes")
+    else:
+        raw = login.get(name)
+    return "" if raw is None else str(raw)
+
+
+def value_bytes(value: str) -> int:
+    """UTF-8 length of `value` (what the variant policy measures)."""
+    return len(value.encode("utf-8", "surrogateescape"))
+
+
+def is_short(value: str) -> bool:
+    """Shorter than the variant policy's 8 bytes: masked and registered
+    raw-only, so the item must opt in with ``agent_secret_allow_short``."""
+    return value_bytes(value) < SHORT_BELOW_BYTES
+
+
+# A flat validator: one early refusal per rule, in field order.
+# pylint: disable-next=too-many-locals,too-many-return-statements,too-many-branches
+def secret_item_from_json(
+    item: Mapping[str, Any], n: int
+) -> tuple[SecretItem, SecretValues | None]:
+    """Build a ``SecretItem`` (+ its values) from a Bitwarden item JSON; problems
+    become ``refused`` and carry no values. `n` numbers unsafe names."""
+    raw_name = str(item.get("name") or "")
+    name = safe_name(raw_name, n)
+    fields = _fields(item)
+    item_id = str(item.get("id") or "")
+    raw_id = (fields.get("agent_secret_id") or "").strip().lower() or slugify(raw_name)
+    secret_id = raw_id if SITE_ID_RE.match(raw_id) else f"item-{n}"
+
+    def refused(reason: str) -> tuple[SecretItem, None]:
+        return SecretItem(secret_id, name, item_id=item_id, refused=reason), None
+
+    if not SITE_ID_RE.match(raw_id):
+        return refused("invalid agent_secret_id")
+    counts = _custom_field_counts(item)
+    if any(c > 1 for c in counts.values()):
+        return refused("duplicate custom field names")
+    allow_short = _parse_flag(fields.get("agent_secret_allow_short", ""))
+    if allow_short is None:
+        return refused("bad agent_secret_allow_short (true or false)")
+    listed_raw = ["password", *_split_list(fields.get("agent_secret_fields", ""))]
+    listed: list[str] = []
+    values: dict[str, str] = {}
+    for k, fname in enumerate(listed_raw):
+        if fname.lower() in ("totp", "seed", "totp_seed"):
+            return refused("the TOTP seed is never a field (use the totp op)")
+        if fname.startswith("agent_"):
+            return refused(
+                f"configuration field {safe_name(fname, k, prefix='field')} cannot be exposed"
+            )
+        shown = safe_name(fname, k, prefix="field")
+        if shown in listed:
+            continue
+        listed.append(shown)
+        if fname in _BUILTIN_FIELDS:
+            value = _builtin_value(item, fname)
+        else:
+            value = fields.get(fname, "")
+        if value:
+            values[shown] = value
+    short = False
+    for value in values.values():
+        if not value.strip():
+            return refused("a value is whitespace only")
+        if value_bytes(value) < MIN_SECRET_BYTES:
+            return refused(
+                f"a value is shorter than {MIN_SECRET_BYTES} bytes (too short to mask)"
+            )
+        if is_short(value):
+            if not allow_short:
+                return refused(
+                    f"a value is shorter than {SHORT_BELOW_BYTES} bytes (too short to mask; "
+                    "set agent_secret_allow_short=true to mask it raw-only)"
+                )
+            short = True
+    login = item.get("login") or {}
+    totp = login.get("totp") if isinstance(login, Mapping) else None
+    seed = str(totp) if totp else None
+    public = SecretItem(
+        secret_id=secret_id,
+        name=name,
+        fields=tuple(f for f in listed if f in values),
+        listed=tuple(listed),
+        has_totp=seed is not None,
+        allow_short=allow_short,
+        short=short,
+        item_id=item_id,
+    )
+    return public, SecretValues(fields=values, totp_seed=seed)
+
+
+def build_secret_items(
+    raw_items: list[Any],
+) -> tuple[list[SecretItem], dict[str, SecretValues]]:
+    """All secrets items (a second item claiming a taken id is refused) and the
+    values of the non-refused ones, keyed by id."""
+    items: list[SecretItem] = []
+    values: dict[str, SecretValues] = {}
+    seen: set[str] = set()
+    n = 0
+    for raw in raw_items:
+        if not isinstance(raw, Mapping):
+            continue
+        n += 1
+        it, vals = secret_item_from_json(raw, n)
+        if it.secret_id in seen:
+            it = SecretItem(
+                it.secret_id,
+                it.name,
+                item_id=it.item_id,
+                refused="duplicate agent_secret_id",
+            )
+            vals = None
+        seen.add(it.secret_id)
+        items.append(it)
+        if vals is not None and it.refused is None:
+            values[it.secret_id] = vals
+    return items, values
+
+
+def filter_org(raw_items: list[Any], org_id: str | None, coll_id: str) -> list[Any]:
+    """With `org_id` set: only items of that organisation that list `coll_id`
+    (a collection id is only unique together with its organisation)."""
+    if not org_id:
+        return list(raw_items)
+    out = []
+    for raw in raw_items:
+        if not isinstance(raw, Mapping):
+            continue
+        colls = raw.get("collectionIds") or []
+        if (
+            raw.get("organizationId") == org_id
+            and isinstance(colls, list)
+            and coll_id in colls
+        ):
+            out.append(raw)
+    return out
+
+
+class _SecretSource:
+    """Cached, single-flight access to a secrets collection (mixin).
+
+    Subclasses provide ``cache``, ``_secrets_key`` (raises SecretsNotConfigured)
+    and ``_load_secrets`` (one uncached read; a ``bw sync`` in it bumps the
+    cache generation).
+    """
+
+    cache: VaultCache
+
+    def _secrets_key(self) -> tuple[str, ...]:
+        raise SecretsNotConfigured(NO_SECRETS_COLLECTION)
+
+    def _load_secrets(self, key: tuple[str, ...]) -> list[Any]:
+        raise SecretsNotConfigured(NO_SECRETS_COLLECTION)
+
+    def _fill(self, key: tuple[str, ...], want: tuple[str, ...]) -> Any:
+        """Under BW_LOCK: the cache again (a concurrent miss may have filled it),
+        else ONE read that fills every entry of the collection."""
+        with BW_LOCK:
+            hit = self.cache.get(want)
+            if hit is not None:
+                return hit
+            raw = self._load_secrets(key)
+            gen = self.cache.generation
+            items, values = build_secret_items(raw)
+            for sid, vals in values.items():
+                self.cache.put(
+                    ("values", *key, sid), vals, size=vals.nbytes(), generation=gen
+                )
+            listing = tuple(items)
+            size = sum(len(json.dumps(it.public())) for it in items)
+            self.cache.put(("items", *key), listing, size=size, generation=gen)
+            if want[0] == "items":
+                return listing
+            return values.get(want[-1])
+
+    def secret_items(self) -> list[SecretItem]:
+        """Every item of the secrets collection, refused ones included."""
+        key = self._secrets_key()
+        want = ("items", *key)
+        hit = self.cache.get(want)
+        if hit is None:
+            hit = self._fill(key, want)
+        return list(hit)
+
+    def secret_values(self, secret_id: str) -> SecretValues:
+        """The values of a non-refused secrets item."""
+        key = self._secrets_key()
+        want = ("values", *key, secret_id)
+        hit = self.cache.get(want)
+        if hit is None:
+            hit = self._fill(key, want)
+        if hit is None:
+            raise VaultError(f"unknown or refused secret {secret_id!r}")
+        assert isinstance(hit, SecretValues)
+        return hit
+
+    def invalidate(self) -> int:
+        """Bump the cache generation (rotation, SIGHUP)."""
+        return self.cache.bump()
 
 
 def slugify(name: str) -> str:
@@ -333,23 +647,45 @@ def _find(raw_items: list[Any], site: str, *, dev: bool) -> Mapping[str, Any]:
     raise VaultError(f"unknown site {site!r}")
 
 
-class FixtureVault:
-    """Items from a JSON file (a list of Bitwarden-shaped items). Dev mode only."""
+class FixtureVault(_SecretSource):
+    """Items from a JSON file. Dev mode only.
 
-    def __init__(self, path: str | os.PathLike[str], *, dev: bool) -> None:
+    The file is either a list of Bitwarden-shaped login items, or an object
+    ``{"logins": [...], "secrets": [...], "collections": [...]}`` — ``secrets``
+    (optional) is the secrets collection, optionally filtered like ``bw`` by
+    ``secrets_organization_id`` + ``secrets_collection_id``; ``collections``
+    (optional) is what ``daemon.py -C`` lists.
+    """
+
+    def __init__(
+        self,
+        path: str | os.PathLike[str],
+        *,
+        dev: bool,
+        cache: VaultCache | None = None,
+    ) -> None:
         if not dev:
             raise VaultError("FixtureVault is only usable with --dev")
         self.path = Path(path)
         self.dev = dev
+        self.cache = cache if cache is not None else VaultCache()
 
-    def _raw(self) -> list[Any]:
+    def _data(self) -> list[Any] | dict[str, Any]:
         try:
             data = json.loads(self.path.read_text(encoding="utf-8"))
         except (OSError, ValueError) as exc:
             raise VaultError(f"cannot read fixture vault {self.path}") from exc
+        if isinstance(data, dict):
+            if not isinstance(data.get("logins", []), list):
+                raise VaultError("fixture vault: logins must be a list")
+            return data
         if not isinstance(data, list):
             raise VaultError("fixture vault must be a JSON list of items")
         return data
+
+    def _raw(self) -> list[Any]:
+        data = self._data()
+        return list(data.get("logins", [])) if isinstance(data, dict) else data
 
     def items(self) -> list[SiteItem]:
         """Every fixture item, refused ones included."""
@@ -358,6 +694,41 @@ class FixtureVault:
     def secret(self, site: str) -> Secret:
         """The fixture secret of `site`."""
         return secret_from_json(_find(self._raw(), site, dev=self.dev))
+
+    def _secrets_key(self) -> tuple[str, ...]:
+        data = self._data()
+        if not isinstance(data, dict) or not isinstance(data.get("secrets"), list):
+            raise SecretsNotConfigured(NO_SECRETS_COLLECTION)
+        return (
+            "fixture",
+            str(self.path),
+            str(data.get("secrets_organization_id") or ""),
+            str(data.get("secrets_collection_id") or ""),
+        )
+
+    def _load_secrets(self, key: tuple[str, ...]) -> list[Any]:
+        data = self._data()
+        if not isinstance(data, dict) or not isinstance(data.get("secrets"), list):
+            raise SecretsNotConfigured(NO_SECRETS_COLLECTION)
+        raw = list(data["secrets"])
+        coll = str(data.get("secrets_collection_id") or "")
+        org = str(data.get("secrets_organization_id") or "")
+        return filter_org(raw, org, coll) if org and coll else raw
+
+    def collections(self) -> list[tuple[str, str, str, str]]:
+        """``(org_id, org_name, collection_id, collection_name)`` rows."""
+        data = self._data()
+        rows = data.get("collections", []) if isinstance(data, dict) else []
+        return [
+            (
+                str(r.get("organizationId") or ""),
+                str(r.get("organizationName") or ""),
+                str(r.get("id") or ""),
+                str(r.get("name") or ""),
+            )
+            for r in rows
+            if isinstance(r, Mapping)
+        ]
 
 
 # Known bw failure messages -> a fixed reason (never the message itself).
@@ -389,15 +760,28 @@ def _bw_reason(text: str) -> str:
 DEFAULT_SERVER_URL = "https://vaultwarden.dom42.space"
 
 
+_OPTIONAL_IDS = ("organization_id", "secrets_organization_id", "secrets_collection_id")
+
+
 @dataclass(frozen=True)
-class BwBootstrap:
-    """Contents of ``<home>/bootstrap.json`` (written by ``install.sh -e``)."""
+class BwBootstrap:  # pylint: disable=too-many-instance-attributes
+    """Contents of ``<home>/bootstrap.json`` (written by ``install.sh -e``; the
+    ID keys by ``install.sh -C`` / ``-X``).
+
+    ``organization_id`` (optional) pins the login collection to its
+    organisation; ``secrets_organization_id`` + ``secrets_collection_id``
+    (optional) name the collection the ``secret``/``totp`` ops read. All absent
+    = the original behaviour, and ``secret``/``totp`` refuse.
+    """
 
     client_id: str = field(repr=False)
     client_secret: str = field(repr=False)
     master_password: str = field(repr=False)
     collection_id: str
     server_url: str = DEFAULT_SERVER_URL
+    organization_id: str | None = None
+    secrets_organization_id: str | None = None
+    secrets_collection_id: str | None = None
 
     @classmethod
     def load(cls, path: str | os.PathLike[str]) -> BwBootstrap:
@@ -414,10 +798,25 @@ class BwBootstrap:
         server = data.get("server_url") or DEFAULT_SERVER_URL
         if not isinstance(server, str) or not server.startswith("https://"):
             raise VaultError(f"bootstrap {path}: server_url must be an https:// URL")
-        return cls(**{k: data[k] for k in keys}, server_url=server)
+        optional: dict[str, str | None] = {}
+        for k in _OPTIONAL_IDS:
+            value = data.get(k)
+            if value is not None and (not isinstance(value, str) or not value):
+                raise VaultError(f"bootstrap {path}: {k} must be a non-empty string")
+            optional[k] = value
+        return cls(
+            client_id=data["client_id"],
+            client_secret=data["client_secret"],
+            master_password=data["master_password"],
+            collection_id=data["collection_id"],
+            server_url=server,
+            organization_id=optional["organization_id"],
+            secrets_organization_id=optional["secrets_organization_id"],
+            secrets_collection_id=optional["secrets_collection_id"],
+        )
 
 
-class BwVault:
+class BwVault(_SecretSource):
     """The broker's own Vaultwarden account, read through the ``bw`` CLI."""
 
     def __init__(
@@ -426,10 +825,12 @@ class BwVault:
         appdata_dir: str | os.PathLike[str],
         *,
         bw_bin: str = "bw",
+        cache: VaultCache | None = None,
     ) -> None:
         self.boot = bootstrap
         self.appdata_dir = str(appdata_dir)
         self.bw_bin = bw_bin
+        self.cache = cache if cache is not None else VaultCache()
 
     def _env(self, **extra: str) -> dict[str, str]:
         env = {
@@ -495,25 +896,73 @@ class BwVault:
             except VaultError:
                 pass
 
-    def _raw(self) -> list[Any]:
-        with self._session() as session:
-            env = self._env(BW_SESSION=session)
-            self._run(["sync"], env)
-            out = self._run(
-                ["list", "items", "--collectionid", self.boot.collection_id], env
-            )
+    @staticmethod
+    def _json_list(out: str, what: str) -> list[Any]:
         try:
             data = json.loads(out)
         except ValueError as exc:
-            raise VaultError("bw list returned no JSON") from exc
+            raise VaultError(f"bw list {what} returned no JSON") from exc
         if not isinstance(data, list):
-            raise VaultError("bw list returned no list")
+            raise VaultError(f"bw list {what} returned no list")
         return data
+
+    def _raw(self, org_id: str | None, coll_id: str) -> list[Any]:
+        """unlock + sync + list + lock under BW_LOCK; with `org_id` only that
+        organisation's items that list `coll_id` are kept."""
+        with BW_LOCK, self._session() as session:
+            env = self._env(BW_SESSION=session)
+            self._run(["sync"], env)
+            self.cache.bump()  # the vault may have changed: no older value served
+            out = self._run(["list", "items", "--collectionid", coll_id], env)
+        return filter_org(self._json_list(out, "items"), org_id, coll_id)
 
     def items(self) -> list[SiteItem]:
         """Every item of the ``agent-logins`` collection."""
-        return build_items(self._raw())
+        return build_items(
+            self._raw(self.boot.organization_id, self.boot.collection_id)
+        )
 
     def secret(self, site: str) -> Secret:
         """Username, password and TOTP seed of `site` (fresh unlock, then lock)."""
-        return secret_from_json(_find(self._raw(), site, dev=False))
+        raw = self._raw(self.boot.organization_id, self.boot.collection_id)
+        return secret_from_json(_find(raw, site, dev=False))
+
+    def _secrets_key(self) -> tuple[str, ...]:
+        if not self.boot.secrets_collection_id:
+            raise SecretsNotConfigured(NO_SECRETS_COLLECTION)
+        return (
+            "bw",
+            self.boot.secrets_organization_id or "",
+            self.boot.secrets_collection_id,
+        )
+
+    def _load_secrets(self, key: tuple[str, ...]) -> list[Any]:
+        return self._raw(key[1] or None, key[2])
+
+    def collections(self) -> list[tuple[str, str, str, str]]:
+        """``(org_id, org_name, collection_id, collection_name)`` of every
+        collection the broker account sees — no item data."""
+        with BW_LOCK, self._session() as session:
+            env = self._env(BW_SESSION=session)
+            self._run(["sync"], env)
+            orgs = self._json_list(
+                self._run(["list", "organizations"], env), "organizations"
+            )
+            colls = self._json_list(
+                self._run(["list", "collections"], env), "collections"
+            )
+        names = {
+            str(o.get("id")): str(o.get("name") or "")
+            for o in orgs
+            if isinstance(o, Mapping)
+        }
+        return [
+            (
+                str(c.get("organizationId") or ""),
+                names.get(str(c.get("organizationId")), ""),
+                str(c.get("id") or ""),
+                str(c.get("name") or ""),
+            )
+            for c in colls
+            if isinstance(c, Mapping)
+        ]

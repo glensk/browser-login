@@ -10,6 +10,7 @@
 #                                      tools/uv, bin/bw, python (uv-managed), browsers
 #   /var/log/login-broker.log          daemon output + install audit trail
 #   /Library/LaunchDaemons/com.albert.login-broker.plist
+#   /usr/local/bin/secret-run          root-owned symlink -> LIBEXEC/current/bin/secret-run
 #
 # ROOT EXECUTES ONLY system binaries (/usr/bin, /bin, /usr/sbin, /sbin) and tools
 # under LIBEXEC that this script downloaded itself against a pinned SHA-256.
@@ -45,6 +46,8 @@ DOWNLOADS="${LIBEXEC}/.downloads"
 LOG_FILE="/var/log/login-broker.log"
 PLIST="/Library/LaunchDaemons/${LABEL}.plist"
 SOCKET="${RUN_DIR}/broker.sock"
+LINK_DIR="/usr/local/bin"
+LINK="${LINK_DIR}/secret-run"
 INVOKER="${SUDO_USER:-}"
 [[ -n "$INVOKER" ]] || INVOKER="$(/usr/bin/id -un)"
 INVOKER_HOME="$(/usr/bin/dscl . -read "/Users/${INVOKER}" NFSHomeDirectory | /usr/bin/awk '{print $2}')"
@@ -54,17 +57,22 @@ DRY=0
 PURGE=0
 MODE="install"
 RESET_SITE=""
+LOGIN_PAIR=""
+SECRETS_PAIR=""
 
 usage() {
 	/bin/cat <<'EOF'
-Usage: sudo install/install.sh [-n] [-U [-P]] [-e] [-r SITE] [-h]
+Usage: sudo install/install.sh [-n] [-U [-P]] [-e] [-r KEY] [-c]
+                               [-C ORG_ID:COLL_ID] [-X ORG_ID:COLL_ID] [-B] [-h]
 
 Install (default), update, uninstall or enrol the login broker LaunchDaemon.
 Refuses unless the repo is clean and HEAD is contained in origin/main; installs
 `git archive HEAD` into a NEW release dir, swaps the `current` symlink
 atomically, restarts the daemon and runs the boundary selfcheck as $SUDO_USER
 (a failing selfcheck rolls back). The installed commit and the diffstat since
-the previous one are appended to /var/log/login-broker.log.
+the previous one are appended to /var/log/login-broker.log. The release also
+ships the `secret-run` client; /usr/local/bin/secret-run becomes a root-owned
+symlink to it (refused when /usr/local/bin is not root-owned).
 
 Options:
   -n, --dry-run           print the actions only (no root needed)
@@ -73,8 +81,21 @@ Options:
   -e, --enroll-bootstrap  prompt (hidden) for the broker's Bitwarden API key,
                           master password and collection id; write
                           /var/db/login-broker/bootstrap.json (0600 _loginbroker)
-  -r, --reset SITE        clear SITE's login limiter (cooldown / hard block after
-                          failed logins); runs the installed daemon's reset as root
+  -r, --reset KEY         clear a login limiter: a SITE (cooldown / hard block after
+                          failed logins) or secret:ITEM / totp:ITEM / secret:* (the
+                          secret-run limiter); runs the installed daemon's reset as root
+  -c, --collections       list the collections the broker account sees
+                          (org_id, org_name, collection_id, collection_name)
+  -C, --login-collection ORG_ID:COLL_ID
+                          point the login items at this collection
+  -X, --secrets-collection ORG_ID:COLL_ID
+                          point secret-run at this collection
+                          (-C/-X: the exact ID pair must be listed by -c, else
+                          nothing is written; bootstrap.json is rewritten keeping
+                          its secrets, the old file kept as bootstrap.json.prev-<UTC>,
+                          and the daemon reloaded with SIGHUP)
+  -B, --rollback-bootstrap
+                          restore the newest bootstrap.json.prev-* and reload
   -h, --help              show this help and exit
 
 Examples:
@@ -82,6 +103,10 @@ Examples:
   sudo install/install.sh        # install / update
   sudo install/install.sh -e     # one-time Bitwarden enrolment
   sudo install/install.sh -r kleinanzeigen  # clear a site's login cooldown
+  sudo install/install.sh -r secret:github  # clear a secret item's limiter
+  sudo install/install.sh -c     # which collections (IDs) the broker sees
+  sudo install/install.sh -C ORG:COLL -X ORG:COLL  # switch collections by ID
+  sudo install/install.sh -B     # roll the last switch back
   sudo install/install.sh -U     # uninstall, keep state
   sudo install/install.sh -U -P  # uninstall and purge state + role account
 EOF
@@ -126,9 +151,24 @@ while (($#)); do
 	-r | --reset)
 		MODE="reset"
 		RESET_SITE="${2:-}"
-		[[ "$RESET_SITE" =~ ^[a-z0-9][a-z0-9_-]*$ ]] || die "-r needs a site id (e.g. -r kleinanzeigen)"
+		[[ "$RESET_SITE" =~ ^[a-z0-9][a-z0-9_-]*$ || "$RESET_SITE" =~ ^(secret|totp):([a-z0-9][a-z0-9._-]*|\*)$ ]] ||
+			die "-r needs a site id or secret:ITEM / totp:ITEM / secret:* (e.g. -r kleinanzeigen)"
 		shift
 		;;
+	-c | --collections) MODE="collections" ;;
+	-C | --login-collection)
+		MODE="switch"
+		LOGIN_PAIR="${2:-}"
+		[[ "$LOGIN_PAIR" =~ ^[A-Za-z0-9-]+:[A-Za-z0-9-]+$ ]] || die "-C needs ORG_ID:COLL_ID"
+		shift
+		;;
+	-X | --secrets-collection)
+		MODE="switch"
+		SECRETS_PAIR="${2:-}"
+		[[ "$SECRETS_PAIR" =~ ^[A-Za-z0-9-]+:[A-Za-z0-9-]+$ ]] || die "-X needs ORG_ID:COLL_ID"
+		shift
+		;;
+	-B | --rollback-bootstrap) MODE="rollback" ;;
 	*)
 		usage >&2
 		exit 2
@@ -294,11 +334,12 @@ install_release() {
 	# The archive is produced as the user (git never runs as root) and only
 	# unpacked as root; it is exactly the audited commit, not the work tree.
 	if ((DRY)); then
-		printf '+ /usr/bin/sudo -H -u %s /usr/bin/git -C %q archive %s broker pyproject.toml uv.lock | /usr/bin/tar -xf - -C %q\n' \
+		printf '+ /usr/bin/sudo -H -u %s /usr/bin/git -C %q archive %s broker bin/secret_run.py bin/secret-run pyproject.toml uv.lock | /usr/bin/tar -xf - -C %q\n' \
 			"$INVOKER" "$REPO_DIR" "$head" "$rel"
 	else
 		as_user /usr/bin/git -C "$REPO_DIR" archive --format=tar "$head" \
-			broker pyproject.toml uv.lock | /usr/bin/tar -xf - -C "$rel"
+			broker bin/secret_run.py bin/secret-run pyproject.toml uv.lock |
+			/usr/bin/tar -xf - -C "$rel"
 		printf '%s\n' "$head" >"${rel}/COMMIT"
 	fi
 	# Interpreter under LIBEXEC (root-owned), never in a user's ~/.local/share/uv:
@@ -427,8 +468,43 @@ wait_for_socket() {
 }
 
 run_selfcheck() {
-	run /usr/bin/sudo -u "$INVOKER" "${LIBEXEC}/current/venv/bin/python" \
-		"${LIBEXEC}/current/broker/selfcheck.py" -b
+	local py="${LIBEXEC}/current/venv/bin/python" check="${LIBEXEC}/current/broker/selfcheck.py"
+	# a-f as the agent uid; g as a uid the broker does not serve; h as root
+	# (the broker home is closed to the agent uid).
+	run /usr/bin/sudo -u "$INVOKER" "$py" "$check" -b &&
+		run /usr/bin/sudo -u nobody "$py" "$check" -F -S "$SOCKET" &&
+		run "$py" "$check" -P -H "$HOME_DIR"
+}
+
+# check_link_dir — /usr/local/bin must be root-owned, or the agent uid could
+# swap the secret-run symlink.
+check_link_dir() {
+	local owner
+	[[ -d "$LINK_DIR" ]] || return 0
+	owner="$(/usr/bin/stat -f %u "$LINK_DIR")"
+	if [[ "$owner" != "0" ]]; then
+		((DRY)) || die "${LINK_DIR} is not root-owned (uid ${owner}) — refusing to install ${LINK}"
+		echo "⚠️ would refuse: ${LINK_DIR} is not root-owned (uid ${owner})" >&2
+	fi
+}
+
+# ensure_link — /usr/local/bin/secret-run -> LIBEXEC/current/bin/secret-run.
+ensure_link() {
+	if [[ ! -d "$LINK_DIR" ]]; then
+		run /usr/bin/install -d -o root -g wheel -m 0755 "$LINK_DIR"
+	fi
+	run /bin/ln -sfn "${LIBEXEC}/current/bin/secret-run" "$LINK"
+	run /usr/sbin/chown -h root:wheel "$LINK"
+}
+
+# reload_daemon — SIGHUP: drop cached values, re-read bootstrap.json per call.
+reload_daemon() {
+	if ((DRY)); then
+		run /bin/launchctl kill SIGHUP "system/${LABEL}"
+	else
+		/bin/launchctl kill SIGHUP "system/${LABEL}" 2>/dev/null ||
+			echo "⚠️ daemon not running — the new bootstrap applies at its next start" >&2
+	fi
 }
 
 # audit_install HEAD PREVIOUS_RELEASE — what code just went root-owned.
@@ -451,6 +527,7 @@ do_install() {
 	local head rel previous=""
 	[[ "$(/usr/bin/uname -m)" == "arm64" ]] || die "pinned tools are arm64-only"
 	head="$(check_repo)"
+	check_link_dir
 	ensure_role_account
 	ensure_dirs
 	ensure_uv
@@ -462,6 +539,7 @@ do_install() {
 	fi
 	write_plist
 	swap_current "$rel"
+	ensure_link
 	restart_daemon
 	if ! wait_for_socket || ! run_selfcheck; then
 		if [[ -n "$previous" ]]; then
@@ -476,12 +554,15 @@ do_install() {
 		run /bin/ln -sfn "$previous" "${LIBEXEC}/previous"
 	fi
 	audit_install "$head" "$previous"
-	echo "✓ login broker installed: ${rel}"
+	echo "✅ login broker installed: ${rel}"
 }
 
 do_uninstall() {
 	bootout
 	run /bin/rm -f "$PLIST"
+	if ((DRY)) || [[ -L "$LINK" && "$(/usr/bin/readlink "$LINK")" == "${LIBEXEC}/"* ]]; then
+		run /bin/rm -f "$LINK"
+	fi
 	run /bin/rm -rf "$LIBEXEC"
 	run /bin/rm -rf "$RUN_DIR"
 	if ((PURGE)); then
@@ -496,7 +577,7 @@ do_uninstall() {
 		echo "ℹ kept ${HOME_DIR} and the ${ROLE} account (purge with -U -P)"
 	fi
 	audit "uninstalled (purge=${PURGE})"
-	echo "✓ login broker uninstalled"
+	echo "✅ login broker uninstalled"
 }
 
 # Secrets are read hidden from the terminal and handed to the JSON writer via
@@ -552,9 +633,60 @@ do_reset() {
 	audit "limiter reset for ${RESET_SITE}"
 }
 
+# collections_tsv — `daemon.py -C` as the role account (it owns the bw state).
+collections_tsv() {
+	local py="${LIBEXEC}/current/venv/bin/python"
+	run /usr/bin/sudo -u "$ROLE" /usr/bin/env HOME="$HOME_DIR" \
+		PATH="${LIBEXEC}/bin:/usr/bin:/bin" "$py" \
+		"${LIBEXEC}/current/broker/daemon.py" -H "$HOME_DIR" -C
+}
+
+# do_collections — what the broker account sees (IDs and names, no items).
+do_collections() {
+	[[ -x "${LIBEXEC}/current/venv/bin/python" ]] || ((DRY)) ||
+		die "install the broker first (no ${LIBEXEC}/current/venv/bin/python)"
+	collections_tsv
+}
+
+# do_switch — rewrite bootstrap.json by ID pairs that -c lists, then reload.
+do_switch() {
+	local py="${LIBEXEC}/current/venv/bin/python" tsv
+	local args=(-H "$HOME_DIR" -v -)
+	[[ -n "$LOGIN_PAIR" ]] && args+=(-C "$LOGIN_PAIR")
+	[[ -n "$SECRETS_PAIR" ]] && args+=(-X "$SECRETS_PAIR")
+	if ((DRY)); then
+		collections_tsv
+		printf '+ <the output above> |'
+		printf ' %q' "$py" "${LIBEXEC}/current/broker/bootstrap_switch.py" "${args[@]}"
+		printf '\n'
+		audit "bootstrap switched (login ${LOGIN_PAIR:-unchanged}, secrets ${SECRETS_PAIR:-unchanged})"
+		reload_daemon
+		return 0
+	fi
+	[[ -x "$py" ]] || die "install the broker first (no ${py})"
+	tsv="$(collections_tsv)" || die "cannot list the broker's collections"
+	printf '%s\n' "$tsv" | "$py" "${LIBEXEC}/current/broker/bootstrap_switch.py" "${args[@]}" ||
+		die "bootstrap.json NOT changed"
+	audit "bootstrap switched (login ${LOGIN_PAIR:-unchanged}, secrets ${SECRETS_PAIR:-unchanged})"
+	reload_daemon
+}
+
+# do_rollback — restore the newest bootstrap.json.prev-*, then reload.
+do_rollback() {
+	local py="${LIBEXEC}/current/venv/bin/python"
+	[[ -x "$py" ]] || ((DRY)) || die "install the broker first (no ${py})"
+	run "$py" "${LIBEXEC}/current/broker/bootstrap_switch.py" -H "$HOME_DIR" -B ||
+		die "bootstrap.json NOT changed"
+	audit "bootstrap rolled back to the newest .prev-*"
+	reload_daemon
+}
+
 case "$MODE" in
 install) do_install ;;
 uninstall) do_uninstall ;;
 enroll) do_enroll ;;
 reset) do_reset ;;
+collections) do_collections ;;
+switch) do_switch ;;
+rollback) do_rollback ;;
 esac

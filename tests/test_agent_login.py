@@ -268,3 +268,57 @@ def test_keychain_names_without_broker_are_strict(monkeypatch) -> None:
     monkeypatch.setattr(kc, "_scrub_client", lambda: None)
     got = kc.mask_known_secrets(["EPFL_VPN_PASSWORD", "gh:github.com", "plainword"])
     assert got == ["EPFL_VPN_PASSWORD", "gh:github.com", kc.MASKED]
+
+
+def test_agents_file_lists_injectable_secrets_by_name_only(
+    monkeypatch, tmp_path
+) -> None:
+    """tp#816 E2: `-S` puts the secret-run items (ids + field names) into the
+    agents file, never a value — against a real broker on a fixture vault."""
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    import secret_fixtures as sf  # pylint: disable=import-outside-toplevel
+
+    pw, token, seed = sf.sentinel(), sf.sentinel(), sf.totp_seed()
+    items = [
+        sf.secret_item(
+            "GitHub",
+            pw,
+            fields={"agent_secret_fields": "api_token", "api_token": token},
+            totp=seed,
+        ),
+        sf.secret_item("Refused", "abc"),
+    ]
+    vpath = sf.write_vault(tmp_path / "v.json", items)
+    monkeypatch.setenv("AGENT_LOGIN_STATE_FILE", str(tmp_path / "state" / "last.json"))
+    with sf.sockdir() as d:
+        brk = sf.make_broker(
+            tmp_path / "h", vpath, allow_uid=os.getuid(), keeper_sock=None
+        )
+        with sf.serving(brk, str(d / "b.sock"), os.getuid()) as path:
+            monkeypatch.setattr(al, "SOCKET", path)
+            note, rows = al.agent_login_secrets.secrets_state(
+                al.broker_request, tmp_path / "state", fresh=True
+            )
+    assert note == "ok"
+    data = {"rows": [], "broker_ok": True}
+    written = al.write_agent_summary(data).read_text()  # reads the snapshot
+    assert "## Secrets agents can inject" in written
+    assert "- `github`: password, api_token (+ TOTP: `-o`)" in written
+    assert "refused" not in written.lower().split("## secrets", 1)[1]
+    for value in (pw, token, seed):
+        assert value not in written
+    assert rows and rows[0]["id"] == "github"
+    snapshot = (tmp_path / "state" / "secrets.json").read_text()
+    for value in (pw, token, seed):
+        assert value not in snapshot
+
+
+def test_secret_rows_are_sanitised_again() -> None:
+    rows = al.agent_login_secrets.clean_rows(
+        [
+            {"id": "pw=hunter2!", "fields": ["ok", "a\tb"], "has_totp": True},
+            {"id": "gone", "refused": True},
+        ]
+    )
+    assert rows == [{"id": "item-1", "fields": ["ok", "field-2"], "has_totp": True}]
+    assert al.agent_login_secrets.summary_lines([]) == []

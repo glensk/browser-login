@@ -16,17 +16,27 @@ re-export from a still-logged-in broker profile is not one. Outcomes:
 
 ``begin_attempt`` marks an attempt in flight on disk BEFORE the login runs; an
 in-flight mark left by another (crashed) instance counts as one ``unknown``.
+
+``reserve(keys)`` is the atomic form the secret ops use: under ONE lock it
+checks every key's caps and, only when all pass, records the attempt for every
+key and fsyncs the state before releasing — so N concurrent callers against a
+cap of M get exactly M grants. Per-key caps come from ``key_caps`` (exact key,
+else the longest matching prefix, else the instance defaults). Any state
+problem denies (fail closed).
 """
 
 from __future__ import annotations
 
 import json
 import os
-import tempfile
 import threading
 import uuid
+from collections.abc import Mapping
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
+
+from broker.statefile import write_json_atomic
 
 OUTCOMES = frozenset({"ok", "failed", "unknown"})
 HOUR_S = 3600.0
@@ -48,10 +58,30 @@ class LimiterStateError(RuntimeError):
     """The state file exists but cannot be read — the limiter fails closed."""
 
 
-class Limiter:  # pylint: disable=too-many-instance-attributes  # 6 policy knobs + 2 internals
+@dataclass(frozen=True)
+class Reservation:
+    """Granted: the attempt is recorded for every key."""
+
+    keys: tuple[str, ...]
+    ts: float
+
+
+@dataclass(frozen=True)
+class Denied:
+    """Refused: nothing was recorded. `key` is the first key over its cap."""
+
+    key: str
+    reason: str
+
+
+# (per_hour, per_day); 0 = no cap of that kind.
+KeyCaps = Mapping[str, tuple[int, int]]
+
+
+class Limiter:  # pylint: disable=too-many-instance-attributes  # 7 policy knobs + 2 internals
     """Minimum interval + hourly + daily caps per site; JSON state at `state_path`."""
 
-    def __init__(
+    def __init__(  # pylint: disable=too-many-arguments
         self,
         state_path: str | os.PathLike[str],
         min_interval_s: float,
@@ -60,8 +90,10 @@ class Limiter:  # pylint: disable=too-many-instance-attributes  # 6 policy knobs
         *,
         cooldown_s: float | None = None,
         max_consecutive: int = DEFAULT_MAX_CONSECUTIVE,
+        key_caps: KeyCaps | None = None,
     ) -> None:
         self.state_path = Path(state_path)
+        self.key_caps = dict(key_caps or {})
         self.cooldown_s = default_cooldown_s() if cooldown_s is None else cooldown_s
         self.max_consecutive = int(max_consecutive)
         self.min_interval_s = float(min_interval_s)
@@ -87,25 +119,7 @@ class Limiter:  # pylint: disable=too-many-instance-attributes  # 6 policy knobs
         return data
 
     def _save(self, data: dict[str, Any]) -> None:
-        directory = self.state_path.parent
-        directory.mkdir(parents=True, exist_ok=True)
-        fd, tmp = tempfile.mkstemp(
-            prefix=f".{self.state_path.name}.", suffix=".tmp", dir=str(directory)
-        )
-        try:
-            with os.fdopen(fd, "w", encoding="utf-8") as fh:
-                json.dump(data, fh, sort_keys=True)
-                fh.flush()
-                os.fsync(fh.fileno())
-            os.replace(tmp, self.state_path)
-        except BaseException:
-            Path(tmp).unlink(missing_ok=True)
-            raise
-        dfd = os.open(str(directory), os.O_RDONLY)
-        try:
-            os.fsync(dfd)
-        finally:
-            os.close(dfd)
+        write_json_atomic(self.state_path, data)
 
     @staticmethod
     def _site(data: dict[str, Any], site: str) -> dict[str, Any]:
@@ -197,6 +211,67 @@ class Limiter:  # pylint: disable=too-many-instance-attributes  # 6 policy knobs
                 entry["consecutive"] = 0
                 entry.pop("cooldown_until", None)
             self._save(data)
+
+    def caps_for(self, key: str) -> tuple[int, int]:
+        """(per_hour, per_day) of `key`: exact entry, longest prefix, defaults."""
+        if key in self.key_caps:
+            return self.key_caps[key]
+        best = ""
+        for prefix in self.key_caps:
+            if key.startswith(prefix) and len(prefix) > len(best):
+                best = prefix
+        if best:
+            return self.key_caps[best]
+        return self.per_hour, self.per_day
+
+    def _deny_reason(self, key: str, entry: dict[str, Any], now: float) -> str:
+        """Why `key` may not take another attempt at `now` ('' = it may)."""
+        if entry.get("blocked"):
+            return "blocked; reset required (daemon.py -r KEY as root)"
+        stamps = [
+            float(a[0]) for a in entry.get("attempts", []) if isinstance(a, list) and a
+        ]
+        if stamps and now - max(stamps) < self.min_interval_s:
+            return f"minimum interval: retry in {self.min_interval_s - (now - max(stamps)):.0f}s"
+        per_hour, per_day = self.caps_for(key)
+        if per_hour and sum(1 for t in stamps if now - t < HOUR_S) >= per_hour:
+            return f"hourly cap of {per_hour} reached for {key}"
+        if per_day and sum(1 for t in stamps if now - t < DAY_S) >= per_day:
+            return f"daily cap of {per_day} reached for {key}"
+        return ""
+
+    def reserve(self, keys: list[str], now: float) -> Reservation | Denied:
+        """Check every key and record one attempt for all of them, atomically
+        and fsync'd; any failure (cap, unreadable or unwritable state) denies."""
+        uniq = tuple(dict.fromkeys(keys))
+        if not uniq:
+            return Denied("", "no limiter key")
+        with self._lock:
+            try:
+                data = self._load()
+            except LimiterStateError as exc:
+                return Denied(
+                    uniq[0], f"limiter state unreadable ({exc}); reset required"
+                )
+            for key in uniq:
+                reason = self._deny_reason(key, data["sites"].get(key) or {}, now)
+                if reason:
+                    return Denied(key, reason)
+            for key in uniq:
+                entry = self._site(data, key)
+                entry["attempts"] = [
+                    a
+                    for a in entry["attempts"]
+                    if isinstance(a, list) and a and now - float(a[0]) < DAY_S
+                ]
+                entry["attempts"].append([now, "ok"])
+            try:
+                self._save(data)
+            except OSError as exc:
+                return Denied(
+                    uniq[0], f"limiter state unwritable ({exc.strerror or exc})"
+                )
+            return Reservation(uniq, now)
 
     def reset(self, site: str) -> None:
         """Forget everything about `site` (root CLI only — never over the socket)."""

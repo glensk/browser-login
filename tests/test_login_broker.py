@@ -31,6 +31,7 @@ import tempfile
 import threading
 import time
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -38,14 +39,17 @@ REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO))
 
 from broker import (  # noqa: E402
+    bootstrap_switch,
     bundle,
     daemon,
     limiter,
     origins,
     peercred,
     recipes,
+    runs,
     selfcheck,  # noqa: E402
     vault,
+    vault_cache,
 )
 
 _BROWSER_PY = REPO / "bin" / "browser.py"
@@ -312,7 +316,7 @@ def test_client_scope_mirrors_broker():
 
 
 def _limiter(path, **kw):
-    args = {"min_interval_s": 60, "per_hour": 3, "per_day": 5}
+    args: dict[str, Any] = {"min_interval_s": 60, "per_hour": 3, "per_day": 5}
     args.update(kw)
     return limiter.Limiter(path, **args)
 
@@ -2399,3 +2403,508 @@ def test_e2e_fresh_login_hands_over_the_session_only_idp_cookie(
                 assert page.locator("input[type=password]").count() == 0
             finally:
                 client.close()
+
+
+# ---------------------------------------------------------------------------
+# tp#816 A1: org-keyed bootstrap, serialised + cached secrets collection
+# ---------------------------------------------------------------------------
+
+
+def _bootfile(path, **extra):
+    data = {
+        "client_id": "cid",
+        "client_secret": "csecret",
+        "master_password": "master-pw",
+        "collection_id": "coll-login",
+        **extra,
+    }
+    path.write_text(json.dumps(data))
+    return path
+
+
+def test_bootstrap_without_and_with_the_new_keys(tmp_path):
+    old = vault.BwBootstrap.load(_bootfile(tmp_path / "a.json"))
+    assert old.organization_id is None and old.secrets_collection_id is None
+    new = vault.BwBootstrap.load(
+        _bootfile(
+            tmp_path / "b.json",
+            organization_id="org-a",
+            secrets_organization_id="org-s",
+            secrets_collection_id="coll-s",
+        )
+    )
+    assert (new.organization_id, new.secrets_organization_id) == ("org-a", "org-s")
+    assert new.secrets_collection_id == "coll-s"
+    assert "master-pw" not in repr(new) and "csecret" not in repr(new)
+    with pytest.raises(vault.VaultError):
+        vault.BwBootstrap.load(_bootfile(tmp_path / "c.json", organization_id=""))
+    with pytest.raises(vault.SecretsNotConfigured):
+        vault.BwVault(old, tmp_path / "appdata").secret_items()
+
+
+FAKE_BW_SECRETS = r"""#!/usr/bin/env python3
+import json, sys, time
+log = "@LOG@"
+cmd = sys.argv[1]
+with open(log, "a") as fh:
+    fh.write(json.dumps(sys.argv[1:]) + "\n")
+if cmd == "status":
+    print(json.dumps({"status": "locked"}))
+elif cmd == "unlock":
+    print("SESSIONKEY")
+elif cmd == "list":
+    time.sleep(@SLEEP@)
+    print(open("@ITEMS@").read())
+"""
+
+
+def _fake_bw(tmp_path, items, *, sleep=0.0):
+    items_file = tmp_path / "secret-items.json"
+    items_file.write_text(json.dumps(items))
+    log = tmp_path / "bw.log"
+    fake = tmp_path / "bw"
+    fake.write_text(
+        FAKE_BW_SECRETS.replace("@LOG@", str(log))
+        .replace("@ITEMS@", str(items_file))
+        .replace("@SLEEP@", str(sleep))
+    )
+    fake.chmod(0o755)
+    return fake, log, items_file
+
+
+def _sitem(name, password, **kw):
+    item = {
+        "id": f"id-{name}",
+        "name": name,
+        "login": {"username": "u", "password": password, "totp": None},
+        "fields": [],
+    }
+    item.update(kw)
+    return item
+
+
+def _bwv(tmp_path, fake, *, org="org-s", cache=None):
+    boot = vault.BwBootstrap(
+        "cid",
+        "csecret",
+        "master-pw",
+        "coll-login",
+        secrets_organization_id=org,
+        secrets_collection_id="coll-s",
+    )
+    return vault.BwVault(boot, tmp_path / "appdata", bw_bin=str(fake), cache=cache)
+
+
+def test_foreign_org_item_with_the_same_collection_id_is_dropped(tmp_path):
+    pw_a, pw_b = os.urandom(12).hex(), os.urandom(12).hex()
+    items = [
+        _sitem("Mine", pw_a, organizationId="org-s", collectionIds=["coll-s"]),
+        _sitem("Foreign", pw_b, organizationId="org-x", collectionIds=["coll-s"]),
+        _sitem("Elsewhere", pw_b, organizationId="org-s", collectionIds=["coll-y"]),
+    ]
+    fake, log, _items = _fake_bw(tmp_path, items)
+    v = _bwv(tmp_path, fake)
+    assert [it.secret_id for it in v.secret_items()] == ["mine"]
+    with pytest.raises(vault.VaultError):
+        v.secret_values("foreign")
+    argvs = [json.loads(line) for line in log.read_text().splitlines()]
+    assert ["list", "items", "--collectionid", "coll-s"] in argvs
+    # Without an org id the collection's items are kept as listed (old bootstrap).
+    assert len(vault.filter_org(items, None, "coll-s")) == 3
+
+
+def test_concurrent_misses_share_one_bw_read(tmp_path):
+    fake, log, _items = _fake_bw(tmp_path, [_sitem("A", "a" * 20)], sleep=0.5)
+    v = _bwv(tmp_path, fake, org=None)
+    results, errors = [], []
+
+    def worker():
+        try:
+            results.append(v.secret_values("a").fields["password"])
+        except Exception as exc:  # noqa: BLE001  # pylint: disable=broad-exception-caught
+            errors.append(exc)
+
+    threads = [threading.Thread(target=worker) for _ in range(8)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(30)
+    assert not errors and results == ["a" * 20] * 8
+    verbs = [json.loads(line)[0] for line in log.read_text().splitlines()]
+    assert verbs.count("unlock") == 1
+    assert verbs.count("sync") == 1
+    assert verbs.count("list") == 1
+    assert verbs.count("lock") == 1
+
+
+def test_rotation_with_invalidate_never_serves_the_old_value(tmp_path):
+    old, new = os.urandom(12).hex(), os.urandom(12).hex()
+    fake, log, items_file = _fake_bw(tmp_path, [_sitem("A", old)])
+    v = _bwv(tmp_path, fake, org=None)
+    assert v.secret_values("a").fields["password"] == old
+    items_file.write_text(json.dumps([_sitem("A", new)]))
+    assert v.secret_values("a").fields["password"] == old  # cached (300 s)
+    v.invalidate()
+    for _ in range(3):
+        assert v.secret_values("a").fields["password"] == new
+    reads = [json.loads(line)[0] for line in log.read_text().splitlines()]
+    assert reads.count("list") == 2
+
+
+def test_cache_ttl_with_a_fake_clock(tmp_path):
+    now = [100.0]
+    cache = vault_cache.VaultCache(ttl_s=300, clock=lambda: now[0])
+    fake, log, _items = _fake_bw(tmp_path, [_sitem("A", "a" * 20)])
+    v = _bwv(tmp_path, fake, org=None, cache=cache)
+    v.secret_values("a")
+    now[0] += 299
+    v.secret_values("a")
+    now[0] += 2
+    v.secret_values("a")
+    lists = [json.loads(line)[0] for line in log.read_text().splitlines()]
+    assert lists.count("list") == 2
+
+
+def test_cache_caps_evict_oldest_and_stale_generations_are_refused():
+    cache = vault_cache.VaultCache(max_items=3, max_bytes=100)
+    gen = cache.generation
+    for k in range(4):
+        assert cache.put(("k", k), k, size=10, generation=gen)
+    assert cache.get(("k", 0)) is None and cache.get(("k", 3)) == 3
+    assert len(cache) == 3
+    cache.put(("big", 1), "x", size=80, generation=gen)
+    assert cache.nbytes <= 100 and cache.get(("k", 1)) is None
+    assert not cache.put(("huge", 1), "x", size=101, generation=gen)
+    new_gen = cache.bump()
+    assert len(cache) == 0
+    assert not cache.put(("k", 9), 9, size=1, generation=gen)  # read before bump
+    assert cache.put(("k", 9), 9, size=1, generation=new_gen)
+
+
+# ---------------------------------------------------------------------------
+# tp#816 A2: SecretItem + field policy
+# ---------------------------------------------------------------------------
+
+
+def _secret_json(name, password, fields=None, **kw):
+    item = _sitem(name, password, **kw)
+    item["fields"] = [{"name": k, "value": v} for k, v in (fields or {}).items()]
+    return item
+
+
+def test_secret_item_default_exposes_password_only():
+    seed = "JBSWY3DPEHPK3PXP"
+    raw = _secret_json("My Item", "p" * 20, {"api_token": "t" * 20})
+    raw["login"]["totp"] = seed
+    item, values = vault.secret_item_from_json(raw, 1)
+    assert item.secret_id == "my-item" and item.fields == ("password",)
+    assert item.has_totp and values is not None
+    assert dict(values.fields) == {"password": "p" * 20}
+    pub = json.dumps(item.public())
+    assert seed not in pub and "p" * 20 not in pub and "t" * 20 not in pub
+    assert "<redacted>" in repr(values) and seed not in repr(values)
+
+
+def test_secret_item_listed_fields():
+    raw = _secret_json(
+        "Svc",
+        "p" * 20,
+        {"agent_secret_fields": "username, api_token", "api_token": "t" * 20},
+    )
+    raw["login"]["username"] = "user-name-1"
+    item, values = vault.secret_item_from_json(raw, 1)
+    assert item.fields == ("password", "username", "api_token")
+    assert values is not None and values.fields["api_token"] == "t" * 20
+    raw2 = _secret_json(
+        "Svc", "p" * 20, {"agent_secret_fields": "notes"}, notes="n" * 9
+    )
+    assert vault.secret_item_from_json(raw2, 1)[0].fields == ("password", "notes")
+
+
+def test_secret_item_refusals():
+    dup = _secret_json("Dup", "p" * 20)
+    dup["fields"] = [{"name": "a", "value": "1"}, {"name": "a", "value": "2"}]
+    assert "duplicate" in (vault.secret_item_from_json(dup, 1)[0].refused or "")
+    seed = _secret_json("Seed", "p" * 20, {"agent_secret_fields": "totp"})
+    assert "TOTP" in (vault.secret_item_from_json(seed, 1)[0].refused or "")
+    cfg = _secret_json("Cfg", "p" * 20, {"agent_secret_fields": "agent_secret_id"})
+    assert vault.secret_item_from_json(cfg, 1)[0].refused
+    bad_id = _secret_json("X", "p" * 20, {"agent_secret_id": "Not Valid!"})
+    item, vals = vault.secret_item_from_json(bad_id, 4)
+    assert item.refused and item.secret_id == "item-4" and vals is None
+    items, values = vault.build_secret_items(
+        [_secret_json("Same", "p" * 20), _secret_json("same", "q" * 20)]
+    )
+    assert items[1].refused == "duplicate agent_secret_id"
+    assert set(values) == {"same"} and values["same"].fields["password"] == "p" * 20
+
+
+def test_secret_item_unsafe_names_are_replaced():
+    raw = _secret_json(
+        "x" * 70, "p" * 20, {"agent_secret_id": "ok-id", "agent_secret_fields": "a\tb"}
+    )
+    raw["fields"].append({"name": "a\tb", "value": "v" * 10})
+    item, _vals = vault.secret_item_from_json(raw, 7)
+    assert item.name == "item-7"
+    assert item.fields == ("password", "field-1")
+    assert vault.safe_name("ok name.1", 3) == "ok name.1"
+    assert vault.safe_name("pw=hunter2!", 3) == "item-3"
+
+
+def test_secret_item_short_values():
+    refused, _ = vault.secret_item_from_json(_secret_json("S", "abc1234"), 1)
+    assert "too short" in (refused.refused or "")
+    assert "allow_short" in (refused.refused or "")
+    ok, vals = vault.secret_item_from_json(
+        _secret_json("S", "abc1234", {"agent_secret_allow_short": "true"}), 1
+    )
+    assert ok.refused is None and ok.short and vals is not None
+    assert vals.fields["password"] == "abc1234"
+    tiny, _ = vault.secret_item_from_json(
+        _secret_json("T", "abc12", {"agent_secret_allow_short": "true"}), 1
+    )
+    assert "too short" in (tiny.refused or "")  # under 6 bytes: not even raw-only
+    ws, _ = vault.secret_item_from_json(_secret_json("W", "        "), 1)
+    assert "whitespace" in (ws.refused or "")
+    eight, _ = vault.secret_item_from_json(_secret_json("S8", "abc12345"), 1)
+    assert eight.refused is None and not eight.short
+
+
+# ---------------------------------------------------------------------------
+# tp#816 A3: atomic limiter reservation + issued-run table
+# ---------------------------------------------------------------------------
+
+
+def test_reserve_is_atomic_under_concurrency(tmp_path):
+    lim = limiter.Limiter(tmp_path / "s.json", 0, 10, 100)
+    granted: list[Any] = []
+    denied: list[Any] = []
+
+    def worker():
+        res = lim.reserve(["secret:x"], 1000.0)
+        (granted if isinstance(res, limiter.Reservation) else denied).append(res)
+
+    threads = [threading.Thread(target=worker) for _ in range(50)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(30)
+    assert len(granted) == 10 and len(denied) == 40
+    again = limiter.Limiter(tmp_path / "s.json", 0, 10, 100)  # crash / restart
+    assert isinstance(again.reserve(["secret:x"], 1001.0), limiter.Denied)
+    assert oct((tmp_path / "s.json").stat().st_mode & 0o777) == "0o600"
+
+
+def test_reserve_checks_item_and_global_caps_in_one_call(tmp_path):
+    caps = {"secret:*": (3, 0), "secret:": (2, 0)}
+    lim = limiter.Limiter(tmp_path / "s.json", 0, 99, 99, key_caps=caps)
+    assert isinstance(lim.reserve(["secret:a", "secret:*"], 0.0), limiter.Reservation)
+    assert isinstance(lim.reserve(["secret:a", "secret:*"], 1.0), limiter.Reservation)
+    item = lim.reserve(["secret:a", "secret:*"], 2.0)
+    assert isinstance(item, limiter.Denied) and item.key == "secret:a"
+    assert isinstance(lim.reserve(["secret:b", "secret:*"], 3.0), limiter.Reservation)
+    glob = lim.reserve(["secret:c", "secret:*"], 4.0)
+    assert isinstance(glob, limiter.Denied) and glob.key == "secret:*"
+    # a denied call recorded nothing for its other keys
+    state = json.loads((tmp_path / "s.json").read_text())["sites"]
+    assert "secret:c" not in state
+    assert len(state["secret:*"]["attempts"]) == 3
+    # an hour later the hourly caps have room again
+    assert isinstance(
+        lim.reserve(["secret:a", "secret:*"], 3700.0), limiter.Reservation
+    )
+
+
+def test_reserve_fails_closed_on_corrupt_state(tmp_path):
+    (tmp_path / "s.json").write_text("{nope")
+    lim = limiter.Limiter(tmp_path / "s.json", 0, 10, 10)
+    res = lim.reserve(["secret:x"], 0.0)
+    assert isinstance(res, limiter.Denied) and "unreadable" in res.reason
+
+
+def test_run_table_nonce_once_expiry_and_crash(tmp_path):
+    now = [1000.0]
+    path = tmp_path / "runs.json"
+    table = runs.RunTable(path, clock=lambda: now[0])
+    nonce = table.issue(501, ["a:password"], ["X"], "kubectl")
+    assert len(nonce) == 64 and int(nonce, 16) >= 0
+    assert oct(path.stat().st_mode & 0o777) == "0o600"
+    # a fresh instance (daemon restart) still knows the row
+    reborn = runs.RunTable(path, clock=lambda: now[0])
+    with pytest.raises(runs.RunError):
+        reborn.close(nonce, 502, exit_code=0, masked=0)  # another uid
+    row = reborn.close(nonce, 501, exit_code=0, masked=1)
+    assert row["state"] == "done" and row["masked"] == 1
+    with pytest.raises(runs.RunError):
+        reborn.close(nonce, 501, exit_code=0, masked=0)
+    stale = table.issue(501, ["a:password"], [], "sh")
+    now[0] += 601
+    abandoned = table.expire()
+    assert [r["nonce"] for r in abandoned] == [stale[:8]]
+    assert stale not in json.dumps(abandoned)
+    with pytest.raises(runs.RunError):
+        table.close(stale, 501, exit_code=0, masked=0)
+
+
+# ---------------------------------------------------------------------------
+# tp#816 A9: install + collection switch tooling
+# ---------------------------------------------------------------------------
+
+
+def _dry(*args):
+    proc = subprocess.run(
+        [str(INSTALL_SH), "-n", *args],
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=120,
+    )
+    assert proc.returncode == 0, proc.stderr
+    return proc.stdout
+
+
+def test_install_sh_dry_run_ships_secret_run_and_links_it():
+    out = _dry()
+    assert "archive" in out and "bin/secret_run.py bin/secret-run" in out
+    assert (
+        "/bin/ln -sfn /usr/local/libexec/login-broker/current/bin/secret-run "
+        "/usr/local/bin/secret-run" in out
+    )
+    assert "selfcheck.py -b" in out
+    assert "/usr/bin/sudo -u nobody" in out and "selfcheck.py -F" in out
+    assert "selfcheck.py -P" in out
+    text = INSTALL_SH.read_text()
+    assert '/usr/bin/stat -f %u "$LINK_DIR"' in text  # refuses a user-owned dir
+    assert "/bin/rm -f /usr/local/bin/secret-run" in _dry("-U")
+
+
+def test_install_sh_dry_run_collection_switch_and_rollback():
+    listing = _dry("-c")
+    assert "/usr/bin/sudo -u _loginbroker" in listing and "daemon.py -H" in listing
+    assert listing.rstrip().endswith("-C")
+    switch = _dry("-C", "org-1:coll-1", "-X", "org-2:coll-2")
+    assert "bootstrap_switch.py -H /var/db/login-broker -v - -C org-1:coll-1" in switch
+    assert "-X org-2:coll-2" in switch
+    assert "/bin/launchctl kill SIGHUP system/com.albert.login-broker" in switch
+    rollback = _dry("-B")
+    assert "bootstrap_switch.py -H /var/db/login-broker -B" in rollback
+    assert "SIGHUP" in rollback
+    reset = _dry("-r", "secret:github")
+    assert "daemon.py -H /var/db/login-broker -r secret:github" in reset
+    for bad in (["-C", "no-colon"], ["-X", "a:b c"], ["-r", "secret:Bad!"]):
+        proc = subprocess.run(
+            [str(INSTALL_SH), "-n", *bad], capture_output=True, text=True, check=False
+        )
+        assert proc.returncode != 0 and "❌" in proc.stderr
+    usage = subprocess.run(
+        [str(INSTALL_SH), "-h"], capture_output=True, text=True, check=False
+    ).stdout
+    for flag in (
+        "-c, --collections",
+        "-C, --login-collection",
+        "-X, --secrets-collection",
+        "-B, --rollback-bootstrap",
+    ):
+        assert flag in usage
+
+
+VISIBLE = (
+    "org-new\tShared\tcoll-new\tagent-login\norg-new\tShared\tcoll-sec\tagent-secrets\n"
+)
+
+
+def test_bootstrap_switch_refuses_invisible_ids_and_keeps_the_file(tmp_path, capsys):
+    home = tmp_path
+    boot = _bootfile(home / "bootstrap.json")
+    before = boot.read_bytes()
+    visible = home / "visible.tsv"
+    visible.write_text(VISIBLE)
+    rc = bootstrap_switch.main(
+        ["-H", str(home), "-v", str(visible), "-C", "org-other:coll-new"]
+    )
+    assert rc == 1 and boot.read_bytes() == before
+    assert not list(home.glob("bootstrap.json.prev-*"))
+    assert "❌" in capsys.readouterr().err
+
+
+def test_bootstrap_switch_rewrites_and_rolls_back(tmp_path, capsys):
+    home = tmp_path
+    boot = _bootfile(home / "bootstrap.json")
+    before = boot.read_bytes()
+    visible = home / "visible.tsv"
+    visible.write_text(VISIBLE)
+    args = ["-H", str(home), "-v", str(visible)]
+    assert (
+        bootstrap_switch.main(
+            [*args, "-C", "org-new:coll-new", "-X", "org-new:coll-sec"]
+        )
+        == 0
+    )
+    new = json.loads(boot.read_text())
+    assert new["client_secret"] == "csecret" and new["master_password"] == "master-pw"
+    assert new["organization_id"] == "org-new" and new["collection_id"] == "coll-new"
+    assert new["secrets_collection_id"] == "coll-sec"
+    assert oct(boot.stat().st_mode & 0o777) == "0o600"
+    prevs = list(home.glob("bootstrap.json.prev-*"))
+    assert len(prevs) == 1 and prevs[0].read_bytes() == before
+    out = capsys.readouterr().out
+    assert "✅" in out and "master-pw" not in out and "csecret" not in out
+    # the same switch again: nothing to do
+    assert bootstrap_switch.main([*args, "-C", "org-new:coll-new"]) == 0
+    assert len(list(home.glob("bootstrap.json.prev-*"))) == 1
+    # rollback restores the original; the switched file is kept
+    assert bootstrap_switch.main(["-H", str(home), "-B"]) == 0
+    assert boot.read_bytes() == before
+    kept = list(home.glob("bootstrap.json.prev-*"))
+    assert (
+        len(kept) == 1
+        and json.loads(kept[0].read_text())["collection_id"] == "coll-new"
+    )
+
+
+def test_selfcheck_secret_run_checks(tmp_path):
+    code = tmp_path / "code"
+    (code / "bin").mkdir(parents=True)
+    (code / "bin" / "secret_run.py").write_text("")
+    (code / "bin" / "secret-run").write_text("")
+    link = tmp_path / "secret-run"
+    ok, msg = selfcheck.check_link(link, code)
+    assert not ok and "missing" in msg
+    link.write_text("")
+    ok, msg = selfcheck.check_link(link, code)
+    assert not ok and "not a symlink" in msg
+    link.unlink()
+    link.symlink_to(code / "bin" / "secret-run")
+    ok, msg = selfcheck.check_link(link, code)
+    assert not ok and ("root" in msg or os.geteuid() == 0)
+    ok, msg = selfcheck.check_client_writable(code, "me")
+    assert not ok and "writable" in msg
+    home = tmp_path / "home"
+    home.mkdir()
+    good = home / "secret-runs.json"
+    good.write_text("{}")
+    good.chmod(0o600)
+    bad = home / "secret-limiter.json"
+    bad.write_text("{}")
+    bad.chmod(0o644)
+    verdicts = dict(
+        (m.split(" ", 2)[1], ok) for ok, m in selfcheck.check_state_perms(home)
+    )
+    assert verdicts["secret-runs.json"] is True
+    assert verdicts["secret-limiter.json"] is False
+    assert verdicts["leakcheck-labels.json"] is True  # not created yet
+
+
+def test_selfcheck_forbidden_probe(sockdir, tmp_path):
+    with running(sockdir, tmp_path, StubRunner(), allow_uid=os.getuid() + 1) as (
+        _b,
+        path,
+    ):
+        ok, msg = selfcheck.probe_forbidden(Path(path))
+    assert ok and "forbidden" in msg
+    sub = tmp_path / "served"
+    sub.mkdir()
+    with running(sockdir, sub, StubRunner()) as (brk, path):  # serves our uid
+        brk.allow_uid = os.getuid()
+        ok, _msg = selfcheck.probe_forbidden(Path(path))
+    assert not ok

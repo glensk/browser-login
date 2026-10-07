@@ -41,6 +41,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))  # the repo's `broker` package
 # pylint: disable=wrong-import-position
 import agent_login_keychain  # noqa: E402
+import agent_login_secrets  # noqa: E402
 from agent_login_claude import (  # noqa: E402
     CLAUDE_ACCOUNTS,
     SITE_INSTANCE,
@@ -440,6 +441,7 @@ def agent_summary(data: dict, checks: dict[str, dict]) -> str:
         "",
         *ok_lines,
         *bad_lines,
+        *agent_login_secrets.summary_lines(data.get("secrets") or []),
         "",
         f"Full status: `{here}/agent-login.py` (❌ items need Albert unless noted).",
     ]
@@ -453,6 +455,8 @@ def write_agent_summary(data: dict | None = None) -> Path:
     data = data or overview()
     path = _state_path(AGENTS_FILE_NAME)
     path.parent.mkdir(parents=True, exist_ok=True)
+    if "secrets" not in data:  # the -S snapshot's list; never a broker call here
+        data = {**data, "secrets": agent_login_secrets.snapshot_secrets(path.parent)}
     tmp = path.with_suffix(".tmp")
     tmp.write_text(agent_summary(data, last_checks()), encoding="utf-8")
     tmp.replace(path)
@@ -875,7 +879,8 @@ def build_parser() -> argparse.ArgumentParser:
         "-S",
         "--snapshot",
         action="store_true",
-        help="refresh the site-list snapshot and the agents file, print nothing "
+        help="refresh the site-list and secret-run snapshots and the agents file "
+        "(which also lists the secrets agents can inject), print nothing "
         "(LaunchAgent, every 10 min)",
     )
     ap.add_argument(
@@ -962,6 +967,9 @@ def main() -> int:
         return rc
     if args.snapshot:
         data = overview(fresh=True)
+        _note, data["secrets"] = agent_login_secrets.secrets_state(
+            broker_request, _state_path(AGENTS_FILE_NAME).parent, fresh=True
+        )
         write_agent_summary(data)
         agent_login_keychain.refresh(_state_path("keychain.json"))
         return 0 if data["broker_ok"] else 1
