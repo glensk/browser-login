@@ -67,6 +67,11 @@ class SiteItem:  # pylint: disable=too-many-instance-attributes
     # Which authenticator to answer when the account has several (Keycloak's
     # "selectedCredentialId" choice): a substring of its label, e.g. "Mac m1".
     otp_label: str | None = None
+    # `agent_fresh_login`: every login first clears the broker profile's cookies
+    # for the site's cookie hosts and fill origins, so the login runs through
+    # the identity provider again and its session-only SSO cookie is created in
+    # THIS run (and exported, when `cookie_hosts` names the IdP host).
+    fresh_login: bool = False
     refused: str | None = None
     item_id: str = ""
 
@@ -91,6 +96,7 @@ class SiteItem:  # pylint: disable=too-many-instance-attributes
             "login_url": self.login_url,
             "check_url": self.check_url,
             "logged_in_selector": self.logged_in_selector,
+            "fresh_login": self.fresh_login,
             "refused": self.refused is not None,
             "reason": self.refused or "",
         }
@@ -124,6 +130,21 @@ def _page_url_ok(url: str, *, dev: bool) -> bool:
     if url.startswith("https://"):
         return True
     return dev and url.startswith("http://127.0.0.1")
+
+
+_TRUE = frozenset({"true", "1", "yes", "on"})
+_FALSE = frozenset({"", "false", "0", "no", "off"})
+
+
+def _parse_flag(raw: str) -> bool | None:
+    """A boolean custom field (``true``/``1``/``yes``/``on`` or the opposites,
+    case-insensitive; empty = false); None for anything else."""
+    value = raw.strip().lower()
+    if value in _TRUE:
+        return True
+    if value in _FALSE:
+        return False
+    return None
 
 
 def _split_list(raw: str) -> list[str]:
@@ -239,6 +260,9 @@ def site_item_from_json(item: Mapping[str, Any], *, dev: bool = False) -> SiteIt
     )
     if not _page_url_ok(login_url, dev=dev):
         return refused("bad agent_login_url")
+    fresh_login = _parse_flag(fields.get("agent_fresh_login", ""))
+    if fresh_login is None:
+        return refused("bad agent_fresh_login (true or false)")
     return SiteItem(
         fill_origins=fill_origins,
         cookie_hosts=cookie_hosts,
@@ -248,6 +272,7 @@ def site_item_from_json(item: Mapping[str, Any], *, dev: bool = False) -> SiteIt
         check_url=check_url,
         logged_in_selector=sentinel,
         otp_label=fields.get("agent_otp_label", "").strip() or None,
+        fresh_login=fresh_login,
         site=site,
         name=name,
         item_id=item_id,

@@ -1943,3 +1943,356 @@ def test_smartsheet_item_gets_built_in_check_and_sentinel() -> None:
         },
     )
     assert vault.site_item_from_json(own).logged_in_selector == "#mine"
+
+
+# ---------------------------------------------------------------------------
+# agent_fresh_login (tp#803): a fresh IdP login per call, IdP cookie handed over
+# ---------------------------------------------------------------------------
+
+EDUID_FIELDS = {
+    "agent_site": "eduid",
+    "agent_fill_origins": "https://login.eduid.ch",
+    "agent_check_url": "https://eduid.ch/account",
+    "agent_cookie_hosts": "eduid.ch login.eduid.ch",
+}
+
+
+def test_item_reads_agent_fresh_login() -> None:
+    def parse(value):
+        fields = dict(EDUID_FIELDS)
+        if value is not None:
+            fields["agent_fresh_login"] = value
+        return vault.site_item_from_json(_item("SWITCH edu-ID", fields))
+
+    for value in ("true", "TRUE", " 1 ", "yes", "on"):
+        assert parse(value).fresh_login is True, value
+    for value in (None, "", "false", "0", "no", "Off"):
+        it = parse(value)
+        assert it.fresh_login is False and not it.refused, value
+    bad = parse("maybe")
+    assert bad.refused and "agent_fresh_login" in bad.refused
+    assert parse("true").public()["fresh_login"] is True
+
+
+def test_fresh_login_hosts_cover_cookie_hosts_fill_origins_and_parents() -> None:
+    it = vault.site_item_from_json(
+        _item(
+            "x",
+            {
+                "agent_fill_origins": "https://login.x.example:8443",
+                "agent_check_url": "https://www.x.example/me",
+                "agent_cookie_hosts": ".www.x.example",
+                "agent_fresh_login": "true",
+            },
+        )
+    )
+    hosts = daemon.fresh_login_hosts(it)
+    assert hosts == ["www.x.example", "login.x.example"]
+    reach = daemon.cookie_reaches_hosts
+    assert reach(".x.example", hosts)  # parent domain: sent to both hosts
+    assert reach("login.x.example", hosts)
+    assert reach("a.www.x.example", hosts)  # set below a cookie host
+    assert not reach("other.x.example", hosts)
+    assert not reach("x.example.evil", hosts)
+    assert not reach("", hosts)
+
+
+def test_eduid_idp_session_cookie_exported_only_when_named() -> None:
+    """The IdP's SSO cookie is session-only (no expiry): it leaves the broker,
+    still without `expires`, only when the item names login.eduid.ch; the
+    client's scope rule agrees in both cases."""
+    cookies = [
+        _ck("login.eduid.ch", "shib_idp_session", "sso", expires=-1, secure=True),
+        _ck("login.eduid.ch", "__Host-JSESSIONID", "j", expires=-1, secure=True),
+        _ck(".eduid.ch", "eduid_account", "acct", expires=2_000_000_000.0),
+    ]
+    named_hosts = ["eduid.ch", "login.eduid.ch"]
+    named = bundle.filter_cookies(cookies, bundle.SiteBundleSpec(named_hosts))
+    assert [c["name"] for c in named] == [
+        "shib_idp_session",
+        "__Host-JSESSIONID",
+        "eduid_account",
+    ]
+    assert "expires" not in named[0] and named[0]["secure"] is True
+    unnamed = bundle.filter_cookies(cookies, bundle.SiteBundleSpec(["eduid.ch"]))
+    assert [c["name"] for c in unnamed] == ["eduid_account"]
+    for hosts in (named_hosts, ["eduid.ch"]):
+        spec = bundle.SiteBundleSpec(hosts)
+        for c in cookies:
+            assert bundle.cookie_in_scope(
+                c["domain"], c["name"], spec
+            ) == browser._broker_cookie_in_scope(c["domain"], c["name"], hosts, None)
+
+
+class _JarCtx:
+    """A cookie jar with Playwright's `cookies` / `clear_cookies` / `add_cookies`."""
+
+    def __init__(self, cookies, log=None):
+        self.jar = [dict(c) for c in cookies]
+        self.log = log if log is not None else []
+        self.pages = [object()]
+
+    def cookies(self):
+        return [dict(c) for c in self.jar]
+
+    def clear_cookies(self, name=None, domain=None, path=None):
+        self.log.append(("clear", name, domain))
+        self.jar = [
+            c
+            for c in self.jar
+            if not (c["name"] == name and c["domain"] == domain and c["path"] == path)
+        ]
+
+    def add_cookies(self, cookies):
+        self.log.append(("add", tuple(c["name"] for c in cookies)))
+        self.jar.extend(dict(c) for c in cookies)
+
+
+class _JarBrowser:
+    def __init__(self, ctx):
+        self.contexts = [ctx]
+
+
+def test_client_import_keeps_a_named_idp_cookie() -> None:
+    """browser.py replaces the shared browser's login.eduid.ch cookies with the
+    bundle's when the item names that host, and never touches them otherwise."""
+    stale = _ck("login.eduid.ch", "shib_idp_session", "stale")
+    other = _ck("accounts.google.com", "SID", "g")
+    fresh = {**_ck("login.eduid.ch", "shib_idp_session", "sso"), "secure": True}
+    named = {
+        "cookie_hosts": ["eduid.ch", "login.eduid.ch"],
+        "cookie_names": None,
+        "cookies": [fresh],
+    }
+    ctx = _JarCtx([stale, other])
+    assert browser._broker_replace_cookies(_JarBrowser(ctx), named) == 1
+    assert sorted((c["domain"], c["value"]) for c in ctx.jar) == [
+        ("accounts.google.com", "g"),
+        ("login.eduid.ch", "sso"),
+    ]
+    unnamed = {**named, "cookie_hosts": ["eduid.ch"]}
+    ctx = _JarCtx([stale])
+    assert browser._broker_replace_cookies(_JarBrowser(ctx), unnamed) == 0
+    assert [c["value"] for c in ctx.jar] == ["stale"]
+    assert not ctx.log
+
+
+def test_fresh_login_clears_profile_cookies_before_the_recipe(
+    tmp_path, monkeypatch
+) -> None:
+    """With agent_fresh_login the runner wipes the site's cookies (account cookie
+    and stale IdP cookie alike), skips the "already logged in" shortcut, and only
+    then runs the recipe; unrelated cookies of the profile stay."""
+    events: list = []
+    ctx = _JarCtx(
+        [
+            _ck(".eduid.ch", "eduid_account", "acct"),
+            _ck("login.eduid.ch", "shib_idp_session", "old"),
+            _ck("example.org", "keep"),
+        ],
+        log=events,
+    )
+    runner = daemon.PlaywrightRunner(tmp_path, dev=False)
+    checks: list = []
+
+    def profile_logged_in(_page, _item):
+        checks.append([c["name"] for c in ctx.jar])
+        return True
+
+    def recipe(_page, _item, secret, *, dev):
+        events.append(("recipe", sorted(c["name"] for c in ctx.jar)))
+        assert secret.password == PASSWORD
+
+    monkeypatch.setattr(runner, "_profile_logged_in", profile_logged_in)
+    monkeypatch.setattr(daemon, "recipe_for", lambda _site: recipe)
+    monkeypatch.setattr(
+        runner, "export_bundle", lambda _ctx, it, via: {"site": it.site, "via": via}
+    )
+    secret = vault.Secret(username="a@b.ch", password=PASSWORD)
+    fresh = vault.site_item_from_json(
+        _item("SWITCH edu-ID", {**EDUID_FIELDS, "agent_fresh_login": "true"})
+    )
+    assert runner.run_in_context(ctx, fresh, lambda: secret)["via"] == "login"
+    assert events == [
+        ("clear", "eduid_account", ".eduid.ch"),
+        ("clear", "shib_idp_session", "login.eduid.ch"),
+        ("recipe", ["keep"]),
+    ]
+    assert checks == [["keep"]]  # only the positive proof AFTER the recipe
+
+    # Without the flag the profile's session is reused: no wipe, no recipe.
+    events.clear()
+    checks.clear()
+    ctx.jar.append(_ck(".eduid.ch", "eduid_account", "acct"))
+    plain = vault.site_item_from_json(_item("SWITCH edu-ID", EDUID_FIELDS))
+    assert runner.run_in_context(ctx, plain, lambda: secret)["via"] == "profile"
+    assert not events and len(checks) == 1
+
+
+E2E_SSO = "sso-0123456789"
+E2E_ACCOUNT = "acct-0123456789"
+
+
+class _IdpApp(http.server.BaseHTTPRequestHandler):
+    """An edu-ID-like pair: the site (check page /account, long-lived account
+    cookie) logs in through an IdP on another origin whose SSO cookie is
+    SESSION-ONLY. A live IdP session passes /idp/login and /idp/authorize
+    without any form."""
+
+    idp_origin = ""
+    site_origin = ""
+    idp_logins: list[str] = []  # one entry per password POST the IdP accepted
+
+    def log_message(self, *args):
+        return
+
+    def _send(self, code, body="", headers=()):
+        self.send_response(code)
+        for k, v in headers:
+            self.send_header(k, v)
+        self.send_header("Content-Type", "text/html")
+        self.end_headers()
+        self.wfile.write(body.encode())
+
+    def do_GET(self):  # noqa: N802
+        cookies = self.headers.get("Cookie") or ""
+        sso = f"idp_sso={E2E_SSO}" in cookies
+        cls = type(self)
+        form = (
+            "<html><body><form method=post action=/idp/login>"
+            "<input type=text name=user><input type=password name=pw>"
+            "<button type=submit>Go</button></form></body></html>"
+        )
+        if self.path.startswith("/account"):
+            if f"acct={E2E_ACCOUNT}" in cookies:
+                self._send(200, "<html><body><h1>My account</h1></body></html>")
+            else:
+                self._send(302, headers=[("Location", cls.idp_origin + "/idp/login")])
+        elif self.path.startswith("/callback"):
+            acct = f"acct={E2E_ACCOUNT}; Path=/; Max-Age=3600; HttpOnly"
+            self._send(302, headers=[("Set-Cookie", acct), ("Location", "/account")])
+        elif self.path.startswith("/idp/login"):
+            if sso:
+                self._send(302, headers=[("Location", cls.site_origin + "/callback")])
+            else:
+                self._send(200, form)
+        elif self.path.startswith("/idp/authorize"):
+            self._send(
+                200, "<html><body><div id=code>c</div></body></html>" if sso else form
+            )
+        else:
+            self._send(404, "nope")
+
+    def do_POST(self):  # noqa: N802
+        n = int(self.headers.get("Content-Length") or 0)
+        from urllib.parse import parse_qs
+
+        q = parse_qs(self.rfile.read(n).decode())
+        cls = type(self)
+        if q.get("user") == [E2E_USER] and q.get("pw") == [PASSWORD]:
+            cls.idp_logins.append(self.path)
+            self._send(
+                302,
+                headers=[
+                    # No Max-Age / Expires: a session cookie, like the real IdP's.
+                    ("Set-Cookie", f"idp_sso={E2E_SSO}; Path=/; HttpOnly"),
+                    ("Location", cls.site_origin + "/callback"),
+                ],
+            )
+        else:
+            self._send(302, headers=[("Location", "/idp/login?err=1")])
+
+
+@contextlib.contextmanager
+def _idp_servers():
+    servers = [
+        http.server.ThreadingHTTPServer(("127.0.0.1", 0), _IdpApp) for _ in range(2)
+    ]
+    for srv in servers:
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+    idp, site = (f"http://127.0.0.1:{srv.server_address[1]}" for srv in servers)
+    _IdpApp.idp_origin, _IdpApp.site_origin = idp, site
+    _IdpApp.idp_logins = []
+    try:
+        yield idp, site
+    finally:
+        for srv in servers:
+            srv.shutdown()
+            srv.server_close()
+
+
+@pytest.mark.browser
+@pytest.mark.skipif(
+    os.environ.get("LOGIN_BROKER_E2E") != "1", reason="set LOGIN_BROKER_E2E=1"
+)
+def test_e2e_fresh_login_hands_over_the_session_only_idp_cookie(
+    sockdir, tmp_path, monkeypatch
+):
+    """tp#803: without agent_fresh_login the second call reuses the profile's
+    account cookie and carries NO IdP cookie (it was session-only); with it,
+    every call logs in at the IdP again and the bundle carries the IdP's
+    session cookie, which a fresh client browser then uses to pass the IdP
+    without a form. The loopback host stands in for an IdP host here."""
+    from playwright.sync_api import sync_playwright
+
+    for mod in (bundle, browser):
+        name = "IDP_HOSTS" if mod is bundle else "BROKER_IDP_HOSTS"
+        monkeypatch.setattr(mod, name, frozenset({*bundle.IDP_HOSTS, "127.0.0.1"}))
+    with _idp_servers() as (idp, site):
+
+        def item(name, **extra):
+            fields = {
+                "agent_site": name,
+                "agent_fill_origins": idp,
+                "agent_check_url": site + "/account",
+                "agent_cookie_hosts": "127.0.0.1",
+                **extra,
+            }
+            return _item(name, fields, user=E2E_USER, totp=None)
+
+        items = [item("plain"), item("fresh", agent_fresh_login="true")]
+        runner = daemon.PlaywrightRunner(tmp_path / "home", dev=True)
+        with running(sockdir, tmp_path, runner, items=items) as (_brk, path):
+            got = {
+                (site_id, n): json.loads(_ask(path, {"op": "login", "site": site_id}))
+                for site_id in ("plain", "fresh")
+                for n in (1, 2)
+            }
+        for resp in got.values():
+            assert resp["ok"], resp
+            assert PASSWORD not in json.dumps(resp)
+
+        def names(key):
+            return sorted(c["name"] for c in got[key]["bundle"]["cookies"])
+
+        assert got["plain", 1]["bundle"]["via"] == "login"
+        assert names(("plain", 1)) == ["acct", "idp_sso"]
+        assert got["plain", 2]["bundle"]["via"] == "profile"
+        assert names(("plain", 2)) == ["acct"]  # the bug: no IdP session left
+        for n in (1, 2):
+            assert got["fresh", n]["bundle"]["via"] == "login"
+            assert names(("fresh", n)) == ["acct", "idp_sso"]
+        sso = next(
+            c for c in got["fresh", 2]["bundle"]["cookies"] if c["name"] == "idp_sso"
+        )
+        assert sso["value"] == E2E_SSO and "expires" not in sso
+        assert len(_IdpApp.idp_logins) == 3  # plain once, fresh twice
+
+        # Client import into a fresh browser holding a stale IdP cookie.
+        with sync_playwright() as pw:
+            client = pw.chromium.launch(headless=True)
+            try:
+                ctx = client.new_context()
+                ctx.add_cookies(
+                    [{"name": "idp_sso", "value": "stale", "url": idp + "/"}]
+                )
+                assert (
+                    browser._broker_replace_cookies(client, got["fresh", 2]["bundle"])
+                    == 2
+                )
+                page = ctx.new_page()
+                page.goto(idp + "/idp/authorize")
+                assert page.locator("#code").count() == 1
+                assert page.locator("input[type=password]").count() == 0
+            finally:
+                client.close()

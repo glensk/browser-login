@@ -38,6 +38,7 @@ import stat
 import sys
 import threading
 import time
+import urllib.parse
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -220,6 +221,61 @@ class PlaywrightRunner:
             "cookie_names": spec.cookie_names,
         }
 
+    def clear_site_cookies(self, ctx: Any, item: SiteItem) -> int:
+        """``agent_fresh_login``: delete every cookie of the broker's OWN profile
+        that the browser would send to one of the site's cookie hosts or fill
+        origin hosts (the host itself, a subdomain or a parent domain of it).
+
+        Afterwards neither the site's long-lived account cookie nor a stale IdP
+        cookie can short-circuit the login. Returns the number deleted.
+        """
+        hosts = fresh_login_hosts(item)
+        cleared = 0
+        for ck in ctx.cookies():
+            domain = str(ck.get("domain") or "")
+            if cookie_reaches_hosts(domain, hosts):
+                ctx.clear_cookies(
+                    name=ck.get("name"), domain=domain, path=ck.get("path") or "/"
+                )
+                cleared += 1
+        return cleared
+
+    def run_in_context(
+        self, ctx: Any, item: SiteItem, get_secret: Callable[[], Secret]
+    ) -> dict[str, Any]:
+        """Profile check (or, with ``fresh_login``, a cookie wipe), recipe,
+        positive proof and export on an already launched context."""
+        page = ctx.pages[0] if ctx.pages else ctx.new_page()
+        if item.fresh_login:
+            # Never "via profile": the login must pass through the IdP in this
+            # run so its session-only SSO cookie exists when the bundle is cut.
+            self.clear_site_cookies(ctx, item)
+            reuse = False
+        else:
+            reuse = self._profile_logged_in(page, item)
+        if reuse:
+            return self.export_bundle(ctx, item, "profile")
+        secret = get_secret()
+        try:
+            recipe_for(item.site)(page, item, secret, dev=self.dev)
+        except RecipeError:
+            self._record_failure(page, item, secret)
+            raise
+        # Snapshot where the recipe ended — the check below navigates away.
+        try:
+            before = diagnose(page, secret)
+        except Exception:  # pylint: disable=broad-exception-caught
+            before = {}
+        # Positive proof after EVERY login, whatever the recipe saw.
+        if not self._profile_logged_in(page, item):
+            self._record_failure(page, item, secret)
+            self.last_diag[item.site]["before_check"] = before
+            raise LoginFailed(
+                "login did not reach a logged-in state (check URL / sentinel)",
+                submitted=True,
+            )
+        return self.export_bundle(ctx, item, "login")
+
     def __call__(
         self, item: SiteItem, get_secret: Callable[[], Secret]
     ) -> dict[str, Any]:
@@ -232,35 +288,35 @@ class PlaywrightRunner:
         with sync_playwright() as pw:
             ctx = self._launch(pw, profile)
             try:
-                page = ctx.pages[0] if ctx.pages else ctx.new_page()
-                if self._profile_logged_in(page, item):
-                    via = "profile"
-                else:
-                    secret = get_secret()
-                    try:
-                        recipe_for(item.site)(page, item, secret, dev=self.dev)
-                    except RecipeError:
-                        self._record_failure(page, item, secret)
-                        raise
-                    # Snapshot where the recipe ended — the check below navigates away.
-                    try:
-                        before = diagnose(page, secret)
-                    except Exception:  # pylint: disable=broad-exception-caught
-                        before = {}
-                    # Positive proof after EVERY login, whatever the recipe saw.
-                    if not self._profile_logged_in(page, item):
-                        self._record_failure(page, item, secret)
-                        self.last_diag[item.site]["before_check"] = before
-                        raise LoginFailed(
-                            "login did not reach a logged-in state "
-                            "(check URL / sentinel)",
-                            submitted=True,
-                        )
-                    via = "login"
-                return self.export_bundle(ctx, item, via)
+                return self.run_in_context(ctx, item, get_secret)
             finally:
                 with contextlib.suppress(Exception):
                     ctx.close()
+
+
+def fresh_login_hosts(item: SiteItem) -> list[str]:
+    """The hosts an ``agent_fresh_login`` wipe covers: the cookie hosts plus the
+    hosts of the fill origins (lower-case, no leading dot, no port)."""
+    hosts: list[str] = []
+    for host in [*item.cookie_hosts, *(url_host(o) for o in item.fill_origins)]:
+        h = host.strip().lstrip(".").lower()
+        if h and h not in hosts:
+            hosts.append(h)
+    return hosts
+
+
+def url_host(origin: str) -> str:
+    """``https://login.eduid.ch:8443`` -> ``login.eduid.ch``."""
+    return (urllib.parse.urlsplit(origin).hostname or "").lower()
+
+
+def cookie_reaches_hosts(domain: str, hosts: list[str]) -> bool:
+    """True iff a cookie of `domain` is sent to (or set below) one of `hosts`:
+    the same host, a subdomain of it, or a parent domain of it."""
+    d = domain.strip().lstrip(".").lower()
+    if not d:
+        return False
+    return any(d == h or d.endswith("." + h) or h.endswith("." + d) for h in hosts)
 
 
 # ---------------------------------------------------------------------------

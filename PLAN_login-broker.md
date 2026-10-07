@@ -310,6 +310,13 @@ the agent the portal session. Record as Albert's decision of 2026-10-01 in
       login-keychain list (`agent_login_keychain.py`, names only; 🔓 = an agent can print it
       without a prompt; `-K` rescans; `-S` rescans hourly). 8 items carry a SECRET as their
       service name → masked in the list, logged under tp#97.
+      **2026-10-07 (tp#803):** item field `agent_fresh_login` (README "Login broker items"):
+      each login wipes the broker profile's cookies for the cookie hosts + fill origins, skips
+      the profile shortcut and logs in at the IdP again, so the bundle carries the IdP's
+      session-only SSO cookie (edu-ID: `agent_cookie_hosts = eduid.ch login.eduid.ch`).
+      Hermetic tests + E2E (`test_e2e_fresh_login_hands_over_the_session_only_idp_cookie`).
+      NEEDS REINSTALL (`install/install.sh`, Albert) and the field on the `eduid` item;
+      acceptance = tp#803 (OIDC authorize returns a code without typing, auth_time < 60 s).
 
 ### Phase 4 — close out
 
