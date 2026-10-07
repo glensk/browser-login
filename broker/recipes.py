@@ -26,6 +26,7 @@ from collections.abc import Callable
 from typing import TYPE_CHECKING, Any
 
 from broker.origins import form_action_allowed, origin_allowed, url_origin
+from broker.otp_detect import OTP_CANDIDATE_SELECTOR, OTP_DESCRIBE_JS, otp_field_like
 
 if TYPE_CHECKING:  # annotations only: vault imports DEFAULT_CHECK_URLS from here
     from broker.vault import Secret, SiteItem
@@ -225,15 +226,36 @@ BLOCKED_TEXT_RE = re.compile(
 )
 
 
+# src of every iframe a human could see. A captcha widget that is rendered but
+# hidden (Infomaniak keeps an idle reCAPTCHA in a ``<div hidden>`` on every
+# login step, verified from its bundle 2026-10-07) is no challenge; once the
+# site reveals it, the next check sees it.
+_SHOWN_IFRAME_SRCS_JS = """els => els.filter(e => e.getClientRects().length > 0
+    && getComputedStyle(e).visibility !== 'hidden')
+  .map(e => e.getAttribute('src') || '')"""
+
+
+def _frame_shown(frame: Any) -> bool:
+    """False only for a child frame whose <iframe> element is provably hidden
+    (no box / ``visibility: hidden``, e.g. inside ``display: none``). The main
+    frame and any frame that cannot be inspected count as shown (fail closed:
+    a challenge there still means "needs a human")."""
+    try:
+        if getattr(frame, "parent_frame", None) is None:
+            return True
+        element = frame.frame_element()
+        return bool(element.is_visible())
+    except Exception:  # pylint: disable=broad-exception-caught
+        return True
+
+
 def challenge_reason(page: Any) -> str | None:
     """``"captcha"`` when a captcha / bot-challenge is on the page, else None."""
     if interstitial_title(page):
         return "captcha"
     try:
-        frames = [f.url for f in page.frames]
-        srcs = page.eval_on_selector_all(
-            "iframe", "els => els.map(e => e.getAttribute('src') || '')"
-        )
+        frames = [f.url for f in page.frames if _frame_shown(f)]
+        srcs = page.eval_on_selector_all("iframe", _SHOWN_IFRAME_SRCS_JS)
     except Exception:  # pylint: disable=broad-exception-caught
         return None
     if any(CHALLENGE_SRC_RE.search(str(u or "")) for u in [*frames, *srcs]):
@@ -407,6 +429,29 @@ def _wait_visible(page: Any, selector: str, timeout_s: float) -> Any:
     return None
 
 
+def _otp_field(page: Any) -> Any:
+    """The visible TOTP input, or None.
+
+    ``OTP_SELECTOR`` first; then — only while no password field is visible —
+    the first visible, editable ``OTP_CANDIDATE_SELECTOR`` input that
+    ``otp_field_like`` accepts (never a username field)."""
+    el = _visible(page, OTP_SELECTOR)
+    if el is not None:
+        return el
+    if _visible(page, PASSWORD_SELECTOR) is not None:
+        return None
+    try:
+        for cand in page.query_selector_all(OTP_CANDIDATE_SELECTOR):
+            if not cand.is_visible() or not cand.is_editable():
+                continue
+            desc = cand.evaluate(OTP_DESCRIBE_JS, USERNAME_SELECTOR)
+            if isinstance(desc, dict) and otp_field_like(desc):
+                return cand
+    except Exception:  # pylint: disable=broad-exception-caught
+        return None
+    return None
+
+
 # Keycloak lists several OTP credentials as radios; labels are not secrets.
 _SELECT_OTP_JS = """(label) => {
   const rs = [...document.querySelectorAll('input[name=selectedCredentialId]')];
@@ -457,7 +502,7 @@ def _fill_otp(  # pylint: disable=too-many-arguments
     code = fresh_totp(secret.totp_seed)
     if not code:
         raise LoginFailed("could not produce a TOTP code", submitted=True)
-    otp_field = _visible(page, OTP_SELECTOR)  # re-query: the wait may have taken s
+    otp_field = _otp_field(page)  # re-query: the wait may have taken s
     if otp_field is None:
         raise LoginFailed("the OTP field disappeared", submitted=True)
     _select_authenticator(page, otp_label)
@@ -642,7 +687,7 @@ def generic_login(
     while time.monotonic() < deadline:
         page.wait_for_timeout(500)
         _check_challenge(page, submitted=True)
-        otp_field = None if otp_done else _visible(page, OTP_SELECTOR)
+        otp_field = None if otp_done else _otp_field(page)
         if otp_field is not None:
             _fill_otp(
                 page, otp_field, secret, allowed, dev=dev, otp_label=item.otp_label
