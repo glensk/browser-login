@@ -37,7 +37,7 @@ import pytest
 REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO))
 
-from broker import daemon, limiter, otp_detect, recipes, vault  # noqa: E402
+from broker import daemon, limiter, otp_detect, page_state, recipes, vault  # noqa: E402
 
 SEED = "JBSWY3DPEHPK3PXP"  # the RFC/pyotp documentation seed, never a real one
 EMAIL = "alice@example.com"
@@ -171,7 +171,7 @@ class _CaptchaPage:
         return "Infomaniak"
 
     def eval_on_selector_all(self, _sel: str, js: str) -> list[str]:
-        assert js == recipes._SHOWN_IFRAME_SRCS_JS  # visibility filtered in-page
+        assert js == page_state._SHOWN_IFRAME_SRCS_JS  # visibility filtered in-page
         return self._srcs
 
     def evaluate(self, _js: str) -> str:

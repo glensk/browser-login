@@ -26,15 +26,23 @@ from collections.abc import Callable
 from typing import TYPE_CHECKING, Any
 
 from broker.login_form import (
+    BUTTON_DESCRIBE_JS,
     FORM_ACTION_JS,
     SUBMIT_BUTTON_JS,
     USERNAME_JS,
+    form_submit_buttons,
     pick_login_password,
     pick_login_username,
+    pick_submit_button,
     pick_visible,
 )
-from broker.origins import form_action_allowed, origin_allowed, url_origin
+from broker.origins import form_action_allowed, origin_allowed, origin_hint, url_origin
 from broker.otp_detect import OTP_CANDIDATE_SELECTOR, OTP_DESCRIBE_JS, otp_field_like
+from broker.page_state import (  # browser.py imports interstitial_title from here
+    challenge_reason,
+    interstitial_title,
+    sentinel_shown,
+)
 
 if TYPE_CHECKING:  # annotations only: vault imports DEFAULT_CHECK_URLS from here
     from broker.vault import Secret, SiteItem
@@ -47,10 +55,6 @@ USERNAME_SELECTOR = (
     "input[name=username], input[name=email], input[name=identifier], input#username"
 )
 OTP_SELECTOR = "input[autocomplete=one-time-code], input[name*=otp i], #otp"
-CHALLENGE_SRC_RE = re.compile(
-    r"recaptcha|hcaptcha|turnstile|challenges\.cloudflare", re.IGNORECASE
-)
-CHALLENGE_TITLES = ("nur einen moment", "just a moment")
 STEP_TIMEOUT_S = 20.0
 # Identifier-first logins that offer a passkey (SWITCH edu-ID, verified
 # 2026-10-07) show "Use password" / "Use a passkey" buttons instead of the
@@ -72,6 +76,8 @@ PASSKEY_RE = re.compile(
     re.IGNORECASE,
 )
 SETTLE_TIMEOUT_S = 30.0
+# agent_pre_click: re-click while the element stays and no login field shows.
+PRE_CLICK_RETRY_S = 3.0
 
 CSCS_AUTH_ORIGIN = "https://auth.cscs.ch"
 CSCS_PORTAL_ORIGIN = "https://portal.cscs.ch"
@@ -181,71 +187,6 @@ def fresh_totp(
     return str(otp.at(now))
 
 
-def interstitial_title(page: Any) -> bool:
-    """True on a bot-check interstitial ("Just a moment…")."""
-    try:
-        title = (page.title() or "").strip().lower()
-    except Exception:  # pylint: disable=broad-exception-caught
-        title = ""
-    return any(title.startswith(t) for t in CHALLENGE_TITLES)
-
-
-# Fraud-protection pages: retrying makes them worse, so they mean "needs a human".
-BLOCKED_TEXT_RE = re.compile(
-    r"IP-Bereich vor\u00fcbergehend gesperrt|IP-Bereich gesperrt|temporarily blocked"
-    r"|too many (?:login )?attempts|zu viele (?:Anmelde)?versuche"
-    r"|trop de tentatives|Zugriff vor\u00fcbergehend gesperrt",
-    re.IGNORECASE,
-)
-
-
-# src of every iframe a human could see. A captcha widget that is rendered but
-# hidden (Infomaniak keeps an idle reCAPTCHA in a ``<div hidden>`` on every
-# login step, verified from its bundle 2026-10-07) is no challenge; once the
-# site reveals it, the next check sees it.
-_SHOWN_IFRAME_SRCS_JS = """els => els.filter(e => e.getClientRects().length > 0
-    && getComputedStyle(e).visibility !== 'hidden')
-  .map(e => e.getAttribute('src') || '')"""
-
-
-def _frame_shown(frame: Any) -> bool:
-    """False only for a child frame whose <iframe> element is provably hidden
-    (no box / ``visibility: hidden``, e.g. inside ``display: none``). The main
-    frame and any frame that cannot be inspected count as shown (fail closed:
-    a challenge there still means "needs a human")."""
-    try:
-        if getattr(frame, "parent_frame", None) is None:
-            return True
-        element = frame.frame_element()
-        return bool(element.is_visible())
-    except Exception:  # pylint: disable=broad-exception-caught
-        return True
-
-
-def challenge_reason(page: Any) -> str | None:
-    """``"captcha"`` when a captcha / bot-challenge is on the page, else None."""
-    if interstitial_title(page):
-        return "captcha"
-    try:
-        frames = [f.url for f in page.frames if _frame_shown(f)]
-        srcs = page.eval_on_selector_all("iframe", _SHOWN_IFRAME_SRCS_JS)
-    except Exception:  # pylint: disable=broad-exception-caught
-        return None
-    if any(CHALLENGE_SRC_RE.search(str(u or "")) for u in [*frames, *srcs]):
-        return "captcha"
-    try:
-        text = str(
-            page.evaluate("() => (document.body?.innerText || '').slice(0, 4000)")
-        )
-    except Exception:  # pylint: disable=broad-exception-caught
-        return None
-    if BLOCKED_TEXT_RE.search(text):
-        return (
-            "the site blocked this IP range / too many attempts — stop and retry later"
-        )
-    return None
-
-
 def _frame_url(handle: Any) -> str:
     """URL of the frame `handle` lives in; "" when it cannot be determined."""
     try:
@@ -267,7 +208,10 @@ def _guard(page: Any, field_handle: Any, allowed: list[str], *, dev: bool) -> No
         raise OriginViolation("page is not on a fill origin")
     frame_url = _frame_url(field_handle)
     if not origin_allowed(frame_url, allowed, dev=dev):
-        raise OriginViolation("the field's frame is not on a fill origin")
+        raise OriginViolation(
+            "the field's frame is not on a fill origin "
+            f"(frame: {origin_hint(frame_url, dev=dev)})"
+        )
     info = field_handle.evaluate(FORM_ACTION_JS)
     action = info.get("action") if isinstance(info, dict) else None
     if not form_action_allowed(frame_url, action, allowed, dev=dev):
@@ -329,6 +273,8 @@ def logged_in(
             return True
         except Exception:  # pylint: disable=broad-exception-caught
             pass
+        if sentinel_shown(page, item.logged_in_selector):
+            return True
     if not item.check_url:
         return False
     if not off_fill_origins(page.url, list(item.fill_origins), dev=dev):
@@ -552,23 +498,38 @@ def _password_choice(page: Any) -> Any:
 
 
 def _pre_click(page: Any, selector: str, allowed: list[str], *, dev: bool) -> bool:
-    """``agent_pre_click``: click `selector` ONCE as soon as it is visible —
-    unless the login password field shows first, or nothing shows within
-    ``STEP_TIMEOUT_S``. The click (no secret involved) happens only while the
-    page AND the element's own frame are on a fill origin. True iff clicked."""
+    """``agent_pre_click``: click `selector` as soon as it is visible — unless
+    the login password field shows first, or nothing shows within
+    ``STEP_TIMEOUT_S``. True iff clicked.
+
+    A SPA may show the element before its click handler is attached: on
+    Jellyfin (2026-10-08) a click at first sight did nothing and the user
+    picker stayed. So while the element stays visible and no login field
+    appears, it is clicked again every ``PRE_CLICK_RETRY_S``; it is done once
+    the element is gone or a login field shows. Every click (no secret
+    involved) happens only while the page AND the element's own frame are on
+    a fill origin."""
     deadline = time.monotonic() + STEP_TIMEOUT_S
+    last_click: float | None = None
     while time.monotonic() < deadline:
         _check_challenge(page, submitted=False)
+        if last_click is not None and (
+            _login_password(page) is not None or _login_username(page) is not None
+        ):
+            return True
         el = _visible(page, selector)
-        if el is not None:
+        if el is None:
+            if last_click is not None:
+                return True  # the element went away: the click took effect
+            if _login_password(page) is not None:
+                return False
+        elif last_click is None or time.monotonic() - last_click >= PRE_CLICK_RETRY_S:
             if not origin_allowed(_frame_url(el), allowed, dev=dev):
                 raise OriginViolation("the pre-click element is not on a fill origin")
             _click_on_fill_origin(page, el, allowed, dev=dev)
-            return True
-        if _login_password(page) is not None:
-            return False
+            last_click = time.monotonic()
         page.wait_for_timeout(250)
-    return False
+    return last_click is not None
 
 
 def _password_after_identifier(page: Any, allowed: list[str], *, dev: bool) -> Any:
@@ -632,6 +593,43 @@ def _submit_identifier(
     button.click()
 
 
+def _submit_password(
+    page: Any, pw_field: Any, allowed: list[str], *, dev: bool
+) -> None:
+    """Submit the typed password: Enter in the field, unless Enter would fire
+    a form button that does something else (``pick_submit_button``: a
+    "forgot password" default button, Calibre-Web Automated 2026-10-08) — then
+    click the form's login button instead. Guarded like every submit: the
+    field, the button's own frame and its ``formaction`` stay on a fill
+    origin. Raises before anything is submitted when no login button shows."""
+    _guard(page, pw_field, allowed, dev=dev)
+    buttons = form_submit_buttons(pw_field)
+    descs: list[dict[str, Any]] = []
+    for button in buttons:
+        try:
+            desc = button.evaluate(BUTTON_DESCRIBE_JS)
+        except Exception:  # pylint: disable=broad-exception-caught
+            desc = None
+        descs.append(desc if isinstance(desc, dict) else {})
+    choice = pick_submit_button(descs)
+    if choice is None:
+        pw_field.press("Enter")
+        return
+    if choice < 0:
+        raise LoginFailed(
+            "Enter would press the form's non-login default button and no login"
+            " button is showing"
+        )
+    button = buttons[choice]
+    frame_url = _frame_url(button)
+    if not origin_allowed(frame_url, allowed, dev=dev):
+        raise OriginViolation("the submit button is not on a fill origin")
+    own_action = button.get_attribute("formaction")
+    if own_action and not form_action_allowed(frame_url, own_action, allowed, dev=dev):
+        raise OriginViolation("submit button posts off the fill origins")
+    _click_on_fill_origin(page, button, allowed, dev=dev)
+
+
 def _needs_fill(field: Any, username: str) -> bool:
     """False when the field already holds `username` or is read-only (Auth0's
     password page echoes the identifier typed on page 1 read-only)."""
@@ -688,8 +686,7 @@ def generic_login(
             _guard(page, user_field, allowed, dev=dev)
             user_field.fill(secret.username)
     pw_field = _fill_password(page, pw_field, secret, allowed, dev=dev)
-    _guard(page, pw_field, allowed, dev=dev)
-    pw_field.press("Enter")
+    _submit_password(page, pw_field, allowed, dev=dev)
 
     otp_done = False
     deadline = time.monotonic() + settle_s
@@ -714,7 +711,7 @@ def generic_login(
 
 def _left_login(page: Any, item: SiteItem, *, dev: bool) -> bool:
     """Cheap "the login is over" signal for the settle loop (NOT the proof)."""
-    if item.logged_in_selector and _visible(page, item.logged_in_selector):
+    if item.logged_in_selector and sentinel_shown(page, item.logged_in_selector):
         return True
     return off_fill_origins(page.url, list(item.fill_origins), dev=dev) and (
         _visible(page, PASSWORD_SELECTOR) is None

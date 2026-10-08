@@ -104,3 +104,15 @@ def form_action_allowed(
     """
     target = urllib.parse.urljoin(page_url, action) if action else page_url
     return origin_allowed(target, allowed, dev=dev)
+
+
+def origin_hint(url: str, *, dev: bool) -> str:
+    """What a failure report may say about a frame URL: its origin, else its
+    scheme, else ``unknown`` (the handle's frame could not be determined)."""
+    if not url:
+        return "unknown"
+    origin = url_origin(url, dev=dev)
+    if origin:
+        return origin
+    scheme = urllib.parse.urlsplit(url).scheme
+    return f"{scheme}: URL" if scheme else "unparsable URL"

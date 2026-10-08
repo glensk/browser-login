@@ -638,7 +638,7 @@ def test_fresh_totp_waits_near_step_end():
     code = recipes.fresh_totp(TOTP_SEED, clock=clock, sleep=sleep)
     import pyotp
 
-    assert slept and code == pyotp.TOTP(TOTP_SEED).at(t[0])
+    assert slept and code == pyotp.TOTP(TOTP_SEED).at(int(t[0]))
     assert recipes.fresh_totp("not base32 !!") is None
     assert recipes.fresh_totp("") is None
 
@@ -826,17 +826,27 @@ def test_client_broker_logged_in_uses_check_url(monkeypatch, capsys):
     opened = []
     final = {"url": ""}
 
-    def fake_bg(port, url, fn):
-        opened.append(url)
-        return fn(_CheckPage(final["url"]))
+    viewports = []
 
-    monkeypatch.setattr(browser, "_with_background_page", fake_bg)
+    class _SizedPage(_CheckPage):
+        def set_viewport_size(self, size):
+            viewports.append(size)
+
+    def fake_bg(port, url, prepare, fn):
+        opened.append(url)
+        page = _SizedPage(final["url"])
+        prepare(page)
+        return fn(page)
+
+    monkeypatch.setattr(browser, "_with_prepared_background_page", fake_bg)
     # still on the login (Auth0 page 2: no visible password) -> NOT logged in
     final["url"] = SHOP_FILL + "/u/login/password?state=x"
     assert browser._broker_logged_in(9222, "shop") == 2
     final["url"] = SHOP_CHECK
     assert browser._broker_logged_in(9222, "shop") == 0
     assert opened == [SHOP_CHECK, SHOP_CHECK]
+    # the probe tab is sized like the broker's page before the check loads
+    assert viewports == [browser.BROKER_PROBE_VIEWPORT] * 2
     # neither check URL nor sentinel: refuses to call it logged in, opens nothing
     entry["check_url"] = ""
     assert browser._broker_logged_in(9222, "shop") == 2

@@ -128,7 +128,6 @@ import functools
 import glob
 import json
 import os
-import plistlib
 import re
 import shutil
 import signal
@@ -159,6 +158,8 @@ from broker.recipes import fresh_totp as _broker_fresh_totp  # noqa: E402
 from broker.recipes import interstitial_title as _broker_interstitial  # noqa: E402
 from broker.recipes import off_fill_origins as _broker_off_fill_origins  # noqa: E402
 from broker.recipes import parse_totp as _parse_totp  # noqa: E402
+from broker.recipes import sentinel_shown as _broker_sentinel_shown  # noqa: E402
+from broker.useragent import engine_user_agent as _engine_user_agent  # noqa: E402
 
 # pylint: enable=wrong-import-position
 # Named instances: a second shared browser with its OWN profile, port and
@@ -1167,19 +1168,7 @@ def _headless_user_agent(binary: str) -> str | None:
     page with the normal UA loads). The version comes from the app's Info.plist
     so the UA matches the real engine; unknown version → no override.
     """
-    plist = Path(binary).parent.parent / "Info.plist"
-    try:
-        with plist.open("rb") as fh:
-            version = str(plistlib.load(fh).get("CFBundleShortVersionString") or "")
-    except (OSError, ValueError, plistlib.InvalidFileException):
-        return None
-    major = version.split(".", 1)[0]
-    if not major.isdigit():
-        return None
-    return (
-        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
-        f"(KHTML, like Gecko) Chrome/{major}.0.0.0 Safari/537.36"
-    )
+    return _engine_user_agent(binary)
 
 
 def _browser_mode(port: int) -> str | None:
@@ -7387,6 +7376,19 @@ def _broker_entry_or_rc(site: str) -> tuple[dict | None, int]:
     return entry, 0
 
 
+def _broker_wait_sentinel(page, sentinel: str) -> bool:
+    """The item's sentinel is visible within 8 s — or, without a box of its
+    own (an inline custom element around a fixed-position child), shows a
+    visible descendant, like the broker's own check."""
+    from playwright.sync_api import Error as PlaywrightError
+
+    try:
+        page.wait_for_selector(sentinel, state="visible", timeout=8_000)
+        return True
+    except PlaywrightError:
+        return bool(_broker_sentinel_shown(page, sentinel))
+
+
 def _broker_probe(page, entry: dict) -> bool:
     """The broker's positive check, client side, on the loaded check page.
 
@@ -7396,8 +7398,6 @@ def _broker_probe(page, entry: dict) -> bool:
     token (polled up to ``CSCS_PROBE_WAIT_S`` while on the portal).
     "No password field" alone proves nothing (page 2 of an Auth0 login).
     """
-    from playwright.sync_api import Error as PlaywrightError
-
     if entry.get("site") == "cscs":
         # The SPA renders on the portal first and only then sends a token-less
         # session to Keycloak: poll for the token while still on the portal.
@@ -7405,12 +7405,8 @@ def _broker_probe(page, entry: dict) -> bool:
         return ready
     page.wait_for_timeout(1000)
     sentinel = entry.get("logged_in_selector")
-    if sentinel:
-        try:
-            page.wait_for_selector(str(sentinel), state="visible", timeout=8_000)
-            return True
-        except PlaywrightError:
-            pass
+    if sentinel and _broker_wait_sentinel(page, str(sentinel)):
+        return True
     if not entry.get("check_url"):
         return False
     fill = [str(o) for o in entry.get("fill_origins") or []]
@@ -7436,6 +7432,18 @@ def _broker_logged_in(port: int, site: str) -> int:
     return _broker_check_entry(port, site, entry)
 
 
+# The probe tab gets the broker's own window size: a background tab of the
+# headed shared browser is ~800x460, where responsive apps hide what the
+# broker (1280x720 headless) saw as the sentinel — Komga's Vuetify navigation
+# drawer is `visibility: hidden` below its desktop breakpoint (2026-10-08).
+BROKER_PROBE_VIEWPORT = {"width": 1280, "height": 720}
+
+
+def _broker_probe_viewport(page) -> None:
+    """Size the probe tab like the broker's page before the check URL loads."""
+    page.set_viewport_size(BROKER_PROBE_VIEWPORT)
+
+
 def _broker_check_entry(port: int, site: str, entry: dict) -> int:
     """`_broker_logged_in` for an entry already in hand (refused ones included)."""
     check_url = str(entry.get("check_url") or "")
@@ -7447,7 +7455,9 @@ def _broker_check_entry(port: int, site: str, entry: dict) -> int:
     if not url.startswith("https://"):
         return _broker_fail(2, f"{site}: the broker lists no https check URL.")
 
-    if _with_background_page(port, url, lambda page: _broker_probe(page, entry)):
+    if _with_prepared_background_page(
+        port, url, _broker_probe_viewport, lambda page: _broker_probe(page, entry)
+    ):
         print(f"✓ Logged into {site} (checked {_tab_hint(url)}).")
         return 0
     print(f"Not logged into {site} (checked {_tab_hint(url)}).", file=sys.stderr)

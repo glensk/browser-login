@@ -98,6 +98,7 @@ from broker.secret_ops import (  # noqa: E402
     SecretOps,
     build_secret_limiter,
 )
+from broker.useragent import CHROME_UA_TEMPLATE, engine_user_agent  # noqa: E402
 from broker.vault import (  # noqa: E402
     SITE_ID_RE,
     BwBootstrap,
@@ -122,11 +123,14 @@ READ_TIMEOUT_S = 30.0
 MIN_INTERVAL_S = 120.0
 PER_HOUR = 4
 PER_DAY = 10
-CHROME_UA = os.environ.get(
-    "LOGIN_BROKER_USER_AGENT",
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
-    "(KHTML, like Gecko) Chrome/141.0.0.0 Safari/537.36",
-)
+# A plain desktop-Chrome User-Agent (headless Chromium says HeadlessChrome,
+# which Cloudflare challenges). Its major version must be the ENGINE's: the
+# browser still sends Sec-CH-UA with the real version, and a mismatch is a bot
+# signal — gitlab.ethz.ch's Anubis answered a fixed "Chrome/141" on engine 148
+# with proof-of-work difficulty 7 (~20 min) instead of 2 (verified 2026-10-08).
+# LOGIN_BROKER_USER_AGENT overrides; the fixed version is only the fallback
+# when the engine's version cannot be read.
+FALLBACK_CHROME_UA = CHROME_UA_TEMPLATE.format(major=141)
 CHROME_ARGS = ["--use-mock-keychain", "--disable-blink-features=AutomationControlled"]
 _BLANK_PASSWORDS_JS = (
     "() => document.querySelectorAll('input[type=password]').forEach(i => i.value = '')"
@@ -138,6 +142,20 @@ _TOKEN_KEYS_JS = (
     "/\\b[0-9a-f]{40}\\b/.test(localStorage.getItem(k) || ''))"
 )
 _STORAGE_JS = "keys => Object.fromEntries(keys.map(k => [k, localStorage.getItem(k)]))"
+
+
+def broker_user_agent(pw: Any) -> str:
+    """``LOGIN_BROKER_USER_AGENT``, else the engine's own version
+    (``engine_user_agent``), else ``FALLBACK_CHROME_UA``."""
+    override = os.environ.get("LOGIN_BROKER_USER_AGENT")
+    if override:
+        return override
+    try:
+        executable = str(pw.chromium.executable_path)
+    except Exception:  # pylint: disable=broad-exception-caught
+        executable = ""
+    return (executable and engine_user_agent(executable)) or FALLBACK_CHROME_UA
+
 
 # A login runner: (item, get_secret) -> bundle. Raises RecipeError on failure.
 Runner = Callable[[SiteItem, Callable[[], Secret]], dict[str, Any]]
@@ -171,7 +189,7 @@ class PlaywrightRunner:
             "user_data_dir": str(profile),
             "headless": True,
             "args": CHROME_ARGS,
-            "user_agent": CHROME_UA,
+            "user_agent": broker_user_agent(pw),
             "chromium_sandbox": True,
         }
         try:

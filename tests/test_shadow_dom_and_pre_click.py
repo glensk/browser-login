@@ -103,12 +103,14 @@ class _Frame:
 
 
 class _Button:
+    """Visible until clicked: the click opens the form, like Jellyfin's."""
+
     def __init__(self, frame_url: str) -> None:
         self.frame_url = frame_url
         self.clicks = 0
 
     def is_visible(self) -> bool:
-        return True
+        return self.clicks == 0
 
     def owner_frame(self) -> _Frame:
         return _Frame(self.frame_url)
@@ -134,6 +136,7 @@ class _Page:
 def no_password(monkeypatch):
     monkeypatch.setattr(recipes, "_check_challenge", lambda *a, **k: None)
     monkeypatch.setattr(recipes, "_login_password", lambda page: None)
+    monkeypatch.setattr(recipes, "_login_username", lambda page: None)
 
 
 @pytest.mark.usefixtures("no_password")
