@@ -109,6 +109,29 @@ accepted and folded in below.
 - Removing `--remote-allow-origins=*`: Chrome then 403s every WebSocket that sends an
   Origin header (even same-origin); Playwright sends none — audit other consumers first.
 
+- Phase 2 BUILT, reviewed, NOT merged: branch `worktree-agent-a14a355ac5d0f6712`
+  (`d3a580d`, worktree `.claude/worktrees/agent-a14a355ac5d0f6712`). Headless-only `up`
+  - `desired-mode.json`; headed lease (`headed-lease.json`, live = owner pid + start
+  time, heartbeat only detects a hung owner >120 s); `_preflight` revert re-checks under
+  the gate, writes to stderr only, never blocks a command (❌ warning + proceed), skipped
+  for doctor/close/close-hung/status/journal/down/switch; `login` exits 4 `needs Albert`
+  outside the lease; `_bring_to_front` only for the lease holder; token/slack-session
+  raises removed; `--deny-permission-prompts` + Preferences (notifications/geo/cam/mic
+  blocked, downloads to `<cache>/downloads`); `--remote-allow-origins=*` removed (all
+  consumers send no Origin — verified py/node Playwright, websockets). Unit-tested; the
+  headed paths are NOT live-tested yet.
+- Merge + deploy sequence (after the baseline soak and the warm/renewal gate):
+  1. `focus_watch.py -s` on the baseline (2026-10-08 13:53 → 2026-10-09 ~14:00).
+  2. `browser.py switch headless` on the real profile; warm + renewal columns of the
+     site matrix; record here.
+  3. Merge the branch to main, `browser.py switch headless` once (deploy step), run
+     `doctor`.
+  4. Live-test the guided path once: `agent-login.py -g <site>` (lease → headed → back).
+  5. Update `sdsc/openai-api/openai-team.py` (assumes a headed shared browser, waits 5 min
+     for a human) — README "Known consumers to update".
+  6. Wrap the Playwright MCP in `register-exec` (mydotfiles MCP config, also
+     `localhost` → `127.0.0.1`).
+
 ### Phase 1 — headless gate (site outcomes, not fingerprint spoofing)
 
 - [x] Diagnostic dump in headless + plain UA: `userAgent`, `userAgentData.brands`, request
