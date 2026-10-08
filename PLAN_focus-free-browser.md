@@ -73,7 +73,7 @@ accepted and folded in below.
       and activate TextEdit and back — both must be logged.
 - [x] Append-only, redacted journal in `browser.py`: every up/switch/down/login/guided
       session/focus-capable action with caller pid, parent chain, argv, origins only.
-- [ ] Baseline soak: one working day on today's setup, steals tabulated by source.
+- [x] Baseline soak: one working day on today's setup, steals tabulated by source.
 
 ### Status 2026-10-08 (handover)
 
@@ -132,42 +132,58 @@ accepted and folded in below.
   6. Wrap the Playwright MCP in `register-exec` (mydotfiles MCP config, also
      `localhost` → `127.0.0.1`).
 
+- 2026-10-08 decisions/results: full-day baseline SKIPPED (Albert) — partial baseline
+  13:53–15:53 (screen mostly locked): 0 on-screen Chrome windows, 0 activations, 0
+  raises; 145 off-screen windows of other headless Chromes (now informational in `-s`,
+  `787f769`); 2 Touch-ID (`coreautha`) prompts not from this browser.
+  Warm + renewal gate on the real profile (headless since 15:53): every matrix site ✅
+  logged in; claude.ai + chatgpt.com after deleting `cf_clearance`/`__cf_bm` (partitioned —
+  `Storage.getCookies` needed): no challenge, new clearance issued silently, still logged
+  in; anthropic-api roster read ✅, Slack xoxc ✅, LAN vaultwarden ✅, download ✅,
+  `agent-login.py -c` no headed fallback, no headless regression (the 13 ❌ sites were ❌
+  before). Non-headless failures filed: tp#843 (login cscs hang, no timeout), tp#844
+  (openai-team selector + headed assumption), tp#845 (logged-in hijacks tabs by URL).
+  Phase 2 merged `4cda030`, `doctor` all ✅ on the live browser. Playwright MCP wrapped in
+  `register-exec` (mydotfiles `dotfiles/claude/.claude/mcp/playwright.json`,
+  `link_all_using_stow.sh`; cpriv local-scope entries re-registered; cwork entries need
+  `claude-config-sync.py -a` with no Claude session open).
+
 ### Phase 1 — headless gate (site outcomes, not fingerprint spoofing)
 
 - [x] Diagnostic dump in headless + plain UA: `userAgent`, `userAgentData.brands`, request
       `Sec-CH-UA`, `webdriver`, WebGL vendor, `outerWidth` (informational only).
-- [ ] Site matrix, each a real logged-in read, three ways — warm (persisted profile),
+- [x] Site matrix, each a real logged-in read, three ways — warm (persisted profile),
       cold (disposable headless profile, no `cf_clearance`), renewal (delete `cf_clearance`
       in the real profile, reload): claude.ai work (`anthropic-api.py` team read),
       chatgpt.com (`openai-team.py -ta` dry-run), Slack, Notion, CSCS, SWITCH Cloud,
       Vaultwarden, Smartsheet, Infomaniak, GitLab admin, a `*.dom42.space` LAN site
       (launched from a terminal AND from launchd), downloads, screenshots, a full
       `agent-login.py` run. ✅/❌ per cell recorded here.
-- [ ] Gate: all ✅ → Phase 2. A ❌ that only headed fixes → Fallback phase.
+- [x] Gate: all ✅ → Phase 2. A ❌ that only headed fixes → Fallback phase.
 
 ### Phase 2 — enforce headless
 
-- [ ] Persisted `desired_mode=headless`; `up` always headless; `up --headed` and
+- [x] Persisted `desired_mode=headless`; `up` always headless; `up --headed` and
       `CLAUDE_BROWSER_HEADLESS=0` removed. Headed only inside a live maintenance lease.
-- [ ] Every `browser.py` command preflight: headed without a live lease → revert to
+- [x] Every `browser.py` command preflight: headed without a live lease → revert to
       headless before doing work. `agent_login_jobs.py` ~284–290: a failed switch back is a
       loud ❌ + retry, never silently ignored.
-- [ ] `browser.py login` never opens a human flow: unattended or exit with
+- [x] `browser.py login` never opens a human flow: unattended or exit with
       `needs Albert: agent-login.py -g <site>`. No TTY/env heuristics.
-- [ ] Remove all non-guided `bring_to_front` calls (inventory of the 8 sites in this file).
-- [ ] Native UI suppression, fault-tested to fail closed: notification/permission prompts
+- [x] Remove all non-guided `bring_to_front` calls (inventory of the 8 sites in this file).
+- [x] Native UI suppression, fault-tested to fail closed: notification/permission prompts
       denied (profile prefs + launch flags), downloads via `Browser.setDownloadBehavior` to a
       fixed dir, `op`/Touch-ID fallback disabled in unattended paths, broker keychain
       `security` ACL prompts listed and pre-authorised or failed closed. Chrome-for-Testing
       auto-update documented as not applicable (Playwright-cache managed).
-- [ ] Register the Playwright MCP: `browser.py register-exec -t playwright-mcp -- npx -y
+- [x] Register the Playwright MCP: `browser.py register-exec -t playwright-mcp -- npx -y
       @playwright/mcp@0.0.76 --cdp-endpoint http://127.0.0.1:9222` in mydotfiles' MCP
       configs (also `localhost` → `127.0.0.1`). `register-exec` refuses to spawn while the
       browser is headed without a live maintenance owner.
-- [ ] Remove `--remote-allow-origins=*`: first audit every consumer's WebSocket Origin
+- [x] Remove `--remote-allow-origins=*`: first audit every consumer's WebSocket Origin
       (Playwright py/node send none; `websocket-client` sends the same origin), then retest
       all consumers.
-- [ ] `doctor`: certify `mode=headless`, frontmost unchanged, no unregistered CDP peers.
+- [x] `doctor`: certify `mode=headless`, frontmost unchanged, no unregistered CDP peers.
 
 ### Phase 3 — guided login (B primary, A fallback)
 
