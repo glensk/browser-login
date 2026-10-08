@@ -52,16 +52,60 @@ framework. It is a **provider**: other repos depend on it, not the reverse. See
   `_tab_hint`/`_tab_title` — origins only, fail closed; raw URLs are opt-in
   (`status --full-urls`) and never the default.
 - **Headless by default — the invariant** (tp#836): the shared browser is
-  headless unless a live HEADED LEASE exists (`<cache>/headed-lease.json`,
-  `_headed_lease(site)`), held only by a guided login Albert starts
-  (`agent-login.py -g SITE` → `agent_login_jobs.guided_window`). `up` always
-  launches headless (`up -H` is a no-op; there is no `up --headed`, and
+  headless unless a live guided-login MAINTENANCE RECORD of mode A exists
+  (`<cache>/maintenance.json`; Phase 2's "headed lease" is that record with
+  `mode: "A"`), written only by a guided login Albert starts
+  (`agent-login.py -g SITE` → `browser.py assisted-login SITE`, or
+  `agent_login_jobs.guided_window` for the claude.ai/SWITCH window flows). `up`
+  always launches headless (`up -H` is a no-op; there is no `up --headed`, and
   `CLAUDE_BROWSER_HEADLESS` is ignored); `switch headed` exits 2 unless the
-  caller carries the lease nonce (`$CLAUDE_BROWSER_HEADED_LEASE`); every
-  connecting command reverts a lease-less headed browser first (`_preflight`
-  in `main`, before any gate; output to stderr only; best effort — a failed
-  revert warns and the command proceeds; `doctor`/`close`/`close-hung` never
-  revert). Never add a way around it.
+  caller carries the owner nonce (`$CLAUDE_BROWSER_MAINTENANCE`) of a live
+  mode-A record; every connecting command reverts a headed browser without one
+  first (`_preflight` in `main`, before any gate; output to stderr only; best
+  effort — a failed revert warns and the command proceeds;
+  `doctor`/`close`/`close-hung` never revert). Never add a way around it.
+- **Guided login = one maintenance transaction** (`_maintenance`, Phase 3):
+  ONE record file is the single source of truth (`owner_nonce`, pid + start
+  time, `site`, `mode` B|A, `state`, `owned_targets`, `paused`,
+  `watchdog_pid`, 10 s heartbeat; liveness = owner pid alive with its start
+  time and heartbeat < 120 s). While it lives, a NEW registration without the
+  owner token exits **75** (`BUSY_RC`, EX_TEMPFAIL: `busy: guided login for
+  SITE in progress (until ~HH:MM)`), and so do `down`/`switch` unless
+  `-F/--force-maintenance` — never add an exemption; the transaction's own
+  children inherit the token. 75 is NOT "logged out": callers (agent-login
+  `-c`/`ensure_logged_in`) skip and re-check later — never `login`, never a
+  failure mail. Human entry only: `assisted-login` refuses without `/dev/tty`
+  (exit 2) — never add a non-interactive way in. **Pause protocol**:
+  `register-exec` installs every signal handler first, then registers with
+  `kind: exec`, then spawns its child in its own process group and records
+  `child_pid`/`child_pgid`/`child_start_time`; SIGUSR1 = pause (only while a
+  record lives: SIGSTOP the group, drop the shared gate, `paused: true`),
+  SIGUSR2 = resume (retake the gate, SIGCONT). A paused wrapper resumes itself
+  only when the record FILE is gone or names another owner (a dead owner is
+  the watchdog's to recover first — it needs the gate exclusively for its
+  revert), or after 60 s of a not-live record. The transaction signals ONLY
+  pids from a live registry entry whose pid AND start time it re-validated —
+  never a bare number; a dead wrapper's validated child group is an orphan and
+  is stopped (resume path, watchdog, `clients`). A registration without `kind`
+  that is not browser.py's own (a pre-protocol wrapper) refuses the start,
+  naming its pids. Cleanup order on every exit: owned targets → headless →
+  lease → record → resume. The detached `maintenance-watchdog` does the same
+  when the owner dies. Everything is journaled. Owned targets come from
+  `open -N` and the relay's target supervisor (popups whose `openerId` is
+  owned) — never a tab picked by URL, and while a record lives `logged-in`
+  checks run only in a fresh background tab (`_logged_in_page_check`).
+- **Tests never leave a real Chrome**: `tests/conftest.py` sets
+  `CLAUDE_BROWSER_TEST_NO_LAUNCH=1`, so `_launch_browser` exits in the test
+  process and every `browser.py` subprocess it starts; a test that must launch
+  a disposable headless browser carries `@pytest.mark.launches_chrome` and
+  stops it again. A fake CDP endpoint reports `HeadlessChrome` (a headed fake
+  makes the preflight "revert" it by launching a real browser).
+- **`bin/login_viewer.py` stays an allowlist relay**: only `ALLOWED_METHODS`
+  leave it, `Target.*` only for owned ids, `Runtime.evaluate`/`addBinding`/
+  `addScriptToEvaluateOnNewDocument` only with the relay's own hook strings;
+  the viewer sends typed messages, never raw CDP. Event handlers that send CDP
+  commands run as tasks, never inline in the CDP reader (they would wait for
+  answers only the reader can deliver).
 - **Never interfere with the user's desktop**: no app activation, no window
   raising. `_bring_to_front` is a journaled no-op outside the lease holder's
   headed browser; never call `page.bring_to_front()` directly. A login step

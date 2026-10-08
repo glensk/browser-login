@@ -109,7 +109,123 @@ def test_allowlist_is_exactly_what_the_relay_sends():
         "Target.createTarget",
         "Target.attachToTarget",
         "Target.closeTarget",
+        # Phase 3: viewport, dialogs, the surface hook (gated, see below).
+        "Emulation.setDeviceMetricsOverride",
+        "Page.handleJavaScriptDialog",
+        "Runtime.enable",
+        "Runtime.addBinding",
+        "Runtime.evaluate",
+        "Page.addScriptToEvaluateOnNewDocument",
     }
+
+
+def test_internal_calls_carry_only_the_relays_own_strings():
+    hook = lv.hook_source("__lvX")
+    internal = {hook, "__lvX"}
+    assert lv.method_allowed("Runtime.evaluate", {"expression": hook}, OWNED, internal)
+    assert not lv.method_allowed(
+        "Runtime.evaluate", {"expression": "document.cookie"}, OWNED, internal
+    )
+    assert not lv.method_allowed("Runtime.evaluate", {"expression": hook}, OWNED)
+    assert lv.method_allowed("Runtime.addBinding", {"name": "__lvX"}, OWNED, internal)
+    assert not lv.method_allowed("Runtime.addBinding", {"name": "x"}, OWNED, internal)
+    assert lv.method_allowed(
+        "Page.addScriptToEvaluateOnNewDocument", {"source": hook}, OWNED, internal
+    )
+    assert not lv.method_allowed(
+        "Page.addScriptToEvaluateOnNewDocument", {"source": "evil()"}, OWNED, internal
+    )
+
+
+def test_target_calls_accept_every_owned_id_and_no_other():
+    owned = ["ROOT", "POPUP"]
+    for tid in owned:
+        assert lv.method_allowed("Target.attachToTarget", {"targetId": tid}, owned)
+    assert not lv.method_allowed("Target.attachToTarget", {"targetId": "X"}, owned)
+    assert not lv.method_allowed("Target.createTarget", {"url": "https://x"}, owned)
+
+
+@pytest.mark.parametrize(
+    ("info", "owned", "recent", "want"),
+    [
+        ({"targetId": "P", "type": "page", "openerId": "R"}, ["R"], False, "follow"),
+        (
+            {"targetId": "P", "type": "page", "openerId": "Q"},
+            ["R", "Q"],
+            False,
+            "follow",
+        ),
+        ({"targetId": "P", "type": "page", "openerId": "Z"}, ["R"], True, "ignore"),
+        ({"targetId": "P", "type": "page"}, ["R"], True, "report"),
+        ({"targetId": "P", "type": "page"}, ["R"], False, "ignore"),
+        ({"targetId": "P", "type": "iframe", "openerId": "R"}, ["R"], False, "ignore"),
+        ({"targetId": "R", "type": "page", "openerId": "R"}, ["R"], False, "ignore"),
+        ({"type": "page", "openerId": "R"}, ["R"], False, "ignore"),
+    ],
+)
+def test_popup_decision(info, owned, recent, want):
+    assert lv.popup_decision(info, owned, recent) == want
+
+
+def test_view_after_close():
+    openers = {"P1": "R", "P2": "P1"}
+    owned = ["R", "P1", "P2"]
+    assert lv.view_after_close("P2", "P2", owned, openers) == "P1"  # back to opener
+    assert lv.view_after_close("P1", "P2", owned, openers) == "P2"  # not shown
+    assert lv.view_after_close("P2", "P2", ["R", "P2"], openers) == "R"  # opener gone
+    assert lv.view_after_close("R", "R", ["R"], {}) is None  # the login tab: end
+    assert lv.view_after_close("R", "R", ["R", "P1"], openers) == "P1"
+
+
+@pytest.mark.parametrize(
+    ("url", "want"),
+    [
+        ("zoommtg://join?x=1", "zoommtg"),
+        ("msteams:/l/meetup", "msteams"),
+        ("https://example.org/", None),
+        ("about:blank", None),
+        ("data:text/html,x", None),
+        ("javascript:void(0)", None),
+        ("chrome-error://chromewebdata/", None),
+        ("", None),
+        (None, None),
+    ],
+)
+def test_external_scheme(url, want):
+    assert lv.external_scheme(url) == want
+
+
+def test_surface_reasons_are_named():
+    assert "passkey" in lv.surface_reason("webauthn", "get")
+    assert "permission" in lv.surface_reason("permission", "getUserMedia")
+    assert "external app" in lv.surface_reason("external", "zoommtg:")
+    assert lv.surface_reason("requested") == "you asked for a visible window"
+
+
+def test_hook_ignores_conditional_mediation_and_hides_the_binding():
+    src = lv.hook_source("__lvABC")
+    assert "mediation !== 'conditional'" in src
+    assert 'delete globalThis["__lvABC"]' in src
+
+
+def test_maintenance_gate(tmp_path):
+    rec = tmp_path / "maintenance.json"
+    assert "no maintenance record" in (lv.maintenance_error(rec, "n") or "")
+    rec.write_text('{"owner_nonce": "abc", "pid": 1}', encoding="utf-8")
+    assert "owner" in (lv.maintenance_error(rec, "zzz") or "")
+    assert "owner" in (lv.maintenance_error(rec, "") or "")
+    assert lv.maintenance_error(rec, "abc") is None
+    rec.write_text('{"owner_nonce": "abc", "pid": 999999999}', encoding="utf-8")
+    assert not lv.owner_alive(rec, "abc")  # owner pid gone → the relay ends
+
+
+def test_main_refuses_without_the_owner_token(tmp_path, monkeypatch, capsys):
+    rec = tmp_path / "maintenance.json"
+    rec.write_text('{"owner_nonce": "abc", "pid": 1}', encoding="utf-8")
+    monkeypatch.delenv("CLAUDE_BROWSER_MAINTENANCE", raising=False)
+    argv = ["-c", "http://127.0.0.1:9", "-t", "T", "-A", "-M", str(rec)]
+    assert lv.main(argv) == 2
+    assert "owner" in capsys.readouterr().err
 
 
 def test_token_check():

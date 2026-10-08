@@ -154,10 +154,13 @@ class FakeCdp:
             def do_GET(self) -> None:  # noqa: N802
                 path = self.path.rstrip("/")
                 if path == "/json/version":
+                    # HEADLESS, like the real shared browser: a fake that looks
+                    # headed makes every CLI's preflight "revert" it — i.e.
+                    # launch a real Chrome on the fake's port (it leaked).
                     body: object = {
-                        "Browser": "Chrome/151.0.0.0",
+                        "Browser": "HeadlessChrome/151.0.0.0",
                         "Protocol-Version": "1.3",
-                        "User-Agent": "Mozilla/5.0 Chrome/151.0.0.0",
+                        "User-Agent": "Mozilla/5.0 HeadlessChrome/151.0.0.0",
                         "webSocketDebuggerUrl": f"{fake.ws_base}/devtools/browser/b",
                     }
                 elif path in ("/json", "/json/list"):

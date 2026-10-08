@@ -30,7 +30,8 @@ Generic lifecycle:
             relaunch it on the SAME profile (every login persists). `headed`
             only for the holder of the live headed lease (else exit 2). Waits for
             registered CDP clients to drain and REFUSES while an unregistered
-            client is attached ([-f|--force] switches anyway).
+            client is attached ([-f|--force] switches anyway). Exit 75 (busy)
+            while a guided login owns the browser ([-F|--force-maintenance]).
   clients   Show who is attached over CDP: the registered clients (tool, pid,
             purpose) plus any unregistered ones a switch would refuse.
   journal [-n N] [-e EVENT] [-j]
@@ -42,7 +43,7 @@ Generic lifecycle:
   register-exec [-t NAME] -- CMD ARGS…
             Run a long-lived CDP client (e.g. the Playwright MCP server) as a
             REGISTERED client: the registration lives exactly as long as CMD.
-  down [-f|--force]
+  down [-f|--force] [-F|--force-maintenance]
             Quit the shared browser. Waits for registered CDP clients to drain
             and refuses while one stays attached (-f/--force stops anyway —
             they lose their connection); a stale lifecycle record with no
@@ -105,6 +106,12 @@ human.
                     (kleinanzeigen only). $SAFARI_COOKIES overrides the file.
   login-cscs-assisted
                     Human-only pre-broker CSCS login (keychain / 1Password).
+  assisted-login SITE [-u URL] [-a] [-f]
+                    Human-only guided login (agent-login.py -g SITE): type the
+                    site name on your terminal to start; log in through a
+                    remote view of a headless tab (B), or in the shown window
+                    (-a, or offered when B cannot do it). Pauses registered
+                    long-lived clients for its duration; no terminal → exit 2.
 
 CSCS aliases (kept for back-compat; cscs-api.py depends on them):
   token             Read the 40-hex Waldur DRF token from the portal tab and cache
@@ -137,6 +144,7 @@ import functools
 import glob
 import json
 import os
+import queue
 import re
 import shutil
 import signal
@@ -211,6 +219,8 @@ CACHE_DIR = (
     / ("claude-browser" + (f"-{INSTANCE}" if INSTANCE else ""))
 )
 PROFILE_DIR = CACHE_DIR / "profile"
+# Test-only: set by tests/conftest.py; `_launch_browser` refuses while it is 1.
+TEST_NO_LAUNCH_ENV = "CLAUDE_BROWSER_TEST_NO_LAUNCH"
 PID_FILE = CACHE_DIR / "browser.pid"
 # Single source of truth for "what is the shared browser doing right now" — see
 # the lifecycle section below. NO file means cleanly down.
@@ -413,10 +423,72 @@ def _add_journal_parser(sub: Any) -> None:
         "--event",
         default=None,
         help="only this event: up, switch, down, login, bring_to_front, register, "
-        "unregister, revert_headed, headed_lease",
+        "unregister, register_refused, revert_headed, headed_lease, guided_login, "
+        "maintenance, client_pause, client_resume, watchdog_recover",
     )
     pjn.add_argument(
         "-j", "--json", action="store_true", help="print the raw JSON lines"
+    )
+
+
+def _add_force_maintenance(parser: argparse.ArgumentParser) -> None:
+    """`-F/--force-maintenance` for `down` and `switch`."""
+    parser.add_argument(
+        "-F",
+        "--force-maintenance",
+        action="store_true",
+        help="act even while a guided login (agent-login.py -g) owns the browser "
+        "— it loses its browser (otherwise exit 75, busy).",
+    )
+
+
+def _add_down_parser(sub: Any) -> None:
+    """The `down` subcommand."""
+    pdn = sub.add_parser("down", help="Quit the shared browser.")
+    pdn.add_argument(
+        "-f",
+        "--force",
+        action="store_true",
+        help="Stop even while registered CDP clients (e.g. the Playwright MCP "
+        "server) are attached — they lose their connection.",
+    )
+    _add_force_maintenance(pdn)
+
+
+def _add_guided_parsers(sub: Any) -> None:
+    """`assisted-login` (the human entry) and the internal `maintenance-watchdog`."""
+    pal = sub.add_parser(
+        "assisted-login",
+        help="Human-only guided login for SITE: confirm by typing the site name "
+        "on your terminal, then log in through a remote view of a headless tab "
+        "(B); as fallback in the shown window (A). No terminal (an agent) → exit 2.",
+    )
+    pal.add_argument("site", help="Site to log into (e.g. slack, notion, anibis).")
+    pal.add_argument(
+        "-u",
+        "--url",
+        default=None,
+        help="where the login starts (default: the site's known login URL)",
+    )
+    pal.add_argument(
+        "-a",
+        "--fallback-window",
+        action="store_true",
+        help="skip the remote view: log in in the shown shared window (path A)",
+    )
+    pal.add_argument(
+        "-f",
+        "--force",
+        action="store_true",
+        help="start even with UNREGISTERED CDP clients attached (they are not "
+        "paused and keep running)",
+    )
+    pmw = sub.add_parser(
+        "maintenance-watchdog",
+        help="(internal) recovery watchdog a guided login starts for itself",
+    )
+    pmw.add_argument(
+        "-n", "--nonce", required=True, help="the guided login's owner nonce (prefix)"
     )
 
 
@@ -591,6 +663,7 @@ def parse_args() -> argparse.Namespace:
         help="Switch even with unknown (unregistered) or unverifiable CDP "
         "clients attached — they lose their connection.",
     )
+    _add_force_maintenance(psw)
     sub.add_parser(
         "clients",
         help="Show the registered CDP clients plus any unregistered ones (a "
@@ -621,14 +694,7 @@ def parse_args() -> argparse.Namespace:
         nargs=argparse.REMAINDER,
         help="Command to run (prefix with -- to stop flag parsing).",
     )
-    pdn = sub.add_parser("down", help="Quit the shared browser.")
-    pdn.add_argument(
-        "-f",
-        "--force",
-        action="store_true",
-        help="Stop even while registered CDP clients (e.g. the Playwright MCP "
-        "server) are attached — they lose their connection.",
-    )
+    _add_down_parser(sub)
     _add_open_eval_parsers(sub)
     sub.add_parser("token", help="Cache the CSCS portal token from the portal tab.")
     sub.add_parser(
@@ -710,6 +776,7 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="only list the cookies that would be copied (names, never values)",
     )
+    _add_guided_parsers(sub)
     sub.add_parser(
         "login-cscs-assisted",
         help="Human-only: the pre-broker CSCS login (keychain / 1Password), "
@@ -1322,6 +1389,13 @@ def _launch_browser(
     immediately, else None. ``CLAUDE_BROWSER_FOREGROUND=1`` forces the direct
     launch even when ``CLAUDE_BROWSER_OPEN_LAUNCH=1`` is set.
     """
+    if os.environ.get(TEST_NO_LAUNCH_ENV) == "1":
+        # tests/conftest.py sets this for every test that does not opt in
+        # (marker `launches_chrome`): a test must never leave a real Chrome.
+        sys.exit(
+            "❌ test guard: this test tried to launch a real Chrome "
+            f"({TEST_NO_LAUNCH_ENV}=1); mark it `launches_chrome` if it must."
+        )
     foreground = os.environ.get("CLAUDE_BROWSER_FOREGROUND") == "1"
     open_launch = os.environ.get("CLAUDE_BROWSER_OPEN_LAUNCH") == "1"
     if sys.platform == "darwin" and open_launch and not foreground and not headless:
@@ -1475,6 +1549,9 @@ _JOURNAL_CHAIN_EVENTS = frozenset(
         "revert_headed",
         "revert_failed",
         "headed_lease",
+        "guided_login",
+        "maintenance",
+        "watchdog_recover",
     }
 )
 # Per-process state: the redacted argv main() recorded, the parent chain (looked
@@ -2577,8 +2654,9 @@ def _read_json_dict(path: Path) -> dict | None:
     return data if isinstance(data, dict) else None
 
 
-def _registry_live_clients() -> list[dict]:
-    """Every LIVE client registration; reaps the files of dead ones on the way.
+def _registry_live_clients(dead: list[dict] | None = None) -> list[dict]:
+    """Every LIVE client registration; reaps the files of dead ones on the way
+    (their records go into `dead` when the caller passes a list).
 
     Liveness is the file's own flock, not its content: a registrant holds
     LOCK_EX on its metadata file for as long as it is attached, so a file we
@@ -2605,6 +2683,8 @@ def _registry_live_clients() -> list[dict]:
                     live.append(rec)
                 continue
             fcntl.flock(fd, fcntl.LOCK_UN)
+            if dead is not None and (gone := _read_json_dict(path)) is not None:
+                dead.append(gone)
             path.unlink(missing_ok=True)  # lockable → dead client's debris
         finally:
             os.close(fd)
@@ -2622,6 +2702,99 @@ def _describe_client(rec: dict) -> str:
     )
 
 
+# Two fds, the metadata, the gate state and the bookkeeping of one registration:
+# splitting them would only scatter one lock-holder's state.
+class Registration:  # pylint: disable=too-many-instance-attributes
+    """One live client registration (see `_registry_register`); calling it releases.
+
+    Holds the gate SHARED and LOCK_EX on its own metadata file. `update`
+    rewrites the metadata in place (the pause protocol of `register-exec`
+    records its child's process group and its paused state there);
+    `drop_gate`/`retake_gate` let a PAUSED long-lived client stop blocking a
+    guided login's exclusive gate while keeping its registration (and so its
+    "known client" status for the unregistered-peer check).
+    """
+
+    def __init__(  # pylint: disable=too-many-arguments
+        self,
+        path: Path,
+        nonce: str,
+        own_fd: int,
+        gate_fd: int,
+        rec: dict,
+    ) -> None:
+        self.path = path
+        self.nonce = nonce
+        self.own_fd = own_fd
+        self.gate_fd = gate_fd
+        self.rec = rec
+        self.gate_held = True
+        self.released = False
+        self.registered_at = time.monotonic()
+
+    def __call__(self) -> None:
+        self.release()
+
+    def update(self, **fields: object) -> None:
+        """Merge `fields` into our metadata file (never raises).
+
+        Written padded to the old length, then truncated: a concurrent reader
+        sees either the old record or the new one plus trailing blanks, both
+        valid JSON — never an empty file.
+        """
+        self.rec.update(fields)
+        data = (json.dumps(self.rec) + "\n").encode()
+        try:
+            old = os.fstat(self.own_fd).st_size
+            os.pwrite(self.own_fd, data.ljust(old), 0)
+            os.ftruncate(self.own_fd, len(data))
+        except OSError as exc:
+            print(
+                f"⚠ could not update registration {self.path.name}: {exc}",
+                file=sys.stderr,
+            )
+
+    def drop_gate(self) -> None:
+        """Stop holding the gate shared (the registration itself stays live)."""
+        if self.gate_held:
+            with contextlib.suppress(OSError):
+                fcntl.flock(self.gate_fd, fcntl.LOCK_UN)
+            self.gate_held = False
+
+    def retake_gate(self, wait_s: float) -> bool:
+        """Hold the gate shared again (bounded); True when held."""
+        if not self.gate_held:
+            self.gate_held = _flock_wait(self.gate_fd, fcntl.LOCK_SH, wait_s)
+        return self.gate_held
+
+    def release(self) -> None:
+        """Drop the registration: unlink our file, then both locks. Idempotent."""
+        if self.released:
+            return
+        self.released = True
+        current = _read_json_dict(self.path)
+        if current is not None and current.get("nonce") not in (None, self.nonce):
+            print(
+                f"⚠ registration {self.path.name} was overwritten by nonce "
+                f"{current.get('nonce')} — leaving it alone (not ours to remove).",
+                file=sys.stderr,
+            )
+        else:
+            self.path.unlink(missing_ok=True)
+        for fd in (self.own_fd, self.gate_fd):
+            with contextlib.suppress(OSError):
+                fcntl.flock(fd, fcntl.LOCK_UN)
+            with contextlib.suppress(OSError):
+                os.close(fd)
+        _journal(
+            "unregister",
+            client=self.rec.get("tool"),
+            client_pid=os.getpid(),
+            nonce=self.nonce[:12],
+            held_ms=int((time.monotonic() - self.registered_at) * 1000),
+        )
+
+
 def _registry_register(
     tool: str,
     purpose: str,
@@ -2629,8 +2802,10 @@ def _registry_register(
     wait_s: float = REGISTRY_SH_WAIT_S,
     *,
     journal_purpose: str | None = None,
-) -> Callable[[], None]:
-    """Register this process as an attached CDP client; return its ``release()``.
+    extra: dict[str, object] | None = None,
+) -> Registration:
+    """Register this process as an attached CDP client; return its `Registration`
+    (call it — or its ``release()`` — to unregister).
 
     Two locks are taken and held until release: the gate SHARED (so `switch`
     and `down` — which need it exclusively — cannot pull the browser out from
@@ -2643,7 +2818,10 @@ def _registry_register(
     Fails loud (exit) when the gate cannot be shared within `wait_s`
     (default REGISTRY_SH_WAIT_S; `close` passes what is left of its deadline):
     that means a mode switch or a shutdown is mid-flight, and attaching anyway
-    is exactly the race this layer exists to prevent.
+    is exactly the race this layer exists to prevent. Refuses with exit 2 while
+    a guided login's maintenance record is live and this process does not
+    carry its owner token ($CLAUDE_BROWSER_MAINTENANCE): the guided login owns
+    the browser for its duration.
     """
     CLIENTS_DIR.mkdir(parents=True, exist_ok=True)
     gate_fd = os.open(str(REGISTRY_GATE), os.O_RDWR | os.O_CREAT, 0o600)
@@ -2655,6 +2833,13 @@ def _registry_register(
             "gate).\n   Retry in a moment; `browser.py status` shows the "
             "lifecycle state."
         )
+    maint = _maint_live()
+    owner = _maint_owner() if maint is not None else False
+    if maint is not None and not owner:
+        _gate_release(gate_fd)
+        _journal("register_refused", client=tool, site=maint.get("site"))
+        print(_maint_refusal(maint), file=sys.stderr)
+        sys.exit(BUSY_RC)
     nonce = uuid.uuid4().hex
     while True:
         path = CLIENTS_DIR / f"{nonce}.json"
@@ -2664,12 +2849,11 @@ def _registry_register(
         except FileExistsError:
             nonce = uuid.uuid4().hex  # a 128-bit collision, humoured anyway
         except OSError as exc:
-            fcntl.flock(gate_fd, fcntl.LOCK_UN)
-            os.close(gate_fd)
+            _gate_release(gate_fd)
             sys.exit(f"❌ Cannot register a CDP client in {CLIENTS_DIR}: {exc}")
     fcntl.flock(own_fd, fcntl.LOCK_EX)  # uncontended by construction
     now = time.strftime("%Y-%m-%dT%H:%M:%S%z")
-    rec = {
+    rec: dict[str, object] = {
         "nonce": nonce,
         "pid": os.getpid(),
         "pid_start_time": _proc_lstart(os.getpid()),
@@ -2679,9 +2863,11 @@ def _registry_register(
         "iso": now,
         "heartbeat_iso": now,
     }
+    rec.update(extra or {})
+    if owner:
+        # A guided login's own client: never paused by its own transaction.
+        rec["maintenance"] = os.environ.get(MAINTENANCE_ENV, "")
     os.pwrite(own_fd, (json.dumps(rec) + "\n").encode(), 0)
-    released = False
-    registered_at = time.monotonic()
     _journal(
         "register",
         client=tool,
@@ -2690,36 +2876,7 @@ def _registry_register(
         purpose=purpose if journal_purpose is None else journal_purpose,
         port=port,
     )
-
-    def release() -> None:
-        """Drop the registration: unlink our file, then both locks. Idempotent."""
-        nonlocal released
-        if released:
-            return
-        released = True
-        current = _read_json_dict(path)
-        if current is not None and current.get("nonce") not in (None, nonce):
-            print(
-                f"⚠ registration {path.name} was overwritten by nonce "
-                f"{current.get('nonce')} — leaving it alone (not ours to remove).",
-                file=sys.stderr,
-            )
-        else:
-            path.unlink(missing_ok=True)
-        for fd in (own_fd, gate_fd):
-            with contextlib.suppress(OSError):
-                fcntl.flock(fd, fcntl.LOCK_UN)
-            with contextlib.suppress(OSError):
-                os.close(fd)
-        _journal(
-            "unregister",
-            client=tool,
-            client_pid=os.getpid(),
-            nonce=nonce[:12],
-            held_ms=int((time.monotonic() - registered_at) * 1000),
-        )
-
-    return release
+    return Registration(path, nonce, own_fd, gate_fd, rec)
 
 
 def _gate_acquire(kind: int, wait_s: float) -> int | None:
@@ -2982,39 +3139,53 @@ def _interaction_lease(
 
 
 # ---------------------------------------------------------------------------
-# Headless by default — desired mode, headed lease, preflight revert (tp#836)
+# Headless by default — desired mode, maintenance record, preflight revert (tp#836)
 # ---------------------------------------------------------------------------
-# THE INVARIANT: the shared browser runs HEADLESS unless a live HEADED LEASE
-# exists. Only a guided login Albert starts himself (`agent-login.py -g SITE`)
-# takes that lease, switches headed for the duration, and switches back. With no
-# window there is nothing that can take focus, be raised or pop native UI.
+# THE INVARIANT: the shared browser runs HEADLESS unless a live guided-login
+# MAINTENANCE RECORD of mode A exists. Only a guided login Albert starts himself
+# (`agent-login.py -g SITE` → `browser.py assisted-login SITE`) writes that
+# record; mode B (remote viewer) keeps the browser headless, mode A (fallback)
+# switches headed for the login and back. With no window there is nothing that
+# can take focus, be raised or pop native UI.
 #
 #   * DESIRED_MODE_FILE records the mode `up` launches in. It is always
 #     "headless" (absent = headless); any other value is reported and ignored.
-#   * HEADED_LEASE_FILE {owner_nonce, pid, pid_start_time, site, started,
-#     heartbeat} is written by `_headed_lease` and refreshed every 10 s. It is
-#     LIVE while the owner pid is alive with the recorded start time (no pid
+#   * MAINTENANCE_FILE {owner_nonce, pid, pid_start_time, site, mode A|B, state
+#     preparing|active, owned_targets, paused, watchdog_pid, started,
+#     heartbeat} — ONE record, the single source of truth for "a guided login
+#     owns the browser". Phase 2's headed lease IS this record with mode A
+#     (a record without a mode is mode A). Refreshed every 10 s. It is LIVE
+#     while the owner pid is alive with the recorded start time (no pid
 #     reuse), unless the heartbeat is older than 120 s (a hung owner; a Mac
-#     asleep for less than that keeps its lease). The owner exports its
-#     nonce as $CLAUDE_BROWSER_HEADED_LEASE, so its own `browser.py` children
-#     (switch headed, login SITE, open …) are recognised as the lease holder.
+#     asleep for less than that keeps it). The owner exports its nonce as
+#     $CLAUDE_BROWSER_MAINTENANCE, so its own `browser.py` children (switch
+#     headed, login SITE, open -N, logged-in …) are recognised as the owner.
+#   * While a record is live, a NEW client registration without that nonce
+#     refuses (exit 2): the guided login owns the browser (see `_maintenance`).
 #   * Every connecting command first reverts a headed browser that has NO
-#     live lease (`_preflight`), before it takes the registry gate itself. A
-#     revert that fails only warns: the command proceeds and the next command
-#     tries again (a lock-out of every agent is worse than a headed minute).
+#     live mode-A record (`_preflight`), before it takes the registry gate
+#     itself. A revert that fails only warns: the command proceeds and the next
+#     command tries again (a lock-out of every agent is worse than a headed
+#     minute).
 
 DESIRED_MODE_FILE = CACHE_DIR / "desired-mode.json"
-HEADED_LEASE_FILE = CACHE_DIR / "headed-lease.json"
-# Serialises take/heartbeat/release of the lease file (never held for long).
-HEADED_LEASE_LOCK = CACHE_DIR / ".headed-lease.lock"
-HEADED_LEASE_ENV = "CLAUDE_BROWSER_HEADED_LEASE"
-HEADED_LEASE_HEARTBEAT_S = 10.0
-# A live owner pid keeps the lease; only a heartbeat older than this (a hung
+MAINTENANCE_FILE = CACHE_DIR / "maintenance.json"
+# Serialises take/heartbeat/update/release of the record (never held for long).
+MAINTENANCE_LOCK = CACHE_DIR / ".maintenance.lock"
+MAINTENANCE_ENV = "CLAUDE_BROWSER_MAINTENANCE"
+MAINTENANCE_HEARTBEAT_S = 10.0
+# A live owner pid keeps the record; only a heartbeat older than this (a hung
 # owner) ends it. Generous on purpose: a Mac asleep for a minute must not cost
 # Albert his guided-login window.
-HEADED_LEASE_HUNG_S = 120.0
+MAINTENANCE_HUNG_S = 120.0
 # Exit code of a login that needs Albert (same meaning as the broker's 4).
 NEEDS_ALBERT_RC = 4
+# `logged-in` runs its active check in a fresh background tab, never a picked
+# one, when this is "1" (the guided login's own probes set it).
+PROBE_BACKGROUND_ENV = "CLAUDE_BROWSER_PROBE_BACKGROUND"
+# Exit code while a guided login owns the browser (EX_TEMPFAIL): "busy, retry
+# later" — never "not logged in" (2), so checks skip instead of logging in.
+BUSY_RC = 75
 # How long a preflight revert waits for registered clients to drain.
 PREFLIGHT_GATE_WAIT_S = 5.0
 # Commands that never drive the browser over CDP, plus the lifecycle commands
@@ -3037,16 +3208,17 @@ _PREFLIGHT_SKIP_CMDS = frozenset(
         "doctor",
         "close-hung",
         "close",
+        "maintenance-watchdog",
     }
 )
 
 
 class HeadedLeaseError(RuntimeError):
-    """The headed lease cannot be taken (see the message)."""
+    """The maintenance record (headed lease) cannot be taken (see the message)."""
 
 
 class HeadedLeaseBusy(HeadedLeaseError):
-    """Another live guided login holds the headed lease (or is taking it)."""
+    """Another live guided login holds the maintenance record (or is taking it)."""
 
 
 def _unique_tmp(path: Path) -> Path:
@@ -3078,8 +3250,9 @@ def _desired_mode_state() -> str:
 def _desired_mode() -> str:
     """The mode `up` launches in: always ``"headless"`` (tp#836).
 
-    Headed exists only inside a live headed lease, so nothing persistent can
-    ask for it; a stray value in the file is reported by `doctor`, not obeyed.
+    Headed exists only inside a live mode-A maintenance record, so nothing
+    persistent can ask for it; a stray value in the file is reported by
+    `doctor`, not obeyed.
     """
     return "headless"
 
@@ -3105,11 +3278,11 @@ def _pid_alive(pid: int) -> bool:
 
 def _headed_lease_state(rec: dict | None, now: float | None = None) -> str:
     """``live``, or why not: ``none``, ``invalid``, ``hung owner``,
-    ``dead pid`` or ``pid reused``.
+    ``dead pid`` or ``pid reused`` — the liveness rule of the maintenance record.
 
     The owner pid decides: alive with the recorded start time = LIVE, whatever
     the heartbeat's age (a Mac asleep for 40 s is not a dead owner) — unless the
-    heartbeat is older than HEADED_LEASE_HUNG_S (a hung owner). A recycled pid
+    heartbeat is older than MAINTENANCE_HUNG_S (a hung owner). A recycled pid
     always has a later start time. When ``ps`` cannot read the start time of a
     live pid (timeout, failure) the answer is unknown, i.e. LIVE: a ``ps``
     hiccup must never revert a guided login's window.
@@ -3123,7 +3296,7 @@ def _headed_lease_state(rec: dict | None, now: float | None = None) -> str:
         return "invalid"
     assert isinstance(pid, int) and isinstance(beat, (int, float))  # for mypy
     age = (time.time() if now is None else now) - float(beat)
-    if age > HEADED_LEASE_HUNG_S:
+    if age > MAINTENANCE_HUNG_S:
         return "hung owner"
     if not _pid_alive(pid):
         return "dead pid"
@@ -3133,115 +3306,188 @@ def _headed_lease_state(rec: dict | None, now: float | None = None) -> str:
     return "live"
 
 
-def _headed_lease_live() -> dict | None:
-    """The live headed-lease record, or None."""
-    rec = _read_json_dict(HEADED_LEASE_FILE)
+def _maint_mode(rec: dict) -> str:
+    """``"B"`` (remote viewer, headless) or ``"A"`` (window) — no mode = A."""
+    return "B" if rec.get("mode") == "B" else "A"
+
+
+def _maint_live() -> dict | None:
+    """The live maintenance record (any mode), or None."""
+    rec = _read_json_dict(MAINTENANCE_FILE)
     return rec if _headed_lease_state(rec) == "live" else None
 
 
-def _headed_lease_held() -> bool:
-    """True when THIS process tree holds the live headed lease.
+def _headed_lease_live() -> dict | None:
+    """The live maintenance record of mode A (the "headed lease"), or None."""
+    rec = _maint_live()
+    return rec if rec is not None and _maint_mode(rec) == "A" else None
 
-    The owner exports its nonce in $CLAUDE_BROWSER_HEADED_LEASE; a child sees
+
+def _maint_owner() -> bool:
+    """True when THIS process tree owns the live maintenance record (any mode).
+
+    The owner exports its nonce in $CLAUDE_BROWSER_MAINTENANCE; a child sees
     the same value, a stranger does not know it. No TTY or other heuristics.
     """
-    nonce = os.environ.get(HEADED_LEASE_ENV, "")
+    nonce = os.environ.get(MAINTENANCE_ENV, "")
     if not nonce:
         return False
-    rec = _headed_lease_live()
+    rec = _maint_live()
     return rec is not None and rec.get("owner_nonce") == nonce
 
 
+def _headed_lease_held() -> bool:
+    """True when THIS process tree owns the live record AND it is mode A."""
+    return _maint_owner() and _headed_lease_live() is not None
+
+
 def _headed_lease_describe() -> str:
-    """One line on the lease, for `status`/`doctor`."""
-    rec = _read_json_dict(HEADED_LEASE_FILE)
+    """One line on the maintenance record, for `status`/`doctor`/the journal."""
+    rec = _read_json_dict(MAINTENANCE_FILE)
     state = _headed_lease_state(rec)
     if rec is None:
         return "none"
-    who = f"site {rec.get('site')!s}, pid {rec.get('pid')!s}, since {rec.get('started')!s}"
+    who = (
+        f"site {rec.get('site')!s}, mode {_maint_mode(rec)}, pid {rec.get('pid')!s}, "
+        f"since {rec.get('started')!s}"
+    )
     return f"{state} ({who})"
 
 
-def _headed_lease_heartbeat(nonce: str, base: dict, stop: threading.Event) -> None:
-    """Refresh the lease's heartbeat every HEADED_LEASE_HEARTBEAT_S (daemon thread).
+def _maint_refusal(rec: dict) -> str:
+    """The refusal a registrant without the owner token gets while `rec` lives
+    (first line machine-stable: ``busy: guided login for SITE in progress``)."""
+    until = rec.get("until")
+    when = (
+        time.strftime("%H:%M", time.localtime(float(until)))
+        if isinstance(until, (int, float)) and not isinstance(until, bool)
+        else "?"
+    )
+    return (
+        f"busy: guided login for {rec.get('site')!s} in progress (until ~{when})\n"
+        f"   The guided login (agent-login.py -g {rec.get('site')!s}, mode "
+        f"{_maint_mode(rec)}, pid {rec.get('pid')!s}) owns the shared browser; "
+        f"retry after it ends (exit {BUSY_RC} = busy, not logged out)."
+    )
 
-    Compare-before-write under the lease lock: once the file names another
-    owner (or is gone) this thread stops — it never resurrects a lease. An
-    OSError (full disk, a transient EIO) is logged once and retried on the next
-    beat: giving up would make a live guided login look hung.
+
+def _maint_blocks(force_maintenance: bool) -> str | None:
+    """Why `down`/`switch` must not touch the browser now, or None.
+
+    A live guided login owns the browser: only its own process tree (the owner
+    token) may switch it; everybody else needs ``-F/--force-maintenance``.
     """
-    warned = False
-    while not stop.wait(HEADED_LEASE_HEARTBEAT_S):
-        fd = -1
-        try:
-            fd = os.open(str(HEADED_LEASE_LOCK), os.O_RDWR | os.O_CREAT, 0o600)
-            if not _flock_wait(fd, fcntl.LOCK_EX, 2.0):
-                continue
-            cur = _read_json_dict(HEADED_LEASE_FILE)
-            if cur is None or cur.get("owner_nonce") != nonce:
-                return
-            _json_write_atomic(HEADED_LEASE_FILE, {**base, "heartbeat": time.time()})
-        except OSError as exc:
-            if not warned:
-                print(
-                    f"⚠ headed-lease heartbeat failed (retrying): {exc}",
-                    file=sys.stderr,
-                )
-                warned = True
-        finally:
-            if fd >= 0:
-                with contextlib.suppress(OSError):
-                    os.close(fd)  # closing the fd drops its flock
+    rec = _maint_live()
+    if rec is None or force_maintenance or _maint_owner():
+        return None
+    return (
+        _maint_refusal(rec)
+        + "\n   -F/--force-maintenance overrides (the guided login loses its browser)."
+    )
 
 
 @contextlib.contextmanager
-def _headed_lease(site: str) -> Iterator[str]:
-    """Hold the HEADED lease for the block; yield the owner nonce.
-
-    The only way the shared browser may be headed (`switch headed`) and the
-    only context in which a login may hand the window to a human. Refuses
-    (`HeadedLeaseBusy`) while another live lease exists. Sets
-    $CLAUDE_BROWSER_HEADED_LEASE for the block so this process's
-    `browser.py` children are the holder; restores it on exit. Release is
-    compare-before-release: the file is removed only while it still carries
-    our nonce. Phase 3 extends this into the full maintenance transaction.
-    """
-    HEADED_LEASE_LOCK.parent.mkdir(parents=True, exist_ok=True)
-    fd = os.open(str(HEADED_LEASE_LOCK), os.O_RDWR | os.O_CREAT, 0o600)
+def _maint_locked(wait_s: float = 5.0) -> Iterator[bool]:
+    """Hold MAINTENANCE_LOCK for the block; yields False when it timed out."""
+    MAINTENANCE_LOCK.parent.mkdir(parents=True, exist_ok=True)
+    fd = os.open(str(MAINTENANCE_LOCK), os.O_RDWR | os.O_CREAT, 0o600)
     try:
-        if not _flock_wait(fd, fcntl.LOCK_EX, 5.0):
-            raise HeadedLeaseBusy("another process is taking the headed lease")
-        current = _read_json_dict(HEADED_LEASE_FILE)
+        yield _flock_wait(fd, fcntl.LOCK_EX, wait_s)
+    finally:
+        os.close(fd)  # closing the fd drops its flock
+
+
+def _maint_update(nonce: str, **fields: object) -> bool:
+    """Merge `fields` (+ a fresh heartbeat) into the record iff it is ours.
+
+    Compare-before-write under the lock: a record that names another owner (or
+    is gone) is never written — a heartbeat or an update never resurrects a
+    record. Returns True when written. OSError propagates (the heartbeat
+    thread retries; other callers warn).
+    """
+    with _maint_locked(2.0) as ok:
+        if not ok:
+            return False
+        cur = _read_json_dict(MAINTENANCE_FILE)
+        if cur is None or cur.get("owner_nonce") != nonce:
+            return False
+        _json_write_atomic(
+            MAINTENANCE_FILE, {**cur, **fields, "heartbeat": time.time()}
+        )
+        return True
+
+
+def _headed_lease_heartbeat(nonce: str, stop: threading.Event) -> None:
+    """Refresh the record's heartbeat every MAINTENANCE_HEARTBEAT_S (daemon thread).
+
+    Stops once the record names another owner (or is gone). An OSError (full
+    disk, a transient EIO) is logged once and retried on the next beat: giving
+    up would make a live guided login look hung.
+    """
+    warned = False
+    while not stop.wait(MAINTENANCE_HEARTBEAT_S):
+        try:
+            cur = _read_json_dict(MAINTENANCE_FILE)
+            if cur is None or cur.get("owner_nonce") != nonce:
+                return
+            _maint_update(nonce)
+        except OSError as exc:
+            if not warned:
+                print(
+                    f"⚠ maintenance-record heartbeat failed (retrying): {exc}",
+                    file=sys.stderr,
+                )
+                warned = True
+
+
+@contextlib.contextmanager
+def _maint_record(site: str, mode: str = "A", state: str = "active") -> Iterator[str]:
+    """Hold the MAINTENANCE RECORD for the block; yield the owner nonce.
+
+    Refuses (`HeadedLeaseBusy`) while another live record exists. Sets
+    $CLAUDE_BROWSER_MAINTENANCE for the block so this process's `browser.py`
+    children are the owner; restores it on exit. Release is
+    compare-before-release: the file is removed only while it still carries
+    our nonce. The record alone — `_maintenance` is the full transaction.
+    """
+    with _maint_locked(5.0) as ok:
+        if not ok:
+            raise HeadedLeaseBusy("another process is taking the maintenance record")
+        current = _read_json_dict(MAINTENANCE_FILE)
         if _headed_lease_state(current) == "live" and current is not None:
             raise HeadedLeaseBusy(
-                f"a guided login already holds the headed lease (site "
-                f"{current.get('site')}, pid {current.get('pid')})"
+                f"a guided login already owns the browser (site "
+                f"{current.get('site')}, mode {_maint_mode(current)}, pid "
+                f"{current.get('pid')})"
             )
         nonce = uuid.uuid4().hex
         lstart = _proc_lstart(os.getpid())
         if not lstart:
             raise HeadedLeaseError(
                 "cannot read this process's start time (`ps -o lstart=` failed); "
-                "the headed lease needs it to rule out pid reuse — retry"
+                "the maintenance record needs it to rule out pid reuse — retry"
             )
         base = {
             "owner_nonce": nonce,
             "pid": os.getpid(),
             "pid_start_time": lstart,
             "site": site,
+            "mode": "B" if mode == "B" else "A",
+            "state": state,
+            "owned_targets": [],
+            "paused": [],
             "started": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+            "until": time.time() + GUIDED_TOTAL_S,
         }
-        _json_write_atomic(HEADED_LEASE_FILE, {**base, "heartbeat": time.time()})
-    finally:
-        os.close(fd)
-    _journal("headed_lease", phase="start", site=site)
-    old_env = os.environ.get(HEADED_LEASE_ENV)
-    os.environ[HEADED_LEASE_ENV] = nonce
+        _json_write_atomic(MAINTENANCE_FILE, {**base, "heartbeat": time.time()})
+    _journal("headed_lease", phase="start", site=site, mode=base["mode"])
+    old_env = os.environ.get(MAINTENANCE_ENV)
+    os.environ[MAINTENANCE_ENV] = nonce
     stop = threading.Event()
     beat = threading.Thread(
         target=_headed_lease_heartbeat,
-        args=(nonce, base, stop),
-        name="browser-headed-lease-heartbeat",
+        args=(nonce, stop),
+        name="browser-maintenance-heartbeat",
         daemon=True,
     )
     beat.start()
@@ -3251,34 +3497,34 @@ def _headed_lease(site: str) -> Iterator[str]:
         stop.set()
         beat.join(timeout=3.0)
         if old_env is None:
-            os.environ.pop(HEADED_LEASE_ENV, None)
+            os.environ.pop(MAINTENANCE_ENV, None)
         else:
-            os.environ[HEADED_LEASE_ENV] = old_env
+            os.environ[MAINTENANCE_ENV] = old_env
         _headed_lease_release(nonce)
         _journal("headed_lease", phase="end", site=site)
 
 
+def _headed_lease(site: str) -> contextlib.AbstractContextManager[str]:
+    """The mode-A maintenance record alone (Phase 2's "headed lease")."""
+    return _maint_record(site, "A")
+
+
 def _headed_lease_release(nonce: str) -> None:
-    """Remove the lease file iff it still carries `nonce` (under the lock)."""
+    """Remove the record iff it still carries `nonce` (under the lock)."""
     try:
-        fd = os.open(str(HEADED_LEASE_LOCK), os.O_RDWR | os.O_CREAT, 0o600)
+        with _maint_locked(5.0):
+            cur = _read_json_dict(MAINTENANCE_FILE)
+            if cur is not None and cur.get("owner_nonce") == nonce:
+                MAINTENANCE_FILE.unlink(missing_ok=True)
+            elif cur is not None:
+                print(
+                    f"⚠ the maintenance record was rewritten by owner "
+                    f"{str(cur.get('owner_nonce'))[:8]} while we held it — left in "
+                    f"place ({MAINTENANCE_FILE}).",
+                    file=sys.stderr,
+                )
     except OSError as exc:
-        print(f"⚠ could not release the headed lease: {exc}", file=sys.stderr)
-        return
-    try:
-        _flock_wait(fd, fcntl.LOCK_EX, 5.0)
-        cur = _read_json_dict(HEADED_LEASE_FILE)
-        if cur is not None and cur.get("owner_nonce") == nonce:
-            HEADED_LEASE_FILE.unlink(missing_ok=True)
-        elif cur is not None:
-            print(
-                f"⚠ the headed lease was rewritten by owner "
-                f"{str(cur.get('owner_nonce'))[:8]} while we held it — left in "
-                f"place ({HEADED_LEASE_FILE}).",
-                file=sys.stderr,
-            )
-    finally:
-        os.close(fd)
+        print(f"⚠ could not release the maintenance record: {exc}", file=sys.stderr)
 
 
 def _preflight_action(cmd: str, mode: str | None, lease_live: bool) -> str | None:
@@ -3448,6 +3694,7 @@ def cmd_switch(  # pylint: disable=too-many-arguments
     gate_wait_s: float | None = None,
     *,
     revert: bool = False,
+    force_maintenance: bool = False,
 ) -> int:
     """Switch the running browser between headed and headless, transactionally.
 
@@ -3484,6 +3731,10 @@ def cmd_switch(  # pylint: disable=too-many-arguments
     if target == "headed" and not _headed_lease_held():
         print(HEADED_REFUSAL, file=sys.stderr)
         return 2
+    blocked = _maint_blocks(force_maintenance)
+    if blocked is not None:
+        print(blocked, file=sys.stderr)
+        return BUSY_RC
     if target == "headless":
         _desired_mode_write()
     live = _browser_mode(port)
@@ -3919,7 +4170,16 @@ def cmd_clients(port: int) -> int:
     registrations also REAPS the files of clients that died holding one, so
     running this is the cheapest way to clean up after a crash.
     """
-    live = _registry_live_clients()
+    dead: list[dict] = []
+    live = _registry_live_clients(dead)
+    for rec in dead:
+        if rec.get("kind") == "exec":
+            how = _kill_orphan_group(rec)
+            if how in ("terminated", "killed"):
+                print(
+                    f"⚠ {rec.get('tool')}: its register-exec wrapper died; the "
+                    f"orphaned child group {rec.get('child_pgid')} was {how}."
+                )
     if live:
         print(f"{len(live)} registered CDP client(s):")
         for rec in live:
@@ -3946,40 +4206,240 @@ def cmd_register_exec(port: int, tool: str, cmd: list[str]) -> int:
 
     For long-lived clients this script cannot instrument from the inside —
     above all the Playwright MCP server, which otherwise shows up as an
-    UNKNOWN client and fails every `switch` closed. The wrapper registers the
-    CHILD's pid (the socket may even belong to a grandchild — npx → node —
-    which the ancestry walk in `_unknown_cdp_clients` resolves), stays alive
-    as its parent with stdio inherited (transparent for MCP's stdio protocol),
-    forwards SIGTERM/SIGINT, and releases the registration when CMD exits.
+    UNKNOWN client and fails every `switch` closed. The wrapper registers
+    (kind ``exec``, then its child's pid/start time and process group), stays
+    alive as the parent with stdio inherited (transparent for MCP's stdio
+    protocol), forwards SIGTERM/SIGINT/SIGHUP to the child's process group, and
+    releases the registration when CMD exits.
+
+    PAUSE PROTOCOL (guided login, `_maintenance`): the child runs in its OWN
+    process group so the wrapper can freeze it as a whole (npx → node).
+    SIGUSR1 = pause: only while a maintenance record is live, the wrapper
+    SIGSTOPs the child's group, drops its shared hold on the registry gate
+    (so the guided login can take it exclusively) and records
+    ``paused: true``. SIGUSR2 = resume: retake the gate (bounded), SIGCONT the
+    group, ``paused: false``. Every handler is installed BEFORE the
+    registration says ``kind: exec`` and before the child exists: a signal in
+    between is queued, never lost and never fatal. A paused wrapper resumes
+    ITSELF once the record that paused it is gone or names another owner — or,
+    as a last resort, after it has been not-live for EXEC_ORPHAN_RESUME_S (the
+    watchdog that should have recovered it is presumed dead). A record whose
+    owner merely died is NOT a reason: the watchdog first needs the gate
+    exclusively to switch a headed browser back to headless.
     """
     if cmd and cmd[0] == "--":
         cmd = cmd[1:]  # argparse.REMAINDER keeps the separator; drop it
     if not cmd:
         return _fail("register-exec: no command given (usage: … -t NAME -- CMD ARGS…)")
+    wrapper = _ExecWrapper()
+    for sig in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
+        signal.signal(sig, wrapper.forward)
+    signal.signal(signal.SIGUSR1, wrapper.request)
+    signal.signal(signal.SIGUSR2, wrapper.request)
     # Register FIRST (fails loud while a switch holds the gate), THEN spawn:
     # a child must never run unregistered. The record carries the WRAPPER's
     # pid; the child's/grandchild's sockets resolve to it via the ancestry
     # walk in _unknown_cdp_clients.
-    release = _registry_register(
-        tool, " ".join(cmd)[:160], port, journal_purpose=_journal_wrapped_cmd(cmd)
+    reg = _registry_register(
+        tool,
+        " ".join(cmd)[:160],
+        port,
+        journal_purpose=_journal_wrapped_cmd(cmd),
+        extra={"kind": "exec", "paused": False},
     )
     try:
-        proc = subprocess.Popen(cmd)  # pylint: disable=consider-using-with
+        # Own process group (not a new session: the controlling terminal and
+        # stdio stay as they were) — what the pause protocol stops as a whole.
+        proc = subprocess.Popen(cmd, process_group=0)  # pylint: disable=consider-using-with
     except OSError as exc:
-        release()
+        reg.release()
         return _fail(f"register-exec: cannot start {cmd[0]!r}: {exc}")
-
-    def _forward(signum: int, _frame: object) -> None:
-        with contextlib.suppress(OSError):
-            proc.send_signal(signum)
-
-    signal.signal(signal.SIGTERM, _forward)
-    signal.signal(signal.SIGINT, _forward)
+    reg.update(
+        child_pid=proc.pid,
+        child_pgid=proc.pid,
+        child_start_time=_proc_lstart(proc.pid),
+    )
     try:
-        rc = proc.wait()
+        return wrapper.run(reg, proc)
     finally:
-        release()
-    return rc
+        reg.release()
+
+
+# How often a register-exec wrapper looks at its child and its pause state.
+EXEC_POLL_S = 0.2
+# How often a PAUSED wrapper re-checks the record that paused it.
+EXEC_SELF_CHECK_S = 2.0
+# A paused wrapper whose record has been NOT live (dead/hung owner) this long
+# presumes the watchdog dead and resumes itself. (Test hook: a disposable
+# cache dir may shorten it via $CLAUDE_BROWSER_EXEC_ORPHAN_S.)
+EXEC_ORPHAN_RESUME_S = (
+    float(os.environ.get("CLAUDE_BROWSER_EXEC_ORPHAN_S", "60"))
+    if os.environ.get("CLAUDE_BROWSER_CACHE_DIR")
+    else 60.0
+)
+
+
+def _exec_self_resume(
+    rec: dict | None, paused_by: str, stale_since: float | None, now: float
+) -> tuple[str | None, float | None]:
+    """A paused wrapper's decision: (why to resume or None, new stale_since). Pure.
+
+    Resume when the record FILE is gone or names another owner. A record that
+    is still OURS but not live (owner dead/hung) is the watchdog's to recover —
+    resuming now would retake the gate its revert needs — unless it has been
+    not-live for EXEC_ORPHAN_RESUME_S (the watchdog is presumed dead).
+    """
+    if rec is None or rec.get("owner_nonce") != paused_by:
+        return "maintenance record gone", None
+    if _headed_lease_state(rec) == "live":
+        return None, None
+    since = now if stale_since is None else stale_since
+    if now - since >= EXEC_ORPHAN_RESUME_S:
+        return "guided login dead and not recovered (watchdog presumed dead)", since
+    return None, since
+
+
+class _ExecWrapper:
+    """The `register-exec` main loop: wait for the child, act on pause/resume.
+
+    Created (and its handlers installed) before the registration and the
+    child exist; `run` gets both once they do.
+    """
+
+    def __init__(self) -> None:
+        self.reg: Registration | None = None
+        self.proc: subprocess.Popen | None = None
+        self.pgid = 0
+        self.pending: list[int] = []  # SIGUSR1/2, handled on the main loop
+        self.early: list[int] = []  # terminating signals before the child exists
+        self.paused_by = ""
+        self.stale_since: float | None = None
+
+    def forward(self, signum: int, _frame: object) -> None:
+        """Forward a terminating signal to the child's group (resumed first)."""
+        if not self.pgid:
+            self.early.append(signum)
+            return
+        with contextlib.suppress(OSError):
+            os.killpg(self.pgid, signum)
+        if self.paused_by:
+            with contextlib.suppress(OSError):
+                os.killpg(self.pgid, signal.SIGCONT)
+
+    def request(self, signum: int, _frame: object) -> None:
+        """Signal handler: queue pause/resume for the main loop (no I/O here)."""
+        self.pending.append(signum)
+
+    def run(self, reg: Registration, proc: subprocess.Popen) -> int:
+        """Wait for the child; pause/resume on request; self-resume when orphaned."""
+        self.reg, self.proc, self.pgid = reg, proc, proc.pid
+        for signum in self.early:  # a SIGTERM that came before the child did
+            self.forward(signum, None)
+        last_check = time.monotonic()
+        while True:
+            try:
+                return proc.wait(timeout=EXEC_POLL_S)
+            except subprocess.TimeoutExpired:
+                pass
+            while self.pending:
+                if self.pending.pop(0) == signal.SIGUSR1:
+                    self.pause()
+                else:
+                    self.resume("requested")
+            now = time.monotonic()
+            if self.paused_by and now - last_check >= EXEC_SELF_CHECK_S:
+                last_check = now
+                why, self.stale_since = _exec_self_resume(
+                    _read_json_dict(MAINTENANCE_FILE),
+                    self.paused_by,
+                    self.stale_since,
+                    now,
+                )
+                if why:
+                    self.resume(why)
+
+    def _tool(self) -> object:
+        return self.reg.rec.get("tool") if self.reg is not None else None
+
+    def pause(self) -> None:
+        """SIGSTOP the child's group, release the gate — only inside a guided login."""
+        if self.paused_by or self.reg is None:
+            return
+        rec = _maint_live()
+        if rec is None:
+            _journal("client_pause", client=self._tool(), result="ignored")
+            return
+        try:
+            os.killpg(self.pgid, signal.SIGSTOP)
+        except OSError as exc:
+            _journal("client_pause", client=self._tool(), result=f"error:{exc}")
+            return
+        self.paused_by = str(rec.get("owner_nonce"))
+        self.stale_since = None
+        self.reg.drop_gate()
+        self.reg.update(paused=True, paused_by=self.paused_by[:12])
+        _journal(
+            "client_pause",
+            client=self._tool(),
+            child_pgid=self.pgid,
+            site=rec.get("site"),
+        )
+
+    def resume(self, why: str) -> None:
+        """Retake the gate (bounded), SIGCONT the child's group."""
+        if not self.paused_by or self.reg is None:
+            return
+        gate = self.reg.retake_gate(REGISTRY_SH_WAIT_S)
+        with contextlib.suppress(OSError):
+            os.killpg(self.pgid, signal.SIGCONT)
+        self.paused_by = ""
+        self.stale_since = None
+        self.reg.update(paused=False, paused_by="")
+        _journal(
+            "client_resume",
+            client=self._tool(),
+            child_pgid=self.pgid,
+            why=why,
+            gate="held" if gate else "lost",
+        )
+        if not gate:
+            print(
+                "⚠ register-exec: resumed without the client gate (a switch or "
+                "shutdown held it) — the next switch will not wait for this client.",
+                file=sys.stderr,
+            )
+
+
+def _kill_orphan_group(entry: dict) -> str:
+    """Stop the child group of a `register-exec` wrapper that is DEAD.
+
+    Only a validated group: the wrapper pid must be gone (or reused) and the
+    group leader must still run with the recorded start time. SIGTERM (+
+    SIGCONT, a stopped process cannot act on it), then SIGKILL after 5 s.
+    Returns what happened: ``killed``, ``terminated``, or why not.
+    """
+    if _client_validated(entry.get("pid"), entry.get("pid_start_time")):
+        return "wrapper alive"
+    child, lstart = entry.get("child_pid"), entry.get("child_start_time")
+    pgid = entry.get("child_pgid")
+    if not _client_validated(child, lstart) or pgid != child:
+        return "no validated orphan"
+    assert isinstance(child, int)  # for mypy (validated above)
+    for sig in (signal.SIGTERM, signal.SIGCONT):
+        with contextlib.suppress(OSError):
+            os.killpg(child, sig)
+    deadline = time.monotonic() + 5.0
+    while time.monotonic() < deadline:
+        if not _pid_alive(child):
+            break
+        time.sleep(0.1)
+    how = "terminated"
+    if _pid_alive(child) and _proc_lstart(child) == lstart:
+        with contextlib.suppress(OSError):
+            os.killpg(child, signal.SIGKILL)
+        how = "killed"
+    _journal("orphan_kill", client=entry.get("tool"), child_pgid=child, how=how)
+    return how
 
 
 def _fresh_transition(rec: dict | None) -> str | None:
@@ -4030,7 +4490,7 @@ def _down_clear_stale(port: int, rec: dict | None) -> bool:
     return True
 
 
-def cmd_down(port: int, force: bool = False) -> int:
+def cmd_down(port: int, force: bool = False, force_maintenance: bool = False) -> int:
     """Quit the shared browser: record the stop, escalate as needed, verify.
 
     A ``stopping`` record goes down FIRST, so a concurrent observer that finds
@@ -4055,6 +4515,10 @@ def cmd_down(port: int, force: bool = False) -> int:
     A record with no browser behind it (no CDP, no root process) is cleared
     straight away, without the gate — see `_down_clear_stale`.
     """
+    blocked = _maint_blocks(force_maintenance)
+    if blocked is not None:
+        print(blocked, file=sys.stderr)
+        return BUSY_RC
     rec = _lifecycle_read()
     if _down_clear_stale(port, rec):
         return 0
@@ -7198,19 +7662,36 @@ def cmd_anthropic_login(port: int) -> int:
         pw.stop()
 
 
-def cmd_anthropic_logged_in(port: int) -> int:
-    """Exit 0 if claude.ai is logged in (billing surface reachable), else 2."""
+def _logged_in_page_check(
+    port: int, url_substr: str, check: Callable[[Any], bool]
+) -> bool:
+    """Run an ACTIVE logged-in `check(page)` (it navigates the page itself).
+
+    Normally on the tab `_pick_page` finds for `url_substr`. While a guided
+    login is live, ONLY in a fresh background tab of its own: the picked tab
+    could be the guided login's OWNED login tab (or its OAuth popup), and the
+    check's navigation would reload Albert's half-typed login every 5 s. The
+    guided login's own probes always run that way ($PROBE_BACKGROUND_ENV),
+    the one before the transaction too: it must not leave or reuse a tab.
+    """
+    if _maint_live() is not None or os.environ.get(PROBE_BACKGROUND_ENV) == "1":
+        return bool(_with_background_page(port, "about:blank", check))
     pw, browser = _connect(port)
     try:
-        _ctx, page = _pick_page(browser, "claude.ai")
-        if _claude_logged_in(page):
-            print("✓ Logged into Claude (claude.ai).")
-            return 0
-        print("Not logged into Claude (claude.ai).", file=sys.stderr)
-        return 2
+        _ctx, page = _pick_page(browser, url_substr)
+        return bool(check(page))
     finally:
         browser.close()
         pw.stop()
+
+
+def cmd_anthropic_logged_in(port: int) -> int:
+    """Exit 0 if claude.ai is logged in (billing surface reachable), else 2."""
+    if _logged_in_page_check(port, "claude.ai", _claude_logged_in):
+        print("✓ Logged into Claude (claude.ai).")
+        return 0
+    print("Not logged into Claude (claude.ai).", file=sys.stderr)
+    return 2
 
 
 # ---------------------------------------------------------------------------
@@ -7325,17 +7806,11 @@ def cmd_openai_login(port: int) -> int:
 
 def cmd_openai_logged_in(port: int) -> int:
     """Exit 0 if chatgpt.com admin is logged in ('Invite member' reachable), else 2."""
-    pw, browser = _connect(port)
-    try:
-        _ctx, page = _pick_page(browser, "chatgpt.com")
-        if _chatgpt_logged_in(page):
-            print("✓ Logged into ChatGPT (chatgpt.com).")
-            return 0
-        print("Not logged into ChatGPT (chatgpt.com).", file=sys.stderr)
-        return 2
-    finally:
-        browser.close()
-        pw.stop()
+    if _logged_in_page_check(port, "chatgpt.com", _chatgpt_logged_in):
+        print("✓ Logged into ChatGPT (chatgpt.com).")
+        return 0
+    print("Not logged into ChatGPT (chatgpt.com).", file=sys.stderr)
+    return 2
 
 
 # ---------------------------------------------------------------------------
@@ -7523,17 +7998,11 @@ def cmd_slack_login(port: int) -> int:
 
 def cmd_slack_logged_in(port: int) -> int:
     """Exit 0 if app.slack.com is logged in, 2 if not."""
-    pw, browser = _connect(port)
-    try:
-        _ctx, page = _pick_page(browser, "slack.com")
-        if _slack_logged_in(page):
-            print("✓ Logged into Slack (app.slack.com).")
-            return 0
-        print("Not logged into Slack (app.slack.com).", file=sys.stderr)
-        return 2
-    finally:
-        browser.close()
-        pw.stop()
+    if _logged_in_page_check(port, "slack.com", _slack_logged_in):
+        print("✓ Logged into Slack (app.slack.com).")
+        return 0
+    print("Not logged into Slack (app.slack.com).", file=sys.stderr)
+    return 2
 
 
 def cmd_slack_session(port: int) -> int:
@@ -9136,6 +9605,984 @@ def cmd_notion_logged_in(port: int) -> int:
     return 2
 
 
+# ---------------------------------------------------------------------------
+# Guided login (`assisted-login`, PLAN_focus-free-browser.md Phase 3)
+# ---------------------------------------------------------------------------
+# ONE human entry: `browser.py assisted-login SITE` (agent-login.py -g SITE calls
+# it), confirmed by typing the site name on /dev/tty — no terminal, no start.
+#
+#   B (primary): an OWNED background tab on the login URL, shown to Albert by
+#     bin/login_viewer.py — a loopback relay that streams the headless tab into
+#     a dedicated, extension-free Brave app window and forwards his input. The
+#     browser stays headless the whole time.
+#   A (fallback, -a or offered when B cannot do the login): `switch headed`
+#     under the same transaction, the old window flow, `switch headless` in a
+#     finally. The only path that shows a window.
+#
+# Both run inside `_maintenance`, the transaction that makes the guided login
+# the browser's only user: registered long-lived clients are PAUSED (SIGSTOP of
+# their process group via the register-exec wrapper), the registry gate is
+# taken exclusively, unregistered CDP peers refuse the start (-f overrides),
+# the maintenance record (owner nonce, mode, owned targets, paused clients,
+# 10 s heartbeat) is written, then the gate is released so the transaction's
+# own `browser.py` children (they carry $CLAUDE_BROWSER_MAINTENANCE) can
+# register — everybody else's new registration refuses (exit 2) until the
+# record is gone. The interaction lease is held throughout. On ANY exit:
+# owned targets closed → headless ensured → record cleared → clients resumed,
+# every step journaled. A detached watchdog (`maintenance-watchdog`) does the
+# same if the owner dies or hangs.
+
+GUIDED_TOTAL_S = 15 * 60
+GUIDED_IDLE_S = 5 * 60
+GUIDED_PROBE_EVERY_S = 5.0
+# How long a paused client has to confirm (its wrapper writes paused: true).
+PAUSE_ACK_S = 5.0
+WATCHDOG_POLL_S = 2.0
+VIEWER_PY = Path(__file__).resolve().parent / "login_viewer.py"
+# The dedicated, extension-free Brave profile the viewer opens in.
+VIEWER_PROFILE_DIR = CACHE_DIR / "viewer-profile"
+BRAVE_APP = Path("/Applications/Brave Browser.app")
+# login_viewer.py's exit code for "this login needs a real window" (an
+# unsupported surface, or Albert pressed "Use a window instead").
+VIEWER_FALLBACK_RC = 5
+# Where B starts for the built-in sites (broker sites: their login_url).
+GUIDED_START_URLS = {
+    "anthropic": CLAUDE_LOGIN_URL,
+    "openai": CHATGPT_ADMIN_URL,
+    "slack": SLACK_WORKSPACE_URL,
+    "notion": NOTION_LOGIN_URL,
+    "switch": SWITCH_ORIGIN + SWITCH_LOGIN_PATH,
+}
+# Built-in sites whose own `login SITE` flow is the window flow of path A.
+GUIDED_BUILTIN_WINDOW = frozenset({"anthropic", "openai", "slack", "notion", "switch"})
+# Test hooks, honoured ONLY with CLAUDE_BROWSER_CACHE_DIR set (a disposable
+# browser): extra sites from a JSON file, and the viewer URL written to a file
+# instead of opening a window.
+TEST_SITES_ENV = "CLAUDE_BROWSER_TEST_SITES"
+TEST_VIEWER_URL_ENV = "CLAUDE_BROWSER_TEST_VIEWER_URL_FILE"
+WATCHDOG_NONCE_LEN = 16
+
+
+class MaintenanceRefused(RuntimeError):
+    """The guided login cannot start (see the message); nothing was changed."""
+
+
+@dataclass
+class Maintenance:
+    """A live guided-login transaction (what `_maintenance` yields)."""
+
+    nonce: str
+    site: str
+    mode: str
+    port: int
+    owned: list[str] = dataclasses.field(default_factory=list)
+    paused: list[dict] = dataclasses.field(default_factory=list)
+
+    def note(self, **fields: object) -> None:
+        """Merge `fields` into the record (a failed write only warns)."""
+        try:
+            if not _maint_update(self.nonce, **fields):
+                print("⚠ the maintenance record is not ours any more", file=sys.stderr)
+        except OSError as exc:
+            print(f"⚠ could not update the maintenance record: {exc}", file=sys.stderr)
+
+    def add_owned(self, tid: str) -> None:
+        """Record a target this guided login owns (closed on every exit)."""
+        if tid and tid not in self.owned:
+            self.owned.append(tid)
+            self.note(owned_targets=list(self.owned))
+
+    def drop_owned(self, tid: str) -> None:
+        """Forget an owned target that is gone."""
+        if tid in self.owned:
+            self.owned.remove(tid)
+            self.note(owned_targets=list(self.owned))
+
+    def set_mode(self, mode: str) -> None:
+        """Switch the record between B and A (A: `switch headed` is allowed)."""
+        self.mode = mode
+        self.note(mode=mode)
+        _journal("maintenance", phase="mode", site=self.site, mode=mode)
+
+
+def _osc8(url: str, text: str) -> str:
+    """OSC 8 hyperlink (invisible where unsupported)."""
+    return f"\x1b]8;;{url}\x1b\\{text}\x1b]8;;\x1b\\"
+
+
+def _test_mode() -> bool:
+    """True only for a disposable browser (CLAUDE_BROWSER_CACHE_DIR set)."""
+    return bool(os.environ.get("CLAUDE_BROWSER_CACHE_DIR"))
+
+
+def _test_sites() -> dict[str, dict]:
+    """Test-hook sites ({name: {login_url, check_url, logged_in_selector}})."""
+    path = os.environ.get(TEST_SITES_ENV, "")
+    if not path or not _test_mode():
+        return {}
+    data = _read_json_dict(Path(path)) or {}
+    return {str(k): v for k, v in data.items() if isinstance(v, dict)}
+
+
+def _test_site_logged_in(port: int, site: str, entry: dict) -> int:
+    """`logged-in` for a test-hook site: its sentinel on its check URL."""
+    url = str(entry.get("check_url") or "")
+    sel = str(entry.get("logged_in_selector") or "")
+
+    def check(page: Any) -> bool:  # an ACTIVE check, like the built-in sites'
+        page.goto(url, wait_until="domcontentloaded", timeout=15_000)
+        return _broker_wait_sentinel(page, sel)
+
+    if not (url and sel):
+        ok = False
+    elif entry.get("probe") == "pick":
+        # Like slack/openai/claude: the tab `_pick_page` finds — except during
+        # a guided login (`_logged_in_page_check`), which the tests pin.
+        ok = _logged_in_page_check(port, _url_origin(url), check)
+    else:
+        ok = bool(
+            _with_background_page(
+                port, url, lambda page: _broker_wait_sentinel(page, sel)
+            )
+        )
+    if ok:
+        print(f"✓ Logged into {site} (checked {_tab_hint(url)}).")
+        return 0
+    print(f"Not logged into {site} (checked {_tab_hint(url)}).", file=sys.stderr)
+    return 2
+
+
+def _test_site_obj(site: str, entry: dict) -> "Site":
+    """A Site for a test-hook entry (login = needs Albert, like every human site)."""
+
+    def login(_port: int) -> int:
+        print(f"needs Albert: agent-login.py -g {site}", file=sys.stderr)
+        return NEEDS_ALBERT_RC
+
+    return Site(
+        name=site,
+        aliases=(),
+        blurb="test site (CLAUDE_BROWSER_TEST_SITES)",
+        login=login,
+        logged_in=functools.partial(_test_site_logged_in, site=site, entry=entry),
+    )
+
+
+def _static_site_name(site: str) -> str | None:
+    """The built-in site `site` names (aliases resolved), or None."""
+    key = site.strip().lower()
+    for s in _sites():
+        if key == s.name or key in s.aliases:
+            return s.name
+    return None
+
+
+def _guided_start_url(site: str, override: str | None) -> str | None:
+    """Where the guided login starts: -u, a test site, built-in, broker; or None."""
+    if override:
+        return override
+    key = site.strip().lower()
+    test = _test_sites().get(key)
+    if test is not None:
+        return str(test.get("login_url") or "") or None
+    name = _static_site_name(key)
+    if name is not None:
+        return GUIDED_START_URLS.get(name)
+    try:
+        entry = _broker_site(key)
+    except BrokerUnavailable:
+        entry = None
+    if entry is None or entry.get("refused"):
+        return None
+    return str(entry.get("login_url") or entry.get("check_url") or "") or None
+
+
+def _self_run(
+    port: int,
+    *args: str,
+    capture: bool = True,
+    timeout: float | None = 120.0,
+    env: dict[str, str] | None = None,
+) -> subprocess.CompletedProcess:
+    """Run this browser.py with `args` (inherits the owner token); never raises."""
+    argv = [sys.executable, str(Path(__file__).resolve()), "--cdp-port", str(port)]
+    try:
+        return subprocess.run(
+            [*argv, *args],
+            check=False,
+            capture_output=capture,
+            text=True,
+            timeout=timeout,
+            stdin=subprocess.DEVNULL,
+            env=None if env is None else {**os.environ, **env},
+        )
+    except subprocess.TimeoutExpired:
+        return subprocess.CompletedProcess(args, 124, "", "timed out")
+    except OSError as exc:
+        return subprocess.CompletedProcess(args, 1, "", str(exc))
+
+
+def _guided_probe(port: int, site: str) -> bool:
+    """`logged-in SITE` — the site's own positive check, ALWAYS in a fresh
+    background tab (never a picked one: it could be the owned login tab)."""
+    res = _self_run(
+        port, "logged-in", site, timeout=90.0, env={PROBE_BACKGROUND_ENV: "1"}
+    )
+    return res.returncode == 0
+
+
+def _guided_open_owned(tx: Maintenance, url: str) -> str | None:
+    """`open -N URL` (background, raw CDP) → the new owned target id, recorded."""
+    res = _self_run(tx.port, "open", "-N", url, timeout=60.0)
+    tid = next(
+        (
+            line.split("=", 1)[1].strip()
+            for line in (res.stdout or "").splitlines()
+            if line.startswith("target=")
+        ),
+        "",
+    )
+    if res.returncode != 0 or not tid:
+        print(
+            f"❌ could not open the login tab (open -N exit {res.returncode})",
+            file=sys.stderr,
+        )
+        return None
+    tx.add_owned(tid)
+    return tid
+
+
+def _close_owned_targets(port: int, ids: Sequence[str]) -> list[str]:
+    """Close every still-open owned target (raw CDP); the ids that are gone now.
+
+    Never closes the last page target: a blank keep-alive goes first (tp#317).
+    """
+    gone: list[str] = []
+    ws_url = _browser_ws_url(port)
+    if ws_url is None:
+        return list(ids)  # browser down: nothing left to close
+    for tid in ids:
+        pages = _page_targets(port)
+        if not any(t.get("id") == tid for t in pages):
+            gone.append(tid)
+            continue
+        if len(pages) <= 1:
+            _cdp_create_background_target(ws_url, "about:blank", 3.0)
+        if _cdp_close_target(port, tid, 3.0, ws_url=ws_url):
+            gone.append(tid)
+    _journal("maintenance", phase="close_owned", closed=len(gone), owned=len(ids))
+    return gone
+
+
+def _ensure_headless(port: int) -> bool:
+    """`switch headless` when the browser is headed: one retry, loud on failure."""
+    for attempt in (1, 2):
+        if _browser_mode(port) != "headed":
+            return True
+        print("▶ hiding the Chromium window again (switch headless) …")
+        if cmd_switch(port, "headless") == 0:
+            return True
+        print(f"❌ switch headless failed (attempt {attempt}/2)", file=sys.stderr)
+        if attempt == 1:
+            time.sleep(2)
+    print(
+        "❌ the shared Chromium is still HEADED after the guided login. Every "
+        "browser.py command will try to revert it; fix it now: browser.py switch "
+        "headless   (-f if an unregistered client blocks it)",
+        file=sys.stderr,
+    )
+    return False
+
+
+# --- pause protocol (transaction side) ----------------------------------------
+
+
+def _client_validated(pid: object, lstart: object) -> bool:
+    """`pid` still runs with start time `lstart` (never a bare number)."""
+    if not isinstance(pid, int) or isinstance(pid, bool) or pid <= 0:
+        return False
+    if not lstart:
+        return False
+    return _pid_alive(pid) and _proc_lstart(pid) == lstart
+
+
+def _pause_targets(nonce: str) -> list[dict]:
+    """Live `register-exec` registrations that are not this transaction's own.
+
+    Refuses (`MaintenanceRefused`) when a long-lived wrapper from before the
+    pause protocol is registered (no ``kind``; any tool but browser.py's own
+    one-shot commands): it cannot be paused and would hold the gate forever.
+    """
+    live = _registry_live_clients()
+    legacy = [
+        rec for rec in live if not rec.get("kind") and rec.get("tool") != "browser.py"
+    ]
+    if legacy:
+        pids = ", ".join(f"{r.get('tool')} pid {r.get('pid')}" for r in legacy)
+        raise MaintenanceRefused(
+            f"registered client(s) from before the guided-login pause protocol: "
+            f"{pids}.\n   Restart the Claude sessions that run the Playwright "
+            "MCP (or stop those pids), then retry."
+        )
+    return [
+        rec
+        for rec in live
+        if rec.get("kind") == "exec" and rec.get("maintenance") != nonce
+    ]
+
+
+def _pause_acked(entry: dict) -> bool:
+    rec = _read_json_dict(CLIENTS_DIR / f"{entry.get('nonce')}.json")
+    return bool(rec and rec.get("paused"))
+
+
+def _pause_clients(tx: Maintenance) -> None:
+    """SIGUSR1 every validated long-lived client; wait for each to confirm.
+
+    The entry goes into the record BEFORE the signal, so a crash right after
+    still lets the watchdog resume it. A registration whose pid/start time
+    cannot be validated is never signalled — the start refuses instead.
+    """
+    for rec in _pause_targets(tx.nonce):
+        if not _client_validated(rec.get("pid"), rec.get("pid_start_time")):
+            raise MaintenanceRefused(
+                f"cannot validate the registered client {_describe_client(rec)} "
+                "(pid/start time) — not signalling it"
+            )
+        entry = {
+            k: rec.get(k)
+            for k in (
+                "nonce",
+                "pid",
+                "pid_start_time",
+                "tool",
+                "child_pid",
+                "child_pgid",
+                "child_start_time",
+            )
+        }
+        tx.paused.append(entry)
+        tx.note(paused=list(tx.paused))
+        os.kill(int(rec["pid"]), signal.SIGUSR1)
+        _journal(
+            "maintenance",
+            phase="pause",
+            client=rec.get("tool"),
+            client_pid=rec.get("pid"),
+        )
+    deadline = time.monotonic() + PAUSE_ACK_S
+    pending = list(tx.paused)
+    while pending and time.monotonic() < deadline:
+        time.sleep(0.1)
+        pending = [p for p in pending if not _pause_acked(p)]
+    if pending:
+        names = ", ".join(f"{p.get('tool')} pid {p.get('pid')}" for p in pending)
+        raise MaintenanceRefused(f"client(s) did not confirm the pause: {names}")
+    if tx.paused:
+        print(f"⏸  paused {len(tx.paused)} registered client(s) for the guided login")
+
+
+def _resume_clients(paused: Sequence[dict]) -> list[str]:
+    """Resume every paused client; the ones that could not be signalled.
+
+    Preferred: SIGUSR2 to the validated wrapper (it retakes the gate, then
+    SIGCONTs its child's group). Wrapper gone: the child group is an ORPHAN —
+    unregistered, it would fail every later switch closed — so it is stopped
+    (`_kill_orphan_group`: validated leader only, SIGTERM, SIGKILL after 5 s).
+    Anything else is left alone and reported.
+    """
+    problems: list[str] = []
+    for p in paused:
+        how = "gone"
+        try:
+            if _client_validated(p.get("pid"), p.get("pid_start_time")):
+                os.kill(int(p["pid"]), signal.SIGUSR2)
+                how = "wrapper"
+            else:
+                how = _kill_orphan_group(p)
+        except (OSError, KeyError, TypeError, ValueError) as exc:
+            how = f"error:{type(exc).__name__}"
+        if how not in ("wrapper", "terminated", "killed"):
+            problems.append(f"{p.get('tool')} pid {p.get('pid')}: {how}")
+        _journal("maintenance", phase="resume", client=p.get("tool"), how=how)
+    return problems
+
+
+# --- the transaction ----------------------------------------------------------
+
+
+def _spawn_watchdog(port: int, nonce: str) -> int | None:
+    """Start the detached recovery watchdog (own session, no stdio); its pid."""
+    argv = [
+        sys.executable,
+        str(Path(__file__).resolve()),
+        "--cdp-port",
+        str(port),
+        "maintenance-watchdog",
+        "-n",
+        nonce[:WATCHDOG_NONCE_LEN],
+    ]
+    env = {k: v for k, v in os.environ.items() if k != MAINTENANCE_ENV}
+    try:
+        proc = subprocess.Popen(  # pylint: disable=consider-using-with
+            argv,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+            env=env,
+        )
+    except OSError as exc:
+        print(f"⚠ could not start the guided-login watchdog: {exc}", file=sys.stderr)
+        return None
+    return proc.pid
+
+
+def _maint_take_gate(tx: Maintenance, stack: contextlib.ExitStack, force: bool) -> None:
+    """Gate EX → unregistered-peer check → interaction lease → state active → gate."""
+    gate = _gate_acquire(fcntl.LOCK_EX, REGISTRY_EX_WAIT_S)
+    if gate is None:
+        raise MaintenanceRefused(_gate_busy("start a guided login"))
+    try:
+        if _is_up(tx.port):
+            verdict = _unknown_clients_verdict(tx.port)
+            if verdict is not None and not force:
+                raise MaintenanceRefused(
+                    f"{verdict}\n   Stop them (or register them via register-exec), "
+                    "or re-run with -f/--force (they keep running, unpaused)."
+                )
+            if verdict is not None:
+                print(f"⚠ --force: guided login anyway — {verdict}", file=sys.stderr)
+        try:
+            stack.enter_context(_interaction_lease(f"guided login {tx.site}"))
+        except SystemExit as exc:
+            raise MaintenanceRefused(str(exc.code)) from None
+        tx.note(state="active")
+    finally:
+        _gate_release(gate)
+
+
+@contextlib.contextmanager
+def _maintenance(
+    site: str, mode: str = "B", *, port: int = DEFAULT_CDP_PORT, force: bool = False
+) -> Iterator[Maintenance]:
+    """THE guided-login transaction (B and A); yields the live `Maintenance`.
+
+    Order: record (state ``preparing``; new foreign registrations refuse from
+    here on) → watchdog → pause registered long-lived clients → gate EX
+    (bounded; refusal names the holders) → unregistered-peer check (refuse
+    unless `force`) → interaction lease → state ``active`` → gate released (our
+    own children register with the token) → the block. Exit, whatever the
+    cause: close owned targets → `switch headless` if headed → lease released
+    → record cleared → clients resumed. Raises `MaintenanceRefused` /
+    `HeadedLeaseBusy` when it cannot start (everything undone).
+    """
+    _journal_parent_chain()
+    _journal("maintenance", phase="start", site=site, mode=mode)
+    tx: Maintenance | None = None
+    problems: list[str] = []
+    result = "exception"
+    old_held = os.environ.get("CLAUDE_BROWSER_LEASE_HELD")
+    try:
+        with _maint_record(site, mode, state="preparing") as nonce:
+            tx = Maintenance(nonce, site, "B" if mode == "B" else "A", port)
+            with contextlib.ExitStack() as stack:
+                try:
+                    tx.note(watchdog_pid=_spawn_watchdog(port, nonce))
+                    _pause_clients(tx)
+                    _maint_take_gate(tx, stack, force)
+                    # The lease is ours: children that take it must not wait on us.
+                    os.environ["CLAUDE_BROWSER_LEASE_HELD"] = "1"
+                    yield tx
+                    result = "ok"
+                finally:
+                    if old_held is None:
+                        os.environ.pop("CLAUDE_BROWSER_LEASE_HELD", None)
+                    else:
+                        os.environ["CLAUDE_BROWSER_LEASE_HELD"] = old_held
+                    _close_owned_targets(port, list(tx.owned))
+                    tx.owned.clear()
+                    if not _ensure_headless(port):
+                        problems.append("still headed")
+    finally:
+        if tx is not None:
+            problems += _resume_clients(tx.paused)
+        for line in problems:
+            print(f"❌ guided-login cleanup: {line}", file=sys.stderr)
+        _journal(
+            "maintenance", phase="end", site=site, result=result, problems=len(problems)
+        )
+
+
+# --- watchdog -----------------------------------------------------------------
+
+
+def cmd_maintenance_watchdog(port: int, nonce: str) -> int:
+    """Recover a guided login whose owner died or hung; exit when it ends normally.
+
+    Polls the record every WATCHDOG_POLL_S. Gone or another owner's → done
+    (exit 0). Not live any more (owner pid dead / reused / heartbeat older
+    than MAINTENANCE_HUNG_S) → recover: close the owned targets, switch a
+    headed browser back to headless, clear the record (compare-before-
+    release), resume the paused clients — in that order: a resumed wrapper
+    retakes the gate shared, which would make the revert's exclusive gate
+    wait for a client that never drains.
+    """
+    prefix = nonce[:WATCHDOG_NONCE_LEN]
+    if len(prefix) < 8:
+        return _fail("maintenance-watchdog: -n/--nonce is too short")
+    while True:
+        rec = _read_json_dict(MAINTENANCE_FILE)
+        if rec is None or not str(rec.get("owner_nonce", "")).startswith(prefix):
+            return 0
+        state = _headed_lease_state(rec)
+        if state != "live":
+            return _watchdog_recover(port, rec, state)
+        time.sleep(WATCHDOG_POLL_S)
+
+
+def _watchdog_recover(port: int, rec: dict, state: str) -> int:
+    """The watchdog's recovery (see `cmd_maintenance_watchdog`)."""
+    _journal("watchdog_recover", phase="start", reason=state, site=rec.get("site"))
+    owned = [str(t) for t in rec.get("owned_targets") or [] if isinstance(t, str)]
+    closed = _close_owned_targets(port, owned) if owned else []
+    reverted: object = "headless"
+    if _browser_mode(port) == "headed":
+        with _stdout_to_stderr():
+            reverted = cmd_switch(port, "headless", revert=True)
+    with _maint_locked(5.0):
+        cur = _read_json_dict(MAINTENANCE_FILE)
+        if cur is not None and cur.get("owner_nonce") == rec.get("owner_nonce"):
+            MAINTENANCE_FILE.unlink(missing_ok=True)
+    paused = [p for p in rec.get("paused") or [] if isinstance(p, dict)]
+    problems = _resume_clients(paused)
+    _journal(
+        "watchdog_recover",
+        phase="end",
+        reason=state,
+        site=rec.get("site"),
+        closed=len(closed),
+        owned=len(owned),
+        revert=reverted,
+        resumed=len(paused) - len(problems),
+        problems=len(problems),
+    )
+    return 0
+
+
+# --- B: remote viewer -----------------------------------------------------------
+
+
+def _open_viewer_window(url: str) -> str:
+    """Show the viewer URL to Albert: a dedicated, extension-free Brave app window.
+
+    Test hook (disposable browser only): write the URL to a file instead.
+    Fallback without Brave: the default browser (`open URL`) with a ⚠ — that
+    profile is NOT dedicated. Returns how it was opened.
+    """
+    test_file = os.environ.get(TEST_VIEWER_URL_ENV, "")
+    if test_file and _test_mode():
+        fd = os.open(test_file, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write(url + "\n")
+        return "test-file"
+    if BRAVE_APP.exists():
+        VIEWER_PROFILE_DIR.mkdir(parents=True, exist_ok=True)
+        subprocess.run(
+            [
+                "open",
+                "-na",
+                str(BRAVE_APP),
+                "--args",
+                f"--user-data-dir={VIEWER_PROFILE_DIR}",
+                "--no-first-run",
+                "--no-default-browser-check",
+                "--disable-extensions",
+                f"--app={url}",
+            ],
+            check=False,
+        )
+        return "brave"
+    print(
+        "⚠ Brave Browser not found — opening the login view in your DEFAULT "
+        "browser (not a dedicated profile).",
+        file=sys.stderr,
+    )
+    subprocess.run(["open", url], check=False)
+    return "default"
+
+
+def _start_viewer(tx: Maintenance, tid: str) -> subprocess.Popen:
+    """bin/login_viewer.py on the owned target, as a REGISTERED long-lived client."""
+    argv = [
+        sys.executable,
+        str(Path(__file__).resolve()),
+        "--cdp-port",
+        str(tx.port),
+        "register-exec",
+        "-t",
+        "login-viewer",
+        "--",
+        sys.executable,
+        str(VIEWER_PY),
+        "-c",
+        f"http://127.0.0.1:{tx.port}",
+        "-t",
+        tid,
+        "-A",
+        "-j",
+        "-E",
+        "-i",
+        str(int(GUIDED_IDLE_S)),
+        "-M",
+        str(MAINTENANCE_FILE),
+    ]
+    return subprocess.Popen(  # pylint: disable=consider-using-with
+        argv, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, text=True
+    )
+
+
+def _pump_lines(stream: Any, out: "queue.Queue[dict | None]") -> None:
+    """Reader thread: the relay's JSON lines → `out`; None at EOF."""
+    try:
+        for line in stream:
+            with contextlib.suppress(ValueError):
+                obj = json.loads(line)
+                if isinstance(obj, dict):
+                    out.put(obj)
+    finally:
+        out.put(None)
+
+
+def _stop_viewer(relay: subprocess.Popen) -> None:
+    """SIGTERM the relay's wrapper (forwarded to the relay), then make sure."""
+    if relay.poll() is None:
+        with contextlib.suppress(OSError):
+            relay.send_signal(signal.SIGTERM)
+        try:
+            relay.wait(10)
+        except subprocess.TimeoutExpired:
+            relay.kill()
+            relay.wait(5)
+
+
+@dataclass
+class _ViewerRun:
+    """What the B loop learned from the relay's events."""
+
+    surface: str = ""
+    end: str = ""
+    connected: bool = False
+
+
+def _viewer_event(tx: Maintenance, run: _ViewerRun, ev: dict) -> None:
+    """Act on one relay event (owned target, popup closed, surface, viewer)."""
+    kind = ev.get("ev")
+    tid = str(ev.get("target") or "")
+    if kind == "owned":
+        tx.add_owned(tid)
+        print("ℹ️  following a popup of the login tab in the viewer")
+    elif kind == "released":
+        tx.drop_owned(tid)
+    elif kind == "surface":
+        run.surface = str(ev.get("reason") or "unsupported prompt")
+    elif kind == "viewer":
+        run.connected = bool(ev.get("connected"))
+    elif kind == "end":
+        run.end = str(ev.get("reason") or "")
+
+
+def _guided_b(tx: Maintenance, site: str, url: str, deadline: float) -> tuple[str, str]:
+    """Path B; ``(outcome, why)`` with outcome ok | fallback | fail | timeout."""
+    tid = _guided_open_owned(tx, url)
+    if tid is None:
+        return "fail", "could not open the login tab"
+    relay = _start_viewer(tx, tid)
+    events: queue.Queue[dict | None] = queue.Queue()
+    threading.Thread(
+        target=_pump_lines,
+        args=(relay.stdout, events),
+        daemon=True,
+        name="viewer-events",
+    ).start()
+    try:
+        try:
+            first = events.get(timeout=30)
+        except queue.Empty:
+            first = None
+        if not first or "url" not in first:
+            return "fail", "the viewer relay did not start"
+        url_v = str(first["url"])
+        how = _open_viewer_window(url_v)
+        print(
+            f"👤 Log in to {site} in the login view ({how}): "
+            f"{_osc8(url_v, 'open the login view')} — it closes by itself when "
+            f"you are logged in (max {GUIDED_TOTAL_S // 60} min, "
+            f"{GUIDED_IDLE_S // 60} min without the view open)."
+        )
+        del url_v, first
+        return _viewer_loop(tx, site, relay, events, deadline)
+    finally:
+        _stop_viewer(relay)
+
+
+def _viewer_loop(
+    tx: Maintenance,
+    site: str,
+    relay: subprocess.Popen,
+    events: "queue.Queue[dict | None]",
+    deadline: float,
+) -> tuple[str, str]:
+    """B's wait: relay events, a `logged-in` probe every GUIDED_PROBE_EVERY_S."""
+    run = _ViewerRun()
+    next_probe = time.monotonic() + GUIDED_PROBE_EVERY_S
+    while time.monotonic() <= deadline:
+        try:
+            ev = events.get(timeout=0.5)
+        except queue.Empty:
+            ev = {}
+        if ev is None:  # the relay ended
+            return _viewer_ended(tx, site, relay.wait(), run)
+        if ev:
+            _viewer_event(tx, run, ev)
+        if time.monotonic() >= next_probe:
+            if _guided_probe(tx.port, site):
+                return "ok", ""
+            next_probe = time.monotonic() + GUIDED_PROBE_EVERY_S
+    return "timeout", f"no login within {GUIDED_TOTAL_S // 60} min"
+
+
+def _viewer_ended(
+    tx: Maintenance, site: str, rc: int, run: _ViewerRun
+) -> tuple[str, str]:
+    """Why the relay ended: a surface (→ fallback), the login done, or a failure."""
+    if rc == VIEWER_FALLBACK_RC or run.surface:
+        return "fallback", run.surface or run.end or "the viewer asked for a window"
+    if _guided_probe(tx.port, site):
+        return "ok", ""
+    return "fail", f"the login view ended: {run.end or f'exit {rc}'}"
+
+
+# --- A: the window --------------------------------------------------------------
+
+
+def _activate_owned(tx: Maintenance, tid: str) -> None:
+    """Bring the owned login tab to the front of the shown window (lease only)."""
+    if not _headed_lease_held():
+        _journal("bring_to_front", command="guided-login", skipped="no-lease")
+        return
+    ws_url = _browser_ws_url(tx.port)
+    if ws_url is None:
+        return
+    _journal("bring_to_front", command="guided-login", origin="owned-target")
+    _cdp_ws_call(ws_url, "Target.activateTarget", {"targetId": tid}, 3.0)
+
+
+def _guided_a(
+    tx: Maintenance, site: str, url: str | None, deadline: float
+) -> tuple[str, str]:
+    """Path A: headed under the record (mode A), the window flow, headless after."""
+    tx.set_mode("A")
+    try:
+        print("▶ showing the shared Chromium window (guided login) …")
+        if _self_run(tx.port, "switch", "headed", capture=False).returncode != 0:
+            return "fail", "browser.py switch headed failed"
+        if _static_site_name(site) in GUIDED_BUILTIN_WINDOW:
+            # The site's own `login` window flow (it waits for Albert itself).
+            left = max(60.0, deadline - time.monotonic())
+            rc = _self_run(
+                tx.port, "login", site, capture=False, timeout=left
+            ).returncode
+            if _guided_probe(tx.port, site):
+                return "ok", ""
+            return "fail", f"browser.py login {site} exit {rc}"
+        return _guided_a_tab(tx, site, url, deadline)
+    finally:
+        _close_owned_targets(tx.port, list(tx.owned))
+        tx.owned.clear()
+        tx.note(owned_targets=[])
+        _ensure_headless(tx.port)
+
+
+def _guided_a_tab(
+    tx: Maintenance, site: str, url: str | None, deadline: float
+) -> tuple[str, str]:
+    """A for a site without a window flow: an owned tab, in front, probed."""
+    if not url:
+        return "fail", f"no login URL known for {site} (pass -u URL)"
+    tid = _guided_open_owned(tx, url)
+    if tid is None:
+        return "fail", "could not open the login tab"
+    _activate_owned(tx, tid)
+    print(
+        f"👤 In the Chromium window: log in to {site}. Waiting up to "
+        f"{max(0, int(deadline - time.monotonic()) // 60)} min …"
+    )
+    while time.monotonic() < deadline:
+        time.sleep(GUIDED_PROBE_EVERY_S)
+        if _guided_probe(tx.port, site):
+            return "ok", ""
+    return "timeout", f"no login within {GUIDED_TOTAL_S // 60} min"
+
+
+# --- the command ------------------------------------------------------------------
+
+
+class _Tty:
+    """The controlling terminal (/dev/tty), read and written unbuffered.
+
+    Not a text file object: a tty is not seekable, which `open(…, "r+")`
+    requires. A context manager that closes the fd.
+    """
+
+    def __init__(self, fd: int) -> None:
+        self.fd = fd
+
+    def __enter__(self) -> "_Tty":
+        return self
+
+    def __exit__(self, *_exc: object) -> None:
+        with contextlib.suppress(OSError):
+            os.close(self.fd)
+
+    def ask(self, prompt: str) -> str:
+        """Write `prompt`, read one line; the stripped answer ('' on EOF)."""
+        os.write(self.fd, prompt.encode())
+        buf = b""
+        while not buf.endswith(b"\n"):
+            chunk = os.read(self.fd, 1024)
+            if not chunk:
+                break
+            buf += chunk
+        return buf.decode("utf-8", "replace").strip()
+
+
+def _open_tty() -> _Tty | None:
+    """The controlling terminal, or None when there is none (agents, launchd)."""
+    try:
+        fd = os.open("/dev/tty", os.O_RDWR)
+    except OSError:
+        return None
+    return _Tty(fd)
+
+
+def _tty_ask(tty: Any, prompt: str) -> str:
+    """Ask on the terminal; the stripped answer ('' on EOF)."""
+    return str(tty.ask(prompt))
+
+
+GUIDED_NO_TTY = (
+    "❌ assisted-login needs your terminal: it is the human entry for a guided "
+    "login (agent-login.py -g SITE) and asks you to confirm. Agents cannot start it."
+)
+
+
+@dataclass(frozen=True)
+class GuidedRequest:
+    """What `assisted-login` was asked for."""
+
+    site: str
+    url: str | None = None
+    window: bool = False  # -a: straight to the window (A)
+    force: bool = False  # -f: past unregistered CDP clients
+
+
+def cmd_assisted_login(port: int, req: GuidedRequest) -> int:
+    """Guided login for SITE: B (remote view) first, A (window) as fallback.
+
+    Exit 0 logged in (or already was), 1 an error (incl. a failed cleanup),
+    2 refused (no terminal, not confirmed, busy) or still not logged in,
+    130 cancelled with Ctrl-C.
+    """
+    tty = _open_tty()
+    if tty is None:
+        print(GUIDED_NO_TTY, file=sys.stderr)
+        return 2
+    with tty:
+        return _assisted_login_tty(tty, port, req)
+
+
+def _assisted_precheck(tty: Any, port: int, req: GuidedRequest) -> int | None:
+    """Before the transaction: a start URL, a running browser, already logged
+    in, the typed confirmation. An exit code, or None to go ahead."""
+    start = _guided_start_url(req.site, req.url)
+    if start is None and _static_site_name(req.site) not in GUIDED_BUILTIN_WINDOW:
+        print(
+            f"❌ no login URL known for {req.site!r}; pass -u/--url URL",
+            file=sys.stderr,
+        )
+        return 2
+    if not _is_up(port) and cmd_up(port) != 0:
+        return 1
+    if _guided_probe(port, req.site):
+        print(
+            f"✅ {req.site}: the shared Chromium is already logged in — nothing to do"
+        )
+        return 0
+    answer = _tty_ask(
+        tty, f"Guided login for {req.site}: type the site name to start: "
+    )
+    if answer.lower() != req.site.strip().lower():
+        print(
+            f"❌ not confirmed (expected {req.site!r}) — nothing started",
+            file=sys.stderr,
+        )
+        return 2
+    return None
+
+
+def _assisted_login_tty(tty: Any, port: int, req: GuidedRequest) -> int:
+    """`assisted-login` once the terminal is open (see `cmd_assisted_login`)."""
+    rc = _assisted_precheck(tty, port, req)
+    if rc is not None:
+        return rc
+    start = _guided_start_url(req.site, req.url)
+    deadline = time.monotonic() + GUIDED_TOTAL_S
+    try:
+        with _maintenance(
+            req.site, "A" if req.window else "B", port=port, force=req.force
+        ) as tx:
+            if req.window:
+                outcome, why = _guided_a(tx, req.site, start, deadline)
+            else:
+                outcome, why = _guided_b(tx, req.site, str(start or ""), deadline)
+                if outcome == "fallback":
+                    outcome, why = _offer_window(tty, tx, start, deadline, why)
+    except (MaintenanceRefused, HeadedLeaseError) as exc:
+        print(f"❌ guided login refused: {exc}", file=sys.stderr)
+        return 2
+    except KeyboardInterrupt:
+        print("❌ guided login cancelled — cleaned up", file=sys.stderr)
+        return 130
+    return _guided_report(req.site, outcome, why)
+
+
+def _offer_window(
+    tty: Any, tx: Maintenance, start: str | None, deadline: float, why: str
+) -> tuple[str, str]:
+    """B could not finish: close its tabs, ask for the window (A) on the terminal."""
+    print(f"⚠ the login view cannot finish this login: {why}")
+    _close_owned_targets(tx.port, list(tx.owned))
+    for tid in list(tx.owned):
+        tx.drop_owned(tid)
+    answer = _tty_ask(tty, "switch to a visible window for this login? [y/N] ")
+    if answer.lower() in ("y", "yes"):
+        return _guided_a(tx, tx.site, start, deadline)
+    return "declined", why
+
+
+def _guided_report(site: str, outcome: str, why: str) -> int:
+    """The final ✅/❌ line and the exit code."""
+    if outcome == "ok":
+        print(f"✅ {site}: logged in — agents can use this session")
+        return 0
+    if outcome == "fail":
+        print(f"❌ {site}: {why}", file=sys.stderr)
+        return 1
+    print(f"❌ {site}: still not logged in ({why or outcome})", file=sys.stderr)
+    return 2
+
+
 def _broker_site_obj(site: str) -> "Site":
     """A dynamic registry entry for a broker-only site."""
     return Site(
@@ -9237,6 +10684,9 @@ def _resolve_site(name: str, *, for_login: bool = False) -> Site:
     (not refused) becomes a dynamic broker Site; anything else exits 2.
     """
     key = name.strip().lower()
+    test = _test_sites().get(key)
+    if test is not None:
+        return _test_site_obj(key, test)
     for site in _sites():
         if key == site.name or key in site.aliases:
             if site.name == "cscs" and for_login:
@@ -9341,6 +10791,7 @@ _JOURNALED_CMDS = {
     "login": "login",
     "cscs-login": "login",
     "login-cscs-assisted": "login",
+    "assisted-login": "guided_login",
 }
 
 
@@ -9431,7 +10882,12 @@ def _dispatch(args: argparse.Namespace, port: int) -> int:
             deadline_s=args.deadline,
         )
     if args.cmd == "switch":
-        return cmd_switch(port, args.mode, args.force)
+        return cmd_switch(
+            port,
+            args.mode,
+            args.force,
+            force_maintenance=getattr(args, "force_maintenance", False),
+        )
     if args.cmd == "clients":
         return cmd_clients(port)
     if args.cmd == "journal":
@@ -9441,7 +10897,7 @@ def _dispatch(args: argparse.Namespace, port: int) -> int:
     if args.cmd == "register-exec":
         return cmd_register_exec(port, args.tool, args.cmd_)
     if args.cmd == "down":
-        return cmd_down(port, args.force)
+        return cmd_down(port, args.force, getattr(args, "force_maintenance", False))
     if args.cmd == "open":
         return cmd_open(port, args.url, reuse=args.reuse, new=args.new)
     if args.cmd == "eval":
@@ -9472,6 +10928,13 @@ def _dispatch(args: argparse.Namespace, port: int) -> int:
         return cmd_import_safari(port, args.site, dry_run=args.dry_run)
     if args.cmd == "login-cscs-assisted":
         return cmd_login_cscs_assisted(port)
+    if args.cmd == "assisted-login":
+        return cmd_assisted_login(
+            port,
+            GuidedRequest(args.site, args.url, args.fallback_window, args.force),
+        )
+    if args.cmd == "maintenance-watchdog":
+        return cmd_maintenance_watchdog(port, args.nonce)
     # CSCS aliases (back-compat; cscs-api.py depends on these names).
     if args.cmd == "cscs-login":
         return cmd_login(port, "cscs")

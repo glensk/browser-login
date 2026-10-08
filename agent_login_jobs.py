@@ -295,6 +295,23 @@ def _browser_module() -> ModuleType:
     return mod
 
 
+# browser.py's exit code while a guided login owns the browser (EX_TEMPFAIL):
+# busy, re-check later — never "logged out", never a reason to log in or mail.
+BUSY_RC = 75
+
+
+def guided_busy() -> str | None:
+    """``busy: guided login for SITE …`` while one owns the shared browser."""
+    try:
+        mod = _browser_module()
+        rec = mod._maint_live()  # pylint: disable=protected-access
+    except (RuntimeError, OSError):
+        return None
+    if rec is None:
+        return None
+    return str(mod._maint_refusal(rec)).splitlines()[0]  # pylint: disable=protected-access
+
+
 @dataclass
 class GuidedWindow:
     """What `guided_window` reports back: did the window go away again?"""
@@ -341,20 +358,24 @@ def hide_window(mod: ModuleType | None = None, nonce: str | None = None) -> bool
 def guided_window(site: str) -> Iterator[GuidedWindow]:
     """Show the shared Chromium for a guided login, then hide it again.
 
-    Order (tp#836): take the headed lease (`_headed_lease`, which exports its
-    nonce to every child browser.py) → `switch headed` → the block →
-    `switch headless` (one retry, loud on failure) → release the lease. A
-    failed `switch headed` raises RuntimeError after reverting whatever is left
+    Order (tp#836): enter the guided-login maintenance transaction in mode A
+    (`_maintenance(site, "A")`: pauses registered long-lived clients, takes the
+    gate and the interaction lease, writes the record whose nonce every child
+    browser.py inherits, starts the recovery watchdog) → `switch headed` → the
+    block → `switch headless` (one retry, loud on failure) → the transaction's
+    cleanup (owned tabs closed, record cleared, clients resumed). A failed
+    `switch headed` raises RuntimeError after reverting whatever is left
     headed. The yielded `GuidedWindow.restored` says whether the window is gone.
     """
     state = GuidedWindow()
     with contextlib.ExitStack() as stack:
         try:
             mod = _browser_module()
-            nonce = stack.enter_context(
-                mod._headed_lease(site)  # pylint: disable=protected-access
+            tx = stack.enter_context(
+                mod._maintenance(site, "A")  # pylint: disable=protected-access
             )
-        except RuntimeError as exc:  # HeadedLeaseBusy/-Error, load failure
+            nonce = tx.nonce
+        except RuntimeError as exc:  # MaintenanceRefused/HeadedLease*, load failure
             print(f"❌ guided login refused: {exc}")
             raise
         print("▶ showing the shared Chromium window (guided login) …")

@@ -27,6 +27,7 @@ import json
 import os
 import sys
 import time
+import types
 from pathlib import Path
 
 import pytest
@@ -78,8 +79,8 @@ def _lease_rec(**over) -> dict:
 
 
 def _write_lease(rec: dict) -> None:
-    browser.HEADED_LEASE_FILE.parent.mkdir(parents=True, exist_ok=True)
-    browser.HEADED_LEASE_FILE.write_text(json.dumps(rec), encoding="utf-8")
+    browser.MAINTENANCE_FILE.parent.mkdir(parents=True, exist_ok=True)
+    browser.MAINTENANCE_FILE.write_text(json.dumps(rec), encoding="utf-8")
 
 
 # --- desired mode -------------------------------------------------------------
@@ -159,14 +160,14 @@ def test_switch_headed_refused_without_lease(cache, monkeypatch, capsys):
 
 def test_switch_headed_refused_with_a_foreign_nonce(cache, monkeypatch):
     _write_lease(_lease_rec())
-    monkeypatch.setenv(browser.HEADED_LEASE_ENV, "x" * 32)
+    monkeypatch.setenv(browser.MAINTENANCE_ENV, "x" * 32)
     monkeypatch.setattr(browser, "_browser_mode", lambda port: "headless")
     assert browser.cmd_switch(PORT, "headed") == 2
 
 
 def test_switch_headed_allowed_for_the_lease_holder(cache, monkeypatch, capsys):
     _write_lease(_lease_rec())
-    monkeypatch.setenv(browser.HEADED_LEASE_ENV, "n" * 32)
+    monkeypatch.setenv(browser.MAINTENANCE_ENV, "n" * 32)
     monkeypatch.setattr(browser, "_browser_mode", lambda port: "headed")
     monkeypatch.setattr(browser, "_heal_running_record", lambda port, mode: False)
     assert browser.cmd_switch(PORT, "headed") == 0
@@ -272,19 +273,19 @@ def test_lease_state_none_and_live_record(cache):
 def test_lease_held_needs_the_matching_nonce(cache, monkeypatch):
     _write_lease(_lease_rec())
     assert not browser._headed_lease_held()  # no env
-    monkeypatch.setenv(browser.HEADED_LEASE_ENV, "x" * 32)
+    monkeypatch.setenv(browser.MAINTENANCE_ENV, "x" * 32)
     assert not browser._headed_lease_held()
-    monkeypatch.setenv(browser.HEADED_LEASE_ENV, "n" * 32)
+    monkeypatch.setenv(browser.MAINTENANCE_ENV, "n" * 32)
     assert browser._headed_lease_held()
     _write_lease(_lease_rec(heartbeat=time.time() - 200))
     assert not browser._headed_lease_held()  # hung owner = not held
 
 
 def test_headed_lease_context_writes_exports_and_releases(cache, monkeypatch):
-    monkeypatch.setattr(browser, "HEADED_LEASE_HEARTBEAT_S", 0.05)
+    monkeypatch.setattr(browser, "MAINTENANCE_HEARTBEAT_S", 0.05)
     with browser._headed_lease("slack") as nonce:
-        assert os.environ[browser.HEADED_LEASE_ENV] == nonce
-        rec = json.loads(browser.HEADED_LEASE_FILE.read_text(encoding="utf-8"))
+        assert os.environ[browser.MAINTENANCE_ENV] == nonce
+        rec = json.loads(browser.MAINTENANCE_FILE.read_text(encoding="utf-8"))
         assert rec["owner_nonce"] == nonce and rec["site"] == "slack"
         assert rec["pid"] == os.getpid() and rec["pid_start_time"] == LSTART
         first = rec["heartbeat"]
@@ -292,12 +293,12 @@ def test_headed_lease_context_writes_exports_and_releases(cache, monkeypatch):
         deadline = time.monotonic() + 3
         while time.monotonic() < deadline:
             time.sleep(0.05)
-            cur = json.loads(browser.HEADED_LEASE_FILE.read_text(encoding="utf-8"))
+            cur = json.loads(browser.MAINTENANCE_FILE.read_text(encoding="utf-8"))
             if cur["heartbeat"] > first:
                 break
         assert cur["heartbeat"] > first, "heartbeat thread never refreshed"
-    assert browser.HEADED_LEASE_ENV not in os.environ
-    assert not browser.HEADED_LEASE_FILE.exists()
+    assert browser.MAINTENANCE_ENV not in os.environ
+    assert not browser.MAINTENANCE_FILE.exists()
 
 
 def test_headed_lease_refuses_a_second_live_owner(cache):
@@ -305,7 +306,7 @@ def test_headed_lease_refuses_a_second_live_owner(cache):
     with pytest.raises(browser.HeadedLeaseBusy):
         with browser._headed_lease("openai"):
             pass
-    assert json.loads(browser.HEADED_LEASE_FILE.read_text())["site"] == "anthropic"
+    assert json.loads(browser.MAINTENANCE_FILE.read_text())["site"] == "anthropic"
 
 
 def test_lease_state_ps_failure_is_live(cache, monkeypatch):
@@ -321,28 +322,28 @@ def test_headed_lease_needs_a_start_time(cache, monkeypatch):
     with pytest.raises(browser.HeadedLeaseError, match="start time"):
         with browser._headed_lease("slack"):
             pass
-    assert not browser.HEADED_LEASE_FILE.exists()
+    assert not browser.MAINTENANCE_FILE.exists()
 
 
 def test_heartbeat_survives_a_write_error(cache, monkeypatch, capsys):
-    monkeypatch.setattr(browser, "HEADED_LEASE_HEARTBEAT_S", 0.02)
+    monkeypatch.setattr(browser, "MAINTENANCE_HEARTBEAT_S", 0.02)
     real = browser._json_write_atomic
     fails = {"n": 0}
 
     def flaky(path, data):
-        if path == browser.HEADED_LEASE_FILE and fails["n"] < 2:
+        if path == browser.MAINTENANCE_FILE and fails["n"] < 2:
             fails["n"] += 1
             raise OSError(28, "No space left on device")
         real(path, data)
 
     with browser._headed_lease("slack"):
-        first = json.loads(browser.HEADED_LEASE_FILE.read_text())["heartbeat"]
+        first = json.loads(browser.MAINTENANCE_FILE.read_text())["heartbeat"]
         monkeypatch.setattr(browser, "_json_write_atomic", flaky)
         deadline = time.monotonic() + 3
         cur = first
         while time.monotonic() < deadline and cur <= first:
             time.sleep(0.05)
-            cur = json.loads(browser.HEADED_LEASE_FILE.read_text())["heartbeat"]
+            cur = json.loads(browser.MAINTENANCE_FILE.read_text())["heartbeat"]
         assert fails["n"] == 2 and cur > first, "heartbeat gave up after an OSError"
     assert capsys.readouterr().err.count("heartbeat failed") == 1  # logged once
 
@@ -357,13 +358,13 @@ def test_headed_lease_takes_over_a_stale_one(cache):
     _write_lease(_lease_rec(heartbeat=time.time() - 200))
     with browser._headed_lease("openai") as nonce:
         assert nonce != "n" * 32
-    assert not browser.HEADED_LEASE_FILE.exists()
+    assert not browser.MAINTENANCE_FILE.exists()
 
 
 def test_headed_lease_release_is_compare_before_release(cache, capsys):
     with browser._headed_lease("notion"):
         _write_lease(_lease_rec(owner_nonce="f" * 32))  # somebody rewrote it
-    assert browser.HEADED_LEASE_FILE.exists()  # a foreign lease is left alone
+    assert browser.MAINTENANCE_FILE.exists()  # a foreign lease is left alone
     assert "rewritten by owner ffffffff" in capsys.readouterr().err
 
 
@@ -507,7 +508,7 @@ def test_guided_login_refused_without_lease(cache, monkeypatch, capsys):
 
 def test_guided_login_allowed_only_headed_under_the_lease(cache, monkeypatch):
     _write_lease(_lease_rec())
-    monkeypatch.setenv(browser.HEADED_LEASE_ENV, "n" * 32)
+    monkeypatch.setenv(browser.MAINTENANCE_ENV, "n" * 32)
     monkeypatch.setattr(browser, "_browser_mode", lambda port: "headed")
     assert browser._guided_login_allowed(PORT, "notion", "Notion")
     monkeypatch.setattr(browser, "_browser_mode", lambda port: "headless")
@@ -583,7 +584,7 @@ def test_bring_to_front_without_lease_is_a_journaled_no_op(cache, monkeypatch):
 
 def test_bring_to_front_headless_under_lease_is_skipped(cache, monkeypatch):
     _write_lease(_lease_rec())
-    monkeypatch.setenv(browser.HEADED_LEASE_ENV, "n" * 32)
+    monkeypatch.setenv(browser.MAINTENANCE_ENV, "n" * 32)
     monkeypatch.setattr(browser, "_browser_mode", lambda port: "headless")
     page = _Page()
     browser._bring_to_front(page, "doctor", PORT)
@@ -593,7 +594,7 @@ def test_bring_to_front_headless_under_lease_is_skipped(cache, monkeypatch):
 
 def test_bring_to_front_raises_inside_a_guided_login(cache, monkeypatch):
     _write_lease(_lease_rec())
-    monkeypatch.setenv(browser.HEADED_LEASE_ENV, "n" * 32)
+    monkeypatch.setenv(browser.MAINTENANCE_ENV, "n" * 32)
     monkeypatch.setattr(browser, "_browser_mode", lambda port: "headed")
     page = _Page()
     browser._bring_to_front(page, "login openai", PORT)
@@ -683,10 +684,11 @@ def guided_env(monkeypatch):
 
         @staticmethod
         @contextlib.contextmanager
-        def _headed_lease(site):
+        def _maintenance(site, mode):
+            assert mode == "A"
             log.append(("lease", site))
             try:
-                yield "nonce"
+                yield types.SimpleNamespace(nonce="nonce")
             finally:
                 log.append(("release", site))
 
@@ -777,5 +779,5 @@ def test_browser_module_systemexit_becomes_runtimeerror(monkeypatch):
 def test_browser_module_loads_the_real_lease(tmp_path, monkeypatch):
     monkeypatch.setenv("CLAUDE_BROWSER_CACHE_DIR", str(tmp_path))
     mod = jobs._browser_module()
-    assert mod.HEADED_LEASE_FILE == tmp_path / "headed-lease.json"
+    assert mod.MAINTENANCE_FILE == tmp_path / "maintenance.json"
     assert callable(mod._headed_lease)

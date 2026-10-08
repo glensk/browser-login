@@ -32,24 +32,33 @@ to that browser tab with an HttpOnly SameSite=Strict session cookie (required
 for the WebSocket); after the viewer disconnects the tab has 10 s to reconnect,
 then the token is burned (404) and the relay exits.
 
-Spike status: popups (``window.open``/OAuth) are only REPORTED (a new target
-whose openerId is the owned id, or ``opener=unknown`` when a page target without
-openerId appears while the human is typing into ours); following them is the job
-of the real target supervisor.
+Guided-login integration (``browser.py assisted-login``, the maintenance
+transaction): the relay runs as a REGISTERED long-lived client (``register-exec``)
+under the transaction's owner token; ``-M FILE`` makes it refuse to start without
+that token and end as soon as the maintenance record is gone or its owner died
+(the watchdog then closes the owned targets). ``-E`` prints one JSON event per
+line on stdout for the transaction:
 
-TODO(Phase 3 integration) — what this spike deliberately leaves out:
-  * register the relay as a long-lived CDP client via ``browser.py register-exec``
-    (it holds a browser-level CDP websocket; unregistered it would trip the
-    "unregistered CDP peers" check of the maintenance transaction);
-  * hold the interaction lease for the relay's whole lifetime;
-  * require the maintenance owner token (refuse to start without it), write the
-    owned target id(s) into the maintenance record, exit when its heartbeat is
-    stale so the watchdog can close the owned targets;
-  * target supervisor: follow owned popups, switch the viewer, handle popup
-    close + opener redirect;
-  * viewport sizing to the viewer window; JS dialogs and unsupported surfaces
-    (WebAuthn, permission and client-cert prompts) -> named-reason exit to
-    fallback A.
+* ``{"ev": "owned", "target", "opener"}`` — the TARGET SUPERVISOR followed a new
+  target whose ``openerId`` is an owned one (an OAuth popup): it is owned now and
+  shown in the viewer; ``{"ev": "released", "target"}`` — an owned target closed
+  (the viewer returns to its opener). A target without an owned opener is never
+  selected (at most reported as ``opener=unknown``).
+* ``{"ev": "viewer", "connected"}`` — the human's view (dis)connected.
+* ``{"ev": "surface", "reason"}`` — something the view cannot do: a WebAuthn /
+  passkey prompt (``navigator.credentials.get/create`` hook, conditional
+  mediation excluded), a permission request (notifications, geolocation,
+  camera/microphone, screen capture), an external-app link (navigation to a
+  non-web scheme), or "Use a window instead" pressed in the viewer. The relay
+  then exits ``5`` and the transaction offers the window (fallback A).
+  Client-certificate prompts are not exposed by CDP in headless Chrome (it
+  silently sends no certificate); the site's error page shows in the view and
+  the button is the way out.
+* ``{"ev": "end", "reason", "code"}`` — the relay's last line.
+
+JS dialogs (alert/confirm/prompt/beforeunload) are answered in the viewer. The
+owned target's viewport follows the viewer window (``Emulation.
+setDeviceMetricsOverride``, session-scoped: it ends with the relay's session).
 """
 
 from __future__ import annotations
@@ -60,10 +69,12 @@ import hmac
 import http.cookies
 import json
 import math
+import os
 import secrets
 import sys
 import time
 import urllib.request
+from collections.abc import Collection, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -79,6 +90,8 @@ SCRIPT = Path(__file__).resolve()
 REPO_ROOT = SCRIPT.parent.parent
 VIEWER_MODULES = ("websockets",)
 EXIT_MISSING_DEP = 3
+# The guided login's owner token (browser.py exports it to its children).
+MAINTENANCE_ENV = "CLAUDE_BROWSER_MAINTENANCE"
 
 # Methods the relay may send to the CDP endpoint, whoever asked for them.
 ALLOWED_METHODS = frozenset(
@@ -97,10 +110,28 @@ ALLOWED_METHODS = frozenset(
         "Target.createTarget",
         "Target.attachToTarget",
         "Target.closeTarget",
+        "Emulation.setDeviceMetricsOverride",
+        "Page.handleJavaScriptDialog",
+        "Runtime.enable",
+        "Runtime.addBinding",
+        "Runtime.evaluate",
+        "Page.addScriptToEvaluateOnNewDocument",
     }
 )
-# Target.* calls that name a target must name the owned one.
+# Target.* calls that name a target must name an owned one.
 _TARGET_SCOPED = frozenset({"Target.attachToTarget", "Target.closeTarget"})
+# Calls that carry relay-internal code/names: only the exact strings the relay
+# registered (the WebAuthn/permission hook and its binding name) pass.
+_INTERNAL_PARAM = {
+    "Runtime.evaluate": "expression",
+    "Runtime.addBinding": "name",
+    "Page.addScriptToEvaluateOnNewDocument": "source",
+}
+EXIT_FALLBACK = 5
+# Browser-level events the target supervisor acts on.
+_SUPERVISOR_EVENTS = frozenset(
+    {"Target.targetCreated", "Target.targetDestroyed", "Target.detachedFromTarget"}
+)
 
 MOD_ALT, MOD_CTRL, MOD_META, MOD_SHIFT = 1, 2, 4, 8
 
@@ -159,14 +190,159 @@ def osc8(url: str, text: str | None = None) -> str:
     return f"\x1b]8;;{url}\x1b\\{text or url}\x1b]8;;\x1b\\"
 
 
-def method_allowed(method: str, params: dict[str, Any], owned_id: str) -> bool:
-    """Final gate for every CDP command the relay sends."""
+def method_allowed(
+    method: str,
+    params: dict[str, Any],
+    owned: str | Collection[str],
+    internal: Collection[str] = (),
+) -> bool:
+    """Final gate for every CDP command the relay sends.
+
+    `owned` = the owned target id(s); `internal` = the relay's own hook source
+    and binding name (the only values ``Runtime.evaluate``/``addBinding`` and
+    ``Page.addScriptToEvaluateOnNewDocument`` may carry).
+    """
+    ids = {owned} if isinstance(owned, str) else set(owned)
+    ids.discard("")
     if method not in ALLOWED_METHODS:
         return False
     if method == "Target.createTarget":
-        return not owned_id  # only the one target the relay creates for itself
+        return not ids  # only the one target the relay creates for itself
     if method in _TARGET_SCOPED:
-        return bool(owned_id) and params.get("targetId") == owned_id
+        return params.get("targetId") in ids
+    key = _INTERNAL_PARAM.get(method)
+    if key is not None:
+        value = params.get(key)
+        return isinstance(value, str) and value in internal
+    return True
+
+
+# Schemes a login tab may navigate to; anything else asks the OS for an app.
+_WEB_SCHEMES = frozenset({"http", "https", "about", "data", "blob", "javascript"})
+
+
+def external_scheme(url: Any) -> str | None:
+    """The non-web scheme `url` navigates to (an external-app prompt), or None."""
+    if not isinstance(url, str) or ":" not in url:
+        return None
+    scheme = url.split(":", 1)[0].lower()
+    if not scheme or scheme in _WEB_SCHEMES or scheme.startswith("chrome"):
+        return None
+    return scheme
+
+
+def popup_decision(
+    ti: dict[str, Any], owned: Collection[str], recent_input: bool
+) -> str:
+    """``follow`` (opener owned), ``report`` (no opener, right after input) or
+    ``ignore`` for a new target — never selects a target without an owned opener."""
+    tid = ti.get("targetId")
+    if not isinstance(tid, str) or not tid or tid in owned:
+        return "ignore"
+    if ti.get("type") != "page":
+        return "ignore"
+    opener = ti.get("openerId")
+    if isinstance(opener, str) and opener in owned:
+        return "follow"
+    if not opener and recent_input:
+        return "report"
+    return "ignore"
+
+
+def view_after_close(
+    closed: str, current: str, owned: Sequence[str], openers: dict[str, str]
+) -> str | None:
+    """What the viewer shows after owned target `closed` went away (None = end).
+
+    Not the shown one → unchanged. The shown one → its opener (or the opener's
+    opener …) if still owned, else the most recent owned target left.
+    """
+    left = [t for t in owned if t != closed]
+    if not left:
+        return None
+    if closed != current:
+        return current
+    opener = openers.get(closed)
+    seen: set[str] = set()
+    while opener is not None and opener not in left and opener not in seen:
+        seen.add(opener)
+        opener = openers.get(opener)
+    return opener if opener in left else left[-1]
+
+
+_SURFACES = {
+    "webauthn": "a passkey / security-key (WebAuthn) prompt",
+    "permission": "a permission request",
+    "external": "a link that opens an external app",
+    "requested": "you asked for a visible window",
+}
+
+
+def surface_reason(kind: str, detail: str = "") -> str:
+    """The named reason a surface ends the remote view."""
+    base = _SURFACES.get(kind, "an unsupported prompt")
+    return f"{base} ({detail})" if detail and kind != "requested" else base
+
+
+def hook_source(binding: str) -> str:
+    """The init script that reports unsupported surfaces through `binding`.
+
+    It removes the binding from the page's global object first (pages cannot
+    call it by name), then wraps the APIs whose UI a headless tab cannot show.
+    Conditional mediation (passkey autofill, called by many login pages on
+    load) is NOT reported — only a modal WebAuthn ceremony is.
+    """
+    name = json.dumps(binding)
+    return (
+        "(() => { const sig = globalThis[" + name + "];"
+        " try { delete globalThis[" + name + "]; } catch (e) {}"
+        " if (typeof sig !== 'function') return;"
+        " const send = (k, d) => { try { sig(JSON.stringify({k: k, d: d}));"
+        " } catch (e) {} };"
+        " const wrap = (o, n, k, test) => { try { const f = o && o[n];"
+        " if (typeof f !== 'function') return;"
+        " o[n] = function (...a) { if (!test || test(a)) send(k, n);"
+        " return f.apply(this, a); }; } catch (e) {} };"
+        " const c = navigator.credentials;"
+        " wrap(c, 'get', 'webauthn', a => !!(a[0] && a[0].publicKey)"
+        " && a[0].mediation !== 'conditional');"
+        " wrap(c, 'create', 'webauthn', a => !!(a[0] && a[0].publicKey));"
+        " if (globalThis.Notification)"
+        " wrap(Notification, 'requestPermission', 'permission');"
+        " wrap(navigator.geolocation, 'getCurrentPosition', 'permission');"
+        " wrap(navigator.geolocation, 'watchPosition', 'permission');"
+        " wrap(navigator.mediaDevices, 'getUserMedia', 'permission');"
+        " wrap(navigator.mediaDevices, 'getDisplayMedia', 'permission');"
+        " })();"
+    )
+
+
+def maintenance_error(path: Path, nonce: str) -> str | None:
+    """Why the relay may not run under maintenance record `path`, or None."""
+    try:
+        rec = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return (
+            f"no maintenance record at {path} (start it via browser.py assisted-login)"
+        )
+    if not isinstance(rec, dict) or not rec.get("owner_nonce"):
+        return f"invalid maintenance record at {path}"
+    if not nonce or not hmac.compare_digest(str(rec["owner_nonce"]), nonce):
+        return "not the guided login's owner ($CLAUDE_BROWSER_MAINTENANCE)"
+    return None
+
+
+def owner_alive(path: Path, nonce: str) -> bool:
+    """The record still carries `nonce` and its owner pid exists."""
+    if maintenance_error(path, nonce) is not None:
+        return False
+    try:
+        pid = int(json.loads(path.read_text(encoding="utf-8")).get("pid"))
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except (OSError, ValueError, TypeError):
+        return True  # EPERM / unreadable: never end a live session on a hiccup
     return True
 
 
@@ -472,7 +648,12 @@ def safe_translate(msg: Any) -> Cmd | None:
 
 @dataclass
 class Relay:  # pylint: disable=too-many-instance-attributes
-    """One CDP attachment to the owned target plus at most one viewer socket."""
+    """One CDP connection, the owned target(s) and at most one viewer socket.
+
+    ``target_id``/``session_id`` name the target the viewer SHOWS right now;
+    ``owned`` lists every owned target (the login tab first, then the popups
+    the target supervisor followed), ``sessions`` their flat CDP sessions.
+    """
 
     cdp_http: str
     target_id: str  # "" until the relay has created its own target
@@ -491,9 +672,38 @@ class Relay:  # pylint: disable=too-many-instance-attributes
     exit_reason: str = ""
     exit_code: int = 0
     done: asyncio.Event = field(default_factory=asyncio.Event)
+    events: bool = False
+    maint_file: Path | None = None
+    maint_nonce: str = ""
+    owned: list[str] = field(default_factory=list)
+    openers: dict[str, str] = field(default_factory=dict)
+    sessions: dict[str, str] = field(default_factory=dict)
+    dims: tuple[int, int, int, int] | None = None  # css w, h; device w, h
+    dialogs: dict[str, dict[str, Any]] = field(default_factory=dict)
+    binding: str = field(default_factory=lambda: "__lv" + secrets.token_hex(8))
     _cdp: Any = None
     _next_id: int = 0
     _pending: dict[int, asyncio.Future[Any]] = field(default_factory=dict)
+    _tasks: set[asyncio.Task[None]] = field(default_factory=set)
+
+    @property
+    def hook(self) -> str:
+        """This relay's surface hook (init script)."""
+        return hook_source(self.binding)
+
+    @property
+    def internal(self) -> frozenset[str]:
+        """The relay-internal strings the gate lets through."""
+        return frozenset({self.hook, self.binding})
+
+    def emit(self, **obj: Any) -> None:
+        """One JSON event line on stdout (``-E``); a closed pipe ends the relay."""
+        if not self.events:
+            return
+        try:
+            print(json.dumps(obj), flush=True)
+        except (BrokenPipeError, OSError):
+            self.finish("the guided login stopped listening", 1)
 
     def finish(self, reason: str, code: int = 0) -> None:
         """Record the first exit reason and stop the relay."""
@@ -501,15 +711,21 @@ class Relay:  # pylint: disable=too-many-instance-attributes
             self.exit_reason, self.exit_code = reason, code
             self.done.set()
 
-    async def call(self, method: str, session: bool = True, **params: Any) -> Any:
-        """Send one gated CDP command and await its result."""
-        if not method_allowed(method, params, self.target_id):
+    async def call(self, method: str, session: bool | str = True, **params: Any) -> Any:
+        """Send one gated CDP command and await its result.
+
+        ``session=True`` → the shown target's session, a str → that session,
+        False → the browser target.
+        """
+        if not method_allowed(method, params, self.owned, self.internal):
             raise PermissionError(f"CDP method not allowed: {method}")
         self._next_id += 1
         mid = self._next_id
         msg: dict[str, Any] = {"id": mid, "method": method, "params": params}
-        if session:
+        if session is True:
             msg["sessionId"] = self.session_id
+        elif session:
+            msg["sessionId"] = session
         fut: asyncio.Future[Any] = asyncio.get_running_loop().create_future()
         self._pending[mid] = fut
         try:
@@ -544,29 +760,88 @@ class Relay:  # pylint: disable=too-many-instance-attributes
                 "Target.createTarget", session=False, url=self.url, background=True
             )
             self.target_id, self.created = res["targetId"], True
+        self.owned.append(self.target_id)
+        self.session_id = await self._adopt(self.target_id)
+
+    async def _adopt(self, tid: str) -> str:
+        """Attach to owned `tid`; install the surface hook; make it render."""
         res = await self.call(
-            "Target.attachToTarget",
-            session=False,
-            targetId=self.target_id,
-            flatten=True,
+            "Target.attachToTarget", session=False, targetId=tid, flatten=True
         )
-        self.session_id = res["sessionId"]
-        await self.call("Page.enable")
-        await self.call("Inspector.enable")
+        sid = str(res["sessionId"])
+        self.sessions[tid] = sid
+        await self.call("Page.enable", session=sid)
+        await self.call("Inspector.enable", session=sid)
+        await self.call("Runtime.enable", session=sid)
+        await self.call("Runtime.addBinding", session=sid, name=self.binding)
+        await self.call(
+            "Page.addScriptToEvaluateOnNewDocument", session=sid, source=self.hook
+        )
+        try:  # the document that is already loaded gets the hook too
+            await self.call("Runtime.evaluate", session=sid, expression=self.hook)
+        except (RuntimeError, asyncio.TimeoutError):
+            pass
         # A background-created tab is "hidden" and renders no frames (Page.startScreencast
         # then never answers). Focus emulation makes it visible to THIS session only —
         # no window is shown or raised.
-        await self.call("Emulation.setFocusEmulationEnabled", enabled=True)
+        await self.call("Emulation.setFocusEmulationEnabled", session=sid, enabled=True)
+        await self._apply_viewport(sid)
+        return sid
+
+    async def _apply_viewport(self, sid: str) -> None:
+        """Size target `sid`'s viewport to the viewer's canvas (CSS pixels)."""
+        if self.dims is None:
+            return
+        cw, ch = self.dims[0], self.dims[1]
+        await self.call(
+            "Emulation.setDeviceMetricsOverride",
+            session=sid,
+            width=cw,
+            height=ch,
+            deviceScaleFactor=0,
+            mobile=False,
+        )
+
+    async def _start_screencast(self) -> None:
+        if self.dims is None:
+            return
+        await self.call(
+            "Page.startScreencast",
+            format="jpeg",
+            quality=self.quality,
+            maxWidth=self.dims[2],
+            maxHeight=self.dims[3],
+            everyNthFrame=1,
+        )
+
+    async def show(self, tid: str) -> None:
+        """Switch the viewer to owned target `tid` (stops the old screencast)."""
+        if tid == self.target_id or tid not in self.sessions:
+            return
+        if self.viewer is not None:
+            try:
+                await self.call("Page.stopScreencast")
+            except (RuntimeError, asyncio.TimeoutError):
+                pass
+        self.target_id, self.session_id = tid, self.sessions[tid]
+        if self.viewer is not None:
+            try:
+                await self._apply_viewport(self.session_id)
+                await self._start_screencast()
+            except (RuntimeError, asyncio.TimeoutError) as e:
+                print(f"❌ cannot show target {tid}: {e}", file=sys.stderr)
+            pending = self.dialogs.get(self.session_id)
+            if pending:
+                await self._to_viewer({"t": "dialog", **pending})
 
     async def close(self) -> None:
-        """Close the target the relay created (never an adopted one), then CDP."""
-        if self.created and self.target_id and self._cdp is not None:
-            try:
-                await self.call(
-                    "Target.closeTarget", session=False, targetId=self.target_id
-                )
-            except Exception:  # pylint: disable=broad-exception-caught
-                pass
+        """Close the targets the relay created (never adopted ones), then CDP."""
+        if self.created and self._cdp is not None:
+            for tid in list(self.owned):
+                try:
+                    await self.call("Target.closeTarget", session=False, targetId=tid)
+                except Exception:  # pylint: disable=broad-exception-caught
+                    pass
         if self._cdp is not None:
             await self._cdp.close()
 
@@ -578,6 +853,9 @@ class Relay:  # pylint: disable=too-many-instance-attributes
             self.finish(f"CDP connection lost: {type(e).__name__}", 1)
         finally:
             self.finish("CDP connection closed", 1)
+
+    def _tid_of(self, sid: Any) -> str | None:
+        return next((t for t, s in self.sessions.items() if s == sid), None)
 
     async def _on_cdp(self, msg: dict[str, Any]) -> None:
         if "id" in msg:
@@ -591,8 +869,9 @@ class Relay:  # pylint: disable=too-many-instance-attributes
                     fut.set_result(msg.get("result", {}))
             return
         method, params = msg.get("method", ""), msg.get("params", {})
-        own_session = bool(self.session_id) and msg.get("sessionId") == self.session_id
-        if method == "Page.screencastFrame" and own_session:
+        sid = msg.get("sessionId")
+        ours = sid is not None and self._tid_of(sid) is not None
+        if method == "Page.screencastFrame" and ours and sid == self.session_id:
             if self.viewer is not None:
                 frame = {
                     "t": "frame",
@@ -602,44 +881,140 @@ class Relay:  # pylint: disable=too-many-instance-attributes
                     "rt": time.time() * 1000,
                 }
                 await self._to_viewer(frame)
-        elif method == "Target.targetCreated":
-            await self._maybe_popup(params.get("targetInfo", {}))
-        elif (
-            method == "Target.targetDestroyed"
-            and params.get("targetId") == self.target_id
-        ):
-            await self._end("the login tab was closed")
-        elif (
-            method == "Target.detachedFromTarget"
-            and params.get("sessionId") == self.session_id
-        ):
-            await self._end("the relay was detached from the login tab")
-        elif method == "Inspector.targetCrashed" and own_session:
+        elif method in _SUPERVISOR_EVENTS or ours:
+            # Handlers send CDP commands and await their answers, which only
+            # THIS reader can deliver: run them as tasks, never inline.
+            task = asyncio.create_task(self._on_event(method, params, sid, ours))
+            self._tasks.add(task)
+            task.add_done_callback(self._tasks.discard)
+
+    async def _on_event(
+        self, method: str, params: dict[str, Any], sid: Any, ours: bool
+    ) -> None:
+        """Target supervisor and owned-session events (runs as its own task)."""
+        try:
+            if method == "Target.targetCreated":
+                await self._maybe_popup(params.get("targetInfo", {}))
+            elif method == "Target.targetDestroyed":
+                await self._owned_gone(str(params.get("targetId", "")))
+            elif method == "Target.detachedFromTarget":
+                await self._detached(params.get("sessionId"))
+            elif ours:
+                await self._on_session_event(method, params, str(sid))
+        except Exception as e:  # pylint: disable=broad-exception-caught
+            print(f"❌ relay event {method} failed: {e}", file=sys.stderr)
+
+    async def _on_session_event(
+        self, method: str, params: dict[str, Any], sid: str
+    ) -> None:
+        """Events of an owned target's session: crash, surfaces, dialogs."""
+        if method == "Inspector.targetCrashed" and sid == self.session_id:
             await self._end("the login tab crashed")
+        elif method == "Runtime.bindingCalled" and params.get("name") == self.binding:
+            try:
+                data = json.loads(str(params.get("payload", "")))
+            except ValueError:
+                data = {}
+            kind = str(data.get("k", "")) if isinstance(data, dict) else ""
+            detail = str(data.get("d", ""))[:40] if isinstance(data, dict) else ""
+            if kind in ("webauthn", "permission"):
+                await self.surface(kind, detail)
+        elif method == "Page.frameRequestedNavigation":
+            scheme = external_scheme(params.get("url"))
+            if scheme:
+                await self.surface("external", f"{scheme}:")
+        elif method == "Page.javascriptDialogOpening":
+            info = {
+                "type": str(params.get("type", "alert"))[:20],
+                "message": str(params.get("message", ""))[:500],
+                "prompt": str(params.get("defaultPrompt", ""))[:200],
+            }
+            self.dialogs[sid] = info
+            tid = self._tid_of(sid)
+            if tid and tid != self.target_id:
+                await self.show(tid)
+            else:
+                await self._to_viewer({"t": "dialog", **info})
+        elif method == "Page.javascriptDialogClosed":
+            self.dialogs.pop(sid, None)
+            if sid == self.session_id:
+                await self._to_viewer({"t": "dialog-closed"})
+
+    async def surface(self, kind: str, detail: str = "") -> None:
+        """End the remote view: this login needs a real window (exit 5)."""
+        if self.done.is_set():
+            return
+        reason = surface_reason(kind, detail)
+        print(f"⚠ {reason} — the remote view cannot do this", file=sys.stderr)
+        self.emit(ev="surface", reason=reason)
+        await self._to_viewer(
+            {
+                "t": "info",
+                "text": f"{reason}: switch to the terminal to continue",
+                "end": True,
+            }
+        )
+        self.finish(reason, EXIT_FALLBACK)
 
     async def _maybe_popup(self, ti: dict[str, Any]) -> None:
-        tid = ti.get("targetId", "")
-        if not tid or tid == self.target_id or ti.get("type") != "page":
-            return
-        opener = ti.get("openerId")
-        if opener == self.target_id:
-            label = "opener=owned"
-        elif (
-            not opener
-            and self.viewer is not None
+        recent = (
+            self.viewer is not None
             and time.monotonic() - self.last_input < POPUP_FOCUS_WINDOW_S
-        ):
-            label = "opener=unknown"
-        else:
-            return
-        if len(self.popups) >= MAX_POPUPS:
+        )
+        action = popup_decision(ti, self.owned, recent)
+        tid = str(ti.get("targetId", ""))
+        if action == "ignore" or len(self.popups) >= MAX_POPUPS:
             return
         self.popups.append(tid)
-        note = f"popup target {tid} ({label})"
-        print(f"ℹ️  {note} — not followed in this spike", file=sys.stderr)
-        await self._to_viewer(
-            {"t": "info", "text": note, "popup": tid, "opener": label}
-        )
+        if action == "report":
+            note = f"popup target {tid} (opener=unknown) — not owned, not shown"
+            print(f"ℹ️  {note}", file=sys.stderr)
+            await self._to_viewer({"t": "info", "text": note, "popup": tid})
+            return
+        opener = str(ti.get("openerId", ""))
+        self.owned.append(tid)
+        self.openers[tid] = opener
+        self.emit(ev="owned", target=tid, opener=opener)
+        try:
+            await self._adopt(tid)
+        except (RuntimeError, PermissionError, KeyError, asyncio.TimeoutError) as e:
+            print(f"❌ cannot attach to the popup {tid}: {e}", file=sys.stderr)
+            return
+        await self.show(tid)
+        await self._to_viewer({"t": "info", "text": "showing a popup of the login tab"})
+
+    async def _owned_gone(self, tid: str) -> None:
+        if tid not in self.owned:
+            return
+        nxt = view_after_close(tid, self.target_id, self.owned, self.openers)
+        self.owned.remove(tid)
+        sid = self.sessions.pop(tid, None)
+        if sid is not None:
+            self.dialogs.pop(sid, None)
+        self.emit(ev="released", target=tid)
+        if nxt is None:
+            await self._end("the login tab was closed")
+        elif tid == self.target_id:
+            self.target_id = ""  # force the switch
+            await self.show(nxt)
+            await self._to_viewer({"t": "info", "text": "back to the login tab"})
+
+    async def _detached(self, sid: Any) -> None:
+        """A session went away: a closing popup (fine) or the relay was cut off."""
+        tid = self._tid_of(sid)
+        if tid is None:
+            return
+        await asyncio.sleep(0.5)  # targetDestroyed follows a closing tab
+        if tid not in self.owned:
+            return
+        try:
+            targets = await asyncio.to_thread(_http_json, f"{self.cdp_http}/json/list")
+        except (OSError, ValueError):
+            targets = []
+        if any(t.get("id") == tid for t in targets):
+            await self._end("the relay was detached from the login tab")
+        else:
+            await self._owned_gone(tid)
 
     async def _end(self, reason: str) -> None:
         await self._to_viewer({"t": "info", "text": reason, "end": True})
@@ -680,16 +1055,32 @@ class Relay:  # pylint: disable=too-many-instance-attributes
             return _html_response(self.port, cookie)
         return connection.respond(404, "not found\n")
 
-    async def _start_screencast(self, msg: dict[str, Any]) -> None:
+    async def _set_dims(self, msg: dict[str, Any], restart: bool) -> None:
+        """Viewer canvas size → target viewport + screencast size."""
         w = int(_num(msg.get("w"), 200, 4096) or 1280)
         h = int(_num(msg.get("h"), 200, 4096) or 800)
+        cw = int(_num(msg.get("cw"), 200, 4096) or w)
+        ch = int(_num(msg.get("ch"), 200, 4096) or h)
+        self.dims = (cw, ch, w, h)
+        if restart:
+            try:
+                await self.call("Page.stopScreencast")
+            except (RuntimeError, asyncio.TimeoutError):
+                pass
+        await self._apply_viewport(self.session_id)
+        await self._start_screencast()
+        pending = self.dialogs.get(self.session_id)
+        if pending:
+            await self._to_viewer({"t": "dialog", **pending})
+
+    async def _answer_dialog(self, msg: dict[str, Any]) -> None:
+        if self.session_id not in self.dialogs:
+            return
+        text = msg.get("text", "")
         await self.call(
-            "Page.startScreencast",
-            format="jpeg",
-            quality=self.quality,
-            maxWidth=w,
-            maxHeight=h,
-            everyNthFrame=1,
+            "Page.handleJavaScriptDialog",
+            accept=msg.get("accept") is True,
+            promptText=text[:MAX_TEXT] if isinstance(text, str) else "",
         )
 
     async def _handle_message(self, raw: Any) -> None:
@@ -698,8 +1089,15 @@ class Relay:  # pylint: disable=too-many-instance-attributes
         if msg is None:
             return
         try:
-            if msg.get("t") == "hello":
-                await self._start_screencast(msg)
+            kind = msg.get("t")
+            if kind in ("hello", "resize"):
+                await self._set_dims(msg, restart=kind == "resize")
+                return
+            if kind == "dialog":
+                await self._answer_dialog(msg)
+                return
+            if kind == "fallback":
+                await self.surface("requested")
                 return
             cmd = safe_translate(msg)
             if cmd is None:
@@ -719,6 +1117,7 @@ class Relay:  # pylint: disable=too-many-instance-attributes
             return
         self.auth.on_connect()
         self.viewer = ws
+        self.emit(ev="viewer", connected=True)
         print("✅ viewer connected", file=sys.stderr)
         try:
             async for raw in ws:
@@ -738,6 +1137,7 @@ class Relay:  # pylint: disable=too-many-instance-attributes
             self.viewer = None
             self.last_viewer = time.monotonic()
             self.auth.on_disconnect(self.last_viewer)
+            self.emit(ev="viewer", connected=False)
             print(
                 f"ℹ️  viewer disconnected — the same tab may reconnect within "
                 f"{RECONNECT_GRACE_S:.0f}s, then the token is burned",
@@ -745,10 +1145,19 @@ class Relay:  # pylint: disable=too-many-instance-attributes
             )
 
     async def lifecycle_watch(self) -> None:
-        """Exit once the token is burned, or after ``idle_timeout`` s with no viewer."""
+        """Exit once the token is burned, after ``idle_timeout`` s with no viewer,
+        or (``-M``) once the guided login's record is gone or its owner died."""
+        last_maint = time.monotonic()
         while not self.done.is_set():
             await asyncio.sleep(0.5)
             now = time.monotonic()
+            if self.maint_file is not None and now - last_maint >= 2.0:
+                last_maint = now
+                if not await asyncio.to_thread(
+                    owner_alive, self.maint_file, self.maint_nonce
+                ):
+                    self.finish("the guided login ended")
+                    continue
             if self.viewer is not None:
                 self.last_viewer = now
             elif self.auth.burned(now):
@@ -802,8 +1211,12 @@ html,body{margin:0;height:100%;background:#202124;color:#e8eaed;font:13px system
 #wrap{position:absolute;top:26px;left:0;right:0;bottom:0;display:flex;align-items:center;justify-content:center}
 canvas{background:#fff;cursor:default;max-width:100%;max-height:100%}
 #ime{position:fixed;left:0;bottom:0;width:2px;height:2px;opacity:0;border:0;padding:0;resize:none}
+#fb{float:right;margin-top:3px;font:12px system-ui,sans-serif}
+#dlg{display:none;position:absolute;top:34px;left:50%;transform:translateX(-50%);z-index:2;background:#303134;border:1px solid #888;padding:12px;max-width:80%}
+#dlg p{white-space:pre-wrap;margin:0 0 8px}
 </style></head><body>
-<div id="bar">Guided login — click into the page and type; paste works. <span id="st"></span></div>
+<div id="bar">Guided login — click into the page and type; paste works. <span id="st"></span><button id="fb" type="button">Use a window instead</button></div>
+<div id="dlg"><p id="dmsg"></p><input id="dval" type="text"><button id="dok" type="button">OK</button> <button id="dno" type="button">Cancel</button></div>
 <div id="wrap"><canvas id="c" width="800" height="600" aria-label="remote login tab"></canvas></div>
 <textarea id="ime" autocomplete="off" autocorrect="off" autocapitalize="off" spellcheck="false"></textarea>
 <script nonce="__NONCE__">
@@ -815,17 +1228,28 @@ let meta = null, composing = false, ended = false;
 window.__viewerStats = {frames: 0, lat: [], relayLat: [], info: []};
 const send = o => { if (ws.readyState === 1) ws.send(JSON.stringify(o)); };
 const mods = e => (e.altKey ? 1 : 0) | (e.ctrlKey ? 2 : 0) | (e.metaKey ? 4 : 0) | (e.shiftKey ? 8 : 0);
-ws.onopen = () => { st.textContent = "connected";
-  send({t: "hello", w: Math.round(innerWidth * devicePixelRatio), h: Math.round((innerHeight - 26) * devicePixelRatio)}); };
+const dims = () => ({w: Math.round(innerWidth * devicePixelRatio), h: Math.round((innerHeight - 26) * devicePixelRatio),
+  cw: Math.round(innerWidth), ch: Math.round(innerHeight - 26)});
+ws.onopen = () => { st.textContent = "connected"; send(Object.assign({t: "hello"}, dims())); };
+let rz = null;
+addEventListener("resize", () => { clearTimeout(rz); rz = setTimeout(() => send(Object.assign({t: "resize"}, dims())), 250); });
+const dlg = document.getElementById("dlg"), dmsg = document.getElementById("dmsg"), dval = document.getElementById("dval");
+function answer(accept) { send({t: "dialog", accept, text: dval.value}); dlg.style.display = "none"; ta.focus(); }
+document.getElementById("dok").addEventListener("click", () => answer(true));
+document.getElementById("dno").addEventListener("click", () => answer(false));
+document.getElementById("fb").addEventListener("click", () => send({t: "fallback"}));
 ws.onclose = () => { if (!ended) st.textContent = "disconnected — reload within 10 s to reconnect"; };
 ws.onmessage = ev => {
   const m = JSON.parse(ev.data);
   if (m.t === "info") { window.__viewerStats.info.push(m); st.textContent = m.text; if (m.end) ended = true; return; }
+  if (m.t === "dialog") { dmsg.textContent = m.type + ": " + m.message; dval.value = m.prompt || "";
+    dval.style.display = m.type === "prompt" ? "" : "none"; dlg.style.display = "block"; return; }
+  if (m.t === "dialog-closed") { dlg.style.display = "none"; return; }
   if (m.t !== "frame") return;
   const now = Date.now(), img = new Image();
   img.onload = () => {
     if (cv.width !== img.naturalWidth || cv.height !== img.naturalHeight) { cv.width = img.naturalWidth; cv.height = img.naturalHeight; }
-    ctx.drawImage(img, 0, 0); meta = m.meta;
+    ctx.drawImage(img, 0, 0); meta = m.meta; window.__viewerStats.meta = m.meta;
     const s = window.__viewerStats; s.frames++; s.lastDraw = Date.now();
     if (s.lat.length < 500) { s.lat.push(Date.now() - m.meta.timestamp * 1000); s.relayLat.push(m.rt - m.meta.timestamp * 1000); }
     send({t: "ack", sessionId: m.sid});
@@ -893,7 +1317,9 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
             "examples:\n"
             "  login_viewer.py -c http://127.0.0.1:9333 -u https://example.org/login\n"
             "  login_viewer.py -c http://127.0.0.1:9333 -u https://example.org/login -j -i 120\n"
-            "  login_viewer.py -c http://127.0.0.1:9333 -t 1A2B... -A  # `browser.py open -N` id"
+            "  login_viewer.py -c http://127.0.0.1:9333 -t 1A2B... -A  # `open -N` id\n\n"
+            "exit codes: 0 ended normally, 1 error/idle timeout, 2 refused,\n"
+            "  5 this login needs a real window (a surface the view cannot show)"
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
@@ -934,6 +1360,21 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         action="store_true",
         help="print {url, port, target} as one JSON line (url = one-shot credential)",
     )
+    p.add_argument(
+        "-E",
+        "--events",
+        action="store_true",
+        help="then one JSON event per line on stdout (owned/released/viewer/"
+        "surface/end) — for browser.py assisted-login",
+    )
+    p.add_argument(
+        "-M",
+        "--maintenance",
+        type=Path,
+        default=None,
+        help="the guided login's maintenance record: refuse without its owner "
+        "token ($CLAUDE_BROWSER_MAINTENANCE), exit once it is gone",
+    )
     a = p.parse_args(argv)
     err = ownership_error(a.url, a.target_id, a.assume_owned)
     if err:
@@ -958,6 +1399,9 @@ async def _amain(a: argparse.Namespace) -> int:
         a.quality,
         a.idle_timeout,
         url=a.url,
+        events=a.events,
+        maint_file=a.maintenance,
+        maint_nonce=os.environ.get(MAINTENANCE_ENV, ""),
     )
     try:
         await relay.attach()
@@ -997,6 +1441,7 @@ async def _amain(a: argparse.Namespace) -> int:
         await relay.close()
     mark = "✅" if relay.exit_code == 0 else "❌"
     print(f"{mark} viewer relay ended: {relay.exit_reason}", file=sys.stderr)
+    relay.emit(ev="end", reason=relay.exit_reason, code=relay.exit_code)
     return relay.exit_code
 
 
@@ -1024,6 +1469,11 @@ def bootstrap_venv() -> None:
 def main(argv: list[str] | None = None) -> int:
     """CLI entry point."""
     a = _parse_args(argv)  # -h needs no venv
+    if a.maintenance is not None:
+        err = maintenance_error(a.maintenance, os.environ.get(MAINTENANCE_ENV, ""))
+        if err:
+            print(f"❌ {err}", file=sys.stderr)
+            return 2
     bootstrap_venv()  # may re-exec under <repo>/.venv
     try:
         return asyncio.run(_amain(a))

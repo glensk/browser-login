@@ -101,8 +101,8 @@ at all — and on a cold start it **wipes stale session-restore state** so it op
 ONE clean tab instead of resurrecting every tab from last time (your logins
 persist — they live in Cookies/Local Storage, not the session files). `open`
 likewise reuses a blank tab or creates new tabs via CDP `Target.createTarget`
-with `background: true`. The only time a window exists is a guided login you
-start yourself (`agent-login.py -g SITE`, see the next section).
+with `background: true`. The only time a window exists is the FALLBACK of a
+guided login you start yourself (`agent-login.py -g SITE`; see "Guided login").
 
 Env toggles: `CLAUDE_BROWSER_KEEP_TABS=1` keeps last session's tabs (skip the
 wipe); `CLAUDE_BROWSER_OPEN_LAUNCH=1` launches a HEADED (guided-login) browser via
@@ -120,9 +120,11 @@ The design goal is that **driving the browser never interferes with your
 desktop**: no focus steal, no window, no z-order change, no native prompt
 (PLAN_focus-free-browser.md, tp#836). It is enforced by one invariant:
 
-> **The shared browser is HEADLESS unless a live headed lease exists** — held by
-> a guided login you start yourself (`agent-login.py -g SITE`). With no window,
-> nothing can take focus, be raised or pop a dialog.
+> **The shared browser is HEADLESS unless a live guided-login maintenance
+> record of mode A exists** — written by a guided login you start yourself
+> (`agent-login.py -g SITE` → `browser.py assisted-login SITE`) when its remote
+> view cannot do the login. With no window, nothing can take focus, be raised
+> or pop a dialog.
 
 - **Headless by default.** `up` always launches `--headless=new` (same profile,
   same logins). `<cache>/desired-mode.json` records `{"mode": "headless"}` (no
@@ -139,25 +141,28 @@ desktop**: no focus steal, no window, no z-order change, no native prompt
   SWITCH, Smartsheet, Infomaniak, gitlab.datascience.ch, console.anthropic.com
   and a LAN `*.dom42.space` site. Residual tells (empty high-entropy UA-CH, an
   800×600 `screen`, no "Google Chrome" brand) are harmless today.
-- **The headed lease.** `<cache>/headed-lease.json` = `{owner_nonce, pid,
-  pid_start_time, site, started, heartbeat}`, written by the guided login,
-  heartbeat every 10 s (a write error is retried, never fatal), removed
-  compare-before-release. It is LIVE while the owner pid runs with the recorded
-  start time (no pid reuse), whatever the heartbeat's age — a Mac asleep for a
-  minute keeps it — unless the heartbeat is over 120 s old (a hung owner). When
-  `ps` cannot read the start time of a live pid, the lease counts as live (a
-  `ps` hiccup never reverts a guided window). The owner exports
-  `CLAUDE_BROWSER_HEADED_LEASE=<nonce>`;
-  only processes carrying that nonce (the guided login and its `browser.py`
-  children) may `switch headed`, run an assisted login step or call
-  `bring_to_front`. Anybody else gets `switch headed` → exit 2 (`headed mode only
-  inside a guided login: agent-login.py -g <site>`). The guided login switches
-  back to headless at the end — unless another guided login's lease is live by
-  then — and a failed switch back is a loud ❌ plus one retry.
+- **The maintenance record (the "headed lease").** `<cache>/maintenance.json` =
+  `{owner_nonce, pid, pid_start_time, site, mode, state, owned_targets, paused,
+  watchdog_pid, started, heartbeat}` — ONE record for "a guided login owns the
+  browser" (see "Guided login"); Phase 2's headed lease is this record with
+  `mode: "A"` (a record without a mode is A). Heartbeat every 10 s (a write
+  error is retried, never fatal), removed compare-before-release. It is LIVE
+  while the owner pid runs with the recorded start time (no pid reuse),
+  whatever the heartbeat's age — a Mac asleep for a minute keeps it — unless
+  the heartbeat is over 120 s old (a hung owner). When `ps` cannot read the
+  start time of a live pid, the record counts as live (a `ps` hiccup never
+  reverts a guided window). The owner exports
+  `CLAUDE_BROWSER_MAINTENANCE=<nonce>`; only processes carrying that nonce (the
+  guided login and its `browser.py` children) may register as clients while it
+  lives, and — in mode A only — `switch headed`, run an assisted login step or
+  call `bring_to_front`. Anybody else gets `switch headed` → exit 2 (`headed
+  mode only inside a guided login: agent-login.py -g <site>`). The guided login
+  switches back to headless at the end, and a failed switch back is a loud ❌
+  plus one retry.
 - **Preflight revert (best effort).** Every command that drives the browser
   (all but `status`, `journal`, `down`, `switch`, `clients`, the recovery tools
   `doctor`, `close-hung`, `close`, and the offline ones) first checks: headed
-  and no live lease → `switch headless` (journaled as `revert_headed`) BEFORE it
+  and no live mode-A record → `switch headless` (journaled as `revert_headed`) BEFORE it
   takes the client gate, with all its output on stderr (a consumer's stdout —
   `slack-session` JSON, `token`, `open -N` — stays clean). It waits at most 5 s
   for the gate, re-checks under it (a guided login that took the lease
@@ -229,8 +234,112 @@ count. Appends are single `O_APPEND`
 writes (< 4 KiB, whole lines under concurrency); past 10 MB the file rotates
 to `.1`/`.2`; a journal failure warns once on stderr and never fails the
 command. `browser.py journal` tails it (`-n/--lines N`, default 50, `0` = all;
-`-e/--event up|switch|down|login|bring_to_front|register|unregister|revert_headed|headed_lease`;
+`-e/--event up|switch|down|login|bring_to_front|register|unregister|register_refused|revert_headed|headed_lease|guided_login|maintenance|client_pause|client_resume|watchdog_recover`;
 `-j/--json` raw lines).
+
+## Guided login (assisted-login)
+
+A login only you can do (a human check, an email code, SSO with 2FA) runs as a
+**guided login**. There is exactly one entry, and only you can start it:
+
+```bash
+./agent-login.py -g slack                 # → browser.py assisted-login slack
+bin/browser.py assisted-login anibis -u https://www.anibis.ch/fr/user/searches
+bin/browser.py assisted-login slack -a    # skip the remote view: the window (A)
+```
+
+`assisted-login SITE` opens `/dev/tty` and asks you to **type the site name** to
+start. Without a controlling terminal (an agent, launchd, a pipe) it exits **2**
+before touching anything — agents cannot start a guided login; they get
+`needs Albert: agent-login.py -g SITE` from `login` instead. Already logged in →
+✅ and exit 0 without asking. `agent-login.py -g` routes the plain human logins
+here (anibis/tutti/ricardo with their start URL, openai, slack, notion); the
+claude.ai accounts and SWITCH keep their own window flows (`guided_window`, now
+also inside the maintenance transaction).
+
+**B — remote view (primary).** The browser stays headless. An OWNED background
+tab opens on the login URL (`open -N`), and `bin/login_viewer.py` — a loopback
+relay registered via `register-exec` under the guided login's token — streams it
+into a dedicated, extension-free Brave app window (`open -na "Brave Browser"
+--args --user-data-dir=<cache>/viewer-profile --app=<url>`; without Brave the
+default browser, with a ⚠). The link is also printed (OSC 8). You click, type,
+paste and use IME there; JS dialogs show in the view; the tab's viewport
+follows the view's size. OAuth popups (a new target whose `openerId` is an owned
+tab) are followed and shown, and the view returns to the opener when they
+close; a tab without an owned opener is never shown. Every 5 s `logged-in SITE`
+(the site's own sentinel, in a separate background tab) decides; on ✅ the view
+closes by itself. Timeouts: 5 min with no view connected, 15 min overall.
+
+**A — the window (fallback).** When the view meets something it cannot show —
+a passkey / security-key prompt (a modal WebAuthn `get`/`create`; passkey
+autofill is ignored), a permission request (notifications, location,
+camera/mic, screen capture), a link to an external app — or you press **Use a
+window instead**, B ends with the named reason, its tabs are closed, and the
+terminal asks `switch to a visible window for this login? [y/N]`. Yes →
+`switch headed` inside the SAME transaction, the old window flow (the site's own
+`login SITE` flow, or an owned tab brought to the front), `switch headless` in a
+`finally`. Client-certificate prompts are not exposed by CDP in headless Chrome
+(it silently sends no certificate): the site's error page shows in the view, and
+the button is the way out.
+
+**The maintenance transaction** (B and A, `_maintenance` in `browser.py`):
+
+1. Write `<cache>/maintenance.json` (state `preparing`; from now on a NEW client
+   registration without `$CLAUDE_BROWSER_MAINTENANCE=<owner nonce>` exits
+   **75** (EX_TEMPFAIL) with `busy: guided login for SITE in progress (until
+   ~HH:MM)`; `down`/`switch` refuse the same way unless
+   `-F/--force-maintenance`) and start the watchdog.
+2. **Pause** every registered long-lived client: SIGUSR1 to its `register-exec`
+   wrapper — only after validating its pid AND start time from its live registry
+   entry; the entry goes into the record first. The wrapper SIGSTOPs its child's
+   process group, releases its shared hold on the client gate and confirms
+   (`paused: true`) within 5 s, or the start is refused. A long-lived
+   registration from before this protocol (no `kind`) refuses the start at
+   once, naming its pids: restart the Claude sessions that run the Playwright
+   MCP.
+3. Take the client gate EXCLUSIVELY (20 s; the refusal names the holders);
+   refuse while UNREGISTERED CDP peers are attached (`lsof`; `-f/--force`
+   proceeds, they keep running unpaused); take the interaction lease (held for
+   the whole session); state `active`; release the gate so the transaction's own
+   `browser.py` children (they carry the token) can register.
+4. On ANY exit — success, timeout, decline, error, Ctrl-C: close the owned
+   targets → `switch headless` if headed (one retry, loud) → release the lease →
+   clear the record → resume the clients (SIGUSR2 to the validated wrapper, which
+   retakes the gate and SIGCONTs). A wrapper that is gone left an ORPHAN —
+   unregistered, it would fail every later switch closed — so its child group is
+   stopped iff the leader still runs with the recorded start time (SIGTERM,
+   SIGKILL after 5 s); `browser.py clients` does the same for any dead
+   `register-exec` registration it reaps. Every step is journaled
+   (`maintenance`, `client_pause`, `client_resume`, `orphan_kill`).
+
+**Watchdog.** `browser.py maintenance-watchdog -n <nonce prefix>` (detached, own
+session) polls the record every 2 s. When the owner is gone (dead pid, reused
+pid, or a heartbeat older than 120 s) it closes the owned targets, reverts a
+headed browser to headless, clears the record and resumes the paused clients —
+in that order, because a resumed wrapper retakes the gate that the revert needs
+exclusively — and journals `watchdog_recover`. It exits when the record is
+cleared normally. Belt and braces: a PAUSED wrapper also resumes itself within
+2 s once the record FILE that paused it is gone or names another owner — not
+when the owner merely died (the watchdog needs the gate first), except after
+60 s of a dead record (watchdog presumed dead) — and the relay ends itself
+(`-M`) when the record or its owner disappears. While a guided login lives,
+`logged-in` checks never pick an existing tab (it could be the owned login
+tab): they run in a fresh background tab of their own.
+
+Known residuals: a paused client keeps its CDP socket, but a fallback-A switch
+restarts the browser, so a paused Playwright MCP finds its connection dropped
+when it resumes (its next call reconnects or fails once); the surface hook is an
+init script, so a passkey prompt in a cross-origin iframe or in the very first
+document of a popup can go unnoticed (the button covers it); the hook wraps
+`navigator.credentials`, which a page could detect.
+
+Test hooks (honoured only with `CLAUDE_BROWSER_CACHE_DIR` set, i.e. a disposable
+browser): `CLAUDE_BROWSER_TEST_SITES=<json>` adds sites
+(`{name: {login_url, check_url, logged_in_selector}}`) and
+`CLAUDE_BROWSER_TEST_VIEWER_URL_FILE=<path>` writes the viewer URL to a file
+instead of opening a window. `tests/test_guided_login.py` (`-m browser`,
+`LOGIN_BROKER_E2E=1`) runs the whole B path that way, with the view driven by a
+second headless browser.
 
 ## Consumer contract (multi-client coordination)
 
@@ -242,7 +351,9 @@ state — so two layers coordinate everyone (all under `~/.cache/claude-browser/
    gate, held for the connection's lifetime). Long-lived clients — e.g. the
    Playwright MCP server — wrap themselves in
    `browser.py register-exec -t NAME -- CMD…` so their registration lives
-   exactly as long as the process. `switch`/`down` acquire the gate
+   exactly as long as the process (and so a guided login can PAUSE them: the
+   wrapper runs CMD in its own process group and SIGSTOPs/SIGCONTs it on
+   request — see "Guided login"). `switch`/`down` acquire the gate
    exclusively (bounded wait, refusal names the holders), and `switch`
    **fails closed** when an *unregistered* client is attached (or when it
    cannot verify — no `lsof`); `-f/--force` overrides. `down` only warns
@@ -435,6 +546,14 @@ subprocess.run(["browser.py", "up"], check=False)
 rc = subprocess.run(["browser.py", "login", "anthropic"], check=False).returncode
 ```
 
+| Exit | Meaning                                                                        |
+| :--- | :----------------------------------------------------------------------------- |
+| 0    | done / logged in                                                               |
+| 2    | not logged in (`logged-in`), refused, bad arguments                            |
+| 3    | the login broker does not answer                                               |
+| 4    | needs Albert: `agent-login.py -g SITE`                                         |
+| 75   | busy: a guided login owns the browser right now — retry later; says NOTHING about the login state (`agent-login.py -c` skips such a site: no `login`, no failure mail) |
+
 Resolution is **PATH-first**: with `bin/` on `$PATH`, `browser.py` is callable from
 anywhere. Tools that use the external-dependency convention resolve it as
 `command="browser.py"` (PATH) → a conventional sibling clone → the `BROWSER_PY_BIN`
@@ -545,7 +664,7 @@ agent-login.py — which of Albert's logins can agents use through the login bro
 
 Without arguments: a health line for the broker, then every login we want agents to use, once: ✅ when it works for agents (setup complete AND the latest real check, -c/-t, passed) or ❌ with the reason. Read-only: it asks the broker for its site list (never a secret), reads the names and expiry dates (never values) of Safari's cookies, and logs into nothing unless you pass -t, -g or -c.
 
-The marketplace sites (anibis, tutti, Ricardo, Kleinanzeigen) run on YOUR Safari session: you log in in Safari, `browser.py login SITE` copies that site's session cookies into the shared Chromium (Kleinanzeigen falls back to the broker). CSCS and Smartsheet log in through the broker. SWITCH Cloud logs in with the broker's edu-ID session plus the portal's SSO click (no window; your own login only when the broker has no usable `eduid` item). Anthropic, OpenAI and Slack need you once (email code / SSO): `-g SITE` shows the window and waits; -t and -c only check them.
+The marketplace sites (anibis, tutti, Ricardo, Kleinanzeigen) run on YOUR Safari session: you log in in Safari, `browser.py login SITE` copies that site's session cookies into the shared Chromium (Kleinanzeigen falls back to the broker). CSCS and Smartsheet log in through the broker. SWITCH Cloud logs in with the broker's edu-ID session plus the portal's SSO click (no window; your own login only when the broker has no usable `eduid` item). Anthropic, OpenAI and Slack need you once (email code / SSO): `-g SITE` asks you on the terminal, then shows a remote view of a headless tab (the window only as a fallback) and waits; -t and -c only check them.
 
 Examples:
 
@@ -556,7 +675,7 @@ Examples:
 ./agent-login.py -c           # every usable site: logged in? if not, log in
 ./agent-login.py -c -m        # the same, and mail Albert when a site stays logged out
 ./agent-login.py -t https://auth.cscs.ch   # SITE may also be a name or login address
-./agent-login.py -g anibis    # guided login typed by hand in the shared Chromium
+./agent-login.py -g anibis    # guided login: confirm, then log in via the remote view
 ./agent-login.py -g anthropic # your login (email code) in the shown shared Chromium
 ./agent-login.py -P           # print the daily LaunchAgent (-I installs, -U removes)
 ./agent-login.py -j           # the same overview as JSON
@@ -568,7 +687,7 @@ Examples:
 |------|-------------|
 | `-t`, `--test` `SITE` | real login test for SITE |
 | `-f`, `--fingerprint` `SITE` | length + 4 hex of the SHA-256 of the broker's password for SITE (no login) |
-| `-g`, `--guided` `SITE` | guided login typed by hand in the shared Chromium window |
+| `-g`, `--guided` `SITE` | guided login by hand (browser.py assisted-login: confirm on the terminal, remote view of a headless tab; the window as fallback) |
 | `-c`, `--check-all` | every usable site: logged in? if not, `browser.py login`; one line per site, exit 1 if any stays logged out |
 | `-m`, `-M`, `--mail` | with -c: mail `albert.glensk@gmail.com` (gog) when a site stays logged out |
 | `-r`, `--refresh` | ask the broker now (re-reads Bitwarden, ~40 s) instead of the snapshot |

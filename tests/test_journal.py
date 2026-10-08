@@ -255,7 +255,9 @@ def test_cmd_fields_failure_does_not_break_dispatch(journal, monkeypatch):
         raise KeyError("x")
 
     monkeypatch.setattr(browser, "_journal_cmd_fields", boom)
-    monkeypatch.setattr(browser, "cmd_down", lambda port, force: 0)
+    monkeypatch.setattr(
+        browser, "cmd_down", lambda port, force, force_maintenance=False: 0
+    )
     args = argparse.Namespace(cmd="down", force=False)
     assert browser._journaled_dispatch(args, PORT) == 0
     assert [r["phase"] for r in _records(journal)] == ["start", "end"]
@@ -459,7 +461,7 @@ def test_journaled_dispatch_records_start_end_and_notes(journal, monkeypatch):
 
 
 def test_journaled_dispatch_records_sys_exit(journal, monkeypatch):
-    def fake_switch(port, mode, force):
+    def fake_switch(port, mode, force, **_kw):
         sys.exit(3)
 
     monkeypatch.setattr(browser, "cmd_switch", fake_switch)

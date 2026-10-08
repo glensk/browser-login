@@ -35,6 +35,11 @@ def pytest_configure(config):
         "browser: drives a real headless Chromium against a local fixture site"
         " (opt-in via LOGIN_BROKER_E2E=1)",
     )
+    config.addinivalue_line(
+        "markers",
+        "launches_chrome: may launch a real (disposable, headless) Chrome through"
+        " browser.py's _launch_browser — and must stop it again",
+    )
 
 
 def _executable(args) -> str:
@@ -120,20 +125,21 @@ def _private_journal(tmp_path, monkeypatch):
 def _private_mode_state(tmp_path, monkeypatch):
     """The headless-invariant state files of every loaded browser.py live in tmp.
 
-    ``desired-mode.json``, ``headed-lease.json`` (+ its lock) and the download
-    dir are module constants computed from the live cache dir at import time;
+    ``desired-mode.json``, ``maintenance.json`` (the guided-login record, + its
+    lock) and the download dir are module constants computed from the live
+    cache dir at import time;
     a test reaching `cmd_up`/`cmd_switch`/`_headed_lease` must never write the
     real ones. A guided login running on this Mac must not leak into a test
     either, hence the lease env var is cleared.
     """
-    monkeypatch.delenv("CLAUDE_BROWSER_HEADED_LEASE", raising=False)
+    monkeypatch.delenv("CLAUDE_BROWSER_MAINTENANCE", raising=False)
     state = tmp_path / "mode-state"
     for mod in list(sys.modules.values()):
-        if getattr(mod, "HEADED_LEASE_FILE", None) is None:
+        if getattr(mod, "MAINTENANCE_FILE", None) is None:
             continue
         monkeypatch.setattr(mod, "DESIRED_MODE_FILE", state / "desired-mode.json")
-        monkeypatch.setattr(mod, "HEADED_LEASE_FILE", state / "headed-lease.json")
-        monkeypatch.setattr(mod, "HEADED_LEASE_LOCK", state / ".headed-lease.lock")
+        monkeypatch.setattr(mod, "MAINTENANCE_FILE", state / "maintenance.json")
+        monkeypatch.setattr(mod, "MAINTENANCE_LOCK", state / ".maintenance.lock")
         monkeypatch.setattr(mod, "DOWNLOAD_DIR", state / "downloads")
     yield
 
@@ -162,6 +168,24 @@ def _assert_journal_not_live() -> None:
                 f"({live}*) — a test would write the real journal",
                 returncode=3,
             )
+
+
+@pytest.fixture(autouse=True)
+def _no_real_chrome_launch(request, monkeypatch):
+    """No test launches a real Chrome through browser.py unless it opts in.
+
+    browser.py's `_launch_browser` exits (❌ test guard) while
+    CLAUDE_BROWSER_TEST_NO_LAUNCH=1 — in this process and in every
+    `browser.py` subprocess a test starts (they inherit the env). A test that
+    really needs one (a disposable headless browser it also stops) carries
+    the `launches_chrome` marker. Without this a fake CDP endpoint that looked
+    headed made `_preflight` "revert" it, i.e. launch a Chrome nobody stopped.
+    """
+    if request.node.get_closest_marker("launches_chrome") is None:
+        monkeypatch.setenv("CLAUDE_BROWSER_TEST_NO_LAUNCH", "1")
+    else:
+        monkeypatch.delenv("CLAUDE_BROWSER_TEST_NO_LAUNCH", raising=False)
+    yield
 
 
 @pytest.fixture(autouse=True)

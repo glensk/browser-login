@@ -13,7 +13,8 @@ cookies into the shared Chromium (Kleinanzeigen falls back to the broker). CSCS 
 Smartsheet log in through the broker. SWITCH Cloud logs in with the broker's edu-ID
 session plus the portal's SSO click (no window; your own login only when the broker has
 no usable `eduid` item). Anthropic, OpenAI and Slack need you once (email code / SSO):
-`-g SITE` shows the window and waits; -t and -c only check them.
+`-g SITE` asks you on the terminal, then shows a remote view of a headless tab (the
+window only as a fallback) and waits; -t and -c only check them.
 
 Examples:
   ./agent-login.py              # overview
@@ -22,7 +23,7 @@ Examples:
   ./agent-login.py -c           # every usable site: logged in? if not, log in
   ./agent-login.py -c -m        # the same, and mail Albert when a site stays logged out
   ./agent-login.py -t https://auth.cscs.ch   # SITE may also be a name or login address
-  ./agent-login.py -g anibis    # guided login typed by hand in the shared Chromium
+  ./agent-login.py -g anibis    # guided login: confirm, then log in via the remote view
   ./agent-login.py -g anthropic # your login (email code) in the shown shared Chromium
   ./agent-login.py -P           # print the daily LaunchAgent (-I installs, -U removes)
   ./agent-login.py -j           # the same overview as JSON
@@ -56,6 +57,7 @@ from agent_login_claude import (  # noqa: E402
     site_instance,
 )
 from agent_login_jobs import (  # noqa: E402
+    BUSY_RC,
     LAUNCH_HOUR,
     LAUNCH_LABEL,
     LAUNCH_MINUTE,
@@ -65,6 +67,7 @@ from agent_login_jobs import (  # noqa: E402
     SNAPSHOT_LABEL,
     _browser,
     browser_mode,
+    guided_busy,
     guided_window,
     install_daily,
     launchagent_plist,
@@ -660,6 +663,9 @@ def run_test(site: str) -> int:
         # its login needs you: -g; -t only checks
         print(f"▶ {site}: your own login (./agent-login.py -g {site}); checking only")
         ok, how = assisted_check(site)
+        if ok is None:
+            print(f"⏸  {site}: {how}")
+            return BUSY_RC
         record_check(site, ok, how)
         print(f"{'✅' if ok else '❌'} {site}: {how}")
         return 0 if ok else 2
@@ -676,6 +682,9 @@ def run_test(site: str) -> int:
     rc = subprocess.run(
         [sys.executable, str(BROWSER_PY), "logged-in", site], check=False
     ).returncode
+    if BUSY_RC in (rc, login_rc):
+        print(f"⏸  {site}: {BUSY_HOW}")
+        return BUSY_RC
     if rc == 0:
         how = "logged in"
     else:
@@ -696,18 +705,23 @@ MANUAL_START = {
     "tutti": "https://www.tutti.ch/de/myads/active",
     "ricardo": "https://www.ricardo.ch/de/my-ricardo/saved/articles/",
 }
-MANUAL_WAIT_S = 15 * 60
 
 
 def manual_login(site: str) -> int:
-    """Guided manual login in the shared Chromium for sites behind a human check.
+    """`-g SITE`: the guided login — a human login in the shared Chromium.
 
-    Shows the Chromium window, opens the site's login, waits (up to 15 min) until
-    the positive check passes, then hides the window again. You type the password
-    yourself (paste it from Bitwarden) — no agent sees it; agents then use the
-    session until the site expires it.
+    Sites whose guided flow is just "Albert logs in by hand" (the marketplace
+    sites behind a human check, and the assisted sites he logs into with an
+    email code / SSO) go through `browser.py assisted-login SITE` — confirmed on
+    the terminal, then a remote view of a headless tab (the window only as a
+    fallback). The claude.ai accounts and SWITCH keep their own window flows
+    (`assisted_login`). You type the password yourself (paste it from
+    Bitwarden) — no agent sees it; agents then use the session until the site
+    expires it.
     """
     site = resolve_site(site)
+    if site in VIEWER_SITES:
+        return viewer_login(site)
     if site in ASSISTED_SITES or site in EDUID_SSO_SITES:
         return assisted_login(site)
     start = MANUAL_START.get(site)
@@ -715,53 +729,72 @@ def manual_login(site: str) -> int:
         known = ", ".join([*MANUAL_START, *sorted(ASSISTED_SITES | EDUID_SSO_SITES)])
         print(f"❌ no guided login known for {site!r} (known: {known})")
         return 2
-    if _browser("logged-in", site, quiet=True) == 0:
-        print(f"✅ {site}: the shared Chromium is already logged in — nothing to do")
+    return assisted_login_cmd(site, start)
+
+
+def assisted_login_cmd(site: str, start: str | None = None) -> int:
+    """`browser.py assisted-login SITE [-u START]` (it asks on the terminal)."""
+    argv = [sys.executable, str(BROWSER_PY), "assisted-login", site]
+    if start:
+        argv += ["-u", start]
+    return subprocess.run(argv, check=False).returncode
+
+
+def viewer_login(site: str) -> int:
+    """An assisted site (email code / SSO) through `assisted-login`, with the
+    pre- and post-check (and the recorded result) of `assisted_login`."""
+    ok, how = assisted_check(site)
+    if ok:
+        print(f"✅ {site}: {how} — nothing to do")
+        record_check(site, True, how)
         return 0
-    ok = False
-    try:
-        with guided_window(site) as win:
-            _browser("open", start, quiet=True)
-            print(
-                "👤 In the Chromium window: tick 'I am human' if asked, enter your "
-                "e-mail,\n   paste the password from Bitwarden, finish the login. "
-                f"Waiting up to {MANUAL_WAIT_S // 60} min …"
-            )
-            deadline = time.monotonic() + MANUAL_WAIT_S
-            while time.monotonic() < deadline:
-                time.sleep(10)
-                if _browser("logged-in", site, quiet=True) == 0:
-                    ok = True
-                    break
-    except RuntimeError:
-        return 1
-    print(
-        f"✅ {site}: logged in — agents can use this session"
-        if ok
-        else f"❌ {site}: still not logged in after {MANUAL_WAIT_S // 60} min"
-    )
-    if not win.restored:
-        return 1
+    with site_instance(site):
+        rc = assisted_login_cmd(browser_site(site))
+    ok, how = assisted_check(site)
+    if ok is not None:
+        record_check(site, ok, how)
+    print(f"{'✅' if ok else '❌'} {site}: {how}")
+    if rc not in (0, 2):
+        return rc
     return 0 if ok else 2
 
 
 ASSISTED_SITES = {t.site for t in TARGETS if t.flow == ASSISTED_FLOW}
 # -g works for these too: `browser.py login` with the window shown.
 EDUID_SSO_SITES = {t.site for t in TARGETS if t.flow == EDUID_SSO_FLOW}
+# Assisted sites whose guided login is a plain human login → the remote view
+# (`browser.py assisted-login`). claude.ai keeps its own flow: its magic link
+# arrives by mail and must be opened in the shared browser itself.
+VIEWER_SITES = ASSISTED_SITES - set(CLAUDE_ACCOUNTS)
 
 
-def assisted_check(site: str) -> tuple[bool, str]:
+def assisted_check(site: str) -> tuple[bool | None, str]:
     """(works?, how) for a site you log into yourself; never starts a login."""
     with site_instance(site):
         return _assisted_check(site)
 
 
-def _assisted_check(site: str) -> tuple[bool, str]:
+def _assisted_check(site: str) -> tuple[bool | None, str]:
+    """(True, how) logged in, (False, how) not, (None, busy) a guided login
+    owns the browser right now — re-check later, it says nothing either way."""
+    busy = guided_busy()
+    if busy:
+        return None, f"{busy} — re-check later"
     hint = f"log in once: ./agent-login.py -g {site}"
     if site not in CLAUDE_ACCOUNTS:
-        if _browser("logged-in", site, quiet=True) == 0:
-            return True, "logged in"
-        return False, f"NOT logged in — {hint}"
+        rc = _browser("logged-in", site, quiet=True)
+        if rc == BUSY_RC:
+            return None, BUSY_RECHECK
+        return (True, "logged in") if rc == 0 else (False, f"NOT logged in — {hint}")
+    return _claude_check(site, hint)
+
+
+BUSY_RECHECK = "busy: guided login in progress — re-check later"
+
+
+def _claude_check(site: str, hint: str) -> tuple[bool | None, str]:
+    """`_assisted_check` for a claude.ai account: the right account, and for
+    the work one the Team admin billing page."""
     email = claude_account_email()
     want = CLAUDE_ACCOUNTS[site].lower()
     if not email:
@@ -772,7 +805,10 @@ def _assisted_check(site: str) -> tuple[bool, str]:
             f"the {where} browser instance holds {email} — one claude.ai session "
             "per browser profile"
         )
-    if site == "anthropic" and _browser("logged-in", "anthropic", quiet=True) != 0:
+    rc = _browser("logged-in", "anthropic", quiet=True) if site == "anthropic" else 0
+    if rc == BUSY_RC:
+        return None, BUSY_RECHECK
+    if rc != 0:
         return False, f"{email} logged in, but the Team admin billing page fails"
     return True, f"logged in as {email}"
 
@@ -800,16 +836,26 @@ def assisted_login(site: str) -> int:
         except RuntimeError:
             return 1
     ok, how = assisted_check(site)
-    record_check(site, ok, how)
+    if ok is not None:
+        record_check(site, ok, how)
     print(f"{'✅' if ok else '❌'} {site}: {how}")
     if not win.restored:
         return 1
     return 0 if ok else 2
 
 
-def ensure_logged_in(site: str) -> tuple[bool, str]:
-    """(logged in?, how) — positive check, else `browser.py login`, then re-check."""
-    if _browser("logged-in", site, quiet=True) == 0:
+BUSY_HOW = "busy: guided login in progress — skipped, re-check later"
+
+
+def ensure_logged_in(site: str) -> tuple[bool | None, str]:
+    """(logged in?, how) — positive check, else `browser.py login`, then re-check.
+
+    None = busy (exit 75: a guided login owns the browser): never a login
+    attempt, never "logged out"."""
+    rc = _browser("logged-in", site, quiet=True)
+    if rc == BUSY_RC:
+        return None, BUSY_HOW
+    if rc == 0:
         return True, "logged in"
     res = subprocess.run(
         [sys.executable, str(BROWSER_PY), "login", site],
@@ -822,7 +868,10 @@ def ensure_logged_in(site: str) -> tuple[bool, str]:
         for line in res.stdout.splitlines()
         if "route:" in line
     ]
-    if _browser("logged-in", site, quiet=True) == 0:
+    rc = _browser("logged-in", site, quiet=True)
+    if BUSY_RC in (rc, res.returncode):
+        return None, BUSY_HOW
+    if rc == 0:
         return True, f"logged in again ({routes[-1] if routes else 'browser.py login'})"
     return False, f"NOT logged in (browser.py login exit {res.returncode})"
 
@@ -870,6 +919,18 @@ def ensure_browser_up() -> bool:
     return browser_mode() is not None
 
 
+def _check_assisted_row(site: str, failed: list[tuple[str, str]]) -> None:
+    """`-c` for a site you log into yourself: check only; busy = skip."""
+    ok, how = assisted_check(site)
+    if ok is None:
+        print(f"⏸  {site}: {how}")
+        return
+    print(f"{'✅' if ok else '❌'} {site}: {how}")
+    record_check(site, ok, how)
+    if not ok:
+        failed.append((site, how))
+
+
 def check_all(*, mail: bool = False) -> int:
     """Every usable site (Safari or broker): logged in? If not, log in. One line
     per site; exit 1 if any stays logged out (and, with `mail`, ONE mail).
@@ -895,11 +956,7 @@ def check_all(*, mail: bool = False) -> int:
         failed.append(("login broker", data["broker"]))
     for row in data["rows"]:
         if row["status"] == "assisted":
-            ok, how = assisted_check(row["site"])
-            print(f"{'✅' if ok else '❌'} {row['site']}: {how}")
-            record_check(row["site"], ok, how)
-            if not ok:
-                failed.append((row["site"], how))
+            _check_assisted_row(row["site"], failed)
             continue
         if row["status"] not in ("ready", "extra", "safari"):
             continue
@@ -914,6 +971,9 @@ def check_all(*, mail: bool = False) -> int:
             failed.append(("shared Chromium", how))
             break
         ok, how = ensure_logged_in(row["site"])
+        if ok is None:
+            print(f"⏸  {row['site']}: {how}")
+            continue
         print(f"{'✅' if ok else '❌'} {row['site']}: {how}")
         record_check(row["site"], ok, how)
         if not ok:
@@ -939,7 +999,8 @@ def build_parser() -> argparse.ArgumentParser:
         "-g",
         "--guided",
         metavar="SITE",
-        help="guided login typed by hand in the shared Chromium window",
+        help="guided login by hand (browser.py assisted-login: confirm on the "
+        "terminal, remote view of a headless tab; the window as fallback)",
     )
     ap.add_argument(
         "-c",
