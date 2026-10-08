@@ -146,7 +146,7 @@ def test_verdict_one_answer_per_login() -> None:
 
 
 def test_assisted_sites_and_resolve() -> None:
-    assert {"anthropic", "openai", "slack"} <= al.ASSISTED_SITES
+    assert {"anthropic", "openai", "slack", "notion"} <= al.ASSISTED_SITES
     assert "switch" not in al.ASSISTED_SITES  # tp#821: the broker logs it in
     sw = next(t for t in al.TARGETS if t.site == "switch")
     assert al.classify(sw, {}, readable=False)[0] == "assisted"
@@ -154,6 +154,8 @@ def test_assisted_sites_and_resolve() -> None:
     assert al.resolve_site("https://auth.cscs.ch/") == "cscs"
     assert al.resolve_site("CSCS") == "cscs"
     assert al.resolve_site("nope") == "nope"
+    assert al.resolve_site("https://app.notion.com") == "notion"
+    assert al.resolve_site("Notion") == "notion"
 
 
 def test_broker_state_uses_recent_snapshot(monkeypatch, tmp_path) -> None:

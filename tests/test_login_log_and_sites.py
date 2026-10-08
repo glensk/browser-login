@@ -172,8 +172,8 @@ def test_read_json_dict_absent(tmp_path):
 # --- login log --------------------------------------------------------------------
 
 
-@pytest.fixture
-def logdir(tmp_path, monkeypatch):
+@pytest.fixture(name="logdir")
+def fixture_logdir(tmp_path, monkeypatch):
     d = tmp_path / "login-log"
     monkeypatch.setattr(browser, "LOGIN_LOG_DIR", d)
     return d
@@ -221,6 +221,8 @@ def test_login_log_empty(logdir, capsys):
         ("  Portal ", "cscs"),
         ("Claude.AI", "anthropic"),
         ("oai", "openai"),
+        ("notion.so", "notion"),
+        ("app.notion.com", "notion"),
         ("edificom", "biopolwifi"),
         ("scp", "switch"),
     ],
@@ -322,3 +324,20 @@ def test_login_log_survives_corrupt_lines(logdir, capsys):
     assert browser.cmd_login_log("cscs") == 0
     assert browser.cmd_login_log(None) == 0
     assert "2 real login(s)" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize(
+    "url, sidebar, ok",
+    [
+        ("https://app.notion.com/p/some-page-123", True, True),
+        ("https://app.notion.com/", True, True),
+        ("https://app.notion.com/login", True, False),  # /login is on the same host
+        ("https://app.notion.com/p/some-page-123", False, False),
+        ("https://www.notion.com/", True, False),  # logged-out marketing page
+        ("http://app.notion.com/", True, False),
+        ("https://app.notion.com.evil.example/", True, False),
+        ("not a url", True, False),
+    ],
+)
+def test_notion_verdict_needs_sidebar_on_app_host(url, sidebar, ok):
+    assert browser._notion_verdict(url, sidebar) is ok

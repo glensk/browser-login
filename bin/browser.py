@@ -59,7 +59,7 @@ Every Playwright attach gives up after $CLAUDE_BROWSER_CONNECT_TIMEOUT_S (defaul
 
 Generic multi-site login (a SITE is one of the entries in the SITES registry —
 currently ``cscs``, ``anthropic``/``claude``, ``openai``/``chatgpt``, ``slack``,
-``biopolwifi`` and ``switch``; add more by registering a Site):
+``notion``, ``biopolwifi`` and ``switch``; add more by registering a Site):
   login SITE        Ensure SITE is logged in in the shared browser. Automated for
                     sites with stored credentials (CSCS Keycloak). For claude.ai:
                     FULLY automatic when $ANTHROPIC_LOGIN_EMAIL is set and himalaya
@@ -69,9 +69,11 @@ currently ``cscs``, ``anthropic``/``claude``, ``openai``/``chatgpt``, ``slack``,
                     otherwise ASSISTED (you complete the email login in the
                     window). For chatgpt.com:
                     ASSISTED (Google SSO + 2FA once in the shared window; the
-                    session persists). For the Switch Cloud Portal: clicks the
-                    edu-ID sign-in button (no password while the edu-ID session
-                    is alive), otherwise ASSISTED. Records a login event.
+                    session persists). For Notion: ASSISTED (e-mail code or
+                    SSO once in the shared window). For the Switch Cloud
+                    Portal: clicks the edu-ID sign-in button (no password while
+                    the edu-ID session is alive), otherwise ASSISTED. Records a
+                    login event.
   logged-in SITE    Exit 0 if SITE is logged in, 2 if not (no login attempted).
   login-log SITE    Show how often a *real* login was actually needed for SITE
                     (count, first/last, average interval) — read from the log.
@@ -265,6 +267,19 @@ SLACK_SIGNIN_MARKERS = (
     "/sign-in",
     "slack.com/get-started",
 )
+
+# --- Notion (app.notion.com) site --------------------------------------------
+# Notion logs in by e-mail code or SSO, which cannot be replayed from a stored
+# secret — so this site does ASSISTED login: you sign in once in the shared
+# window; the session then persists in the profile. No token is extracted.
+# notion.so redirects to app.notion.com, and so does its /login page — the host
+# alone proves nothing. Logged-in sentinel = the workspace sidebar (or its
+# workspace switcher), which neither /login nor the www.notion.com marketing
+# page renders.
+NOTION_APP_ORIGIN = "https://app.notion.com"
+NOTION_APP_HOST = "app.notion.com"
+NOTION_LOGIN_URL = NOTION_APP_ORIGIN + "/login"
+NOTION_SIDEBAR_SELECTOR = ".notion-sidebar, .notion-sidebar-switcher"
 
 # --- Biopol WiFi (Ruckus Cloudpath MDU portal) site -------------------------
 # The SDSC Biopole WiFi units are managed through a Ruckus Cloudpath MDU
@@ -603,7 +618,7 @@ def parse_args() -> argparse.Namespace:
     pl.add_argument(
         "site",
         help="Site to log into (e.g. cscs, anthropic/claude, openai/chatgpt, "
-        "slack, biopolwifi, switch).",
+        "slack, notion, biopolwifi, switch).",
     )
     pli = sub.add_parser(
         "logged-in", help="Exit 0 if SITE is logged in, 2 if not (no login)."
@@ -7869,6 +7884,142 @@ def cmd_login_cscs_assisted(port: int) -> int:
     return cmd_cscs_login(port)
 
 
+# ---------------------------------------------------------------------------
+# Notion (app.notion.com) — assisted e-mail-code / SSO login, no token
+# ---------------------------------------------------------------------------
+
+
+def _notion_verdict(url: str, has_sidebar: bool) -> bool:
+    """True iff a tab at `url` showing (or not) the workspace sidebar is a
+    logged-in Notion session: on app.notion.com, outside /login, sidebar up."""
+    try:
+        parts = urllib.parse.urlsplit(url)
+    except ValueError:
+        return False
+    if parts.scheme != "https" or parts.hostname != NOTION_APP_HOST:
+        return False
+    if parts.path.startswith("/login"):
+        return False
+    return has_sidebar
+
+
+def _notion_page_logged_in(page) -> bool:
+    """READ-ONLY check of a live tab (never navigates it); False when the DOM
+    cannot be read — fail closed."""
+    try:
+        url = page.url
+        has_sidebar = page.query_selector(NOTION_SIDEBAR_SELECTOR) is not None
+    except Exception:  # pylint: disable=broad-exception-caught
+        return False
+    return _notion_verdict(url, has_sidebar)
+
+
+def _notion_wait_for_login(
+    page, timeout_s: float, poll_s: float = 1.0, heartbeat: bool = False
+) -> bool:
+    """PASSIVE poll of `page`: True as soon as it shows a logged-in workspace.
+
+    Never navigates — a `goto` would wipe the e-mail code you are typing.
+    `heartbeat` prints a progress line to stderr every 30 s (the long assisted
+    wait), like `_chatgpt_wait_for_login`.
+    """
+    start = time.monotonic()
+    last_beat = 0.0
+    while time.monotonic() - start < timeout_s:
+        if _notion_page_logged_in(page):
+            return True
+        elapsed = time.monotonic() - start
+        if heartbeat and elapsed - last_beat >= 30:
+            print(
+                f"  …waiting for you to finish the Notion login in the shared "
+                f"browser window ({int(elapsed)}s elapsed)…",
+                file=sys.stderr,
+            )
+            last_beat = elapsed
+        try:
+            page.wait_for_timeout(poll_s * 1000)
+        except Exception:  # pylint: disable=broad-exception-caught
+            time.sleep(poll_s)
+    return False
+
+
+def _notion_probe(port: int) -> bool:
+    """READ-ONLY: open app.notion.com in a BACKGROUND tab (never focused, no
+    tab of the user's touched), wait up to 30 s for the workspace sidebar,
+    close the tab. Anything that goes wrong is False (fail closed)."""
+    return bool(
+        _with_background_page(
+            port,
+            NOTION_APP_ORIGIN + "/",
+            lambda page: _notion_wait_for_login(page, timeout_s=30, poll_s=0.5),
+        )
+    )
+
+
+def cmd_notion_login(port: int) -> int:
+    """Ensure Notion (app.notion.com) is logged in. Idempotent (a warm session
+    just returns 0). Notion logs in by e-mail code or SSO, which can't be
+    replayed from stored credentials — a cold session is ASSISTED: you sign in
+    once in the shared window; the session then persists. Held under the
+    INTERACTION lease — no other tool clicks in the meantime."""
+    from playwright.sync_api import Error as PlaywrightError
+
+    # Warm probe + headless guard FIRST, outside the lease (both are the
+    # read-only checks `logged-in` does lease-free).
+    if _notion_probe(port):
+        print("✓ Already logged into Notion (app.notion.com).")
+        return 0
+    if not _require_headed_for_assisted(port, "Notion"):
+        return 2
+    pw, browser = _connect(port)
+    try:
+        with _interaction_lease("login notion"):
+            ctx = browser.contexts[0] if browser.contexts else browser.new_context()
+            # Interactive and headed (guard above): a new tab in the window is
+            # what the human works in; it stays open afterwards.
+            page = ctx.new_page()
+            try:
+                page.goto(NOTION_LOGIN_URL, wait_until="domcontentloaded")
+            except PlaywrightError as exc:
+                return _fail(
+                    f"could not open {NOTION_LOGIN_URL} in the shared browser: {exc}"
+                )
+            with contextlib.suppress(PlaywrightError):
+                page.bring_to_front()
+            print(
+                "\n🔐 Notion (app.notion.com) needs a login.\n"
+                "   In the shared Chrome window (now in front):\n"
+                "     1. Log in on the page that opened (e-mail code, or SSO).\n"
+                "     2. Land in the workspace — success is auto-detected once the\n"
+                "        sidebar shows.\n",
+                file=sys.stderr,
+            )
+            if not _notion_wait_for_login(
+                page, timeout_s=300, poll_s=2.0, heartbeat=True
+            ):
+                return _fail(
+                    "Notion login not detected within 5 min. Finish the login in "
+                    "the shared browser, then re-run: browser.py login notion"
+                )
+            print("✓ Logged into Notion (app.notion.com).")
+            _record_login_event("notion", "assisted")
+            return 0
+    finally:
+        browser.close()
+        pw.stop()
+
+
+def cmd_notion_logged_in(port: int) -> int:
+    """Exit 0 if Notion is logged in (workspace sidebar on app.notion.com), else
+    2 — also when it cannot be told (fail closed). READ-ONLY: no lease, one
+    background tab, closed again."""
+    if _notion_probe(port):
+        print("✓ Logged into Notion (app.notion.com).")
+        return 0
+    print("Not logged into Notion (app.notion.com).", file=sys.stderr)
+    return 2
+
+
 def _broker_site_obj(site: str) -> "Site":
     """A dynamic registry entry for a broker-only site."""
     return Site(
@@ -7934,6 +8085,13 @@ def _sites() -> list[Site]:
             blurb="app.slack.com (assisted login; `slack-session` prints xoxc+d creds)",
             login=cmd_slack_login,
             logged_in=cmd_slack_logged_in,
+        ),
+        Site(
+            name="notion",
+            aliases=("notion.so", "app.notion.com", "notion.com"),
+            blurb="app.notion.com (assisted e-mail-code / SSO login; no token)",
+            login=cmd_notion_login,
+            logged_in=cmd_notion_logged_in,
         ),
         Site(
             name="biopolwifi",

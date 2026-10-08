@@ -179,6 +179,13 @@ TARGETS = (
         "SDSC Slack: log in with ./agent-login.py -g slack",
     ),
     Target(
+        "notion",
+        "Notion",
+        "https://app.notion.com",
+        ASSISTED_FLOW,
+        "Notion (SDSC/Renku workspace): log in with ./agent-login.py -g notion",
+    ),
+    Target(
         "switch",
         "SWITCH Cloud",
         "https://cloud.switch.ch",
