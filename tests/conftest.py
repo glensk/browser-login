@@ -116,6 +116,28 @@ def _private_journal(tmp_path, monkeypatch):
         _assert_journal_not_live()
 
 
+@pytest.fixture(autouse=True)
+def _private_mode_state(tmp_path, monkeypatch):
+    """The headless-invariant state files of every loaded browser.py live in tmp.
+
+    ``desired-mode.json``, ``headed-lease.json`` (+ its lock) and the download
+    dir are module constants computed from the live cache dir at import time;
+    a test reaching `cmd_up`/`cmd_switch`/`_headed_lease` must never write the
+    real ones. A guided login running on this Mac must not leak into a test
+    either, hence the lease env var is cleared.
+    """
+    monkeypatch.delenv("CLAUDE_BROWSER_HEADED_LEASE", raising=False)
+    state = tmp_path / "mode-state"
+    for mod in list(sys.modules.values()):
+        if getattr(mod, "HEADED_LEASE_FILE", None) is None:
+            continue
+        monkeypatch.setattr(mod, "DESIRED_MODE_FILE", state / "desired-mode.json")
+        monkeypatch.setattr(mod, "HEADED_LEASE_FILE", state / "headed-lease.json")
+        monkeypatch.setattr(mod, "HEADED_LEASE_LOCK", state / ".headed-lease.lock")
+        monkeypatch.setattr(mod, "DOWNLOAD_DIR", state / "downloads")
+    yield
+
+
 _LIVE_CACHE_PREFIX = os.path.join(os.path.expanduser("~"), ".cache", "claude-browser")
 
 

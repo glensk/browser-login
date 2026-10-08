@@ -296,7 +296,9 @@ def test_assisted_fallback_submits_only_when_auto_did_not(
     monkeypatch.setattr(browser, "ANTHROPIC_LOGIN_EMAIL", ME)
     monkeypatch.setattr(browser, "_himalaya_bin", lambda: "himalaya")
     monkeypatch.setattr(browser, "_claude_auto_login", lambda p, e, h: result)
-    monkeypatch.setattr(browser, "_require_headed_for_assisted", lambda port, s: True)
+    monkeypatch.setattr(
+        browser, "_guided_login_allowed", lambda port, site, label: True
+    )
     monkeypatch.setattr(
         browser, "_claude_fill_email_and_continue", lambda p, e: fills.append(e)
     )

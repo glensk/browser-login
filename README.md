@@ -37,7 +37,7 @@ shipping its own brittle auth flow.
 | Python ≥ 3.10 + `uv`    | runtime (`uv` auto-creates the venv on first run) | yes       |
 | Playwright + Chromium   | the browser itself (`playwright install chromium`) | yes       |
 | `himalaya`              | full-auto claude.ai magic-link login (reads the email) | optional |
-| `op` (1Password CLI)    | CSCS credential fallback before the keychain is set up | optional |
+| `op` (1Password CLI)    | legacy: only the human-only `login-cscs-assisted` / `cscs-store-creds`; never an unattended login | no (not in use) |
 
 `playwright`, `pyotp`, `requests` and `websockets` (raw-CDP tab probe) are declared in `pyproject.toml`. You don't
 have to install them yourself: on first run `browser.py` **self-bootstraps** an
@@ -62,12 +62,13 @@ That's it — `browser.py` creates its own venv on first use.
 ## Quick start
 
 ```commands
-browser.py up                 # launch the shared Chromium (idempotent, BACKGROUND, clean tab)
-browser.py up --headless      # opt-in windowless mode (same profile — see the headless note!)
+browser.py up                 # launch the shared Chromium, always HEADLESS (idempotent, clean tab;
+                              #   -H is a no-op kept for compatibility)
 browser.py status             # CDP health, version, open tabs (origins only; -f full URLs) + the lifecycle record
 browser.py status -p          # + probe every tab over raw CDP: marks '⚠ unresponsive' / '? indeterminate'
 browser.py close-hung [-y]    # close tabs that answer no CDP command (asks first; see Troubleshooting)
-browser.py switch headless    # transactional mode switch (stop + relaunch, logins persist)
+browser.py switch headless    # revert a headed browser (stop + relaunch, logins persist);
+                              #   `switch headed` only inside a guided login (else exit 2)
 browser.py clients            # who is attached over CDP (registered + unknown clients)
 browser.py journal [-n N] [-e EVENT] [-j]  # who launched/switched/stopped it, logins, window raises
 browser.py doctor             # full health check on a disposable tab (never touches real tabs)
@@ -95,59 +96,110 @@ browser.py down [-f]          # quit the shared browser (graceful CDP close → 
                               #   -f/--force stops anyway; a stale record with no browser is cleared
 ```
 
-`up` launches the binary directly (detached) so Chrome for Testing opens behind
-the frontmost app and never pops over what you're doing, and on a cold start it **wipes stale
-session-restore state** so it opens ONE clean tab instead of resurrecting every
-tab from last time (your logins persist — they live in Cookies/Local Storage,
-not the session files). `open` likewise reuses a blank tab or creates new tabs
-via CDP `Target.createTarget` with `background: true`. Only the assisted login
-flows intentionally raise the window because you must act in it.
+`up` launches the binary directly (detached) and HEADLESS — there is no window
+at all — and on a cold start it **wipes stale session-restore state** so it opens
+ONE clean tab instead of resurrecting every tab from last time (your logins
+persist — they live in Cookies/Local Storage, not the session files). `open`
+likewise reuses a blank tab or creates new tabs via CDP `Target.createTarget`
+with `background: true`. The only time a window exists is a guided login you
+start yourself (`agent-login.py -g SITE`, see the next section).
 
 Env toggles: `CLAUDE_BROWSER_KEEP_TABS=1` keeps last session's tabs (skip the
-wipe); `CLAUDE_BROWSER_OPEN_LAUNCH=1` launches via `open -g -n` instead (breaks LAN
-access — see below); `CLAUDE_BROWSER_FOREGROUND=1` forces the direct launch;
-`CLAUDE_BROWSER_HEADLESS=1` makes `up` default to headless;
+wipe); `CLAUDE_BROWSER_OPEN_LAUNCH=1` launches a HEADED (guided-login) browser via
+`open -g -n` instead (breaks LAN access — see below; never used for headless);
+`CLAUDE_BROWSER_FOREGROUND=1` forces the direct launch;
 `CLAUDE_BROWSER_CONNECT_TIMEOUT_S` (default 30) bounds every Playwright attach
-(see Troubleshooting).
+(see Troubleshooting). `CLAUDE_BROWSER_HEADLESS` is ignored (headless is the
+only mode `up` knows; `CLAUDE_BROWSER_HEADLESS=0` does NOT give a window).
 Separately, the Claude Code wrapper only auto-starts the browser when
 `CLAUDE_BROWSER_AUTOSTART=1` — by default it is lazy (started on first use).
 
 ## Why you never see the window
 
-The whole design goal is that **driving the browser never interferes with your
-desktop**: no focus steal, no window raising, no z-order change. How that is
-achieved (and where the sharp edges are — all measured, see
-`PLAN_background-browser.md` for the evidence):
+The design goal is that **driving the browser never interferes with your
+desktop**: no focus steal, no window, no z-order change, no native prompt
+(PLAN_focus-free-browser.md, tp#836). It is enforced by one invariant:
 
-- **Background launch.** The binary is spawned directly (not `open -a`); its
-  window opens *behind* the frontmost app without taking focus (measured
-  2026-09-29, same as `open -g -n`). Why not `open`: LaunchServices makes the
-  app its own responsible process, and macOS Local Network privacy then
-  blocked every LAN address (`ERR_ADDRESS_UNREACHABLE` on 192.168.178.x and
-  `*.dom42.space`) even with the toggle ON; spawned directly it inherits the
-  launching terminal's grant (tp#703);
-  new tabs are created with `Target.createTarget {background: true}`, which
-  does not raise the window.
-- **Occlusion freezes rendering.** When the window is fully occluded, macOS
-  pauses rendering: `requestAnimationFrame` stops, and every Playwright click
-  times out on its "element is stable" wait (needs 2 rAF frames). The
-  `--disable-backgrounding-*` launch flags alone did NOT prevent this.
-- **`bring_to_front` unfreezes rendering but is NOT free.** On Chrome for
-  Testing 151 the tab-level CDP `Page.bringToFront` can raise the window to
-  the top of the z-order and even make Chrome the frontmost app (focus
-  steal) — it depends on macOS cooperative-activation state, so it
-  sometimes looks harmless. Treat it as an **escalation of last resort**:
-  probe rAF first, call `bring_to_front` only when rendering is actually
-  frozen (this is exactly what `browser.py doctor` does).
-- **Headless would solve all of this — but is a NO-GO for the admin sites.**
-  `--headless=new` advertises `HeadlessChrome` in the User-Agent and
-  Cloudflare hard-challenges it: claude.ai and chatgpt.com never load
-  ("Just a moment…" forever). CSCS/Slack/Cloudpath logins, screenshots,
-  downloads and evals all work headless. Hence headless stays **opt-in**
-  (`up -H`, `switch headless`) for non-Cloudflare work only.
-- **A hidden window is not an option either.** `open -g -j` is undone by
-  Chrome at window creation, and both `Target.createTarget` and
-  `Page.bringToFront` un-hide a manually hidden (Cmd+H) app.
+> **The shared browser is HEADLESS unless a live headed lease exists** — held by
+> a guided login you start yourself (`agent-login.py -g SITE`). With no window,
+> nothing can take focus, be raised or pop a dialog.
+
+- **Headless by default.** `up` always launches `--headless=new` (same profile,
+  same logins). `<cache>/desired-mode.json` records `{"mode": "headless"}` (no
+  file = headless; any other value is reported by `doctor` and ignored). There is
+  no `up --headed` and no env toggle for one; `up -H` is accepted as a no-op.
+- **Why the 2026-08-20 NO-GO no longer holds.** Headless used to announce
+  `HeadlessChrome` in the User-Agent, and Cloudflare hard-challenged it
+  (claude.ai and chatgpt.com never loaded). Since commit `34c78ea` (2026-10-06)
+  the headless launch passes a plain desktop `--user-agent` (version from the
+  app's Info.plist), which removes that tell everywhere (page, workers, request
+  headers, `/json/version`). The Phase 1 cold matrix (disposable profile,
+  Chrome for Testing 153.0.8010.12, 2026-10-08) loaded 12/12 sites with no
+  challenge: claude.ai, chatgpt.com, platform.openai.com, Slack, Notion, CSCS,
+  SWITCH, Smartsheet, Infomaniak, gitlab.datascience.ch, console.anthropic.com
+  and a LAN `*.dom42.space` site. Residual tells (empty high-entropy UA-CH, an
+  800×600 `screen`, no "Google Chrome" brand) are harmless today.
+- **The headed lease.** `<cache>/headed-lease.json` = `{owner_nonce, pid,
+  pid_start_time, site, started, heartbeat}`, written by the guided login,
+  heartbeat every 10 s (a write error is retried, never fatal), removed
+  compare-before-release. It is LIVE while the owner pid runs with the recorded
+  start time (no pid reuse), whatever the heartbeat's age — a Mac asleep for a
+  minute keeps it — unless the heartbeat is over 120 s old (a hung owner). When
+  `ps` cannot read the start time of a live pid, the lease counts as live (a
+  `ps` hiccup never reverts a guided window). The owner exports
+  `CLAUDE_BROWSER_HEADED_LEASE=<nonce>`;
+  only processes carrying that nonce (the guided login and its `browser.py`
+  children) may `switch headed`, run an assisted login step or call
+  `bring_to_front`. Anybody else gets `switch headed` → exit 2 (`headed mode only
+  inside a guided login: agent-login.py -g <site>`). The guided login switches
+  back to headless at the end — unless another guided login's lease is live by
+  then — and a failed switch back is a loud ❌ plus one retry.
+- **Preflight revert (best effort).** Every command that drives the browser
+  (all but `status`, `journal`, `down`, `switch`, `clients`, the recovery tools
+  `doctor`, `close-hung`, `close`, and the offline ones) first checks: headed
+  and no live lease → `switch headless` (journaled as `revert_headed`) BEFORE it
+  takes the client gate, with all its output on stderr (a consumer's stdout —
+  `slack-session` JSON, `token`, `open -N` — stays clean). It waits at most 5 s
+  for the gate, re-checks under it (a guided login that took the lease
+  meanwhile is left alone: `revert_skipped`), and is skipped while another
+  up/switch/down is in flight. A revert that fails (e.g. an unregistered client
+  blocks the switch) is one ❌ line on stderr plus a `revert_failed` journal
+  event — the command still runs, and the next command tries again. By hand:
+  `browser.py switch headless` (`-f` past an unregistered client).
+- **`login` never opens a human flow.** Where a login needs you (claude.ai
+  without a readable magic link, chatgpt.com, Slack, Notion, the SWITCH edu-ID
+  fallback) it exits **4** and prints `needs Albert: agent-login.py -g <site>` —
+  same code as the broker's "needs a human". Inside a guided login (lease held
+  by this process tree, browser headed) the old window flow runs. No TTY or env
+  heuristics. An unattended `login cscs` never falls back to 1Password/Touch ID.
+- **`bring_to_front` is a journaled no-op** (`skipped: no-lease|headless`)
+  outside a guided login; `token` and `slack-session` no longer call it. `doctor`
+  never escalates to it in headless — frozen rendering is a ❌ there.
+- **No native UI.** Launch flag `--deny-permission-prompts` plus profile prefs
+  written before every launch (`profile.default_content_setting_values`
+  notifications/geolocation/camera/mic = block; `download.default_directory` =
+  `<cache>/downloads`, no Save dialog). Prefs rather than CDP
+  `Browser.setDownloadBehavior`: that one is reset when the CDP session that set
+  it detaches (measured on CfT 153), and each Playwright attach sets its own.
+  `--disable-notifications` is not used — with it a page script probing
+  `Notification` threw on CfT 153, and the prefs already deny notifications.
+  Chrome for Testing has no auto-updater (Playwright's cache manages it). The
+  macOS keychain prompts that remain possible are listed under Security.
+- **No `--remote-allow-origins`.** Without it Chrome answers 403 to every CDP
+  WebSocket that sends an `Origin` header (even its own origin), so no web page
+  can drive the browser. Playwright (Python and Node, incl. the Playwright MCP)
+  and this repo's `websockets` clients (`_cdp_ws_call`, `login_viewer.py`) send
+  none; a third-party CDP client that sends an Origin must stop doing so.
+- **Background launch (headed, guided login only).** The binary is spawned
+  directly (not `open -a`): LaunchServices would make the app its own
+  responsible process, and macOS Local Network privacy then blocked every LAN
+  address (`ERR_ADDRESS_UNREACHABLE` on 192.168.178.x and `*.dom42.space`, tp#703);
+  spawned directly it inherits the launching terminal's grant. A headed window
+  opens behind the frontmost app; macOS pauses rendering of an occluded window
+  (rAF stops, every Playwright click times out on "stable"), which is why the
+  `--disable-backgrounding-*` flags stay, and why `Page.bringToFront` (which on
+  CfT 151 could raise the window and even steal focus) is the guided login's
+  escalation only.
 
 `status` prints the **lifecycle record** (`~/.cache/claude-browser/
 .browser-lifecycle.json`): state (`starting|running|stopping|switching`),
@@ -177,7 +229,7 @@ count. Appends are single `O_APPEND`
 writes (< 4 KiB, whole lines under concurrency); past 10 MB the file rotates
 to `.1`/`.2`; a journal failure warns once on stderr and never fails the
 command. `browser.py journal` tails it (`-n/--lines N`, default 50, `0` = all;
-`-e/--event up|switch|down|login|bring_to_front|register|unregister`;
+`-e/--event up|switch|down|login|bring_to_front|register|unregister|revert_headed|headed_lease`;
 `-j/--json` raw lines).
 
 ## Consumer contract (multi-client coordination)
@@ -212,9 +264,11 @@ state — so two layers coordinate everyone (all under `~/.cache/claude-browser/
 
 Rules for anything that drives this browser:
 
-- **Never activate the app or raise the window.** Tab-level
-  `bring_to_front` only as an escalation when rAF is frozen (see above) —
-  never unconditionally, never AppleScript `activate`.
+- **Never activate the app or raise the window.** The browser is headless;
+  `bring_to_front` is a no-op outside a guided login (see above). Never
+  AppleScript `activate`, never `switch headed` (it refuses without the lease).
+- **Send no `Origin` header** on a CDP WebSocket — the browser runs without
+  `--remote-allow-origins` and answers 403.
 - **`force=True` clicks never on final mutating controls.** Force-fallback is
   acceptable for non-final controls only; the last click of a mutation must
   pass normal actionability.
@@ -244,7 +298,8 @@ A **site** is one entry in the `SITES` registry inside `browser.py`. Generic
 subcommands dispatch through it:
 
 ```commands
-browser.py login SITE         # ensure logged in (automated or assisted)
+browser.py login SITE         # ensure logged in; exit 4 + "needs Albert: agent-login.py -g SITE"
+                              #   when only you can finish it (never opens a window itself)
 browser.py logged-in SITE     # exit 0 if logged in, 2 if not (no login attempted)
 browser.py login-log [SITE]   # how often a *real* login was needed (no SITE = all tools)
 browser.py store-creds SITE   # save credentials in the macOS keychain (cscs-style)
@@ -389,6 +444,15 @@ Current consumers: a CSCS portal client (token auto-refresh + re-login), an
 Anthropic admin tool (claude.ai login for roster auto-export + invoice download),
 and a ChatGPT Business roster scraper (chatgpt.com admin login).
 
+**Known consumers to update for headless-by-default (tp#836):**
+
+- `sdsc/openai-api/openai-team.py` assumes the shared browser is HEADED:
+  `_open_shared_browser` returns `headed=True`, and `_ensure_logged_in` then
+  waits up to 5 min for a human to finish a login on the auth screen. With the
+  browser headless nobody can; it should treat a logged-out shared browser as
+  "needs Albert: agent-login.py -g openai" (or `browser.py login openai` exit 4)
+  instead of waiting.
+
 ## Adding a new site
 
 Two shapes cover almost everything:
@@ -397,6 +461,9 @@ Two shapes cover almost everything:
   form. Store secrets via `store-creds`, fill at login, optionally extract a token.
 - **Assisted / magic-link** (like claude.ai): can't be scripted from a stored secret —
   let the user complete it once, or automate end-to-end if a login email is readable.
+  Gate the human step with `_guided_login_allowed(port, site, label)` and return
+  `NEEDS_ALBERT_RC` (4) when it refuses: the window flow runs only inside a guided
+  login (`agent-login.py -g SITE`); raise the tab only via `_bring_to_front`.
 
 Steps: write `cmd_<site>_login(port)` and `cmd_<site>_logged_in(port)` (check a DOM
 sentinel on a stable post-login surface — never "the URL isn't `/login`"), optionally
@@ -444,6 +511,25 @@ the `himalaya` helpers. The CDP endpoint is always `http://127.0.0.1:<port>` (ne
   waits for the running call to finish, removes a partially written set, then exits.
   Consequence: a read against a LOCKED keychain waits until you unlock it, and
   `store-creds` prints "If macOS shows a keychain dialog, answer it." first.
+- **Native keychain prompts that remain possible** (tp#836 lists them; they are
+  not changed). A SecurityAgent dialog can appear when the login keychain is
+  locked, or when an item's access list does not trust `/usr/bin/security`
+  (items `store-creds` wrote carry `-T /usr/bin/security` and read silently):
+
+  | Call site                                              | `security` call                     | Reached unattended?                                   |
+  | :----------------------------------------------------- | :---------------------------------- | :---------------------------------------------------- |
+  | `browser.py` `_keychain_get` via `_keychain_creds`     | `find-generic-password -g`          | yes — `login cscs` (static flow, broker not listing cscs) |
+  | `browser.py` `_keychain_get` in `cmd_biopolwifi_login` | `find-generic-password -g`          | yes — `login biopolwifi`                              |
+  | `browser.py` `_keychain_write` (`security -i` add)     | `add-generic-password`              | no — `store-creds` only                               |
+  | `browser.py` `_kc_delete`                              | `delete-generic-password`           | no — `store-creds` / `forget-creds` only              |
+  | `browser.py` `_kc_target_keychain`                     | `default-keychain -d user`          | no — `store-creds` only (never prompts)               |
+  | `agent_login_keychain.py` `scan`                       | `dump-keychain -a` (no secrets)     | yes — `agent-login.py -S` every 10 min (locked keychain) |
+
+  Chrome for Testing itself reads its "Safe Storage" key from the login keychain
+  at launch; after a CfT upgrade (new binary) macOS can ask once whether the new
+  binary may use it. `--use-mock-keychain` would avoid that but makes every
+  existing cookie unreadable (all logins lost), so it is not used for the shared
+  profile (the broker's own Chromium uses it).
 
 ## License
 

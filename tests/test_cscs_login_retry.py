@@ -119,14 +119,25 @@ def test_creds_are_reresolved_per_attempt(monkeypatch, capsys):
     assert out.count("macOS keychain") == 1
 
 
-def test_creds_fall_back_to_1password(monkeypatch):
+def test_creds_never_fall_back_to_1password_unattended(monkeypatch):
+    """tp#836: an unattended `login cscs` never reaches the Touch-ID `op` path."""
+    monkeypatch.setattr(browser, "_keychain_creds", lambda: None)
+
+    def no_op(item, account):
+        raise AssertionError("op must not run in an unattended login")
+
+    monkeypatch.setattr(browser, "_op_creds", no_op)
+    assert browser._cscs_creds(announce=True) == (None, "none")
+
+
+def test_creds_fall_back_to_1password_only_when_allowed(monkeypatch):
     monkeypatch.setattr(browser, "_keychain_creds", lambda: None)
     monkeypatch.setattr(
         browser,
         "_op_creds",
         lambda item, account: browser.CscsCreds("aglensk", "pw", lambda: "333333"),
     )
-    creds, mode = browser._cscs_creds(announce=False)
+    creds, mode = browser._cscs_creds(announce=False, allow_op=True)
     assert mode == "1password"
     assert creds is not None and creds[:2] == ("aglensk", "pw")
     assert creds.otp() == "333333"

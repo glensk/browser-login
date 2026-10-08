@@ -426,7 +426,7 @@ def test_check_all_starts_a_down_browser(monkeypatch) -> None:
         al, "overview", lambda: {"broker_ok": True, "broker": "ok", "rows": []}
     )
     assert al.check_all() == 0
-    assert calls == [("up", "--headless")]
+    assert calls == [("up",)]
 
 
 def test_check_all_browser_wont_start(monkeypatch) -> None:

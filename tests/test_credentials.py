@@ -1077,7 +1077,9 @@ def _cscs_login_env(monkeypatch, page):
     )
     monkeypatch.setattr(browser, "_pick_portal_page", lambda b: (None, page))
     monkeypatch.setattr(browser, "_close_stale_cscs_tabs", lambda ctx, keep=None: 0)
-    monkeypatch.setattr(browser, "_cscs_creds", lambda announce: (("u", "p", "1"), "k"))
+    monkeypatch.setattr(
+        browser, "_cscs_creds", lambda announce, allow_op=False: (("u", "p", "1"), "k")
+    )
     monkeypatch.setattr(browser, "_submit_keycloak_login", lambda pg, creds: False)
     monkeypatch.setattr(browser, "_keycloak_flow_expired", lambda pg: False)
     recorded: list = []

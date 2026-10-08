@@ -532,7 +532,11 @@ class Relay:  # pylint: disable=too-many-instance-attributes
                 for t in targets
             ):
                 raise LookupError(f"no page target {self.target_id} on {self.cdp_http}")
-        self._cdp = await connect(info["webSocketDebuggerUrl"], max_size=None)
+        # origin=None: the shared browser runs without --remote-allow-origins,
+        # so Chrome rejects (403) any CDP WebSocket that sends an Origin.
+        self._cdp = await connect(
+            info["webSocketDebuggerUrl"], max_size=None, origin=None
+        )
         asyncio.create_task(self._cdp_reader())
         await self.call("Target.setDiscoverTargets", session=False, discover=True)
         if self.url:

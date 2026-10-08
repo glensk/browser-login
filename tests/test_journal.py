@@ -240,13 +240,13 @@ def test_dispatch_prefetches_chain_before_command(journal, monkeypatch):
         order.append("ps")
         return []
 
-    def token(port):
+    def doctor(port):
         order.append("cmd")
         return 0
 
     monkeypatch.setattr(browser, "_journal_parent_chain", chain)
-    monkeypatch.setattr(browser, "cmd_token", token)
-    assert browser._journaled_dispatch(argparse.Namespace(cmd="token"), PORT) == 0
+    monkeypatch.setattr(browser, "cmd_doctor", doctor)
+    assert browser._journaled_dispatch(argparse.Namespace(cmd="doctor"), PORT) == 0
     assert order == ["ps", "cmd"]
 
 
@@ -345,7 +345,15 @@ def test_rotation_skipped_when_path_already_rotated(journal, monkeypatch):
     assert '"event":"up"' in Path(f"{journal}.1").read_text(encoding="utf-8")
 
 
-def test_bring_to_front_journals_then_calls(journal):
+@pytest.fixture
+def guided(monkeypatch):
+    """This process holds the live headed lease and the browser is headed."""
+    monkeypatch.setattr(browser, "_headed_lease_held", lambda: True)
+    monkeypatch.setattr(browser, "_browser_mode", lambda port: "headed")
+
+
+def test_bring_to_front_journals_then_calls(journal, guided):
+    del guided
     calls: list[str] = []
 
     class FakePage:
@@ -364,7 +372,9 @@ def test_bring_to_front_journals_then_calls(journal):
     assert SECRET not in journal.read_text()
 
 
-def test_bring_to_front_error_propagates_after_journal(journal):
+def test_bring_to_front_error_propagates_after_journal(journal, guided):
+    del guided
+
     class Boom(RuntimeError):
         pass
 

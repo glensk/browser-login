@@ -14,9 +14,10 @@ Because both share one profile, you authenticate (Keycloak SSO) a single time;
 the session persists in the profile dir across browser restarts.
 
 Generic lifecycle:
-  up        Launch the shared browser (idempotent). Log into sites once here.
-            [-H|--headless] opts into a windowless browser (same profile, same
-            logins) — everything works except assisted (human) logins.
+  up        Launch the shared browser, always HEADLESS (idempotent; -H is a
+            no-op kept for compatibility). Headed exists only inside a guided
+            login (agent-login.py -g SITE holds the headed lease); a headed
+            browser without a live lease is reverted by every command.
   status    Show CDP health, browser version, open tabs (origins only; -f full
             URLs), and the lifecycle record. [-p|--probe] also probes every tab
             over raw CDP and marks the ones that answer nothing.
@@ -26,7 +27,8 @@ Generic lifecycle:
             consecutive probes; asks first unless -y.
   switch MODE
             Transactionally switch to headed|headless: stop the browser and
-            relaunch it on the SAME profile (every login persists). Waits for
+            relaunch it on the SAME profile (every login persists). `headed`
+            only for the holder of the live headed lease (else exit 2). Waits for
             registered CDP clients to drain and REFUSES while an unregistered
             client is attached ([-f|--force] switches anyway).
   clients   Show who is attached over CDP: the registered clients (tool, pid,
@@ -77,7 +79,10 @@ currently ``cscs``, ``anthropic``/``claude``, ``openai``/``chatgpt``, ``slack``,
                     SSO once in the shared window). For the Switch Cloud
                     Portal: clicks the edu-ID sign-in button (no password while
                     the edu-ID session is alive), otherwise ASSISTED. Records a
-                    login event.
+                    login event. An ASSISTED step runs ONLY inside a guided
+                    login (agent-login.py -g SITE, which holds the headed
+                    lease); anywhere else `login` exits 4 and prints
+                    `needs Albert: agent-login.py -g SITE`.
   logged-in SITE    Exit 0 if SITE is logged in, 2 if not (no login attempted).
   login-log SITE    Show how often a *real* login was actually needed for SITE
                     (count, first/last, average interval) — read from the log.
@@ -408,7 +413,7 @@ def _add_journal_parser(sub: Any) -> None:
         "--event",
         default=None,
         help="only this event: up, switch, down, login, bring_to_front, register, "
-        "unregister",
+        "unregister, revert_headed, headed_lease",
     )
     pjn.add_argument(
         "-j", "--json", action="store_true", help="print the raw JSON lines"
@@ -486,8 +491,7 @@ def parse_args() -> argparse.Namespace:
         epilog=(
             "Examples:\n"
             "  ./browser.py up                 # start it, then log into sites once\n"
-            "  ./browser.py up --headless      # windowless (same profile/logins)\n"
-            "  ./browser.py switch headless    # stop + relaunch windowless\n"
+            "  ./browser.py switch headless    # revert a headed browser (stop + relaunch)\n"
             "  ./browser.py status             # CDP health + tabs (origins only) + lifecycle\n"
             "  ./browser.py clients            # who is attached over CDP\n"
             "  ./browser.py journal -n 20 -e up  # who launched the browser, lately\n"
@@ -521,14 +525,17 @@ def parse_args() -> argparse.Namespace:
         "env CLAUDE_BROWSER_CDP_PORT).",
     )
     sub = p.add_subparsers(dest="cmd", required=True)
-    pup = sub.add_parser("up", help="Launch the shared browser (idempotent).")
+    pup = sub.add_parser(
+        "up",
+        help="Launch the shared browser, always HEADLESS (idempotent); a headed "
+        "browser without a live guided-login lease is switched back to headless.",
+    )
     pup.add_argument(
         "-H",
         "--headless",
         action="store_true",
-        default=os.environ.get("CLAUDE_BROWSER_HEADLESS") == "1",
-        help="Opt-in headless mode (--headless=new): same profile, same logins, "
-        "no window at all (env default CLAUDE_BROWSER_HEADLESS=1).",
+        help="No-op, kept for compatibility: `up` is always headless. "
+        "($CLAUDE_BROWSER_HEADLESS is ignored too.)",
     )
     pst = sub.add_parser(
         "status",
@@ -569,7 +576,8 @@ def parse_args() -> argparse.Namespace:
     psw = sub.add_parser(
         "switch",
         help="Transactional mode switch: stop the browser and relaunch it in MODE "
-        "on the SAME profile (every login persists).",
+        "on the SAME profile (every login persists). `headed` only for the holder "
+        "of the live guided-login lease (agent-login.py -g SITE); else exit 2.",
     )
     psw.add_argument(
         "mode",
@@ -945,6 +953,9 @@ def _cdp_ws_call(
             max_size=None,  # a CDP reply (a frame tree, a screenshot) can be big
             ping_interval=None,
             user_agent_header=None,
+            # No Origin header: without --remote-allow-origins Chrome answers
+            # 403 to any WebSocket that sends one (tp#836).
+            origin=None,
         ) as ws:
             out.opened = True
             _cdp_ws_exchange(ws, method, params, left, out)
@@ -1200,7 +1211,8 @@ def _headless_user_agent(binary: str) -> str | None:
     page with the normal UA loads). The version comes from the app's Info.plist
     so the UA matches the real engine; unknown version → no override.
     """
-    return _engine_user_agent(binary)
+    user_agent: str | None = _engine_user_agent(binary)
+    return user_agent
 
 
 def _browser_mode(port: int) -> str | None:
@@ -1228,19 +1240,21 @@ def _browser_mode(port: int) -> str | None:
     return "headless" if headless else "headed"
 
 
-def _require_headed_for_assisted(port: int, site: str) -> bool:
-    """True if a human could see the browser; else explain the fix and return False.
+def _guided_login_allowed(port: int, site: str, label: str) -> bool:
+    """True when a login may hand the window to a human; else say so and False.
 
-    An ASSISTED login hands the window to the human (type an emailed code, finish
-    an SSO+2FA prompt), which is impossible with no window. Fail fast with the
-    remedy instead of blocking for 5–10 min on a wait nobody can satisfy.
+    An ASSISTED step (type an emailed code, finish SSO+2FA) needs Albert at a
+    visible window. That exists only inside a guided login: this process tree
+    holds the live headed lease (`_headed_lease_held`) and the browser runs
+    headed. Everybody else gets ``needs Albert: agent-login.py -g <site>`` and
+    the caller exits NEEDS_ALBERT_RC — `browser.py login` never opens a human
+    flow on its own (tp#836). No TTY or environment heuristics.
     """
-    if _browser_mode(port) != "headless":
+    if _headed_lease_held() and _browser_mode(port) == "headed":
         return True
     print(
-        f"❌ Assisted login for {site} needs a visible window, but the shared "
-        "browser is running HEADLESS.\n"
-        "   Run `browser.py down && browser.py up` (headed), then retry.",
+        f"❌ {label} needs a login only you can finish.\n"
+        f"needs Albert: agent-login.py -g {site}",
         file=sys.stderr,
     )
     return False
@@ -1451,7 +1465,18 @@ _JOURNAL_STD_KEYS = (
 )
 # Events that carry the full parent chain. Client (un)registrations — one per
 # attach, on every `eval` — and the watchdog carry pid + ppid only.
-_JOURNAL_CHAIN_EVENTS = frozenset({"up", "switch", "down", "login", "bring_to_front"})
+_JOURNAL_CHAIN_EVENTS = frozenset(
+    {
+        "up",
+        "switch",
+        "down",
+        "login",
+        "bring_to_front",
+        "revert_headed",
+        "revert_failed",
+        "headed_lease",
+    }
+)
 # Per-process state: the redacted argv main() recorded, the parent chain (looked
 # up once), what a command noted for its end event, and the warn-once flag.
 _JOURNAL_ARGV: list[list[str]] = []
@@ -1733,10 +1758,25 @@ def _journal(event: str, **fields: object) -> None:
         _journal_warn(exc)
 
 
-def _bring_to_front(page: Any, reason: str) -> None:
-    """Journal a focus-capable ``page.bring_to_front()``, then do it.
+def _bring_to_front_skip(mode: str | None, lease_held: bool) -> str | None:
+    """Why a raise must NOT happen (``"no-lease"``/``"headless"``), or None. Pure.
 
-    The journal entry is written FIRST so a raise that steals focus is on record
+    Only the holder of the live headed lease (a guided login Albert started)
+    may surface the window, and only while the browser is headed (tp#836).
+    """
+    if not lease_held:
+        return "no-lease"
+    if mode != "headed":
+        return "headless"
+    return None
+
+
+def _bring_to_front(page: Any, reason: str, port: int | None = None) -> None:
+    """Journal a focus-capable ``page.bring_to_front()``, then do it — or skip it.
+
+    Outside a guided login (no headed lease held by this process tree) or in
+    a headless browser it is a journaled no-op (``skipped``). Otherwise the
+    journal entry is written FIRST so a raise that steals focus is on record
     even when the call itself then fails; the call's own exception propagates
     unchanged — callers keep their existing error handling.
     """
@@ -1744,6 +1784,12 @@ def _bring_to_front(page: Any, reason: str) -> None:
         origin = _tab_hint(str(getattr(page, "url", "") or ""))
     except Exception:  # pylint: disable=broad-exception-caught
         origin = "<unknown>"
+    held = _headed_lease_held()
+    mode = _browser_mode(DEFAULT_CDP_PORT if port is None else port) if held else None
+    skip = _bring_to_front_skip(mode, held)
+    if skip is not None:
+        _journal("bring_to_front", command=reason, origin=origin, skipped=skip)
+        return
     _journal("bring_to_front", command=reason, origin=origin)
     page.bring_to_front()
 
@@ -2287,6 +2333,77 @@ def _heal_running_record(port: int, mode: str) -> bool:
     return True
 
 
+DOWNLOAD_DIR = CACHE_DIR / "downloads"
+# Profile prefs merged into Default/Preferences before every launch (tp#836):
+# permission requests default to "block" (2) — together with
+# `--deny-permission-prompts` no permission prompt can appear — and downloads
+# land in DOWNLOAD_DIR without a Save dialog. Prefs, not a CDP
+# `Browser.setDownloadBehavior`: that one is reset when the CDP session that set
+# it detaches (measured on CfT 153), and every Playwright attach sets its own.
+# `--disable-notifications` is deliberately NOT used: with it, a plain page
+# script probing `Notification`/`navigator.permissions` threw on CfT 153, and
+# the block pref + `--deny-permission-prompts` already deny notifications.
+_PROFILE_PREFS: tuple[tuple[tuple[str, ...], object], ...] = (
+    (("profile", "default_content_setting_values", "notifications"), 2),
+    (("profile", "default_content_setting_values", "geolocation"), 2),
+    (("profile", "default_content_setting_values", "media_stream_camera"), 2),
+    (("profile", "default_content_setting_values", "media_stream_mic"), 2),
+    (("download", "prompt_for_download"), False),
+    (("download", "directory_upgrade"), True),
+)
+
+
+def _profile_pref_values() -> list[tuple[tuple[str, ...], object]]:
+    """Every pref `_apply_profile_prefs` enforces, the download dir included."""
+    return [*_PROFILE_PREFS, (("download", "default_directory"), str(DOWNLOAD_DIR))]
+
+
+def _merge_prefs(data: dict, values: Sequence[tuple[tuple[str, ...], object]]) -> bool:
+    """Set each dotted-path pref in `data` (in place); True if anything changed."""
+    changed = False
+    for path, value in values:
+        node = data
+        for key in path[:-1]:
+            nxt = node.get(key)
+            if not isinstance(nxt, dict):
+                nxt = {}
+                node[key] = nxt
+            node = nxt
+        if node.get(path[-1]) != value:
+            node[path[-1]] = value
+            changed = True
+    return changed
+
+
+def _apply_profile_prefs() -> str | None:
+    """Merge the native-UI prefs into the profile's Preferences; a problem or None.
+
+    Called only by `_launch_and_record` after `_launch_guard` passed, i.e. while
+    no browser runs on this profile, so Chrome cannot rewrite the file under
+    us. A Preferences file that is not a JSON object is left untouched (a
+    rewrite would lose whatever Chrome keeps there); the caller only warns —
+    `--deny-permission-prompts` still blocks every permission prompt.
+    """
+    prefs = PROFILE_DIR / "Default" / "Preferences"
+    try:
+        DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True)
+        data: object = (
+            json.loads(prefs.read_text(encoding="utf-8")) if prefs.exists() else {}
+        )
+        if not isinstance(data, dict):
+            return f"{prefs} is not a JSON object — left untouched"
+        if not _merge_prefs(data, _profile_pref_values()):
+            return None
+        prefs.parent.mkdir(parents=True, exist_ok=True)
+        tmp = _unique_tmp(prefs)
+        tmp.write_text(json.dumps(data), encoding="utf-8")
+        tmp.chmod(0o600)
+        os.replace(tmp, prefs)
+    except (OSError, ValueError) as exc:
+        return f"{prefs}: {exc}"
+    return None
+
+
 def _launch_and_record(port: int, headless: bool) -> int:
     """Cold-launch the shared browser and record it. Shared by ``up``/``switch``.
 
@@ -2316,7 +2433,14 @@ def _launch_and_record(port: int, headless: bool) -> int:
         "--no-first-run",
         "--no-default-browser-check",
         "--hide-crash-restore-bubble",
-        "--remote-allow-origins=*",
+        # No `--remote-allow-origins`: without it Chrome rejects (403) every
+        # CDP WebSocket that sends an Origin header, so a web page can never
+        # drive this browser. Every consumer (Playwright py/node, websockets
+        # in this repo) sends none (tp#836).
+        # Native UI: a permission request is denied instead of prompted
+        # (notifications/geolocation/camera/mic also default to "block" in the
+        # profile prefs, see `_apply_profile_prefs`).
+        "--deny-permission-prompts",
         # The window deliberately opens behind the frontmost app and is
         # therefore usually OCCLUDED — macOS then pauses rendering, freezing
         # requestAnimationFrame, which makes Playwright's click actionability
@@ -2335,6 +2459,9 @@ def _launch_and_record(port: int, headless: bool) -> int:
         user_agent = _headless_user_agent(binary)
         if user_agent:
             flags.append(f"--user-agent={user_agent}")
+    pref_problem = _apply_profile_prefs()
+    if pref_problem is not None:
+        print(f"⚠ profile prefs not applied: {pref_problem}", file=sys.stderr)
     rec = _lifecycle_write("starting", want, port=port)
     # Launch in the background so it never steals focus (see _launch_browser).
     pid = _launch_browser(binary, flags, headless=headless)
@@ -2346,16 +2473,15 @@ def _launch_and_record(port: int, headless: bool) -> int:
             if headless:
                 print(
                     f"✓ Shared browser launched HEADLESS "
-                    f"(no window; pid {pid or '?'}, CDP http://localhost:{port}).\n"
-                    "  Logins from the profile still apply; assisted (human) "
-                    "logins need a window — `browser.py switch headed` for those.\n"
+                    f"(no window; pid {pid or '?'}, CDP http://127.0.0.1:{port}).\n"
+                    "  Logins from the profile still apply; a login that needs "
+                    "you runs as a guided login: agent-login.py -g <site>.\n"
                     f"  Profile: {PROFILE_DIR}"
                 )
             else:
                 print(
-                    f"✓ Shared browser launched in background "
-                    f"(pid {pid or '?'}, CDP http://localhost:{port}).\n"
-                    "  Log into your sites in that window ONCE; the session persists.\n"
+                    f"✓ Shared browser launched HEADED for the guided login "
+                    f"(pid {pid or '?'}, CDP http://127.0.0.1:{port}).\n"
                     f"  Profile: {PROFILE_DIR}"
                 )
             return 0
@@ -2855,36 +2981,422 @@ def _interaction_lease(
             os.close(fd)
 
 
-def cmd_up(port: int, headless: bool = False) -> int:
-    """Launch the shared browser if not already running (idempotent).
+# ---------------------------------------------------------------------------
+# Headless by default — desired mode, headed lease, preflight revert (tp#836)
+# ---------------------------------------------------------------------------
+# THE INVARIANT: the shared browser runs HEADLESS unless a live HEADED LEASE
+# exists. Only a guided login Albert starts himself (`agent-login.py -g SITE`)
+# takes that lease, switches headed for the duration, and switches back. With no
+# window there is nothing that can take focus, be raised or pop native UI.
+#
+#   * DESIRED_MODE_FILE records the mode `up` launches in. It is always
+#     "headless" (absent = headless); any other value is reported and ignored.
+#   * HEADED_LEASE_FILE {owner_nonce, pid, pid_start_time, site, started,
+#     heartbeat} is written by `_headed_lease` and refreshed every 10 s. It is
+#     LIVE while the owner pid is alive with the recorded start time (no pid
+#     reuse), unless the heartbeat is older than 120 s (a hung owner; a Mac
+#     asleep for less than that keeps its lease). The owner exports its
+#     nonce as $CLAUDE_BROWSER_HEADED_LEASE, so its own `browser.py` children
+#     (switch headed, login SITE, open …) are recognised as the lease holder.
+#   * Every connecting command first reverts a headed browser that has NO
+#     live lease (`_preflight`), before it takes the registry gate itself. A
+#     revert that fails only warns: the command proceeds and the next command
+#     tries again (a lock-out of every agent is worse than a headed minute).
 
-    ``headless`` opts into ``--headless=new``: same profile, same logins, no
-    window at all. The mode is fixed at launch, so a request that disagrees with
-    the browser already running is REFUSED (loudly) instead of silently ignored —
-    ``browser.py switch MODE`` does that transactionally. When the running mode
-    DOES match, the lifecycle record is healed to describe the live process.
+DESIRED_MODE_FILE = CACHE_DIR / "desired-mode.json"
+HEADED_LEASE_FILE = CACHE_DIR / "headed-lease.json"
+# Serialises take/heartbeat/release of the lease file (never held for long).
+HEADED_LEASE_LOCK = CACHE_DIR / ".headed-lease.lock"
+HEADED_LEASE_ENV = "CLAUDE_BROWSER_HEADED_LEASE"
+HEADED_LEASE_HEARTBEAT_S = 10.0
+# A live owner pid keeps the lease; only a heartbeat older than this (a hung
+# owner) ends it. Generous on purpose: a Mac asleep for a minute must not cost
+# Albert his guided-login window.
+HEADED_LEASE_HUNG_S = 120.0
+# Exit code of a login that needs Albert (same meaning as the broker's 4).
+NEEDS_ALBERT_RC = 4
+# How long a preflight revert waits for registered clients to drain.
+PREFLIGHT_GATE_WAIT_S = 5.0
+# Commands that never drive the browser over CDP, plus the lifecycle commands
+# that handle the mode themselves: no preflight revert for them.
+_PREFLIGHT_SKIP_CMDS = frozenset(
+    {
+        "up",
+        "status",
+        "journal",
+        "down",
+        "switch",
+        "clients",
+        "login-log",
+        "store-creds",
+        "forget-creds",
+        "cscs-store-creds",
+        "cscs-forget-creds",
+        "broker-sites",
+        # Recovery tools: they must work in exactly the state a revert is for.
+        "doctor",
+        "close-hung",
+        "close",
+    }
+)
+
+
+class HeadedLeaseError(RuntimeError):
+    """The headed lease cannot be taken (see the message)."""
+
+
+class HeadedLeaseBusy(HeadedLeaseError):
+    """Another live guided login holds the headed lease (or is taking it)."""
+
+
+def _unique_tmp(path: Path) -> Path:
+    """A sibling temp path no other process, thread or call can pick."""
+    tag = f"{os.getpid()}.{threading.get_ident()}.{uuid.uuid4().hex[:8]}"
+    return path.with_name(f".{path.name}.{tag}.tmp")
+
+
+def _json_write_atomic(path: Path, data: dict) -> None:
+    """Write `data` as JSON to `path` via a unique sibling tmp + ``os.replace``."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = _unique_tmp(path)
+    tmp.write_text(json.dumps(data) + "\n", encoding="utf-8")
+    tmp.chmod(0o600)
+    os.replace(tmp, path)
+
+
+def _desired_mode_state() -> str:
+    """What the desired-mode file says, for `doctor`/`status` (never raises)."""
+    if not DESIRED_MODE_FILE.exists():
+        return "headless (no file — the default)"
+    data = _read_json_dict(DESIRED_MODE_FILE)
+    mode = data.get("mode") if data else None
+    if mode == "headless":
+        return "headless"
+    return f"{mode!r} is not allowed — treated as headless"
+
+
+def _desired_mode() -> str:
+    """The mode `up` launches in: always ``"headless"`` (tp#836).
+
+    Headed exists only inside a live headed lease, so nothing persistent can
+    ask for it; a stray value in the file is reported by `doctor`, not obeyed.
+    """
+    return "headless"
+
+
+def _desired_mode_write() -> None:
+    """Persist ``{"mode": "headless"}``; a write failure only warns."""
+    try:
+        _json_write_atomic(DESIRED_MODE_FILE, {"mode": "headless"})
+    except OSError as exc:
+        print(f"⚠ could not write {DESIRED_MODE_FILE}: {exc}", file=sys.stderr)
+
+
+def _pid_alive(pid: int) -> bool:
+    """True while `pid` exists (signal 0; EPERM = exists, another user's)."""
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except OSError:
+        return True  # EPERM, or cannot tell: never declare an owner dead on a hiccup
+    return True
+
+
+def _headed_lease_state(rec: dict | None, now: float | None = None) -> str:
+    """``live``, or why not: ``none``, ``invalid``, ``hung owner``,
+    ``dead pid`` or ``pid reused``.
+
+    The owner pid decides: alive with the recorded start time = LIVE, whatever
+    the heartbeat's age (a Mac asleep for 40 s is not a dead owner) — unless the
+    heartbeat is older than HEADED_LEASE_HUNG_S (a hung owner). A recycled pid
+    always has a later start time. When ``ps`` cannot read the start time of a
+    live pid (timeout, failure) the answer is unknown, i.e. LIVE: a ``ps``
+    hiccup must never revert a guided login's window.
+    """
+    if rec is None:
+        return "none"
+    pid, beat = rec.get("pid"), rec.get("heartbeat")
+    pid_ok = isinstance(pid, int) and not isinstance(pid, bool) and pid > 0
+    fields_ok = bool(rec.get("owner_nonce")) and bool(rec.get("pid_start_time"))
+    if not (pid_ok and fields_ok and isinstance(beat, (int, float))):
+        return "invalid"
+    assert isinstance(pid, int) and isinstance(beat, (int, float))  # for mypy
+    age = (time.time() if now is None else now) - float(beat)
+    if age > HEADED_LEASE_HUNG_S:
+        return "hung owner"
+    if not _pid_alive(pid):
+        return "dead pid"
+    lstart = _proc_lstart(pid)
+    if lstart is not None and lstart != rec.get("pid_start_time"):
+        return "pid reused"
+    return "live"
+
+
+def _headed_lease_live() -> dict | None:
+    """The live headed-lease record, or None."""
+    rec = _read_json_dict(HEADED_LEASE_FILE)
+    return rec if _headed_lease_state(rec) == "live" else None
+
+
+def _headed_lease_held() -> bool:
+    """True when THIS process tree holds the live headed lease.
+
+    The owner exports its nonce in $CLAUDE_BROWSER_HEADED_LEASE; a child sees
+    the same value, a stranger does not know it. No TTY or other heuristics.
+    """
+    nonce = os.environ.get(HEADED_LEASE_ENV, "")
+    if not nonce:
+        return False
+    rec = _headed_lease_live()
+    return rec is not None and rec.get("owner_nonce") == nonce
+
+
+def _headed_lease_describe() -> str:
+    """One line on the lease, for `status`/`doctor`."""
+    rec = _read_json_dict(HEADED_LEASE_FILE)
+    state = _headed_lease_state(rec)
+    if rec is None:
+        return "none"
+    who = f"site {rec.get('site')!s}, pid {rec.get('pid')!s}, since {rec.get('started')!s}"
+    return f"{state} ({who})"
+
+
+def _headed_lease_heartbeat(nonce: str, base: dict, stop: threading.Event) -> None:
+    """Refresh the lease's heartbeat every HEADED_LEASE_HEARTBEAT_S (daemon thread).
+
+    Compare-before-write under the lease lock: once the file names another
+    owner (or is gone) this thread stops — it never resurrects a lease. An
+    OSError (full disk, a transient EIO) is logged once and retried on the next
+    beat: giving up would make a live guided login look hung.
+    """
+    warned = False
+    while not stop.wait(HEADED_LEASE_HEARTBEAT_S):
+        fd = -1
+        try:
+            fd = os.open(str(HEADED_LEASE_LOCK), os.O_RDWR | os.O_CREAT, 0o600)
+            if not _flock_wait(fd, fcntl.LOCK_EX, 2.0):
+                continue
+            cur = _read_json_dict(HEADED_LEASE_FILE)
+            if cur is None or cur.get("owner_nonce") != nonce:
+                return
+            _json_write_atomic(HEADED_LEASE_FILE, {**base, "heartbeat": time.time()})
+        except OSError as exc:
+            if not warned:
+                print(
+                    f"⚠ headed-lease heartbeat failed (retrying): {exc}",
+                    file=sys.stderr,
+                )
+                warned = True
+        finally:
+            if fd >= 0:
+                with contextlib.suppress(OSError):
+                    os.close(fd)  # closing the fd drops its flock
+
+
+@contextlib.contextmanager
+def _headed_lease(site: str) -> Iterator[str]:
+    """Hold the HEADED lease for the block; yield the owner nonce.
+
+    The only way the shared browser may be headed (`switch headed`) and the
+    only context in which a login may hand the window to a human. Refuses
+    (`HeadedLeaseBusy`) while another live lease exists. Sets
+    $CLAUDE_BROWSER_HEADED_LEASE for the block so this process's
+    `browser.py` children are the holder; restores it on exit. Release is
+    compare-before-release: the file is removed only while it still carries
+    our nonce. Phase 3 extends this into the full maintenance transaction.
+    """
+    HEADED_LEASE_LOCK.parent.mkdir(parents=True, exist_ok=True)
+    fd = os.open(str(HEADED_LEASE_LOCK), os.O_RDWR | os.O_CREAT, 0o600)
+    try:
+        if not _flock_wait(fd, fcntl.LOCK_EX, 5.0):
+            raise HeadedLeaseBusy("another process is taking the headed lease")
+        current = _read_json_dict(HEADED_LEASE_FILE)
+        if _headed_lease_state(current) == "live" and current is not None:
+            raise HeadedLeaseBusy(
+                f"a guided login already holds the headed lease (site "
+                f"{current.get('site')}, pid {current.get('pid')})"
+            )
+        nonce = uuid.uuid4().hex
+        lstart = _proc_lstart(os.getpid())
+        if not lstart:
+            raise HeadedLeaseError(
+                "cannot read this process's start time (`ps -o lstart=` failed); "
+                "the headed lease needs it to rule out pid reuse — retry"
+            )
+        base = {
+            "owner_nonce": nonce,
+            "pid": os.getpid(),
+            "pid_start_time": lstart,
+            "site": site,
+            "started": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+        }
+        _json_write_atomic(HEADED_LEASE_FILE, {**base, "heartbeat": time.time()})
+    finally:
+        os.close(fd)
+    _journal("headed_lease", phase="start", site=site)
+    old_env = os.environ.get(HEADED_LEASE_ENV)
+    os.environ[HEADED_LEASE_ENV] = nonce
+    stop = threading.Event()
+    beat = threading.Thread(
+        target=_headed_lease_heartbeat,
+        args=(nonce, base, stop),
+        name="browser-headed-lease-heartbeat",
+        daemon=True,
+    )
+    beat.start()
+    try:
+        yield nonce
+    finally:
+        stop.set()
+        beat.join(timeout=3.0)
+        if old_env is None:
+            os.environ.pop(HEADED_LEASE_ENV, None)
+        else:
+            os.environ[HEADED_LEASE_ENV] = old_env
+        _headed_lease_release(nonce)
+        _journal("headed_lease", phase="end", site=site)
+
+
+def _headed_lease_release(nonce: str) -> None:
+    """Remove the lease file iff it still carries `nonce` (under the lock)."""
+    try:
+        fd = os.open(str(HEADED_LEASE_LOCK), os.O_RDWR | os.O_CREAT, 0o600)
+    except OSError as exc:
+        print(f"⚠ could not release the headed lease: {exc}", file=sys.stderr)
+        return
+    try:
+        _flock_wait(fd, fcntl.LOCK_EX, 5.0)
+        cur = _read_json_dict(HEADED_LEASE_FILE)
+        if cur is not None and cur.get("owner_nonce") == nonce:
+            HEADED_LEASE_FILE.unlink(missing_ok=True)
+        elif cur is not None:
+            print(
+                f"⚠ the headed lease was rewritten by owner "
+                f"{str(cur.get('owner_nonce'))[:8]} while we held it — left in "
+                f"place ({HEADED_LEASE_FILE}).",
+                file=sys.stderr,
+            )
+    finally:
+        os.close(fd)
+
+
+def _preflight_action(cmd: str, mode: str | None, lease_live: bool) -> str | None:
+    """``"revert"`` when `cmd` must first switch a lease-less headed browser
+    back to headless; else None. Pure — the decision `_preflight` acts on."""
+    if cmd in _PREFLIGHT_SKIP_CMDS or mode != "headed" or lease_live:
+        return None
+    return "revert"
+
+
+def _revert_headed(port: int, why: str) -> int:
+    """Switch a headed browser that has no live lease back to headless.
+
+    Journaled as ``revert_headed`` (start + end with the exit code). Uses
+    `cmd_switch`'s own transaction (exclusive gate, unknown-client refusal,
+    re-check under the gate) with a short gate wait — never `--force`. With
+    ``revert=True`` the switch also stands down when a guided login took the
+    lease while we waited for the gate.
+    """
+    print(
+        f"⚠ the shared browser is HEADED without a live guided-login lease — "
+        f"reverting to headless before {why} …",
+        file=sys.stderr,
+    )
+    _journal(
+        "revert_headed", phase="start", trigger=why, lease=_headed_lease_describe()
+    )
+    rc = cmd_switch(port, "headless", gate_wait_s=PREFLIGHT_GATE_WAIT_S, revert=True)
+    _journal("revert_headed", phase="end", trigger=why, result=rc)
+    return rc
+
+
+@contextlib.contextmanager
+def _stdout_to_stderr() -> Iterator[None]:
+    """Route stdout — Python's AND fd 1, so child processes too — to stderr.
+
+    A preflight revert must never print into the triggering command's stdout:
+    consumers parse it (`slack-session` JSON, `token`, `open -N`'s target=).
+    """
+    sys.stdout.flush()
+    saved = os.dup(1)
+    try:
+        os.dup2(2, 1)
+        with contextlib.redirect_stdout(sys.stderr):
+            yield
+    finally:
+        with contextlib.suppress(Exception):
+            sys.stderr.flush()
+        os.dup2(saved, 1)
+        os.close(saved)
+
+
+def _preflight(cmd: str, port: int) -> None:
+    """Revert a lease-less headed browser before `cmd` works — best effort.
+
+    Runs in `main` before the command takes the registry gate or any lease,
+    so the revert's exclusive gate cannot deadlock against this process.
+    Everything it prints goes to stderr. It never blocks the command: a fresh
+    transition (another up/switch/down in flight) skips the revert, and a
+    revert that fails is one ❌ line + a ``revert_failed`` journal event, then
+    the command runs anyway — the next command enforces the invariant again.
+    """
+    if cmd in _PREFLIGHT_SKIP_CMDS:
+        return
+    mode = _browser_mode(port)
+    if mode != "headed":
+        return
+    if _preflight_action(cmd, mode, _headed_lease_live() is not None) is None:
+        return
+    busy = _fresh_transition(_lifecycle_read())
+    if busy is not None:
+        _journal("revert_skipped", reason=f"transition:{busy}", trigger=cmd)
+        return
+    _journal_parent_chain()  # before the gate is taken (no ps under the gate)
+    with _stdout_to_stderr():
+        rc = _revert_headed(port, f"`{cmd}`")
+    if rc != 0:
+        reason = f"switch headless exit {rc}"
+        _journal("revert_failed", trigger=cmd, reason=reason)
+        print(
+            f"❌ headed without lease — revert failed: {reason}; run browser.py "
+            "switch headless",
+            file=sys.stderr,
+        )
+
+
+def cmd_up(port: int, headless: bool = True) -> int:  # pylint: disable=unused-argument
+    """Launch the shared browser HEADLESS if not already running (idempotent).
+
+    ``headless`` is accepted for compatibility (``up -H``) and ignored: `up`
+    always launches in the desired mode, which is always headless (tp#836).
+    A running HEADED browser is fine only inside a live headed lease (a guided
+    login); without one it is switched back to headless here. When the running
+    mode matches, the lifecycle record is healed to describe the live process.
 
     A COLD launch takes the client gate shared for its duration, so it cannot
     slip into the middle of a `switch`/`down` window and race the relaunch that
     switch is about to do itself. The already-up branch needs no gate — it
     touches no process.
     """
-    want = "headless" if headless else "headed"
+    want = _desired_mode()
+    _desired_mode_write()
     running = _browser_mode(port)
     if running is not None:
         if running != want:
-            print(
-                f"❌ Mode mismatch: the shared browser is up in {running.upper()} "
-                f"mode, but {want.upper()} was requested.\n"
-                "   The mode is fixed at launch. Switch it in one transaction:\n"
-                f"     browser.py switch {want}",
-                file=sys.stderr,
-            )
-            return 1
+            live = _headed_lease_live()
+            if live is not None:
+                print(
+                    f"✓ Shared browser up, HEADED inside a guided login (site "
+                    f"{live.get('site')}, pid {live.get('pid')}); it returns to "
+                    f"headless when that login ends (CDP http://127.0.0.1:{port})."
+                )
+                return 0
+            return _revert_headed(port, "`up`")
         healed = _heal_running_record(port, running)
         print(
             f"✓ Shared browser already up, {running.upper()} "
-            f"(CDP http://localhost:{port})."
+            f"(CDP http://127.0.0.1:{port})."
             + (" (lifecycle record refreshed)" if healed else "")
         )
         return 0
@@ -2896,13 +3408,58 @@ def cmd_up(port: int, headless: bool = False) -> int:
             "`browser.py status` shows the lifecycle state."
         )
     try:
-        return _launch_and_record(port, headless)
+        return _launch_and_record(port, want == "headless")
     finally:
         _gate_release(gate)
 
 
-def cmd_switch(port: int, target: str, force: bool = False) -> int:
+def _switch_recheck(port: int, target: str, revert: bool) -> int | None:
+    """The re-check `cmd_switch` runs once it HOLDS the gate; an exit code when
+    the switch must not happen any more, else None.
+
+    While we waited, a guided login may have taken the lease (a preflight
+    revert then stands down: ``revert_skipped``), another switch may have
+    reached `target` already, or the browser may have gone down.
+    """
+    if revert and _headed_lease_live() is not None:
+        _journal("revert_skipped", reason="lease")
+        print("✓ a guided login took the headed lease meanwhile — not reverting.")
+        return 0
+    live = _browser_mode(port)
+    if live is None:
+        return _fail("Nothing to switch — the shared browser went down meanwhile.")
+    if live == target:
+        print(f"✓ Shared browser already {target.upper()} (switched meanwhile).")
+        return 0
+    return None
+
+
+HEADED_REFUSAL = (
+    "❌ headed mode only inside a guided login: agent-login.py -g <site>\n"
+    "   (the shared browser stays headless; `switch headed` needs the live "
+    "headed lease that guided login holds)."
+)
+
+
+def cmd_switch(  # pylint: disable=too-many-arguments
+    port: int,
+    target: str,
+    force: bool = False,
+    gate_wait_s: float | None = None,
+    *,
+    revert: bool = False,
+) -> int:
     """Switch the running browser between headed and headless, transactionally.
+
+    ``switch headed`` is allowed ONLY to the holder of the live headed lease
+    (`_headed_lease_held`, i.e. a guided login and its children); anybody
+    else gets exit 2 and the guided-login hint. ``switch headless`` is always
+    allowed — it is also what the preflight revert runs (``revert=True``).
+
+    The mode is RE-READ once the gate is held: a waiting switch whose target
+    another switch already reached does nothing, and a preflight revert stands
+    down (journal ``revert_skipped``) when a guided login took the lease
+    meanwhile — a revert queued behind the gate never kills a guided window.
 
     The mode is fixed at launch, so switching means stop + relaunch — on the
     SAME profile, so every login survives (they live in the profile, not the
@@ -2920,28 +3477,36 @@ def cmd_switch(port: int, target: str, force: bool = False) -> int:
     itself must NOT re-acquire the gate (deadlock rule), so `_launch_and_record`
     is called directly here while we still hold it.
     """
-    # Each of the 7 exits is a distinct, named refusal (down / already in that
-    # mode / unknown CDP client / stale lock / …) that callers read off stdout;
-    # funnelling them through one return would hide which invariant refused.
+    # Each of the exits is a distinct, named refusal (down / already in that
+    # mode / unknown CDP client / stale lock / no lease …) that callers read off
+    # stdout; funnelling them through one return would hide which one refused.
     # pylint: disable=too-many-return-statements
+    if target == "headed" and not _headed_lease_held():
+        print(HEADED_REFUSAL, file=sys.stderr)
+        return 2
+    if target == "headless":
+        _desired_mode_write()
     live = _browser_mode(port)
     if live is None:
         return _fail(
             "Nothing to switch — the shared browser is down. Run: browser.py up"
-            f"{' --headless' if target == 'headless' else ''}"
         )
     if live == target:
         healed = _heal_running_record(port, live)
         print(
             f"✓ Shared browser already in {target.upper()} mode "
-            f"(CDP http://localhost:{port})."
+            f"(CDP http://127.0.0.1:{port})."
             + (" (lifecycle record refreshed)" if healed else "")
         )
         return 0
-    gate = _gate_acquire(fcntl.LOCK_EX, REGISTRY_EX_WAIT_S)
+    wait_s = REGISTRY_EX_WAIT_S if gate_wait_s is None else gate_wait_s
+    gate = _gate_acquire(fcntl.LOCK_EX, wait_s)
     if gate is None:
         return _fail(_gate_busy(f"switch to {target.upper()}"))
     try:
+        settled = _switch_recheck(port, target, revert)
+        if settled is not None:
+            return settled
         verdict = _unknown_clients_verdict(port)
         if verdict is not None and not force:
             return _fail(
@@ -2983,6 +3548,8 @@ def _print_lifecycle(port: int) -> None:
         )
     for problem in _lifecycle_problems(port):
         print(f"  ⚠ {problem}")
+    print(f"Desired mode: {_desired_mode_state()}")
+    print(f"Headed lease: {_headed_lease_describe()}")
 
 
 PROBE_MARKS = {"unresponsive": "  ⚠ unresponsive", "indeterminate": "  ? indeterminate"}
@@ -4252,6 +4819,39 @@ def _doctor_lifecycle(log: list[str], port: int) -> bool:
     return _is_up(port)
 
 
+def _doctor_mode(log: list[str], port: int) -> None:
+    """Certify the headless invariant (tp#836): mode, desired mode, headed lease.
+
+    ❌ when the browser runs headed without a live headed lease (the preflight
+    revert failed or something launched it behind browser.py's back); headed
+    under a live lease is a guided login in progress (⚠, informational).
+    """
+    mode = _browser_mode(port)
+    lease = _headed_lease_live()
+    lease_line = _headed_lease_describe()
+    if mode == "headless":
+        _doctor_add(log, "ok", "mode", "headless")
+    elif mode == "headed" and lease is not None:
+        _doctor_add(
+            log, "warn", "mode", f"headed inside a guided login — lease {lease_line}"
+        )
+    elif mode == "headed":
+        _doctor_add(
+            log,
+            "fail",
+            "mode",
+            f"HEADED without a live guided-login lease (lease: {lease_line}) — "
+            "run: browser.py switch headless",
+        )
+    else:
+        _doctor_add(log, "fail", "mode", "unknown — /json/version did not answer")
+    _doctor_add(
+        log, "ok", "desired mode", f"{_desired_mode_state()} ({DESIRED_MODE_FILE})"
+    )
+    if lease is None:
+        _doctor_add(log, "ok", "headed lease", lease_line)
+
+
 def _doctor_coordination(log: list[str], port: int) -> None:
     """Report who else is attached over CDP — informational, never a failure.
 
@@ -4374,8 +4974,8 @@ def _doctor_raf(log: list[str], page, *, escalated: bool) -> bool:
             log,
             "warn",
             label,
-            f"no animation frame within 5000 ms ({took}) — rendering is frozen; "
-            "escalating to tab-level bring_to_front (the consumer fallback)",
+            f"no animation frame within 5000 ms ({took}) — rendering is frozen "
+            "(bring_to_front is the escalation, only inside a guided login)",
         )
         return False
     _doctor_add(
@@ -4441,7 +5041,7 @@ def _doctor_screenshot(log: list[str], page) -> None:
         )
 
 
-def _doctor_drivability(log: list[str], page) -> None:
+def _doctor_drivability(log: list[str], page, port: int = DEFAULT_CDP_PORT) -> None:
     """The bounded drivability checks on the probe page, in consumer order.
 
     ``bring_to_front`` is an ESCALATION, not a default: on Chrome for Testing
@@ -4449,10 +5049,12 @@ def _doctor_drivability(log: list[str], page) -> None:
     (measured 2026-08-20, reproducible), so the probe only reaches for it when
     rendering is actually frozen — exactly the situation in which a consumer
     would need it — and flags the escalation so the window checks that follow
-    are read in that light.
+    are read in that light. Headless, or outside the guided login that holds
+    the headed lease, it never escalates (tp#836): a frozen frame is a ❌.
     """
     from playwright.sync_api import Error as PlaywrightError
 
+    held = _headed_lease_held()
     if _doctor_raf(log, page, escalated=False):
         _doctor_add(
             log,
@@ -4461,9 +5063,19 @@ def _doctor_drivability(log: list[str], page) -> None:
             "not needed — rendering is alive without it (and on CfT 151 it can "
             "raise the window / steal focus)",
         )
+    elif _bring_to_front_skip(_browser_mode(port) if held else None, held):
+        # Headless (or headed outside the guided login that owns the window):
+        # never escalate — frozen rendering is the verdict, not a raise.
+        _doctor_add(
+            log,
+            "fail",
+            "rendering (rAF)",
+            "frozen and NOT escalated — bring_to_front only inside a guided "
+            "login (headless rendering should never freeze)",
+        )
     else:
         try:
-            _bring_to_front(page, "doctor")
+            _bring_to_front(page, "doctor", port)
             _doctor_add(
                 log,
                 "warn",
@@ -4611,7 +5223,7 @@ def _doctor_probe(log: list[str], port: int) -> None:
                 f"({len(pages)} tab(s) seen)",
             )
             return
-        _doctor_drivability(log, page)
+        _doctor_drivability(log, page, port)
     except BrowserAttachTimeout as exc:
         _doctor_add(log, "fail", "attach", str(exc).replace("\n", " "))
     finally:
@@ -4674,6 +5286,7 @@ def cmd_doctor(port: int) -> int:
     if not _doctor_lifecycle(log, port):
         _doctor_add(log, "fail", "doctor", "browser is down — nothing to probe")
         return 1
+    _doctor_mode(log, port)
     _doctor_coordination(log, port)
     before = _doctor_windows_before(log)
     release = _registry_register("browser.py", _purpose(), port)
@@ -4859,11 +5472,9 @@ def cmd_token(port: int) -> int:
             page.goto(PORTAL_PROFILE_URL, wait_until="domcontentloaded")
             page.wait_for_timeout(1500)
         if "auth.cscs.ch" in page.url:  # portal bounced us to Keycloak → not logged in
-            _bring_to_front(page, "token")  # surface the login tab in the shared window
             _fail(
                 "Not logged in — the portal redirected to Keycloak.\n"
-                "Log into CSCS in THIS shared browser window (Chrome for Testing), "
-                "then re-run: browser.py token"
+                "Run: browser.py login cscs   (then re-run: browser.py token)"
             )
             return 2  # distinct code: caller maps this to a 'needs login' hint
         rc = _capture_and_cache_token(ctx, page)
@@ -5496,12 +6107,17 @@ def _on_portal(page) -> bool:
     )
 
 
-def _cscs_creds(*, announce: bool = True) -> tuple[CscsCreds | None, str]:
+def _cscs_creds(
+    *, announce: bool = True, allow_op: bool = False
+) -> tuple[CscsCreds | None, str]:
     """Resolve ``CscsCreds`` for CSCS plus the source that produced it.
 
     Keychain first (prompt-free; the 6-digit code is generated locally from the
-    stored seed), else the single 1Password item (Touch-ID-gated). Called once
-    per login ATTEMPT; the OTP itself is produced only at fill time
+    stored seed). The 1Password item (``op``, Touch-ID-gated — native UI) is
+    tried ONLY when `allow_op` is set, i.e. by the human-only
+    ``login-cscs-assisted``; an unattended ``login cscs`` never falls back to it
+    (tp#836: no Touch ID prompt outside a human flow; ``op`` is not installed).
+    Called once per login ATTEMPT; the OTP itself is produced only at fill time
     (``CscsCreds.otp``), so every OTP step gets a code with time left.
     """
     creds = _keychain_creds()
@@ -5509,6 +6125,8 @@ def _cscs_creds(*, announce: bool = True) -> tuple[CscsCreds | None, str]:
         if announce:
             print("Using CSCS credentials from the macOS keychain (no Touch ID).")
         return creds, "keychain"
+    if not allow_op:
+        return None, "none"
     if announce:
         print(
             "No keychain credentials yet — falling back to 1Password "
@@ -5615,11 +6233,12 @@ def _submit_keycloak_login(page, creds: CscsCreds) -> bool:
     return _on_portal(page)
 
 
-def cmd_cscs_login(port: int) -> int:
+def cmd_cscs_login(port: int, allow_op: bool = False) -> int:
     """Log into CSCS in the shared browser using stored credentials, then cache.
 
     Fills the Keycloak username/password + TOTP from the macOS keychain when set
-    up (``cscs-store-creds``, no fingerprint), else from the single ``op`` item
+    up (``cscs-store-creds``, no fingerprint); only with `allow_op` (the
+    human-only ``login-cscs-assisted``) else from the single ``op`` item
     (Touch-ID-gated; vault never exposed to the browser). Captures the API token
     from the SAME connection (no second ``connect_over_cdp``). Idempotent: if
     already logged in, it skips the login form and just refreshes the token.
@@ -5652,14 +6271,15 @@ def cmd_cscs_login(port: int) -> int:
             else:
                 cscs_login_mode = "keychain"
                 for attempt in (1, 2):
-                    creds, cscs_login_mode = _cscs_creds(announce=attempt == 1)
+                    creds, cscs_login_mode = _cscs_creds(
+                        announce=attempt == 1, allow_op=allow_op
+                    )
                     if creds is None:
                         return _fail(
-                            "No CSCS credentials available. Either run "
-                            "`browser.py cscs-store-creds` (keychain, no fingerprint), "
-                            f"or make 1Password item '{CSCS_OP_ITEM}' (account "
-                            f"{CSCS_OP_ACCOUNT}) readable via op (desktop 'Integrate "
-                            "with 1Password CLI' on, Touch ID approved)."
+                            "No CSCS credentials in the macOS keychain. Run "
+                            "`browser.py cscs-store-creds` once (keychain, no "
+                            "fingerprint) — an unattended login never falls back "
+                            "to 1Password/Touch ID."
                         )
                     if _submit_keycloak_login(page, creds):
                         break
@@ -6516,7 +7136,7 @@ def cmd_anthropic_login(port: int) -> int:
 
             try:
                 page.goto(CLAUDE_LOGIN_URL, wait_until="domcontentloaded")
-                _bring_to_front(page, "login anthropic")
+                _bring_to_front(page, "login anthropic", port)
             except PlaywrightError:
                 pass
 
@@ -6540,8 +7160,8 @@ def cmd_anthropic_login(port: int) -> int:
 
             # Assisted fallback — needs a human at a real window (the automatic
             # magic-link path above works fine headless, so it is NOT gated).
-            if not _require_headed_for_assisted(port, "claude.ai"):
-                return 2
+            if not _guided_login_allowed(port, "anthropic", "claude.ai"):
+                return NEEDS_ALBERT_RC
             # If auto already triggered the email, don't re-send.
             if ANTHROPIC_LOGIN_EMAIL and not auto_attempted:
                 _claude_fill_email_and_continue(page, ANTHROPIC_LOGIN_EMAIL)
@@ -6663,21 +7283,21 @@ def cmd_openai_login(port: int) -> int:
     under the INTERACTION lease — no other tool clicks in the meantime."""
     pw, browser = _connect(port)
     try:
-        # Warm probe + headless guard FIRST, outside the lease (both are the
+        # Warm probe + guided-login gate FIRST, outside the lease (both are the
         # read-only checks `logged-in` does lease-free); only the assisted
         # interaction below needs the exclusive lease.
         _ctx, page = _pick_page(browser, "chatgpt.com")
         if _chatgpt_logged_in(page):
             print("✓ Already logged into ChatGPT (chatgpt.com).")
             return 0
-        # A cold session is assisted-only — pointless without a window.
-        if not _require_headed_for_assisted(port, "chatgpt.com"):
-            return 2
+        # A cold session needs Albert — only inside a guided login (exit 4).
+        if not _guided_login_allowed(port, "openai", "chatgpt.com"):
+            return NEEDS_ALBERT_RC
         with _interaction_lease("login openai"):
             from playwright.sync_api import Error as PlaywrightError
 
             try:
-                _bring_to_front(page, "login openai")
+                _bring_to_front(page, "login openai", port)
             except PlaywrightError:
                 pass
             print(
@@ -6854,22 +7474,22 @@ def cmd_slack_login(port: int) -> int:
     tool clicks in the shared window while you sign in."""
     pw, browser = _connect(port)
     try:
-        # Warm probe + headless guard FIRST, outside the lease (read-only, the
+        # Warm probe + guided-login gate FIRST, outside the lease (read-only, the
         # same checks `logged-in` does lease-free).
         _ctx, page = _pick_page(browser, "slack.com")
         if _slack_logged_in(page):
             print("✓ Already logged into Slack — session persists; nothing to do.")
             return 0
-        # A cold session is assisted-only — pointless without a window.
-        if not _require_headed_for_assisted(port, "Slack"):
-            return 2
+        # A cold session needs Albert — only inside a guided login (exit 4).
+        if not _guided_login_allowed(port, "slack", "Slack"):
+            return NEEDS_ALBERT_RC
         with _interaction_lease("login slack"):
             from playwright.sync_api import Error as PlaywrightError
 
             # Land straight on the SDSC workspace sign-in (skips the workspace picker).
             try:
                 page.goto(SLACK_WORKSPACE_URL, wait_until="domcontentloaded")
-                _bring_to_front(page, "login slack")
+                _bring_to_front(page, "login slack", port)
                 page.wait_for_timeout(1500)
                 _slack_prefill_email(page)
             except PlaywrightError:
@@ -6925,7 +7545,6 @@ def cmd_slack_session(port: int) -> int:
     try:
         _ctx, page = _pick_page(browser, "slack.com")
         if not _slack_logged_in(page):
-            _bring_to_front(page, "slack-session")
             print(
                 "Not logged into Slack. Run: browser.py login slack",
                 file=sys.stderr,
@@ -7431,12 +8050,12 @@ def cmd_switch_login(port: int) -> int:
     """
     from playwright.sync_api import Error as PlaywrightError
 
-    # Warm probe + headless guard FIRST, outside the lease (both are read-only,
+    # Warm probe + guided-login gate FIRST, outside the lease (both are read-only,
     # exactly what `logged-in` does lease-free).
     if _switch_warm_or_via_broker(port):
         return 0
-    if not _require_headed_for_assisted(port, "Switch Cloud Portal"):
-        return 2
+    if not _guided_login_allowed(port, "switch", "Switch Cloud Portal"):
+        return NEEDS_ALBERT_RC
     pw, browser = _connect(port)
     try:
         with _interaction_lease("login switch"):
@@ -7456,7 +8075,7 @@ def cmd_switch_login(port: int) -> int:
                     f"browser: {exc}"
                 )
             with contextlib.suppress(PlaywrightError):
-                _bring_to_front(page, "login switch")
+                _bring_to_front(page, "login switch", port)
             # A failed click is not fatal: it just means no sign-in form was
             # there (already mid-flow, or already logged in) — fall through to
             # the wait, which decides on evidence.
@@ -8378,7 +8997,7 @@ def cmd_login_cscs_assisted(port: int) -> int:
             "login-cscs-assisted is human-only (needs a terminal). Agents use "
             "`browser.py login cscs` (login broker)."
         )
-    return cmd_cscs_login(port)
+    return cmd_cscs_login(port, allow_op=True)
 
 
 # ---------------------------------------------------------------------------
@@ -8461,13 +9080,13 @@ def cmd_notion_login(port: int) -> int:
     INTERACTION lease — no other tool clicks in the meantime."""
     from playwright.sync_api import Error as PlaywrightError
 
-    # Warm probe + headless guard FIRST, outside the lease (both are the
+    # Warm probe + guided-login gate FIRST, outside the lease (both are the
     # read-only checks `logged-in` does lease-free).
     if _notion_probe(port):
         print("✓ Already logged into Notion (app.notion.com).")
         return 0
-    if not _require_headed_for_assisted(port, "Notion"):
-        return 2
+    if not _guided_login_allowed(port, "notion", "Notion"):
+        return NEEDS_ALBERT_RC
     pw, browser = _connect(port)
     try:
         with _interaction_lease("login notion"):
@@ -8482,7 +9101,7 @@ def cmd_notion_login(port: int) -> int:
                     f"could not open {NOTION_LOGIN_URL} in the shared browser: {exc}"
                 )
             with contextlib.suppress(PlaywrightError):
-                _bring_to_front(page, "login notion")
+                _bring_to_front(page, "login notion", port)
             print(
                 "\n🔐 Notion (app.notion.com) needs a login.\n"
                 "   In the shared Chrome window (now in front):\n"
@@ -8705,6 +9324,10 @@ def main() -> int:
     _set_purpose(f"{args.cmd} {site}" if site else str(args.cmd))
     _journal_set_argv(args)
     try:
+        # Headless invariant (tp#836): a headed browser without a live
+        # guided-login lease is reverted BEFORE the command takes any gate
+        # (best effort: a failed revert warns, the command still runs).
+        _preflight(str(args.cmd), args.cdp_port)
         return _journaled_dispatch(args, args.cdp_port)
     except BrowserAttachTimeout as exc:
         return _fail(str(exc))
@@ -8723,13 +9346,13 @@ _JOURNALED_CMDS = {
 
 # Unjournaled commands that may raise the window (`_bring_to_front`): their
 # parent chain is collected up front so the raise event can carry it.
-_JOURNAL_RAISING_CMDS = frozenset({"doctor", "token", "slack-session"})
+_JOURNAL_RAISING_CMDS = frozenset({"doctor"})
 
 
 def _journal_cmd_fields(args: argparse.Namespace) -> dict[str, object]:
     """The event-specific journal fields of a journaled subcommand."""
     if args.cmd == "up":
-        return {"mode": "headless" if args.headless else "headed"}
+        return {"mode": _desired_mode()}
     if args.cmd == "switch":
         rec = _lifecycle_read()
         return {"from": rec.get("mode") if rec else None, "to": args.mode}
@@ -8791,7 +9414,7 @@ def _dispatch(args: argparse.Namespace, port: int) -> int:
     # would need a per-command adapter lambda — more indirection, not less.
     # pylint: disable=too-many-return-statements,too-many-branches
     if args.cmd == "up":
-        return cmd_up(port, args.headless)
+        return cmd_up(port)
     if args.cmd == "status":
         if args.probe:
             return cmd_status(port, args.full_urls, probe=True)

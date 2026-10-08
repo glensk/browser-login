@@ -1,15 +1,20 @@
 """Helpers of agent-login.py: LaunchAgents, mail, network wait, Safari sessions,
-the shared Chromium's window mode."""
+the shared Chromium's window mode (guided logins under the headed lease)."""
 
 from __future__ import annotations
 
+import contextlib
+import importlib.util
 import os
 import shutil
 import socket
 import subprocess
 import sys
 import time
+from collections.abc import Iterator
+from dataclasses import dataclass
 from pathlib import Path
+from types import ModuleType
 
 from broker import safari_cookies
 
@@ -272,17 +277,92 @@ def browser_mode() -> str | None:
     return "headless" if "(headless)" in first else "headed"
 
 
-def show_window() -> str | None:
-    """Switch the shared Chromium to headed; the mode to go back to (or None)."""
-    before = browser_mode()
-    print("▶ showing the shared Chromium window …")
-    if _browser("switch", "headed") != 0:
-        raise RuntimeError("browser.py switch headed failed")
-    return before
+def _browser_module() -> ModuleType:
+    """bin/browser.py loaded as a module, fresh, for the CURRENT instance.
+
+    browser.py reads $CLAUDE_BROWSER_INSTANCE (and so its cache dir, where the
+    headed lease lives) at import time, and `site_instance` changes it per
+    site — hence a fresh load per guided login instead of a cached import.
+    """
+    spec = importlib.util.spec_from_file_location("browser_py_guided", BROWSER_PY)
+    if spec is None or spec.loader is None:
+        raise RuntimeError(f"cannot load {BROWSER_PY}")
+    mod = importlib.util.module_from_spec(spec)
+    try:
+        spec.loader.exec_module(mod)
+    except SystemExit as exc:  # e.g. an unknown $CLAUDE_BROWSER_INSTANCE
+        raise RuntimeError(f"cannot load {BROWSER_PY}: {exc.code}") from None
+    return mod
 
 
-def restore_mode(before: str | None) -> None:
-    """Back to headless only when the browser WAS headless before -g."""
-    if before == "headless":
-        print("▶ hiding the Chromium window again …")
-        _browser("switch", "headless", quiet=True)
+@dataclass
+class GuidedWindow:
+    """What `guided_window` reports back: did the window go away again?"""
+
+    restored: bool = True
+
+
+def hide_window(mod: ModuleType | None = None, nonce: str | None = None) -> bool:
+    """`browser.py switch headless`, one retry; False (loudly) when both fail.
+
+    With `mod`/`nonce` (the guided login's own lease) it first checks the lease
+    file: when ANOTHER owner's lease is live now (ours was lost and a new
+    guided login took over), that window is not ours to close — skip, True.
+    Our own live lease, or none at all, means switch back.
+
+    Never silent: a browser left headed outside the lease is exactly what the
+    headless invariant forbids — the next browser.py command would revert it,
+    but the human must know now.
+    """
+    if mod is not None and nonce is not None:
+        live = mod._headed_lease_live()  # pylint: disable=protected-access
+        if live is not None and live.get("owner_nonce") != nonce:
+            print(
+                "⚠ another guided login holds the headed lease now — leaving its "
+                "window alone (not switching headless)."
+            )
+            return True
+    print("▶ hiding the Chromium window again (switch headless) …")
+    for attempt in (1, 2):
+        if _browser("switch", "headless") == 0:
+            return True
+        print(f"❌ browser.py switch headless failed (attempt {attempt}/2)")
+        if attempt == 1:
+            time.sleep(2)
+    print(
+        "❌ the shared Chromium is still HEADED after the guided login. Every "
+        "browser.py command will try to revert it; fix it now: "
+        f"{BROWSER_PY} switch headless   (-f if an unregistered client blocks it)"
+    )
+    return False
+
+
+@contextlib.contextmanager
+def guided_window(site: str) -> Iterator[GuidedWindow]:
+    """Show the shared Chromium for a guided login, then hide it again.
+
+    Order (tp#836): take the headed lease (`_headed_lease`, which exports its
+    nonce to every child browser.py) → `switch headed` → the block →
+    `switch headless` (one retry, loud on failure) → release the lease. A
+    failed `switch headed` raises RuntimeError after reverting whatever is left
+    headed. The yielded `GuidedWindow.restored` says whether the window is gone.
+    """
+    state = GuidedWindow()
+    with contextlib.ExitStack() as stack:
+        try:
+            mod = _browser_module()
+            nonce = stack.enter_context(
+                mod._headed_lease(site)  # pylint: disable=protected-access
+            )
+        except RuntimeError as exc:  # HeadedLeaseBusy/-Error, load failure
+            print(f"❌ guided login refused: {exc}")
+            raise
+        print("▶ showing the shared Chromium window (guided login) …")
+        if _browser("switch", "headed") != 0:
+            if browser_mode() == "headed":
+                hide_window(mod, nonce)
+            raise RuntimeError("browser.py switch headed failed")
+        try:
+            yield state
+        finally:
+            state.restored = hide_window(mod, nonce)

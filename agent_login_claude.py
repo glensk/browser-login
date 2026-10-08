@@ -49,7 +49,7 @@ def site_instance(site: str) -> Iterator[None]:
     started = False
     try:
         if inst and browser_mode() is None:
-            started = _browser("up", "-H", quiet=True) == 0
+            started = _browser("up", quiet=True) == 0
         yield
     finally:
         if started:

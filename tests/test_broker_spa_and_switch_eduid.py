@@ -247,7 +247,8 @@ def switch_env(monkeypatch):
         log["page"] = page
         return fn(page)
 
-    def headed(port, site):
+    def headed(port, site, label):
+        assert site == "switch" and label
         log["headed"] += 1
         return state["headed"]
 
@@ -264,7 +265,7 @@ def switch_env(monkeypatch):
     monkeypatch.setattr(
         browser, "_interaction_lease", lambda purpose: contextlib.nullcontext("n")
     )
-    monkeypatch.setattr(browser, "_require_headed_for_assisted", headed)
+    monkeypatch.setattr(browser, "_guided_login_allowed", headed)
     monkeypatch.setattr(
         browser, "_record_login_event", lambda s, m: log["events"].append((s, m))
     )
@@ -285,7 +286,8 @@ def test_switch_login_chains_broker_eduid_and_background_click(switch_env, capsy
 def test_switch_login_falls_back_when_the_click_does_not_log_in(switch_env, capsys):
     log, state = switch_env
     state["verdict"] = "login"  # the edu-ID session did not carry the SSO
-    assert browser.cmd_switch_login(9222) == 2  # headless: manual flow refused
+    # no guided login: the window flow is refused with "needs Albert"
+    assert browser.cmd_switch_login(9222) == browser.NEEDS_ALBERT_RC
     assert log["broker"] == ["eduid"] and len(log["bg"]) == 1
     assert log["headed"] == 1 and not log["events"]
     assert "falling back to the window flow" in capsys.readouterr().err
@@ -294,7 +296,7 @@ def test_switch_login_falls_back_when_the_click_does_not_log_in(switch_env, caps
 def test_switch_login_falls_back_when_the_broker_login_fails(switch_env, capsys):
     log, state = switch_env
     state["broker_rc"] = 4
-    assert browser.cmd_switch_login(9222) == 2
+    assert browser.cmd_switch_login(9222) == browser.NEEDS_ALBERT_RC
     assert log["broker"] == ["eduid"] and not log["bg"]
     assert log["headed"] == 1
     assert "broker login eduid failed (exit 4)" in capsys.readouterr().err
@@ -312,7 +314,7 @@ def test_switch_login_falls_back_when_the_broker_login_fails(switch_env, capsys)
 def test_switch_login_without_broker_eduid_is_the_window_flow(switch_env, entry):
     log, state = switch_env
     state["entry"] = entry
-    assert browser.cmd_switch_login(9222) == 2
+    assert browser.cmd_switch_login(9222) == browser.NEEDS_ALBERT_RC
     assert not log["broker"] and not log["bg"]
     assert log["headed"] == 1
 

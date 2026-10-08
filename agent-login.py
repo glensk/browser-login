@@ -65,12 +65,11 @@ from agent_login_jobs import (  # noqa: E402
     SNAPSHOT_LABEL,
     _browser,
     browser_mode,
+    guided_window,
     install_daily,
     launchagent_plist,
-    restore_mode,
     safari_sessions,
     send_mail,
-    show_window,
     snapshot_plist,
     uninstall_daily,
     wait_for_network,
@@ -460,7 +459,7 @@ def agent_summary(data: dict, checks: dict[str, dict]) -> str:
             if inst:
                 how += (
                     f" — its own browser (CDP 127.0.0.1:9223), stopped when idle: "
-                    f"`CLAUDE_BROWSER_INSTANCE={inst} browser.py up -H` first, "
+                    f"`CLAUDE_BROWSER_INSTANCE={inst} browser.py up` first, "
                     "`… down` when done; every browser.py call needs that prefix"
                 )
             ok_lines.append(
@@ -719,29 +718,30 @@ def manual_login(site: str) -> int:
     if _browser("logged-in", site, quiet=True) == 0:
         print(f"✅ {site}: the shared Chromium is already logged in — nothing to do")
         return 0
+    ok = False
     try:
-        before = show_window()
+        with guided_window(site) as win:
+            _browser("open", start, quiet=True)
+            print(
+                "👤 In the Chromium window: tick 'I am human' if asked, enter your "
+                "e-mail,\n   paste the password from Bitwarden, finish the login. "
+                f"Waiting up to {MANUAL_WAIT_S // 60} min …"
+            )
+            deadline = time.monotonic() + MANUAL_WAIT_S
+            while time.monotonic() < deadline:
+                time.sleep(10)
+                if _browser("logged-in", site, quiet=True) == 0:
+                    ok = True
+                    break
     except RuntimeError:
         return 1
-    _browser("open", start, quiet=True)
-    print(
-        f"👤 In the Chromium window: tick 'I am human' if asked, enter your e-mail,\n"
-        f"   paste the password from Bitwarden, finish the login. Waiting up to "
-        f"{MANUAL_WAIT_S // 60} min …"
-    )
-    deadline = time.monotonic() + MANUAL_WAIT_S
-    ok = False
-    while time.monotonic() < deadline:
-        time.sleep(10)
-        if _browser("logged-in", site, quiet=True) == 0:
-            ok = True
-            break
-    restore_mode(before)
     print(
         f"✅ {site}: logged in — agents can use this session"
         if ok
         else f"❌ {site}: still not logged in after {MANUAL_WAIT_S // 60} min"
     )
+    if not win.restored:
+        return 1
     return 0 if ok else 2
 
 
@@ -792,19 +792,18 @@ def assisted_login(site: str) -> int:
         return 2
     with site_instance(site):
         try:
-            before = show_window()
+            with guided_window(site) as win:
+                if site in SITE_INSTANCE and site in CLAUDE_ACCOUNTS:
+                    claude_login_by_hand(site)
+                else:
+                    _browser("login", browser_site(site))
         except RuntimeError:
             return 1
-        try:
-            if site in SITE_INSTANCE and site in CLAUDE_ACCOUNTS:
-                claude_login_by_hand(site)
-            else:
-                _browser("login", browser_site(site))
-        finally:
-            restore_mode(before)
     ok, how = assisted_check(site)
     record_check(site, ok, how)
     print(f"{'✅' if ok else '❌'} {site}: {how}")
+    if not win.restored:
+        return 1
     return 0 if ok else 2
 
 
@@ -866,8 +865,8 @@ def ensure_browser_up() -> bool:
     through it: checking while it is down reports each site as logged out."""
     if browser_mode() is not None:
         return True
-    print("▶ shared Chromium is down — starting it (browser.py up --headless)")
-    _browser("up", "--headless", quiet=True)
+    print("▶ shared Chromium is down — starting it (browser.py up, headless)")
+    _browser("up", quiet=True)
     return browser_mode() is not None
 
 
@@ -879,7 +878,7 @@ def check_all(*, mail: bool = False) -> int:
         print(f"⏸  no network ({NETWORK_HOST} does not resolve) — skipped, no mail")
         return 0
     if not ensure_browser_up():
-        how = "down, and `browser.py up --headless` did not start it"
+        how = "down, and `browser.py up` did not start it"
         print(f"❌ shared Chromium: {how} — no site checked")
         if mail:
             send_mail(

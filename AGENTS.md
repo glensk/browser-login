@@ -27,8 +27,11 @@ framework. It is a **provider**: other repos depend on it, not the reverse. See
 - Pre-commit: `pre-commit run --all-files` (gitleaks secret scan)
 - Smoke test: `bin/browser.py -h` must exit 0; `browser.py up && browser.py status`.
 - Full health check: `browser.py doctor` (bounded probe on a disposable tab;
-  asserts the desktop is left untouched). Run it after changes to launch,
-  lifecycle, or coordination code.
+  asserts the desktop is left untouched; certifies mode=headless, the desired
+  mode and the headed lease). Run it after changes to launch, lifecycle, or
+  coordination code — against a DISPOSABLE instance
+  (`CLAUDE_BROWSER_CACHE_DIR=<tmp> browser.py --cdp-port <free port> up`, then
+  `down`), never the live 9222/9223 browser.
 
 ## Conventions
 
@@ -48,12 +51,30 @@ framework. It is a **provider**: other repos depend on it, not the reverse. See
 - Tab URLs and titles in any captured output (`status`, error lines) go through
   `_tab_hint`/`_tab_title` — origins only, fail closed; raw URLs are opt-in
   (`status --full-urls`) and never the default.
+- **Headless by default — the invariant** (tp#836): the shared browser is
+  headless unless a live HEADED LEASE exists (`<cache>/headed-lease.json`,
+  `_headed_lease(site)`), held only by a guided login Albert starts
+  (`agent-login.py -g SITE` → `agent_login_jobs.guided_window`). `up` always
+  launches headless (`up -H` is a no-op; there is no `up --headed`, and
+  `CLAUDE_BROWSER_HEADLESS` is ignored); `switch headed` exits 2 unless the
+  caller carries the lease nonce (`$CLAUDE_BROWSER_HEADED_LEASE`); every
+  connecting command reverts a lease-less headed browser first (`_preflight`
+  in `main`, before any gate; output to stderr only; best effort — a failed
+  revert warns and the command proceeds; `doctor`/`close`/`close-hung` never
+  revert). Never add a way around it.
 - **Never interfere with the user's desktop**: no app activation, no window
-  raising; tab-level `bring_to_front` only as an escalation when rendering is
-  frozen (on CfT 151 it can steal focus — README "Why you never see the
-  window"). Interactive flows hold the interaction lease; long-lived CDP
-  clients register via `register-exec`; `switch` fails closed on unregistered
-  clients. Full contract: README "Consumer contract".
+  raising. `_bring_to_front` is a journaled no-op outside the lease holder's
+  headed browser; never call `page.bring_to_front()` directly. A login step
+  that needs Albert goes through `_guided_login_allowed` and returns
+  `NEEDS_ALBERT_RC` (4, "needs Albert: agent-login.py -g SITE") — no TTY or
+  env heuristics, no window flow outside the lease, no `op`/Touch-ID fallback
+  in unattended paths. Interactive flows hold the interaction lease;
+  long-lived CDP clients register via `register-exec`; `switch` fails closed
+  on unregistered clients. Full contract: README "Why you never see the
+  window" and "Consumer contract".
+- **No `--remote-allow-origins`**: CDP WebSocket clients send NO `Origin`
+  header (Chrome then answers 403); new `websockets` clients pass
+  `origin=None` explicitly.
 - **A Playwright attach is bounded and can be blocked by ONE tab** (tp#693):
   `connect_over_cdp` waits for every page target, so `_connect` passes
   `timeout=CONNECT_TIMEOUT_S` and turns a timeout into `BrowserAttachTimeout`
