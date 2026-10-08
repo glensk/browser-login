@@ -42,8 +42,9 @@ Facts:
 - `--remote-allow-origins=*` is set unconditionally today; it disables Chrome's WebSocket
   Origin check on CDP. The stock DevTools screencast forwards mouse/wheel/basic keys only —
   no paste, `insertText` or IME composition.
-- The Verification block runs pytest, mypy and pylint, which execute repository code, so it
-  is deliberately not strict-eligible.
+- The Verification block runs pytest, mypy, pylint, the `-h` smoke runs of `bin/browser.py`,
+  `bin/focus_watch.py` and `agent-login.py`, and `pre-commit` — all of them execute
+  repository code, so it is deliberately not strict-eligible.
 
 Options:
 
