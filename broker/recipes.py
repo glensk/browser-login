@@ -42,6 +42,7 @@ from broker.page_state import (  # browser.py imports interstitial_title from he
     challenge_reason,
     interstitial_title,
     sentinel_shown,
+    trust_prompt_button,
 )
 
 if TYPE_CHECKING:  # annotations only: vault imports DEFAULT_CHECK_URLS from here
@@ -726,7 +727,7 @@ def generic_login(
     pw_field = _fill_password(page, pw_field, secret, allowed, dev=dev)
     _submit_password(page, pw_field, allowed, dev=dev)
 
-    otp_done = False
+    otp_done = trusted = False
     deadline = time.monotonic() + settle_s
     while time.monotonic() < deadline:
         page.wait_for_timeout(500)
@@ -740,6 +741,14 @@ def generic_login(
             continue
         if _left_login(page, item, dev=dev):
             return
+        trust = (
+            None
+            if trusted or off_fill_origins(page.url, allowed, dev=dev)
+            else (trust_prompt_button(page))
+        )
+        if trust is not None:
+            trust.click(timeout=5000)
+            trusted = True
     # Still on the login after the password: wrong password, an e-mail code, a
     # captcha... Fail HERE so the failure report shows this page.
     raise LoginFailed(

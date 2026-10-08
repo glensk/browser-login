@@ -173,3 +173,35 @@ def diagnose(page: Any, secret: Secret) -> dict[str, Any]:
         "frames": [str(x) for x in raw.get("frames", [])],
         "challenge": challenge_reason(page) or "",
     }
+
+
+# "Trust this browser?" / "Stay signed in?" asked AFTER the password and second
+# factor were accepted (Zoho accounts, 2026-10-08: "Trust" | "Not now"). The
+# login is done; the page only waits for this answer. Answering "trust" keeps
+# the broker's own profile out of the second factor next time.
+TRUST_PROMPT_RE = re.compile(
+    r"trust this (?:browser|device)\?|stay signed in\?|remember this (?:browser|device)\?",
+    re.IGNORECASE,
+)
+TRUST_BUTTON_LABELS = frozenset({"trust", "trust browser", "trust this browser", "yes"})
+
+
+def trust_prompt_button(page: Any) -> Any:
+    """The visible confirming button of a post-login "trust this browser" prompt,
+    or None (no such prompt, or no unambiguous button). Inspection only."""
+    try:
+        text = page.inner_text("body", timeout=1000)
+    except Exception:  # pylint: disable=broad-exception-caught
+        return None
+    if not TRUST_PROMPT_RE.search(text or ""):
+        return None
+    try:
+        for button in page.query_selector_all(
+            "button, input[type=submit], input[type=button], [role=button]"
+        ):
+            label = (button.inner_text() or button.get_attribute("value") or "").strip()
+            if label.lower() in TRUST_BUTTON_LABELS and button.is_visible():
+                return button
+    except Exception:  # pylint: disable=broad-exception-caught
+        return None
+    return None
