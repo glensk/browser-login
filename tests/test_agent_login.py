@@ -438,3 +438,25 @@ def test_check_all_browser_wont_start(monkeypatch) -> None:
     monkeypatch.setattr(al, "send_mail", lambda *a: sent.append(a))
     assert al.check_all(mail=True) == 1
     assert len(sent) == 1 and "does not start" in sent[0][0]
+
+
+def test_check_all_browser_dies_mid_run(monkeypatch) -> None:
+    """The browser dies after the first site: the run stops, later sites keep
+    their previous verdict instead of being recorded as logged out."""
+    monkeypatch.setattr(al, "wait_for_network", lambda: True)
+    ups = iter([True, True, False])
+    monkeypatch.setattr(al, "ensure_browser_up", lambda: next(ups))
+    rows = [{"site": s, "status": "ready"} for s in ("a", "b", "c")]
+    monkeypatch.setattr(
+        al, "overview", lambda: {"broker_ok": True, "broker": "ok", "rows": rows}
+    )
+    seen: list[str] = []
+
+    def ensure(site: str) -> tuple[bool, str]:
+        seen.append(site)
+        return True, "x"
+
+    monkeypatch.setattr(al, "ensure_logged_in", ensure)
+    monkeypatch.setattr(al, "record_check", lambda *a, **k: None)
+    assert al.check_all() == 1
+    assert seen == ["a"]

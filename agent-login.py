@@ -901,6 +901,12 @@ def check_all(*, mail: bool = False) -> int:
         if rule is not None and not rule.auto:
             print(f"⏭  {row['site']}: not imported unattended (see SAFARI_SITES)")
             continue
+        if not ensure_browser_up():
+            # The browser went away mid-run: stop instead of failing every site.
+            how = "shared Chromium went down mid-run and did not restart"
+            print(f"❌ {row['site']}: {how} — remaining sites not checked")
+            failed.append(("shared Chromium", how))
+            break
         ok, how = ensure_logged_in(row["site"])
         print(f"{'✅' if ok else '❌'} {row['site']}: {how}")
         record_check(row["site"], ok, how)
