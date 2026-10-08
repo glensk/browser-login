@@ -473,3 +473,28 @@ def test_worktree_detection():
     )
     main = fw.worktree_main_checkout()
     assert (main is None) == (git_dir == common)
+
+
+def test_summary_offscreen_window_is_informational_until_shown():
+    recs = [
+        # A headless Chrome's invisible window: never on screen → informational.
+        fw.make_record(
+            "window_new", app=CFT, pid=9, chrome=True, window=1, on_screen=False
+        ),
+        # Created off screen, later shown: its first appearance counts.
+        fw.make_record(
+            "window_new", app=CFT, pid=9, chrome=True, window=2, on_screen=False
+        ),
+        fw.make_record("window_shown", app=CFT, pid=9, chrome=True, window=2),
+        # Shown again (Space round-trip) → informational.
+        fw.make_record("window_shown", app=CFT, pid=9, chrome=True, window=2),
+        # Created on screen → counts.
+        fw.make_record(
+            "window_new", app=CFT, pid=9, chrome=True, window=3, on_screen=True
+        ),
+    ]
+    summary = fw.summarize(recs)
+    assert summary.chrome_offscreen == 2
+    assert summary.chrome_events == 2
+    assert summary.chrome_shown == 1
+    assert [r["window"] for r in summary.flagged] == [2, 2, 3]

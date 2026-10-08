@@ -541,6 +541,7 @@ class Summary:  # pylint: disable=too-many-instance-attributes
     flagged: list[dict[str, Any]]
     chrome_events: int  # counted: activate / window_new / window_raise
     chrome_shown: int  # informational: window_shown
+    chrome_offscreen: int  # informational: window_new never on screen
     native_events: int
     ignored_selftest: int
     total: int
@@ -553,10 +554,16 @@ def summarize(records: list[dict[str, Any]]) -> Summary:
 
     Events of a self-test's Chrome (pid between ``selftest_begin`` and
     ``selftest_end`` records) are ignored: they are the watcher's own probe.
+
+    A Chrome ``window_new`` created OFF screen (a headless or occluded Chrome's
+    invisible window, a window on another Space) disturbs nobody and is only
+    counted as informational; it fails the summary when that window first comes
+    on screen (its first ``window_shown``).
     """
     counts: Counter[tuple[str, str]] = Counter()
     flagged: list[dict[str, Any]] = []
-    chrome_events = chrome_shown = native_events = ignored = 0
+    chrome_events = chrome_shown = chrome_offscreen = native_events = ignored = 0
+    offscreen_windows: set[Any] = set()
     selftest_pids: set[int] = set()
     for rec in records:
         event = str(rec.get("event") or "?")
@@ -572,7 +579,15 @@ def summarize(records: list[dict[str, Any]]) -> Summary:
             continue
         is_chrome_event = bool(rec.get("chrome"))
         is_native_event = bool(rec.get("native_prompt"))
-        if is_chrome_event and event in COUNTED_CHROME_EVENTS:
+        window = (rec.get("pid"), rec.get("window"))
+        if is_chrome_event and event == "window_new" and rec.get("on_screen") is False:
+            chrome_offscreen += 1
+            offscreen_windows.add(window)
+            continue
+        if is_chrome_event and event == "window_shown" and window in offscreen_windows:
+            offscreen_windows.discard(window)
+            chrome_events += 1  # first appearance on screen of an off-screen window
+        elif is_chrome_event and event in COUNTED_CHROME_EVENTS:
             chrome_events += 1
         elif is_chrome_event:
             chrome_shown += 1
@@ -585,6 +600,7 @@ def summarize(records: list[dict[str, Any]]) -> Summary:
         flagged=flagged,
         chrome_events=chrome_events,
         chrome_shown=chrome_shown,
+        chrome_offscreen=chrome_offscreen,
         native_events=native_events,
         ignored_selftest=ignored,
         total=len(records),
@@ -684,6 +700,10 @@ def format_summary(summary: Summary, files: list[Path], bad_lines: int = 0) -> s
     lines.append(
         f"Chrome window_shown events (informational, not counted — a Space switch "
         f"looks the same): {summary.chrome_shown}"
+    )
+    lines.append(
+        "Chrome windows created off screen (informational, never shown): "
+        f"{summary.chrome_offscreen}"
     )
     if summary.native_events:
         lines.append(f"❌ {summary.native_events} native-prompt event(s)")
