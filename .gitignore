@@ -50,3 +50,6 @@ Icon?
 # AI assistant private files (public conventions live in AGENTS.md)
 CLAUDE.md
 CLAUDE.local.md
+
+# agent worktrees (Claude Code isolation)
+.claude/worktrees/

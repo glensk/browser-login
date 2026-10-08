@@ -31,6 +31,10 @@ Generic lifecycle:
             client is attached ([-f|--force] switches anyway).
   clients   Show who is attached over CDP: the registered clients (tool, pid,
             purpose) plus any unregistered ones a switch would refuse.
+  journal [-n N] [-e EVENT] [-j]
+            Tail the append-only, redacted journal (origins only): who ran
+            up/switch/down/login, every window raise, client (un)registrations
+            — with pid, parent chain and argv.
   doctor    Full health check: the lifecycle record, client coordination, and a
             drivability probe (rAF/click/screenshot) on a disposable tab.
   register-exec [-t NAME] -- CMD ARGS…
@@ -385,6 +389,32 @@ def _add_open_eval_parsers(sub: Any) -> None:
     )
 
 
+def _add_journal_parser(sub: Any) -> None:
+    """The `journal` subcommand: tail/filter the append-only journal."""
+    pjn = sub.add_parser(
+        "journal",
+        help="Show the append-only journal (origins only): who launched, switched "
+        "or stopped the browser, logins, window raises, client (un)registrations.",
+    )
+    pjn.add_argument(
+        "-n",
+        "--lines",
+        type=int,
+        default=50,
+        help="show the last N entries (default 50; 0 = all, incl. rotated files)",
+    )
+    pjn.add_argument(
+        "-e",
+        "--event",
+        default=None,
+        help="only this event: up, switch, down, login, bring_to_front, register, "
+        "unregister",
+    )
+    pjn.add_argument(
+        "-j", "--json", action="store_true", help="print the raw JSON lines"
+    )
+
+
 def _add_close_parser(sub: Any) -> argparse.ArgumentParser:
     """The `close` subparser; returned so `parse_args` can reject bad mixes."""
     pcl: argparse.ArgumentParser = sub.add_parser(
@@ -460,6 +490,7 @@ def parse_args() -> argparse.Namespace:
             "  ./browser.py switch headless    # stop + relaunch windowless\n"
             "  ./browser.py status             # CDP health + tabs (origins only) + lifecycle\n"
             "  ./browser.py clients            # who is attached over CDP\n"
+            "  ./browser.py journal -n 20 -e up  # who launched the browser, lately\n"
             "  ./browser.py doctor             # full health check (disposable tab)\n"
             "  ./browser.py open https://portal.cscs.ch/profile/\n"
             "  ./browser.py eval -t 20 'document.title'\n"
@@ -557,6 +588,7 @@ def parse_args() -> argparse.Namespace:
         help="Show the registered CDP clients plus any unregistered ones (a "
         "switch refuses while those are attached).",
     )
+    _add_journal_parser(sub)
     sub.add_parser(
         "doctor",
         help="Full health check of the shared browser: lifecycle record, "
@@ -1366,6 +1398,437 @@ def _lifecycle_clear() -> None:
     LIFECYCLE_FILE.unlink(missing_ok=True)
 
 
+# ---------------------------------------------------------------------------
+# Journal — append-only, redacted history: who launched / switched / stopped
+# ---------------------------------------------------------------------------
+# The lifecycle record is ONE current state and a client's registry file is
+# deleted on unregister, so neither can say who launched the headed browser at
+# 10:42 or which command raised its window. The journal can: one JSON object
+# per line in CACHE_DIR/journal.jsonl (so each instance has its own), appended
+# with O_APPEND in a single os.write, so concurrent writers interleave whole
+# lines, never bytes. Redacted like `status`: any URL in argv or a field is cut
+# to its origin, an `eval` expression to its length. Best effort by contract —
+# a journal failure warns once on stderr and never changes a command's outcome.
+
+JOURNAL_NAME = "journal.jsonl"
+# Past this size the next writer rotates journal.jsonl → .1 → .2 (oldest dropped).
+JOURNAL_MAX_BYTES = 10 * 1024 * 1024
+JOURNAL_KEEP = 2
+# A line stays well under a pipe buffer, so one O_APPEND write lands whole.
+JOURNAL_LINE_MAX = 4000
+JOURNAL_PARENT_DEPTH = 5
+JOURNAL_ARG_MAX = 160
+JOURNAL_ARGV_MAX = 16
+# URL-shaped substrings, matched fail closed (over-redaction is the price):
+#   - the opaque schemes whose payload may hold quotes and spaces (a `data:`
+#     page, a `javascript:` bookmarklet) — to the END of the string;
+#   - `scheme://` or `scheme:\\` with ANY scheme-shaped prefix, no word
+#     boundary needed (`foo_https://…`, `1https://…`), and `http(s):` followed
+#     by any run of `/` or `\` including none (`https:h.example/p?t=…`);
+#   - `mailto:` / `about:` not glued to a preceding scheme character.
+# The URL body runs to the next whitespace and, when any later word of the
+# same string carries a `?` or `#`, on through the last such word — so a URL
+# with spaces in its path (`https://h/a b?t=…`) cannot leak its query.
+_JOURNAL_URL_RE = re.compile(
+    r"(?:(?<![A-Za-z])(?:data|javascript|vbscript|blob):.*"
+    r"|(?:[A-Za-z][A-Za-z0-9+.-]*:[/\\]{2}|https?:[/\\]*"
+    r"|(?<![A-Za-z0-9+.-])(?:mailto|about):)"
+    r"\S*(?:(?:\s+\S+)*\s+\S*[?#]\S*)?)",
+    re.DOTALL | re.IGNORECASE,
+)
+# An argument that is just a word (site, mode, target id, number, flag) — any
+# other positional gets the origin treatment in the journal's argv.
+_JOURNAL_PLAIN_ARG = re.compile(r"[A-Za-z0-9_.@+-]{1,80}")
+_JOURNAL_STD_KEYS = (
+    "ts",
+    "instance",
+    "event",
+    "pid",
+    "ppid",
+    "parents",
+    "argv",
+    "mode",
+)
+# Events that carry the full parent chain. Client (un)registrations — one per
+# attach, on every `eval` — and the watchdog carry pid + ppid only.
+_JOURNAL_CHAIN_EVENTS = frozenset({"up", "switch", "down", "login", "bring_to_front"})
+# Per-process state: the redacted argv main() recorded, the parent chain (looked
+# up once), what a command noted for its end event, and the warn-once flag.
+_JOURNAL_ARGV: list[list[str]] = []
+_JOURNAL_PARENTS: list[list[dict[str, object]]] = []
+_JOURNAL_NOTES: dict[str, object] = {}
+_JOURNAL_WARNED: list[bool] = []
+
+
+def _journal_path() -> Path:
+    """This instance's journal; ``CLAUDE_BROWSER_JOURNAL_FILE`` overrides (tests)."""
+    override = os.environ.get("CLAUDE_BROWSER_JOURNAL_FILE")
+    return Path(override) if override else CACHE_DIR / JOURNAL_NAME
+
+
+def _journal_redact(text: object, limit: int = JOURNAL_ARG_MAX) -> str:
+    """`text` with every URL reduced to its origin, printable, at most `limit`.
+
+    The URL pass runs on the whole string BEFORE the cut, so a URL can never be
+    half-kept; non-printable characters become ``?`` so a value cannot forge a
+    line in the human `journal` output.
+    """
+    out = _JOURNAL_URL_RE.sub(lambda m: _tab_hint(m.group(0)), str(text))
+    if not out.isprintable():
+        out = "".join(c if c.isprintable() else "?" for c in out)
+    return out if len(out) <= limit else out[: limit - 1] + "…"
+
+
+def _journal_origin(arg: str) -> str:
+    """Origin of a URL argument, fail closed; scheme-less ``host/path`` → host."""
+    hint = _tab_hint(arg)
+    if hint == "<unparseable url>" and "://" not in arg:
+        alt = _tab_hint("//" + arg)  # `open h.example/reset?token=…`
+        if alt.startswith("://"):
+            return alt[3:]
+    return hint
+
+
+def _journal_wrapped_cmd(cmd: Sequence[str]) -> str:
+    """A wrapped command as basename + argument count — never its arguments."""
+    rest = list(cmd[1:] if cmd and cmd[0] == "--" else cmd)
+    if not rest:
+        return "(none)"
+    return f"{os.path.basename(rest[0])} (+{len(rest) - 1} args)"
+
+
+def _journal_set_argv(args: argparse.Namespace) -> None:
+    """Record this process's redacted argv; main() calls it once after parsing.
+
+    Structural first, by what each argument IS: an ``eval`` expression becomes
+    its length (JS can carry anything, including a value it types into a
+    form), `open`'s URL and `close`'s URLs their origin, a ``register-exec``
+    command its basename + argument count. Any other value that is not a plain
+    word (site, mode, id, number) gets the origin treatment too, and then
+    everything goes through `_journal_redact` (URLs anywhere → origin).
+    """
+    cmd = getattr(args, "cmd", None)
+    raw = list(sys.argv[1:])
+    tail: list[str] = []
+    if cmd == "register-exec":
+        wrapped = list(getattr(args, "cmd_", None) or [])
+        if wrapped and raw[-len(wrapped) :] == wrapped:
+            raw = raw[: -len(wrapped)]
+            if wrapped[0] == "--":
+                raw.append("--")
+        tail = [_journal_wrapped_cmd(wrapped)]
+    js = getattr(args, "js", None) if cmd == "eval" else None
+    urls: set[str] = set()
+    if cmd == "open" and isinstance(getattr(args, "url", None), str):
+        urls.add(args.url)
+    if cmd == "close":
+        urls.update(u for u in getattr(args, "urls", None) or [] if isinstance(u, str))
+    argv = [os.path.basename(sys.argv[0]) if sys.argv else "browser.py"]
+    for arg in raw:
+        if js and arg == js:
+            argv.append(f"<js: {len(arg)} chars>")
+        elif arg in urls:
+            argv.append(_journal_origin(arg))
+        elif arg.startswith("-") and "=" in arg:
+            flag, _, value = arg.partition("=")
+            plain = _JOURNAL_PLAIN_ARG.fullmatch(value)
+            argv.append(f"{flag}={value if plain else _journal_origin(value)}")
+        elif arg.startswith("-") or _JOURNAL_PLAIN_ARG.fullmatch(arg):
+            argv.append(arg)
+        else:
+            argv.append(_journal_origin(arg))
+    _JOURNAL_ARGV[:] = [_journal_argv_redacted(argv + tail)]
+
+
+def _journal_argv_redacted(argv: Sequence[str]) -> list[str]:
+    """`argv` redacted per element and capped in count."""
+    out = [_journal_redact(a) for a in argv[:JOURNAL_ARGV_MAX]]
+    if len(argv) > JOURNAL_ARGV_MAX:
+        out.append(f"<+{len(argv) - JOURNAL_ARGV_MAX} args>")
+    return out
+
+
+def _journal_argv() -> list[str]:
+    """The argv main() recorded, else a generically redacted ``sys.argv``."""
+    if _JOURNAL_ARGV:
+        return _JOURNAL_ARGV[0]
+    return _journal_argv_redacted(
+        [os.path.basename(sys.argv[0]) if sys.argv else "?", *sys.argv[1:]]
+    )
+
+
+def _journal_parent_chain() -> list[dict[str, object]]:
+    """Up to JOURNAL_PARENT_DEPTH ancestors as ``[{"pid", "comm"}, …]``, parent first.
+
+    ONE ``ps -A`` call (2 s bound), cached for the process. Called ONLY from
+    `_journaled_dispatch` before the command runs — never from `_journal`
+    itself — so no ``ps`` ever runs while this process holds the registry gate
+    or the interaction lease. Any failure (no ``ps``, the timeout, garbage
+    output) yields an empty chain; it never raises.
+    """
+    if _JOURNAL_PARENTS:
+        return _JOURNAL_PARENTS[0]
+    chain: list[dict[str, object]] = []
+    try:
+        r = subprocess.run(
+            ["ps", "-A", "-o", "pid=", "-o", "ppid=", "-o", "comm="],
+            capture_output=True,
+            text=True,
+            timeout=2,
+            check=False,
+            env={**os.environ, "LC_ALL": "C"},
+        )
+        table: dict[int, tuple[int, str]] = {}
+        for line in str(r.stdout or "").splitlines():
+            parts = line.split(None, 2)
+            if len(parts) == 3 and parts[0].isdigit() and parts[1].isdigit():
+                table[int(parts[0])] = (int(parts[1]), parts[2].strip())
+        pid = os.getppid()
+        while pid > 0 and len(chain) < JOURNAL_PARENT_DEPTH and pid in table:
+            ppid, comm = table[pid]
+            chain.append({"pid": pid, "comm": _journal_redact(comm, 100)})
+            if pid in (1, ppid):
+                break
+            pid = ppid
+    except Exception:  # pylint: disable=broad-exception-caught
+        pass
+    _JOURNAL_PARENTS[:] = [chain]
+    return chain
+
+
+def _journal_note(**fields: object) -> None:
+    """Add fields to the END event main() writes for this command (e.g. ``flow``)."""
+    _JOURNAL_NOTES.update(fields)
+
+
+def _journal_warn(exc: BaseException) -> None:
+    """Report a journal failure on stderr — once per process, never raising."""
+    if _JOURNAL_WARNED:
+        return
+    _JOURNAL_WARNED.append(True)
+    with contextlib.suppress(Exception):
+        print(
+            f"⚠ journal: not recorded ({_journal_path()}): {_exc_line(exc)}",
+            file=sys.stderr,
+        )
+
+
+def _journal_encode(rec: dict[str, object]) -> bytes:
+    """One JSON line ≤ JOURNAL_LINE_MAX; shrinks argv/parents, then minimal."""
+    for attempt in range(3):
+        line = json.dumps(rec, ensure_ascii=True, separators=(",", ":")) + "\n"
+        if len(line) <= JOURNAL_LINE_MAX:
+            return line.encode()
+        if attempt == 0:
+            argv = rec.get("argv")
+            parents = rec.get("parents")
+            rec = {
+                **rec,
+                "argv": [*(argv[:3] if isinstance(argv, list) else []), "<truncated>"],
+                "parents": parents[:2] if isinstance(parents, list) else [],
+            }
+        else:
+            rec = {k: rec.get(k) for k in ("ts", "instance", "event", "pid", "ppid")}
+            rec["truncated"] = True
+    return (json.dumps(rec, ensure_ascii=True, separators=(",", ":")) + "\n").encode()
+
+
+def _journal_append(data: bytes) -> None:
+    """Append one encoded line: O_APPEND, a single write, 0600; rotate when big.
+
+    Rotation never waits: the writer that finds the file over
+    JOURNAL_MAX_BYTES tries ``flock(LOCK_EX|LOCK_NB)`` on its fd — busy means
+    another writer is rotating, so it just appends. Holding the lock it
+    re-stats, and shifts ``.1`` → ``.2`` and renames the live file to ``.1``
+    only while the path still names the file its fd has open (a writer that
+    already rotated changed the inode). Plain appends take no lock, so its own
+    line, and any racing writer's, lands in ``.1`` or the new file, never
+    nowhere.
+    """
+    path = _journal_path()
+    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    fd = os.open(str(path), os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
+    try:
+        if os.fstat(fd).st_size >= JOURNAL_MAX_BYTES:
+            _journal_rotate(path, fd)
+        with contextlib.suppress(OSError):
+            os.fchmod(fd, 0o600)
+        os.write(fd, data)
+    finally:
+        os.close(fd)
+
+
+def _journal_rotate(path: Path, fd: int) -> None:
+    """Rotate `path` if `fd` still names it and no other writer is rotating."""
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        return  # another writer holds it: that writer rotates
+    try:
+        st = os.fstat(fd)
+        cur = os.stat(path)
+        if st.st_size < JOURNAL_MAX_BYTES or (cur.st_ino, cur.st_dev) != (
+            st.st_ino,
+            st.st_dev,
+        ):
+            return
+        for i in range(JOURNAL_KEEP, 1, -1):
+            with contextlib.suppress(FileNotFoundError):
+                os.replace(f"{path}.{i - 1}", f"{path}.{i}")
+        os.replace(path, f"{path}.1")
+    except OSError:
+        return
+    finally:
+        with contextlib.suppress(OSError):
+            fcntl.flock(fd, fcntl.LOCK_UN)
+
+
+def _journal_ts() -> str:
+    """Local ISO-8601 time with milliseconds and UTC offset, from ONE clock read."""
+    now = time.time()
+    local = time.localtime(now)
+    return (
+        time.strftime("%Y-%m-%dT%H:%M:%S", local)
+        + f".{int(now * 1000) % 1000:03d}"
+        + time.strftime("%z", local)
+    )
+
+
+def _journal(event: str, **fields: object) -> None:
+    """Append one redacted event to the journal. Never raises.
+
+    Every event carries who (pid, ppid), how (redacted argv) and the browser
+    mode — from ``fields["mode"]`` when the caller knows it, else from the
+    lifecycle record. The events in _JOURNAL_CHAIN_EVENTS also carry the
+    parent chain — the one `_journaled_dispatch` collected BEFORE the command
+    ran; this function never runs ``ps`` (it is called under the registry gate
+    and the interaction lease, and from the eval watchdog). String field
+    values are redacted again here (URLs → origin), so a caller cannot leak a
+    path or query by accident.
+    """
+    try:
+        rec: dict[str, object] = {
+            "ts": _journal_ts(),
+            "instance": INSTANCE or "default",
+            "event": event,
+            "pid": os.getpid(),
+            "ppid": os.getppid(),
+            "argv": _journal_argv(),
+        }
+        if event in _JOURNAL_CHAIN_EVENTS:
+            rec["parents"] = _JOURNAL_PARENTS[0] if _JOURNAL_PARENTS else None
+        if "mode" not in fields:
+            lrec = _lifecycle_read()
+            rec["mode"] = lrec.get("mode") if lrec else None
+        for key, value in fields.items():
+            rec[key] = (
+                _journal_redact(value)
+                if isinstance(value, str)
+                else value
+                if value is None or isinstance(value, (bool, int, float))
+                else _journal_redact(value)
+            )
+        _journal_append(_journal_encode(rec))
+    except Exception as exc:  # pylint: disable=broad-exception-caught
+        _journal_warn(exc)
+
+
+def _bring_to_front(page: Any, reason: str) -> None:
+    """Journal a focus-capable ``page.bring_to_front()``, then do it.
+
+    The journal entry is written FIRST so a raise that steals focus is on record
+    even when the call itself then fails; the call's own exception propagates
+    unchanged — callers keep their existing error handling.
+    """
+    try:
+        origin = _tab_hint(str(getattr(page, "url", "") or ""))
+    except Exception:  # pylint: disable=broad-exception-caught
+        origin = "<unknown>"
+    _journal("bring_to_front", command=reason, origin=origin)
+    page.bring_to_front()
+
+
+def _journal_read_lines(limit: int, event: str | None) -> list[str]:
+    """The last `limit` raw journal lines (0 = all), optionally for one event.
+
+    Reads the live file and, when it alone does not hold `limit` matching
+    lines, the rotated ``.1``/``.2`` before it — oldest first in the result.
+    Lines that are not a JSON object are skipped.
+    """
+    path = _journal_path()
+    files = [path] + [Path(f"{path}.{i}") for i in range(1, JOURNAL_KEEP + 1)]
+    picked: list[str] = []
+    for f in files:
+        try:
+            raw = f.read_text(encoding="utf-8", errors="replace").splitlines()
+        except FileNotFoundError:
+            continue
+        chunk = []
+        for line in raw:
+            try:
+                rec = json.loads(line)
+            except ValueError:
+                continue
+            if isinstance(rec, dict) and (event is None or rec.get("event") == event):
+                chunk.append(line)
+        picked = chunk + picked
+        if limit and len(picked) >= limit:
+            break
+    return picked[-limit:] if limit else picked
+
+
+def _journal_format(rec: dict) -> str:
+    """One human line for a journal record — every value re-redacted."""
+    event = _journal_redact(rec.get("event", "?"), 40)
+    phase = rec.get("phase")
+    head = f"{event}/{_journal_redact(phase, 10)}" if phase else event
+    extras = [
+        f"{_journal_redact(k, 40)}={_journal_redact(v, 80)}"
+        for k, v in rec.items()
+        if k not in _JOURNAL_STD_KEYS and k != "phase"
+    ]
+    mode = rec.get("mode")
+    if mode:
+        extras.insert(0, f"mode={_journal_redact(mode, 20)}")
+    parents = rec.get("parents") or []
+    chain = " < ".join(
+        f"{os.path.basename(_journal_redact(p.get('comm', '?'), 100))}"
+        f"({_journal_redact(p.get('pid', '?'), 10)})"
+        for p in parents
+        if isinstance(p, dict)
+    )
+    argv = rec.get("argv") or []
+    argv_s = (
+        " ".join(_journal_redact(a, 80) for a in argv) if isinstance(argv, list) else ""
+    )
+    return (
+        f"{_journal_redact(rec.get('ts', '?'), 40)}  {head:<22} "
+        f"pid {_journal_redact(rec.get('pid', '?'), 10)}  "
+        + ("  ".join(extras) + "  " if extras else "")
+        + (f"[{argv_s}]" if argv_s else "")
+        + (f"  ← {chain}" if chain else "")
+    )
+
+
+def cmd_journal(lines: int, event: str | None, as_json: bool) -> int:
+    """Print the tail of the journal: one human line per event, or raw JSON."""
+    if lines < 0:
+        return _fail("-n/--lines must be >= 0 (0 = everything)")
+    picked = _journal_read_lines(lines, event)
+    if not picked:
+        print(
+            f"(no journal entries{f' for event {event!r}' if event else ''} in "
+            f"{_journal_path()})"
+        )
+        return 0
+    for line in picked:
+        if as_json:
+            print(line)
+        else:
+            print(_journal_format(json.loads(line)))
+    return 0
+
+
 def _ps_field(pid: int, fmt: str) -> str | None:
     """One ``ps -o <fmt>`` field for PID, stripped; None if the process is gone.
 
@@ -2034,7 +2497,12 @@ def _describe_client(rec: dict) -> str:
 
 
 def _registry_register(
-    tool: str, purpose: str, port: int, wait_s: float = REGISTRY_SH_WAIT_S
+    tool: str,
+    purpose: str,
+    port: int,
+    wait_s: float = REGISTRY_SH_WAIT_S,
+    *,
+    journal_purpose: str | None = None,
 ) -> Callable[[], None]:
     """Register this process as an attached CDP client; return its ``release()``.
 
@@ -2087,6 +2555,15 @@ def _registry_register(
     }
     os.pwrite(own_fd, (json.dumps(rec) + "\n").encode(), 0)
     released = False
+    registered_at = time.monotonic()
+    _journal(
+        "register",
+        client=tool,
+        client_pid=os.getpid(),
+        nonce=nonce[:12],
+        purpose=purpose if journal_purpose is None else journal_purpose,
+        port=port,
+    )
 
     def release() -> None:
         """Drop the registration: unlink our file, then both locks. Idempotent."""
@@ -2108,6 +2585,13 @@ def _registry_register(
                 fcntl.flock(fd, fcntl.LOCK_UN)
             with contextlib.suppress(OSError):
                 os.close(fd)
+        _journal(
+            "unregister",
+            client=tool,
+            client_pid=os.getpid(),
+            nonce=nonce[:12],
+            held_ms=int((time.monotonic() - registered_at) * 1000),
+        )
 
     return release
 
@@ -2909,7 +3393,9 @@ def cmd_register_exec(port: int, tool: str, cmd: list[str]) -> int:
     # a child must never run unregistered. The record carries the WRAPPER's
     # pid; the child's/grandchild's sockets resolve to it via the ancestry
     # walk in _unknown_cdp_clients.
-    release = _registry_register(tool, " ".join(cmd)[:160], port)
+    release = _registry_register(
+        tool, " ".join(cmd)[:160], port, journal_purpose=_journal_wrapped_cmd(cmd)
+    )
     try:
         proc = subprocess.Popen(cmd)  # pylint: disable=consider-using-with
     except OSError as exc:
@@ -3373,6 +3859,7 @@ def _eval_watchdog_fire(timeout_s: float) -> None:
         "never settled)\n"
     )
     sys.stderr.flush()
+    _journal("watchdog", command="eval", timeout_s=timeout_s)  # never raises
     os._exit(1)  # pylint: disable=protected-access
 
 
@@ -3976,7 +4463,7 @@ def _doctor_drivability(log: list[str], page) -> None:
         )
     else:
         try:
-            page.bring_to_front()
+            _bring_to_front(page, "doctor")
             _doctor_add(
                 log,
                 "warn",
@@ -4372,7 +4859,7 @@ def cmd_token(port: int) -> int:
             page.goto(PORTAL_PROFILE_URL, wait_until="domcontentloaded")
             page.wait_for_timeout(1500)
         if "auth.cscs.ch" in page.url:  # portal bounced us to Keycloak → not logged in
-            page.bring_to_front()  # surface the login tab in the shared window
+            _bring_to_front(page, "token")  # surface the login tab in the shared window
             _fail(
                 "Not logged in — the portal redirected to Keycloak.\n"
                 "Log into CSCS in THIS shared browser window (Chrome for Testing), "
@@ -6029,7 +6516,7 @@ def cmd_anthropic_login(port: int) -> int:
 
             try:
                 page.goto(CLAUDE_LOGIN_URL, wait_until="domcontentloaded")
-                page.bring_to_front()
+                _bring_to_front(page, "login anthropic")
             except PlaywrightError:
                 pass
 
@@ -6190,7 +6677,7 @@ def cmd_openai_login(port: int) -> int:
             from playwright.sync_api import Error as PlaywrightError
 
             try:
-                page.bring_to_front()
+                _bring_to_front(page, "login openai")
             except PlaywrightError:
                 pass
             print(
@@ -6382,7 +6869,7 @@ def cmd_slack_login(port: int) -> int:
             # Land straight on the SDSC workspace sign-in (skips the workspace picker).
             try:
                 page.goto(SLACK_WORKSPACE_URL, wait_until="domcontentloaded")
-                page.bring_to_front()
+                _bring_to_front(page, "login slack")
                 page.wait_for_timeout(1500)
                 _slack_prefill_email(page)
             except PlaywrightError:
@@ -6438,7 +6925,7 @@ def cmd_slack_session(port: int) -> int:
     try:
         _ctx, page = _pick_page(browser, "slack.com")
         if not _slack_logged_in(page):
-            page.bring_to_front()
+            _bring_to_front(page, "slack-session")
             print(
                 "Not logged into Slack. Run: browser.py login slack",
                 file=sys.stderr,
@@ -6969,7 +7456,7 @@ def cmd_switch_login(port: int) -> int:
                     f"browser: {exc}"
                 )
             with contextlib.suppress(PlaywrightError):
-                page.bring_to_front()
+                _bring_to_front(page, "login switch")
             # A failed click is not fatal: it just means no sign-in form was
             # there (already mid-flow, or already logged in) — fall through to
             # the wait, which decides on evidence.
@@ -7995,7 +8482,7 @@ def cmd_notion_login(port: int) -> int:
                     f"could not open {NOTION_LOGIN_URL} in the shared browser: {exc}"
                 )
             with contextlib.suppress(PlaywrightError):
-                page.bring_to_front()
+                _bring_to_front(page, "login notion")
             print(
                 "\n🔐 Notion (app.notion.com) needs a login.\n"
                 "   In the shared Chrome window (now in front):\n"
@@ -8167,8 +8654,14 @@ def cmd_login(port: int, site_name: str) -> int:
     """Ensure SITE is logged in (automated or assisted, per the site)."""
     key = site_name.strip().lower()
     if key in _safari.SAFARI_SITES:
+        _journal_note(flow="safari")
         return _safari_login(port, key)
-    return _resolve_site(site_name, for_login=True).login(port)
+    site = _resolve_site(site_name, for_login=True)
+    is_broker = (
+        isinstance(site.login, functools.partial) and site.login.func is _broker_login
+    )
+    _journal_note(site=site.name, flow="broker" if is_broker else "builtin")
+    return site.login(port)
 
 
 def cmd_logged_in(port: int, site_name: str) -> int:
@@ -8210,10 +8703,85 @@ def main() -> int:
     # `purpose` every client registration reports to whoever waits on the gate.
     site = getattr(args, "site", None)
     _set_purpose(f"{args.cmd} {site}" if site else str(args.cmd))
+    _journal_set_argv(args)
     try:
-        return _dispatch(args, args.cdp_port)
+        return _journaled_dispatch(args, args.cdp_port)
     except BrowserAttachTimeout as exc:
         return _fail(str(exc))
+
+
+# Subcommands whose start and end go to the journal, keyed to their event name.
+_JOURNALED_CMDS = {
+    "up": "up",
+    "switch": "switch",
+    "down": "down",
+    "login": "login",
+    "cscs-login": "login",
+    "login-cscs-assisted": "login",
+}
+
+
+# Unjournaled commands that may raise the window (`_bring_to_front`): their
+# parent chain is collected up front so the raise event can carry it.
+_JOURNAL_RAISING_CMDS = frozenset({"doctor", "token", "slack-session"})
+
+
+def _journal_cmd_fields(args: argparse.Namespace) -> dict[str, object]:
+    """The event-specific journal fields of a journaled subcommand."""
+    if args.cmd == "up":
+        return {"mode": "headless" if args.headless else "headed"}
+    if args.cmd == "switch":
+        rec = _lifecycle_read()
+        return {"from": rec.get("mode") if rec else None, "to": args.mode}
+    if args.cmd == "down":
+        return {"forced": bool(args.force)}
+    if args.cmd == "login-cscs-assisted":
+        return {"site": "cscs", "flow": "cscs-assisted"}
+    return {"site": "cscs" if args.cmd == "cscs-login" else str(args.site)}
+
+
+def _journaled_dispatch(args: argparse.Namespace, port: int) -> int:
+    """`_dispatch`, with a start and an end journal event for lifecycle/login.
+
+    The end event carries the exit code (or the exception's class name), the
+    wall-clock duration and whatever the command noted via `_journal_note`
+    (e.g. a login's flow). A ``sys.exit`` inside a command is recorded with
+    its code and re-raised unchanged.
+    """
+    event = _JOURNALED_CMDS.get(str(args.cmd))
+    if event is not None or args.cmd in _JOURNAL_RAISING_CMDS:
+        _journal_parent_chain()  # now, before any gate/lease is held
+    if event is None:
+        return _dispatch(args, port)
+    try:
+        fields = _journal_cmd_fields(args)
+    except Exception:  # pylint: disable=broad-exception-caught
+        fields = {}
+    _journal(event, phase="start", **fields)
+    t0 = time.monotonic()
+    result: object = "exception"
+    try:
+        rc = _dispatch(args, port)
+        result = rc
+        return rc
+    except SystemExit as exc:
+        code = exc.code
+        result = 0 if code is None else code if isinstance(code, int) else 1
+        raise
+    except BaseException as exc:
+        result = f"exception:{type(exc).__name__}"
+        raise
+    finally:
+        _journal(
+            event,
+            phase="end",
+            **{
+                **fields,
+                **_JOURNAL_NOTES,
+                "result": result,
+                "duration_ms": int((time.monotonic() - t0) * 1000),
+            },
+        )
 
 
 def _dispatch(args: argparse.Namespace, port: int) -> int:
@@ -8243,6 +8811,8 @@ def _dispatch(args: argparse.Namespace, port: int) -> int:
         return cmd_switch(port, args.mode, args.force)
     if args.cmd == "clients":
         return cmd_clients(port)
+    if args.cmd == "journal":
+        return cmd_journal(args.lines, args.event, args.json)
     if args.cmd == "doctor":
         return cmd_doctor(port)
     if args.cmd == "register-exec":

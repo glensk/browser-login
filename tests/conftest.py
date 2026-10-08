@@ -17,6 +17,7 @@ from __future__ import annotations
 import os
 import shlex
 import subprocess
+import sys
 
 import pytest
 
@@ -93,6 +94,52 @@ def _guard(real):
         return real(args, *a, **kw)
 
     return wrapper
+
+
+@pytest.fixture(autouse=True)
+def _private_journal(tmp_path, monkeypatch):
+    """Every test journals into its own tmp file, never the live cache's journal.
+
+    browser.py appends to ``CACHE_DIR/journal.jsonl`` on up/switch/down/login,
+    window raises and client (un)registration; many tests reach those paths
+    without repointing CACHE_DIR, so the path override is set for all of them.
+
+    The override lives in its OWN MonkeyPatch, so a test that calls
+    ``monkeypatch.undo()`` mid-way cannot drop it; requesting ``monkeypatch``
+    only orders teardown, so the after-check still sees the test's patches.
+    """
+    del monkeypatch  # requested for teardown ordering only
+    with pytest.MonkeyPatch.context() as own:
+        own.setenv("CLAUDE_BROWSER_JOURNAL_FILE", str(tmp_path / "journal.jsonl"))
+        _assert_journal_not_live()
+        yield
+        _assert_journal_not_live()
+
+
+_LIVE_CACHE_PREFIX = os.path.join(os.path.expanduser("~"), ".cache", "claude-browser")
+
+
+def _assert_journal_not_live() -> None:
+    """Abort the whole session if any loaded browser.py would journal live.
+
+    Checks every imported copy of browser.py (each test file loads its own
+    under its own module name) by asking it where it would write right now.
+    """
+    for name, mod in list(sys.modules.items()):
+        resolve = getattr(mod, "_journal_path", None)
+        if not callable(resolve):
+            continue
+        try:
+            path = os.path.realpath(os.fspath(resolve()))
+        except Exception:  # pylint: disable=broad-exception-caught
+            continue
+        live = os.path.realpath(_LIVE_CACHE_PREFIX)
+        if path.startswith(live):
+            pytest.exit(
+                f"❌ {name}: journal path {path} is under the live browser cache "
+                f"({live}*) — a test would write the real journal",
+                returncode=3,
+            )
 
 
 @pytest.fixture(autouse=True)

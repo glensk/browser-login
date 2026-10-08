@@ -69,6 +69,7 @@ browser.py status -p          # + probe every tab over raw CDP: marks '⚠ unres
 browser.py close-hung [-y]    # close tabs that answer no CDP command (asks first; see Troubleshooting)
 browser.py switch headless    # transactional mode switch (stop + relaunch, logins persist)
 browser.py clients            # who is attached over CDP (registered + unknown clients)
+browser.py journal [-n N] [-e EVENT] [-j]  # who launched/switched/stopped it, logins, window raises
 browser.py doctor             # full health check on a disposable tab (never touches real tabs)
 browser.py open https://…     # navigate a tab (opens in the BACKGROUND — no focus steal)
 browser.py open -r https://…  # --reuse: navigate an existing same-URL tab (no duplicate tabs;
@@ -161,6 +162,23 @@ and is unsafe from an agent session. `doctor` certifies the whole stack: record 
 attached clients, and a bounded rAF/click/screenshot probe on a disposable
 `data:` tab, asserting the frontmost app and window z-order are unchanged
 afterwards.
+
+The record says what the browser is doing NOW; the **journal**
+(`~/.cache/claude-browser/journal.jsonl`, per instance, mode 0600) says who did
+what before. Every `up`/`switch`/`down`/`login` (a start and an end line with
+mode, `from`→`to`, site and flow, exit code, duration), every window raise
+(`bring_to_front`, with the command and the page's origin), every client
+`register`/`unregister` and an `eval` `watchdog` exit appends one JSON line
+carrying the pid, ppid and argv — lifecycle, login and raise events also the
+parent chain (5 ancestors, one bounded `ps` before any lock is taken).
+Redacted like `status`, fail closed: any URL is cut to its origin, an `eval`
+expression to its length, a `register-exec` command to its name and argument
+count. Appends are single `O_APPEND`
+writes (< 4 KiB, whole lines under concurrency); past 10 MB the file rotates
+to `.1`/`.2`; a journal failure warns once on stderr and never fails the
+command. `browser.py journal` tails it (`-n/--lines N`, default 50, `0` = all;
+`-e/--event up|switch|down|login|bring_to_front|register|unregister`;
+`-j/--json` raw lines).
 
 ## Consumer contract (multi-client coordination)
 
