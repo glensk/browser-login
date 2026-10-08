@@ -1,14 +1,19 @@
-"""What a page shows a human: bot challenges and logged-in sentinels.
+"""What a page shows a human: bot challenges, logged-in sentinels and the
+secret-free picture of a page a login stopped on (``diagnose``).
 
-Pure page inspection for the login recipes (``broker.recipes``) and the
-client-side check in ``bin/browser.py`` — nothing here types, clicks or reads
-a field value.
+Pure page inspection for the login recipes (``broker.recipes``), the daemon's
+failure report and the client-side check in ``bin/browser.py`` — nothing here
+types, clicks or reads a field value.
 """
 
 from __future__ import annotations
 
 import re
-from typing import Any
+import urllib.parse
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:  # annotations only
+    from broker.vault import Secret
 
 CHALLENGE_SRC_RE = re.compile(
     r"recaptcha|hcaptcha|turnstile|challenges\.cloudflare", re.IGNORECASE
@@ -118,3 +123,53 @@ def sentinel_shown(page: Any, selector: str) -> bool:
         except Exception:  # pylint: disable=broad-exception-caught
             continue
     return False
+
+
+# What a failure report lists: visible message-like elements and buttons.
+_DIAG_JS = """() => {
+  const vis = e => !!(e.offsetWidth || e.offsetHeight || e.getClientRects().length);
+  const txt = e => (e.innerText || e.value || e.getAttribute('aria-label') || '')
+    .replace(/\\s+/g, ' ').trim();
+  const pick = (sel, n, len) => [...document.querySelectorAll(sel)].filter(vis)
+    .map(txt).filter(Boolean).map(t => t.slice(0, len)).slice(0, n);
+  const inputs = [...document.querySelectorAll('input')].filter(vis)
+    .map(i => (i.type || 'text') + (i.name ? ':' + i.name : '')).slice(0, 10);
+  return {
+    messages: pick('[role=alert], [aria-live], .error, [class*=error i], [class*=alert i],'
+      + ' [id*=error i], .ulp-input-error-message, .ulp-validator-error', 5, 200),
+    buttons: pick('button, input[type=submit]', 6, 40),
+    inputs: inputs,
+    frames: [...document.querySelectorAll('iframe')].map(f => {
+      try { return new URL(f.src).host; } catch (e) { return ''; } }).filter(Boolean)
+      .slice(0, 6),
+  };
+}"""
+
+
+def _redact(text: str, secret: Secret) -> str:
+    """Mask the username and password wherever a page echoes them."""
+    for value in (secret.password, secret.username):
+        if value:
+            text = text.replace(value, "***")
+    return text
+
+
+def diagnose(page: Any, secret: Secret) -> dict[str, Any]:
+    """Secret-free picture of the page a login stopped on.
+
+    URL without query/fragment, title, visible inputs (type:name only, never
+    values), message-like texts and buttons (username/password masked), iframe
+    hosts, and whether a bot challenge is showing.
+    """
+    parts = urllib.parse.urlsplit(page.url)
+    raw = page.evaluate(_DIAG_JS)
+    raw = raw if isinstance(raw, dict) else {}
+    return {
+        "url": f"{parts.scheme}://{parts.netloc}{parts.path}",
+        "title": _redact(str(page.title() or "")[:120], secret),
+        "inputs": [str(x) for x in raw.get("inputs", [])],
+        "messages": [_redact(str(x), secret) for x in raw.get("messages", [])],
+        "buttons": [_redact(str(x), secret) for x in raw.get("buttons", [])],
+        "frames": [str(x) for x in raw.get("frames", [])],
+        "challenge": challenge_reason(page) or "",
+    }

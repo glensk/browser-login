@@ -75,6 +75,26 @@ PASSKEY_RE = re.compile(
     r"passkey|webauthn|security\s*key|fido|cl[eé]\s+d.acc[eè]s|sicherheitsschl",
     re.IGNORECASE,
 )
+# The broker never answers a passkey prompt, and its headless Chromium has no
+# authenticator, so `navigator.credentials.get({publicKey})` never settles:
+# Zoho (accounts.zoho.eu, verified 2026-10-08) calls it right after the e-mail
+# lookup for an account whose primary sign-in is a passkey, and its "Next"
+# button spins forever. Installed in every broker page before the page's own
+# scripts, this rejects each WebAuthn request at once with the
+# NotAllowedError a human's "Cancel" gives; Zoho then shows its password field.
+NO_PASSKEY_JS = """(() => {
+  const C = window.CredentialsContainer;
+  if (!C) return;
+  const deny = () => Promise.reject(new DOMException(
+      'The operation either timed out or was not allowed.', 'NotAllowedError'));
+  for (const name of ['get', 'create']) {
+    const orig = C.prototype[name];
+    if (typeof orig !== 'function') continue;
+    C.prototype[name] = function (options) {
+      return options && options.publicKey ? deny() : orig.call(this, options);
+    };
+  }
+})();"""
 SETTLE_TIMEOUT_S = 30.0
 # agent_pre_click: re-click while the element stays and no login field shows.
 PRE_CLICK_RETRY_S = 3.0
@@ -84,6 +104,8 @@ CSCS_PORTAL_ORIGIN = "https://portal.cscs.ch"
 CSCS_LOGIN_URL = CSCS_PORTAL_ORIGIN + "/profile/"
 SMARTSHEET_ORIGIN = "https://app.smartsheet.com"
 SUBMIT_CHANGE_S = 3.0
+# Bound on the identifier step's fallback click (Playwright's default is 30 s).
+FALLBACK_CLICK_TIMEOUT_S = 5.0
 
 # Built-in check URLs: a page that needs the login and, when logged out,
 # redirects to the site's login page on a fill origin (each verified with an
@@ -569,7 +591,13 @@ def _submit_identifier(
     """Submit the username step: Enter in the field; if neither the URL nor the
     DOM changes within ``SUBMIT_CHANGE_S``, click the form's visible submit
     button (re-guarded: the button's own ``formaction`` must stay on a fill
-    origin too)."""
+    origin too).
+
+    The click is a fallback only. A disabled button means the page is still
+    busy with the Enter (Zoho turns "Next" into a disabled spinner during its
+    lookup) and is left alone; a click that cannot happen within
+    ``FALLBACK_CLICK_TIMEOUT_S`` is given up. Either way the caller's wait
+    for the password field decides."""
     before = page.url
     user_field.press("Enter")
     deadline = time.monotonic() + SUBMIT_CHANGE_S
@@ -583,14 +611,24 @@ def _submit_identifier(
             return
     handle = user_field.evaluate_handle(SUBMIT_BUTTON_JS)
     button = handle.as_element() if handle is not None else None
-    if button is None:
+    if button is None or not _enabled(button):
         return
     _guard(page, user_field, allowed, dev=dev)
     frame_url = _frame_url(button)
     own_action = button.get_attribute("formaction")
     if own_action and not form_action_allowed(frame_url, own_action, allowed, dev=dev):
         raise OriginViolation("submit button posts off the fill origins")
-    button.click()
+    try:
+        button.click(timeout=FALLBACK_CLICK_TIMEOUT_S * 1000)
+    except Exception:  # pylint: disable=broad-exception-caught
+        pass  # not clickable (detached, covered): the Enter may still land
+
+
+def _enabled(element: Any) -> bool:
+    try:
+        return bool(element.is_enabled())
+    except Exception:  # pylint: disable=broad-exception-caught
+        return False
 
 
 def _submit_password(
@@ -941,53 +979,3 @@ Recipe = Callable[..., None]
 def recipe_for(site: str) -> Recipe:
     """The recipe for a site id (recipes are code: changing one needs sudo)."""
     return {"cscs": cscs_login, "smartsheet": smartsheet_login}.get(site, generic_login)
-
-
-# What a failure report lists: visible message-like elements and buttons.
-_DIAG_JS = """() => {
-  const vis = e => !!(e.offsetWidth || e.offsetHeight || e.getClientRects().length);
-  const txt = e => (e.innerText || e.value || e.getAttribute('aria-label') || '')
-    .replace(/\\s+/g, ' ').trim();
-  const pick = (sel, n, len) => [...document.querySelectorAll(sel)].filter(vis)
-    .map(txt).filter(Boolean).map(t => t.slice(0, len)).slice(0, n);
-  const inputs = [...document.querySelectorAll('input')].filter(vis)
-    .map(i => (i.type || 'text') + (i.name ? ':' + i.name : '')).slice(0, 10);
-  return {
-    messages: pick('[role=alert], [aria-live], .error, [class*=error i], [class*=alert i],'
-      + ' [id*=error i], .ulp-input-error-message, .ulp-validator-error', 5, 200),
-    buttons: pick('button, input[type=submit]', 6, 40),
-    inputs: inputs,
-    frames: [...document.querySelectorAll('iframe')].map(f => {
-      try { return new URL(f.src).host; } catch (e) { return ''; } }).filter(Boolean)
-      .slice(0, 6),
-  };
-}"""
-
-
-def _redact(text: str, secret: Secret) -> str:
-    """Mask the username and password wherever a page echoes them."""
-    for value in (secret.password, secret.username):
-        if value:
-            text = text.replace(value, "***")
-    return text
-
-
-def diagnose(page: Any, secret: Secret) -> dict[str, Any]:
-    """Secret-free picture of the page a login stopped on.
-
-    URL without query/fragment, title, visible inputs (type:name only, never
-    values), message-like texts and buttons (username/password masked), iframe
-    hosts, and whether a bot challenge is showing.
-    """
-    parts = urllib.parse.urlsplit(page.url)
-    raw = page.evaluate(_DIAG_JS)
-    raw = raw if isinstance(raw, dict) else {}
-    return {
-        "url": f"{parts.scheme}://{parts.netloc}{parts.path}",
-        "title": _redact(str(page.title() or "")[:120], secret),
-        "inputs": [str(x) for x in raw.get("inputs", [])],
-        "messages": [_redact(str(x), secret) for x in raw.get("messages", [])],
-        "buttons": [_redact(str(x), secret) for x in raw.get("buttons", [])],
-        "frames": [str(x) for x in raw.get("frames", [])],
-        "challenge": challenge_reason(page) or "",
-    }

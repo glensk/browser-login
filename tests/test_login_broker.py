@@ -44,6 +44,7 @@ from broker import (  # noqa: E402
     daemon,
     limiter,
     origins,
+    page_state,
     peercred,
     recipes,
     runs,
@@ -1770,7 +1771,7 @@ def test_install_cleanliness_ignores_untracked_files() -> None:
 
 
 class _DiagPage:
-    """Fake page for recipes.diagnose: echoes the username/password in its texts."""
+    """Fake page for page_state.diagnose: echoes the username/password in its texts."""
 
     url = "https://login.example.ch/u/login/password?state=SECRETSTATE#x"
 
@@ -1799,7 +1800,7 @@ USERNAME_FOR_DIAG = "albert@example.ch"
 
 def test_diagnose_masks_secrets_and_query() -> None:
     sec = vault.Secret(USERNAME_FOR_DIAG, PASSWORD, None)
-    diag = recipes.diagnose(_DiagPage(), sec)
+    diag = page_state.diagnose(_DiagPage(), sec)
     flat = json.dumps(diag)
     assert PASSWORD not in flat and USERNAME_FOR_DIAG not in flat
     assert "SECRETSTATE" not in flat

@@ -59,6 +59,7 @@ import stat
 import sys
 import threading
 import time
+import traceback
 import urllib.parse
 from collections.abc import Callable
 from dataclasses import dataclass, field
@@ -82,13 +83,14 @@ from broker.leakcheck import (  # noqa: E402
 )
 from broker.limiter import Limiter  # noqa: E402
 from broker.origins import origin_allowed  # noqa: E402
+from broker.page_state import diagnose  # noqa: E402
 from broker.peercred import peer_uid  # noqa: E402
 from broker.recipes import (  # noqa: E402
+    NO_PASSKEY_JS,
     LoginFailed,
     RecipeError,
     check_logged_in,
     cscs_portal_ready,
-    diagnose,
     recipe_for,
 )
 from broker.runs import RunTable  # noqa: E402
@@ -193,14 +195,17 @@ class PlaywrightRunner:
             "chromium_sandbox": True,
         }
         try:
-            return pw.chromium.launch_persistent_context(channel="chromium", **kwargs)
+            ctx = pw.chromium.launch_persistent_context(channel="chromium", **kwargs)
         except Exception:  # pylint: disable=broad-exception-caught
             if not self.dev:
                 raise
             # Dev only: the full `chromium` build may be missing from the local
             # Playwright cache; the default build is good enough for a fixture.
             self.channel_fallback = True
-            return pw.chromium.launch_persistent_context(**kwargs)
+            ctx = pw.chromium.launch_persistent_context(**kwargs)
+        # Every page and frame of the context, the already open one included.
+        ctx.add_init_script(NO_PASSKEY_JS)
+        return ctx
 
     def _profile_logged_in(self, page: Any, item: SiteItem) -> bool:
         """The positive check (check URL / sentinel) on the broker's own profile."""
@@ -320,6 +325,15 @@ class PlaywrightRunner:
         except RecipeError:
             self._record_failure(page, item, secret)
             raise
+        except Exception as exc:  # pylint: disable=broad-exception-caught
+            # A Playwright timeout or a detached element: report it like a
+            # recipe failure (screenshot, page picture) and say where it
+            # happened. Whether the secret was already submitted is unknown.
+            self._record_failure(page, item, secret)
+            raise LoginFailed(
+                f"unexpected error in the login recipe: {exception_site(exc)}",
+                submitted=True,
+            ) from exc
         # Snapshot where the recipe ended — the check below navigates away.
         try:
             before = diagnose(page, secret)
@@ -351,6 +365,26 @@ class PlaywrightRunner:
             finally:
                 with contextlib.suppress(Exception):
                     ctx.close()
+
+
+def exception_site(exc: BaseException) -> str:
+    """``TimeoutError in _submit_identifier (recipes.py:612)``: the exception's
+    class and the innermost frame of the broker package it passed through,
+    this module's own frames aside (else the innermost frame at all). Never
+    the message — a Playwright error message may quote page content."""
+    frames = traceback.extract_tb(exc.__traceback__)
+    ours = [
+        f
+        for f in frames
+        if Path(f.filename).parent.name == "broker"
+        and Path(f.filename).name != Path(__file__).name
+    ]
+    where = (ours or frames)[-1:] if frames else []
+    name = type(exc).__name__
+    if not where:
+        return name
+    frame = where[0]
+    return f"{name} in {frame.name} ({Path(frame.filename).name}:{frame.lineno})"
 
 
 def fresh_login_hosts(item: SiteItem) -> list[str]:
