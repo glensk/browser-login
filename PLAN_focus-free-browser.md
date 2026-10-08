@@ -62,22 +62,56 @@ accepted and folded in below.
 
 ### Phase 0 — instruments (acceptance tools, built first)
 
-- [ ] `bin/focus_watch.py` (`-h`, short flags, ✅/❌): pyobjc-framework-Cocoa + -Quartz in a
+- [x] `bin/focus_watch.py` (`-h`, short flags, ✅/❌): pyobjc-framework-Cocoa + -Quartz in a
       `focus` dependency group; Cocoa run loop (`AppHelper.runConsoleEventLoop`) for
       NSWorkspace activation notifications, plus 500 ms polling of
       `frontmostApplication` and CGWindowList (Chrome-for-Testing window creation / z-order,
       reusing `doctor`'s Quartz logic) as a fallback; size-capped rotating log;
       LaunchAgent with `LimitLoadToSessionType=Aqua`. Logs activations of native-prompt
       processes (SecurityAgent, UserNotificationCenter, TCC) too.
-- [ ] Watcher self-test, recorded here: spawn a throwaway headed Chrome with a temp profile
+- [x] Watcher self-test, recorded here: spawn a throwaway headed Chrome with a temp profile
       and activate TextEdit and back — both must be logged.
-- [ ] Append-only, redacted journal in `browser.py`: every up/switch/down/login/guided
+- [x] Append-only, redacted journal in `browser.py`: every up/switch/down/login/guided
       session/focus-capable action with caller pid, parent chain, argv, origins only.
 - [ ] Baseline soak: one working day on today's setup, steals tabulated by source.
 
+### Status 2026-10-08 (handover)
+
+- Phase 0 done: `bin/focus_watch.py` (`f93dcff`; 5 Hz poll, seen-set window tracking,
+  `window_shown` separate from failures, self-test bracketing) — self-test ✅ chrome
+  window_new + TextEdit activate. LaunchAgent `com.albert.focus-watch` installed from the
+  main checkout 2026-10-08 13:53; log `~/.local/state/focus-watch/focus.jsonl`. Journal
+  (`fd7398a`): `~/.cache/claude-browser/journal.jsonl`, `browser.py journal`; all 8
+  `bring_to_front` calls go through `_bring_to_front(page, reason)`.
+- Baseline soak running since 2026-10-08 13:53 (headed setup) → `focus_watch.py -s` on
+  2026-10-09.
+- Phase 1 cold column (disposable profile, home egress, CfT 153.0.8010.12): 12/12 ✅ —
+  claude.ai, chatgpt.com, platform.openai.com, Slack, Notion, CSCS, SWITCH, Smartsheet,
+  Infomaniak, gitlab.datascience.ch, console.anthropic.com (→ platform.claude.com),
+  vaultwarden.dom42.space (LAN, terminal-launched). No challenge anywhere.
+  Diagnostics: the only explicit tell is `HeadlessChrome` in the UA, removed everywhere
+  (page, worker, headers, `/json/version`) by the shipped `--user-agent`. Residual tells,
+  harmless today: `--user-agent` empties high-entropy UA-CH (`fullVersionList`,
+  `platformVersion`, `architecture`) — fix = `Emulation.setUserAgentOverride` with
+  `userAgentMetadata` if a site starts failing; `screen` 800×600; no "Google Chrome" brand
+  (CfT). Open: warm + renewal columns (need `switch headless` on the real profile), EPFL/ETH
+  egress.
+- Phase 3 B spike: stock DevTools screencast REJECTED — WebSocket 403 unless a narrow
+  `--remote-allow-origins` is set, and its key events (`nativeVirtualKeyCode`) hang
+  headless CfT 153 on macOS from the 2nd keystroke; no paste/IME. Own viewer
+  `bin/login_viewer.py` (websockets only): every input item ✅ (scaled clicks, typing,
+  Backspace/Tab/Enter, password paste, äöü€/日本, IME, dead key, Meta+A, wheel), popup
+  reported with `openerId`; one-shot token bound to an HttpOnly cookie, Host/Origin
+  checks, single viewer, owned target created by the relay (`-t` needs `-A`); input→frame
+  p50 10 ms; idle CPU ≈ 0. Background-created tabs need
+  `Emulation.setFocusEmulationEnabled` to render headless. Integration TODOs are listed
+  at the top of the module.
+- Removing `--remote-allow-origins=*`: Chrome then 403s every WebSocket that sends an
+  Origin header (even same-origin); Playwright sends none — audit other consumers first.
+
 ### Phase 1 — headless gate (site outcomes, not fingerprint spoofing)
 
-- [ ] Diagnostic dump in headless + plain UA: `userAgent`, `userAgentData.brands`, request
+- [x] Diagnostic dump in headless + plain UA: `userAgent`, `userAgentData.brands`, request
       `Sec-CH-UA`, `webdriver`, WebGL vendor, `outerWidth` (informational only).
 - [ ] Site matrix, each a real logged-in read, three ways — warm (persisted profile),
       cold (disposable headless profile, no `cf_clearance`), renewal (delete `cf_clearance`
