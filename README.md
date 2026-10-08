@@ -326,6 +326,15 @@ item, `agent-login.py` shows the reason):
 | `agent_fresh_login`        | `true` (also `1`/`yes`/`on`; default `false`): every login first deletes the broker profile's cookies for the cookie hosts and fill origins (host, subdomains, parent domains), skips the "profile still logged in" shortcut and runs the full login (e-mail, password, TOTP). Needed when the bundle must carry an IdP's **session-only** SSO cookie, which the broker profile loses whenever it closes — e.g. SWITCH edu-ID: `agent_cookie_hosts = eduid.ch login.eduid.ch` plus `agent_fresh_login = true` hands the shared Chromium a live `login.eduid.ch` session, so an OIDC authorize there needs no typing. Every call is a real login and counts against the rate limiter. |
 | `agent_pre_click`          | CSS selector of an element clicked as soon as it shows, before the login fields are looked for (only while the page and the element are on a fill origin; skipped when the login password field shows first). Clicked again every 3 s while it stays visible and no login field appears — a SPA can show it before its click handler is attached — e.g. Jellyfin's user picker: `.btnManual` reveals the manual login form.                                                                                                                                                                                                                                                          |
 
+`broker-add.py` (mydotfiles `bin/`) writes these fields and the collection
+membership from the command line. Agents may run it themselves once Albert has
+enrolled Touch ID approval (`vault-touchid enroll -a main`, mydotfiles
+`tools/vault-touchid/`): each run asks for two Touch ID touches — one to open the
+main vault, one after the vault-touchid window has shown every change — and the
+master password never reaches the agent. Without the enrolment it asks for the
+typed master password in a terminal. `-N` (new items from the Keychain) is not
+available through Touch ID; it needs `-P` in a terminal.
+
 ## Troubleshooting
 
 **`open` / `eval` / `doctor` / `login` fail with "could not attach … within
