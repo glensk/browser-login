@@ -64,6 +64,7 @@ from agent_login_jobs import (  # noqa: E402
     SNAPSHOT_INTERVAL_S,
     SNAPSHOT_LABEL,
     _browser,
+    browser_mode,
     install_daily,
     launchagent_plist,
     restore_mode,
@@ -853,6 +854,16 @@ def safari_fix(site: str) -> str:
     return f"run ./agent-login.py -t {site} and read its error (in {here})"
 
 
+def ensure_browser_up() -> bool:
+    """Start the shared Chromium (headless) when it is down. Every site check runs
+    through it: checking while it is down reports each site as logged out."""
+    if browser_mode() is not None:
+        return True
+    print("▶ shared Chromium is down — starting it (browser.py up --headless)")
+    _browser("up", "--headless", quiet=True)
+    return browser_mode() is not None
+
+
 def check_all(*, mail: bool = False) -> int:
     """Every usable site (Safari or broker): logged in? If not, log in. One line
     per site; exit 1 if any stays logged out (and, with `mail`, ONE mail).
@@ -860,6 +871,17 @@ def check_all(*, mail: bool = False) -> int:
     if not wait_for_network():
         print(f"⏸  no network ({NETWORK_HOST} does not resolve) — skipped, no mail")
         return 0
+    if not ensure_browser_up():
+        how = "down, and `browser.py up --headless` did not start it"
+        print(f"❌ shared Chromium: {how} — no site checked")
+        if mail:
+            send_mail(
+                "agent-login: shared Chromium does not start",
+                f"The daily agent-login check found the shared Chromium {how}.\n"
+                "No site was checked. Fix: run `browser.py up` and read its error, "
+                "then ./agent-login.py -c.\n",
+            )
+        return 1
     data = overview()
     failed: list[tuple[str, str]] = []
     if not data["broker_ok"]:

@@ -458,6 +458,7 @@ def _rows(*pairs: tuple[str, str]) -> dict:
 
 
 def test_check_all(monkeypatch, capsys) -> None:
+    monkeypatch.setattr(al, "ensure_browser_up", lambda: True)
     monkeypatch.setattr(
         al,
         "overview",
@@ -492,6 +493,7 @@ def test_check_all(monkeypatch, capsys) -> None:
 
 
 def test_check_all_all_good_sends_nothing(monkeypatch) -> None:
+    monkeypatch.setattr(al, "ensure_browser_up", lambda: True)
     monkeypatch.setattr(al, "overview", lambda: _rows(("anibis", "safari")))
     monkeypatch.setattr(al, "ensure_logged_in", lambda site: (True, "logged in"))
     monkeypatch.setattr(al, "send_mail", pytest.fail)
@@ -499,6 +501,7 @@ def test_check_all_all_good_sends_nothing(monkeypatch) -> None:
 
 
 def test_check_all_broker_down_fails(monkeypatch) -> None:
+    monkeypatch.setattr(al, "ensure_browser_up", lambda: True)
     data = _rows()
     data["broker_ok"], data["broker"] = False, "not installed"
     monkeypatch.setattr(al, "overview", lambda: data)

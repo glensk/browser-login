@@ -7,6 +7,8 @@ import os
 import sys
 from pathlib import Path
 
+import pytest
+
 _PATH = Path(__file__).resolve().parent.parent / "agent-login.py"
 _SPEC = importlib.util.spec_from_file_location("agent_login", _PATH)
 assert _SPEC and _SPEC.loader
@@ -402,3 +404,37 @@ def test_guided_switch_is_the_window_login(monkeypatch) -> None:
     monkeypatch.setattr(al, "assisted_login", fake_assisted_login)
     assert al.manual_login("switch") == 0 and seen == ["switch"]
     assert "-g switch" in al.safari_fix("switch")
+
+
+def test_check_all_starts_a_down_browser(monkeypatch) -> None:
+    """A down shared Chromium is started before any site is checked."""
+    monkeypatch.setattr(al, "wait_for_network", lambda: True)
+    state: dict[str, str | None] = {"mode": None}
+    calls: list[tuple[str, ...]] = []
+
+    def fake_browser(*args: str, quiet: bool = False) -> int:
+        del quiet
+        calls.append(args)
+        state["mode"] = "headless"
+        return 0
+
+    monkeypatch.setattr(al, "_browser", fake_browser)
+    monkeypatch.setattr(al, "browser_mode", lambda: state["mode"])
+    monkeypatch.setattr(
+        al, "overview", lambda: {"broker_ok": True, "broker": "ok", "rows": []}
+    )
+    assert al.check_all() == 0
+    assert calls == [("up", "--headless")]
+
+
+def test_check_all_browser_wont_start(monkeypatch) -> None:
+    """Browser stays down: ONE failure (and one mail), no per-site verdicts."""
+    monkeypatch.setattr(al, "wait_for_network", lambda: True)
+    monkeypatch.setattr(al, "_browser", lambda *a, quiet=False: 1)
+    monkeypatch.setattr(al, "browser_mode", lambda: None)
+    monkeypatch.setattr(al, "overview", pytest.fail)
+    monkeypatch.setattr(al, "record_check", pytest.fail)
+    sent: list = []
+    monkeypatch.setattr(al, "send_mail", lambda *a: sent.append(a))
+    assert al.check_all(mail=True) == 1
+    assert len(sent) == 1 and "does not start" in sent[0][0]
