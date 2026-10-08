@@ -24,6 +24,10 @@ package = false
 # Note: browser.py ALSO self-bootstraps an isolated venv at
 # ~/.cache/claude-browser/venv on first run (it installs playwright/pyotp/requests
 # via uv), so `uv sync` here is optional — it just gives you a project-local .venv.
+# `focus` is a default group so a plain `uv sync` (which removes packages no
+# synced group asks for) never strips pyobjc from under the focus-watch
+# LaunchAgent, which runs bin/focus_watch.py with this project's .venv python.
+default-groups = ["dev", "focus"]
 
 [dependency-groups]
 # pylint and pytest must run inside this venv: browser.py's deferred imports
@@ -34,4 +38,10 @@ dev = [
     "mypy>=2.3.1",
     "pylint>=4",
     "pytest>=9.1.1",
+]
+# bin/focus_watch.py — the macOS focus/window watcher (NSWorkspace activation
+# notifications + CGWindowList polling). macOS-only, hence the markers.
+focus = [
+    "pyobjc-framework-Cocoa>=11; sys_platform == 'darwin'",
+    "pyobjc-framework-Quartz>=11; sys_platform == 'darwin'",
 ]
