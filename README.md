@@ -109,7 +109,12 @@ wipe); `CLAUDE_BROWSER_OPEN_LAUNCH=1` launches a HEADED (guided-login) browser v
 `open -g -n` instead (breaks LAN access — see below; never used for headless);
 `CLAUDE_BROWSER_FOREGROUND=1` forces the direct launch;
 `CLAUDE_BROWSER_CONNECT_TIMEOUT_S` (default 30) bounds every Playwright attach
-(see Troubleshooting). `CLAUDE_BROWSER_HEADLESS` is ignored (headless is the
+(see Troubleshooting). `CLAUDE_BROWSER_LOGIN_TIMEOUT_S` (default 300; a finite
+number > 0, anything else means 300) bounds every unattended `login` — its
+`LoginDeadline` closes the tabs the login opened and exits 124/125; `logged-in`
+gets a fixed 120 s. agent-login's runner kills `browser.py login` at this value
+
+- 90 s as the last resort. Never applied to a guided login (`-g SITE`). `CLAUDE_BROWSER_HEADLESS` is ignored (headless is the
 only mode `up` knows; `CLAUDE_BROWSER_HEADLESS=0` does NOT give a window).
 Separately, the Claude Code wrapper only auto-starts the browser when
 `CLAUDE_BROWSER_AUTOSTART=1` — by default it is lazy (started on first use).
@@ -225,7 +230,9 @@ The record says what the browser is doing NOW; the **journal**
 what before. Every `up`/`switch`/`down`/`login` (a start and an end line with
 mode, `from`→`to`, site and flow, exit code, duration), every window raise
 (`bring_to_front`, with the command and the page's origin), every client
-`register`/`unregister` and an `eval` `watchdog` exit appends one JSON line
+`register`/`unregister`, an `eval` `watchdog` exit and, for a `login`/`logged-in`,
+its `login_step` breadcrumbs, the `owned_target` tabs it opened/closed and a
+fired deadline's `watchdog` line (`step` = where it hung) appends one JSON line
 carrying the pid, ppid and argv — lifecycle, login and raise events also the
 parent chain (5 ancestors, one bounded `ps` before any lock is taken).
 Redacted like `status`, fail closed: any URL is cut to its origin, an `eval`
@@ -234,7 +241,7 @@ count. Appends are single `O_APPEND`
 writes (< 4 KiB, whole lines under concurrency); past 10 MB the file rotates
 to `.1`/`.2`; a journal failure warns once on stderr and never fails the
 command. `browser.py journal` tails it (`-n/--lines N`, default 50, `0` = all;
-`-e/--event up|switch|down|login|bring_to_front|register|unregister|register_refused|revert_headed|headed_lease|guided_login|maintenance|client_pause|client_resume|watchdog_recover`;
+`-e/--event up|switch|down|login|login_step|owned_target|watchdog|bring_to_front|register|unregister|register_refused|revert_headed|headed_lease|guided_login|maintenance|client_pause|client_resume|watchdog_recover`;
 `-j/--json` raw lines).
 
 ## Guided login (assisted-login)
@@ -613,6 +620,8 @@ rc = subprocess.run(["browser.py", "login", "anthropic"], check=False).returncod
 | 3    | the login broker does not answer                                               |
 | 4    | needs Albert: `agent-login.py -g SITE`                                         |
 | 75   | busy: a guided login owns the browser right now — retry later; says NOTHING about the login state (`agent-login.py -c` skips such a site: no `login`, no failure mail) |
+| 124  | `login`/`logged-in` timed out; owned tabs closed; retried once by agent-login |
+| 125  | timed out; tab cleanup unconfirmed; not retried                                |
 
 Resolution is **PATH-first**: with `bin/` on `$PATH`, `browser.py` is callable from
 anywhere. Tools that use the external-dependency convention resolve it as

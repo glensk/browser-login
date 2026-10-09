@@ -86,9 +86,9 @@ browser, never a real Chrome). mypy/pylint are this repo's documented gates (AGE
 
 ## Steps
 
-- [ ] **0. Worktree.** All work in a git worktree — AGENTS.md forbids editing
+- [x] **0. Worktree.** All work in a git worktree — AGENTS.md forbids editing
       `bin/browser.py` in place while consumers exec it.
-- [ ] **1. Constants (`bin/browser.py`).**
+- [x] **1. Constants (`bin/browser.py`).**
   - Generalise `_connect_timeout_s` into `_positive_seconds(raw, default)` (finite > 0,
     else the default); keep the old name as an alias.
   - `LOGIN_TIMEOUT_S = _positive_seconds($CLAUDE_BROWSER_LOGIN_TIMEOUT_S, 300)` —
@@ -100,7 +100,7 @@ browser, never a real Chrome). mypy/pylint are this repo's documented gates (AGE
   - `DEADLINE_CLEANUP_S = 15`.
   - `LOGIN_TIMEOUT_RC = 124`, `LOGIN_TIMEOUT_DIRTY_RC = 125`, commented next to
     `BUSY_RC`/`NEEDS_ALBERT_RC` and in the broker exit-code block (~l. 8707).
-- [ ] **2. `class LoginDeadline`** — command-scoped; no module-level mutable sets.
+- [x] **2. `class LoginDeadline`** — command-scoped; no module-level mutable sets.
   - Fields: `lock`, `armed`, `generation`, `firing`, `port`, `cmd`, `site`, `t0`,
     `owned: set[str]`, `step: str`, and a stack of absolute deadlines (overall + nested
     steps).
@@ -119,7 +119,7 @@ browser, never a real Chrome). mypy/pylint are this repo's documented gates (AGE
   - One accessor, `_active_deadline()`, lets helpers deep in the call stack
     (`_background_page_run`, `_broker_login`, `cmd_token`) call `step_to`/`add_owned`;
     without an active instance they are no-ops.
-- [ ] **3. Fire procedure** (watcher thread, never raises):
+- [x] **3. Fire procedure** (watcher thread, never raises):
   1. stderr: `❌ {cmd} {site}: no progress after {s:g}s in step {step} (a Playwright call
      never returned)`;
   2. `_close_owned_targets(port, snapshot, budget_s=DEADLINE_CLEANUP_S,
@@ -133,7 +133,7 @@ browser, never a real Chrome). mypy/pylint are this repo's documented gates (AGE
 
   Registry/gate/lease flocks die with the process; `_registry_live_clients` reaps the
   leftover file.
-- [ ] **4. Arm in `cmd_login` and `cmd_logged_in`.**
+- [x] **4. Arm in `cmd_login` and `cmd_logged_in`.**
   - `cmd_login`, at the very top (before the Safari check and `_resolve_site`):
     `with _login_deadline(port, "login", site_name, LOGIN_TIMEOUT_S)` unless
     `_maint_owner()`.
@@ -144,7 +144,7 @@ browser, never a real Chrome). mypy/pylint are this repo's documented gates (AGE
     `_scan_token` evaluate on `logged-in cscs`.
   - `login-cscs-assisted` and `assisted-login` are human-only (they need a TTY) and stay
     unarmed; comment the reason.
-- [ ] **5. `_close_owned_targets(port, ids, *, budget_s=30.0,
+- [x] **5. `_close_owned_targets(port, ids, *, budget_s=30.0,
       journal_event="maintenance")` — budgeted and confirming.**
   - One monotonic deadline; each `_cdp_get`/`_cdp_close_target` gets `min(3.0, left)`.
   - Keeps the keep-alive rule (never close the last page).
@@ -152,7 +152,7 @@ browser, never a real Chrome). mypy/pylint are this repo's documented gates (AGE
     `confirmed` = no owned id still listed.
   - Update the maintenance callers (~l. 10103, 10148, 10401, 10565) to keep their old
     behaviour with an explicit budget.
-- [ ] **6. Harden `_background_page_run`.**
+- [x] **6. Harden `_background_page_run`.**
   - **Phase 1 (create):** resolve `_browser_ws_url(port)`, then
     `_cdp_create_background_target(ws_url, start, 5.0)` (raw CDP, bounded), replacing the
     Playwright `new_browser_cdp_session().send(...)` and the first `_connect` entirely;
@@ -164,15 +164,15 @@ browser, never a real Chrome). mypy/pylint are this repo's documented gates (AGE
   - `finally`: close by owned id with `_cdp_close_target(port, tid, 5.0)` (replaces
     `page.close()`/`_switch_close_target`); `drop_owned(tid)` only once a re-list confirms
     it gone, otherwise it stays owned for step 4's command-scope cleanup.
-- [ ] **7. Breadcrumbs.** `_broker_login`: `broker:precheck`, `broker:request`,
+- [x] **7. Breadcrumbs.** `_broker_login`: `broker:precheck`, `broker:request`,
       `broker:cookies`, `broker:storage`, `broker:verify`, `broker:after`. `cmd_token`:
       `token:pick`, `token:goto`, `token:scan`. `_resolve_site`: `resolve`.
-- [ ] **8. One monotonic deadline in `_broker_request`:**
+- [x] **8. One monotonic deadline in `_broker_request`:**
       `deadline = monotonic() + timeout`; before connect, send and every `recv`,
       `sock.settimeout(max(0.01, deadline - now))`; when exhausted, raise
       `BrokerUnavailable("login broker did not answer within {timeout:g}s")`. Also covers
       `_broker_sites` (60 s).
-- [ ] **9. Runner helper (`agent_login_jobs.py`).**
+- [x] **9. Runner helper (`agent_login_jobs.py`).**
   - `@dataclass BrowserRun(rc: int | None, killed: bool, stdout: str, elapsed_s: float)`.
   - `run_browser(*args, timeout_s: float | None, capture: bool = False,
     quiet: bool = False) -> BrowserRun` — `timeout_s` is **required, keyword-only, no
@@ -190,7 +190,7 @@ browser, never a real Chrome). mypy/pylint are this repo's documented gates (AGE
     - `status` = 30; `up`/`switch` = 120; `down`/`open` = 60; `eval -t 30` = 60.
   - `browser_mode()` → `run_browser("status", timeout_s=30, capture=True)`; a killed run
     counts as down/unknown (None).
-- [ ] **10. Route every call site explicitly.**
+- [x] **10. Route every call site explicitly.**
   - **Unattended (bounded):**
     - `agent-login.py`: `ensure_logged_in` (`logged-in`/`login`), `run_test`
       (`login`/`logged-in`), `_assisted_check`/`_claude_check` (`logged-in`),
@@ -203,7 +203,7 @@ browser, never a real Chrome). mypy/pylint are this repo's documented gates (AGE
     (~l. 751).
   - Replace the raw `subprocess.run([... BROWSER_PY ...])` calls (agent-login.py ~l. 677,
     683, 873; agent_login_claude.py ~l. 71) with `run_browser`.
-- [ ] **11. Retry/reporting (`ensure_logged_in`, `run_test`).**
+- [x] **11. Retry/reporting (`ensure_logged_in`, `run_test`).**
   - **124:** run the bounded `logged-in`; if it passes → `logged in (after an inner
     timeout)`; else `ensure_logged_in` retries `login` **once**, `run_test` does not.
   - **125 (dirty):** no retry; report `NOT logged in (browser.py login timed out after
@@ -213,7 +213,7 @@ browser, never a real Chrome). mypy/pylint are this repo's documented gates (AGE
   - Both go into the failure mail.
   - Worst case 2 × (inner + cleanup) + 2 × check ≈ 17 min — bounded and journaled,
     unlike the old unbounded hang. 124/125 are never `BUSY_RC`.
-- [ ] **12. Docs.**
+- [x] **12. Docs.**
   - README exit table: `124 | timed out; owned tabs closed; retried once by agent-login`
     and `125 | timed out; tab cleanup unconfirmed; not retried`.
   - README env list (~l. 107): `CLAUDE_BROWSER_LOGIN_TIMEOUT_S` — default 300, finite
@@ -223,7 +223,7 @@ browser, never a real Chrome). mypy/pylint are this repo's documented gates (AGE
     `LoginDeadline` (tp#843): armed unless the process owns a live maintenance record;
     raw-CDP create/close of owned targets; exit 124/125; runner calls pass an explicit
     `timeout_s` (None only for guided calls)".
-- [ ] **13. Tests — new `tests/test_login_timeout.py`** (no Chrome, ever).
+- [x] **13. Tests — new `tests/test_login_timeout.py`** (no Chrome, ever).
   - a) In-process `_background_page_run`, a fake attach whose `evaluate` blocks,
     `BG_PAGE_STEP_S=0.3`, `_hard_exit` patched → 124 within 2 s; the fake
     `_cdp_close_target` called with the owned tid; journal `watchdog step=bg:fn` and
@@ -253,7 +253,7 @@ browser, never a real Chrome). mypy/pylint are this repo's documented gates (AGE
     `LoginDeadline(0.5)` and blocks → rc 124, lease and gate free, registration reaped.
   - j) Env parsing: invalid/≤ 0/NaN/inf → 300; parity between browser.py's and
     agent_login_jobs's parser.
-- [ ] **14. Tests — extend `tests/test_agent_login.py`.**
+- [x] **14. Tests — extend `tests/test_agent_login.py`.**
   - AST: parse agent-login.py, agent_login_jobs.py, agent_login_claude.py — every
     `subprocess.run`/`Popen` whose argv references `BROWSER_PY` sits inside
     `run_browser`; every `_browser(...)`/`run_browser(...)` call passes `timeout_s=`
@@ -267,6 +267,38 @@ browser, never a real Chrome). mypy/pylint are this repo's documented gates (AGE
 - [ ] **16. Out of scope (separate tp items):** `cmd_token`'s URL-based tab pick
       (`_pick_page` — tp#845); the intermittent Keycloak bounce after injecting the bundle
       is still unexplained.
+
+## Implementation notes (steps 0–14, deviations from the text above)
+
+- Step 1: `_positive_seconds` already names the argparse type, so the env
+  parser is `_env_seconds(raw, default)` (`_connect_timeout_s` stays as an
+  alias); the runner's copy is `agent_login_jobs.env_seconds` (written
+  differently on purpose — pylint's duplicate-code — parity pinned by a
+  hypothesis test).
+- Step 6: phase 1 still registers a client (`_registry_register`, plus
+  `_ensure_page_target`) BEFORE the raw create, like `open -N`: the dropped
+  first `_connect` was also the registration that makes a guided login's
+  record refuse us before we touch its browser. The close goes through
+  `_close_owned_targets(port, [tid], budget_s=5.0, journal_event=None)`
+  (raw `_cdp_close_target` + keep-alive rule + confirming re-list).
+  Playwright detaches (`bg:teardown`) before the raw close (`bg:close`).
+  The attached part is its own helper, `_background_page_attached`.
+- Step 5: `journal_event=None` = no journal line; an unreachable browser whose
+  port refuses connections is down (every id gone, confirmed — the old
+  behaviour), any other failure is unconfirmed. Maintenance callers pass
+  `MAINT_CLOSE_BUDGET_S = 30`.
+- Step 7: every `step_to` is journaled as a `login_step` event (step 15 reads
+  the breadcrumbs from the journal).
+- Step 10: `assisted_login_argv` returns only the browser.py arguments, so
+  `assisted_login_cmd` runs through `_browser(..., timeout_s=None)`.
+- Step 14: the AST rule is per function — any function that spawns a
+  subprocess and names `BROWSER_PY` must be `run_browser`.
+- Step 13h: the target is not marked silent — `FakeCdp` never answers
+  page-session commands, so every Playwright attach stalls anyway.
+  `FakeCdp` gained a `create_stall` knob (13b).
+- Incidental: `tests/test_login_viewer.py::_record` now writes atomically — the
+  relay polls the record from a worker thread, and a read between
+  `write_text`'s truncate and write made the success test flaky.
 
 ## Debate
 

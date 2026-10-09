@@ -145,6 +145,17 @@ framework. It is a **provider**: other repos depend on it, not the reverse. See
   close the last page (a blank keep-alive first, tp#317), and run over raw CDP
   under one deadline. `open -N` and `eval -T` are raw CDP too (no Playwright
   attach).
+- **Every unattended `login`/`logged-in` runs under a `LoginDeadline`**
+  (tp#843): armed at the top of `cmd_login`/`cmd_logged_in` unless the process
+  owns a live maintenance record (`_maint_owner()` — guided logins are never
+  bounded); one watcher thread, nested step deadlines (`_deadline_push`) and
+  `step_to` breadcrumbs (journal `login_step`). Background pages create and
+  close their owned target over raw CDP by id (never `page.close()`);
+  `_close_owned_targets` has one budget and confirms by re-listing. A fired
+  deadline exits 124 (tabs closed) / 125 (unconfirmed) via `_hard_exit`.
+  Runner calls (`agent_login_jobs.run_browser`/`_browser`) always pass an
+  explicit `timeout_s` — `None` only for the two guided calls; the AST test in
+  `tests/test_agent_login.py` enforces it.
 - **`security` (keychain) calls go through `_security_run` only**: new session, no
   timeout, never `kill`/`terminate` — killing a client mid-dialog crashed
   `securityd` (tp#504). Writes are delete-then-add pinned to the default keychain,
