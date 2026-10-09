@@ -1032,6 +1032,8 @@ def check_all(*, mail: bool = False) -> int:
                 "then ./agent-login.py -c.\n",
             )
         return 1
+    # Tabs that killed browser.py runs left (since the last run) go first (tp#845).
+    _browser("reap-owned", quiet=True, timeout_s=browser_timeout("reap-owned"))
     data = overview()
     failed: list[tuple[str, str]] = []
     if not data["broker_ok"]:

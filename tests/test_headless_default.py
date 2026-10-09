@@ -517,17 +517,13 @@ def test_guided_login_allowed_only_headed_under_the_lease(cache, monkeypatch):
     assert not browser._guided_login_allowed(PORT, "notion", "Notion")
 
 
-class _Closer:
-    def close(self):
-        pass
-
-    def stop(self):
-        pass
-
-
 def test_openai_login_exits_needs_albert(cache, monkeypatch, capsys):
-    monkeypatch.setattr(browser, "_connect", lambda port: (_Closer(), _Closer()))
-    monkeypatch.setattr(browser, "_pick_page", lambda b, host: (None, object()))
+    @contextlib.contextmanager
+    def owned(port, *, prepare=None):  # the fresh owned tab (tp#845)
+        yield object()
+
+    monkeypatch.setattr(browser, "_connect", pytest.fail)  # never a picked tab
+    monkeypatch.setattr(browser, "_owned_background_page", owned)
     monkeypatch.setattr(browser, "_chatgpt_logged_in", lambda page: False)
     monkeypatch.setattr(browser, "_browser_mode", lambda port: "headless")
     monkeypatch.setattr(

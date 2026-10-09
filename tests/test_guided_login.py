@@ -686,26 +686,32 @@ def test_viewer_without_brave_is_an_info_line(cache, monkeypatch, tmp_path, caps
 # --- review fixes ----------------------------------------------------------------
 
 
-def test_probe_uses_a_fresh_background_tab_during_a_guided_login(cache, monkeypatch):
-    """`logged-in` never picks a tab (the owned login tab!) while one lives."""
-    used: list[str] = []
+@pytest.mark.parametrize("record", [True, False], ids=["guided", "no-record"])
+def test_probe_uses_a_fresh_background_tab_during_a_guided_login(
+    cache, monkeypatch, record
+):
+    """`logged-in` never picks a tab (the owned login tab!) while a guided
+    login lives — and, since tp#845, not without one either."""
+    used: list[tuple] = []
     monkeypatch.setattr(
         browser, "_connect", lambda *a, **k: pytest.fail("picked an existing tab")
     )
 
-    def background(port, url, fn):
-        used.append(url)
+    def background(port, url, prepare, fn):
+        used.append((url, prepare))
         return True
 
-    monkeypatch.setattr(browser, "_with_background_page", background)
-    _write_record()
+    monkeypatch.setattr(browser, "_background_page_run", background)
+    monkeypatch.delenv(browser.PROBE_BACKGROUND_ENV, raising=False)
+    if record:
+        _write_record()
     for cmd in (
         browser.cmd_slack_logged_in,
         browser.cmd_openai_logged_in,
         browser.cmd_anthropic_logged_in,
     ):
         assert cmd(59990) == 0
-    assert used == ["about:blank"] * 3
+    assert used == [("about:blank", browser._broker_probe_viewport)] * 3
 
 
 @pytest.mark.parametrize(
@@ -1042,9 +1048,6 @@ def disposable(cache, tmp_path):
                     "login_url": f"{base}{path}",
                     "check_url": f"{base}/account",
                     "logged_in_selector": "#account",
-                    # testsite's check picks a tab by origin (like slack/openai/
-                    # claude) — outside a guided login that IS the owned tab.
-                    **({"probe": "pick"} if name == "testsite" else {}),
                 }
                 for name, path in (
                     ("testsite", "/login"),

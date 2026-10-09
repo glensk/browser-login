@@ -1064,19 +1064,15 @@ class _LoginPage:
 def _cscs_login_env(monkeypatch, page):
     import contextlib
 
-    class _Closer:
-        def close(self):
-            pass
+    @contextlib.contextmanager
+    def owned(port, *, prepare=None):  # the fresh owned tab (tp#845)
+        yield page
 
-        def stop(self):
-            pass
-
-    monkeypatch.setattr(browser, "_connect", lambda port: (_Closer(), _Closer()))
+    monkeypatch.setattr(browser, "_connect", pytest.fail)  # never a picked tab
     monkeypatch.setattr(
         browser, "_interaction_lease", lambda *a, **k: contextlib.nullcontext()
     )
-    monkeypatch.setattr(browser, "_pick_portal_page", lambda b: (None, page))
-    monkeypatch.setattr(browser, "_close_stale_cscs_tabs", lambda ctx, keep=None: 0)
+    monkeypatch.setattr(browser, "_owned_background_page", owned)
     monkeypatch.setattr(
         browser, "_cscs_creds", lambda announce, allow_op=False: (("u", "p", "1"), "k")
     )

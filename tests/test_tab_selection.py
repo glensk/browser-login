@@ -7,7 +7,7 @@ Three failure modes are pinned here:
 * ``eval --url SUBSTR`` used to fall back to an arbitrary tab when nothing
   matched — a SharePoint query then ran inside the Slack tab and returned
   Slack's HTML, which reads like an API error instead of a wrong-tab result.
-  `_pick_page(..., require_match=True)` must return no page at all.
+  `_match_page` (reserved for `eval --url`, tp#845) must return no page at all.
 * A Chromium whose last tab was closed keeps running with zero page targets,
   and `connect_over_cdp` then fails for every consumer. `_ensure_page_target`
   creates exactly one blank tab first — and creates none when a tab exists.
@@ -76,34 +76,37 @@ class _Playwright:
         pass
 
 
-# --- _pick_page -------------------------------------------------------------
+# --- _match_page (eval --url only; tp#845) -----------------------------------
 
 
-def test_require_match_refuses_a_non_matching_tab():
+def test_match_refuses_a_non_matching_tab():
     br = _Browser(["https://app.slack.com/client/T1/C1"])
-    ctx, page = browser._pick_page(br, "epflch.sharepoint.com", require_match=True)
+    ctx, page = browser._match_page(br, "epflch.sharepoint.com")
     assert page is None
     assert ctx.created == 0  # and it did not open one either
 
 
-def test_require_match_still_returns_the_matching_tab():
+def test_match_still_returns_the_matching_tab():
     br = _Browser(["https://app.slack.com/client/T1", "https://portal.cscs.ch/"])
-    _ctx, page = browser._pick_page(br, "portal.cscs.ch", require_match=True)
+    _ctx, page = browser._match_page(br, "portal.cscs.ch")
     assert page is not None and page.url == "https://portal.cscs.ch/"
-
-
-def test_default_fallback_is_unchanged_for_the_site_flows():
-    # The in-repo site flows (cscs, slack, claude.ai, …) pick a reusable tab and
-    # NAVIGATE it — they must keep getting a page when nothing matches.
-    br = _Browser(["about:blank", "https://app.slack.com/client/T1"])
-    _ctx, page = browser._pick_page(br, "portal.cscs.ch")
-    assert page is not None and page.url == "https://app.slack.com/client/T1"
 
 
 def test_no_substring_prefers_a_content_tab_over_a_blank_one():
     br = _Browser(["https://example.com/", "about:blank"])
-    _ctx, page = browser._pick_page(br, None)
+    _ctx, page = browser._match_page(br, None)
     assert page is not None and page.url == "https://example.com/"
+
+
+def test_owned_marker_tabs_are_never_matched_and_never_blank():
+    marker = browser._owned_marker_url("ab" * 16)
+    assert not browser._is_blank(marker)
+    br = _Browser([marker])
+    assert browser._match_page(br, None)[1] is None
+    assert browser._match_page(br, "about:blank")[1] is None
+    assert browser._match_page(br, "owned")[1] is None
+    br = _Browser(["about:blank", marker])
+    assert browser._match_page(br, None)[1].url == "about:blank"
 
 
 # --- the zero-tab guard -----------------------------------------------------
@@ -270,7 +273,7 @@ def test_eval_no_match_dedups_before_capping(monkeypatch, capsys):
 def test_eval_matching_still_uses_the_full_url():
     # Only the PRINTED hint shrinks; a path substring still selects the tab.
     br = _Browser(["https://x.test/sites/foo/a", "https://x.test/other"])
-    _ctx, page = browser._pick_page(br, "/sites/foo", require_match=True)
+    _ctx, page = browser._match_page(br, "/sites/foo")
     assert page is not None and page.url.endswith("/a")
 
 

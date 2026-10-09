@@ -271,7 +271,7 @@ LOGIN_TIMEOUT_DIRTY_RC = 125
 # `_browser`'s exit code after the RUNNER killed browser.py (never BUSY_RC).
 KILLED_RC = -9
 # Fixed budgets of the other subcommands (seconds; `logged-in` = 120 + margin;
-# `eval` is always called with `-t 30`).
+# `eval`/`eval-fresh` are always called with `-t 30`).
 BROWSER_TIMEOUTS = {
     "logged-in": 120.0 + RUNNER_MARGIN_S,
     "status": 30.0,
@@ -280,6 +280,8 @@ BROWSER_TIMEOUTS = {
     "down": 60.0,
     "open": 60.0,
     "eval": 60.0,
+    "eval-fresh": 60.0,
+    "reap-owned": 60.0,
 }
 
 
@@ -326,7 +328,8 @@ def run_browser(
     `capture` collects stdout (stderr too, not returned); `quiet` discards
     both; neither = they go to our terminal. On a timeout ``subprocess.run``
     SIGKILLs browser.py only — its `security` children run in their own
-    session and are left alone (tp#504).
+    session and are left alone (tp#504). A killed run cannot close the tab it
+    owned, so `reap_owned_tabs` runs right after (tp#845).
     """
     argv = [sys.executable, str(BROWSER_PY), *args]
     t0 = time.monotonic()
@@ -344,9 +347,20 @@ def run_browser(
         partial = exc.stdout or ""
         if isinstance(partial, bytes):
             partial = partial.decode(errors="replace")
-        return BrowserRun(None, True, partial, time.monotonic() - t0)
+        killed = BrowserRun(None, True, partial, time.monotonic() - t0)
+        if args[:1] != ("reap-owned",):
+            reap_owned_tabs()
+        return killed
     stdout = res.stdout if capture and isinstance(res.stdout, str) else ""
     return BrowserRun(res.returncode, False, stdout, time.monotonic() - t0)
+
+
+def reap_owned_tabs() -> int | None:
+    """`browser.py reap-owned`: close the tabs dead browser.py runs left
+    (after a kill, and at the start of the daily check). Its exit code, None
+    when it had to be killed itself; never raises."""
+    run = run_browser("reap-owned", timeout_s=browser_timeout("reap-owned"), quiet=True)
+    return run.rc
 
 
 def _browser(*args: str, quiet: bool = False, timeout_s: float | None) -> int:

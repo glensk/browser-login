@@ -429,7 +429,7 @@ def test_check_all_starts_a_down_browser(monkeypatch) -> None:
         al, "overview", lambda: {"broker_ok": True, "broker": "ok", "rows": []}
     )
     assert al.check_all() == 0
-    assert calls == [("up",)]
+    assert calls == [("up",), ("reap-owned",)]  # dead runs' tabs first (tp#845)
 
 
 def test_check_all_browser_wont_start(monkeypatch) -> None:
@@ -463,6 +463,7 @@ def test_check_all_browser_dies_mid_run(monkeypatch) -> None:
 
     monkeypatch.setattr(al, "ensure_logged_in", ensure)
     monkeypatch.setattr(al, "record_check", lambda *a, **k: None)
+    monkeypatch.setattr(al, "_browser", lambda *a, **_k: 0)  # never a real one
     assert al.check_all() == 1
     assert seen == ["a"]
 
@@ -475,6 +476,8 @@ _RUNNER_FILES = ("agent-login.py", "agent_login_jobs.py", "agent_login_claude.py
 _GUIDED_UNBOUNDED = {
     ("agent-login.py", "assisted_login"),
     ("agent-login.py", "assisted_login_cmd"),
+    # `login anthropic -e EMAIL`, called inside `guided_window` (tp#845).
+    ("agent_login_claude.py", "claude_login_by_hand"),
 }
 
 
@@ -611,3 +614,85 @@ def test_run_test_never_retries_a_124(monkeypatch, tmp_path):
     assert al.run_test("cscs") == 2
     assert runs.login_calls == 1
     assert "timed out" in al.last_checks(tmp_path / "last.json")["cscs"]["how"]
+
+
+# --- tp#845: claude.ai account in a fresh tab, reaping after a kill ---------------
+
+claude = sys.modules["agent_login_claude"]
+
+
+class _Recorder:
+    """`subprocess.run` stand-in: records argv[2:], answers from `answers`."""
+
+    def __init__(self, answers: list) -> None:
+        self.answers = list(answers)
+        self.calls: list[list[str]] = []
+
+    def __call__(self, argv, **kw):
+        self.calls.append(list(argv[2:]))
+        ans = self.answers.pop(0) if self.answers else (0, "")
+        if ans == "kill":
+            raise subprocess.TimeoutExpired(argv, float(kw.get("timeout") or 0))
+        rc, out = ans
+        return subprocess.CompletedProcess(argv, rc, out, "")
+
+
+@pytest.mark.parametrize(
+    ("answer", "want"),
+    [
+        ((0, '"Albert.Glensk@EPFL.ch"\n'), "albert.glensk@epfl.ch"),
+        ((0, '✓ something\n"a@b.c"\n'), "a@b.c"),  # last line decides
+        ((0, '""\n'), None),  # logged out
+        ((0, "not json\n"), None),
+        ((0, '{"email": "a@b.c"}\n'), None),  # JSON, but not a string
+        ((0, ""), None),
+        ((1, ""), None),  # could not open / JS error
+        ((75, ""), None),  # busy
+        ("kill", None),
+    ],
+)
+def test_claude_account_email_uses_eval_fresh(monkeypatch, answer, want):
+    rec = _Recorder([answer])
+    monkeypatch.setattr(subprocess, "run", rec)
+    assert claude.claude_account_email() == want
+    first = rec.calls[0]
+    assert first[:4] == ["eval-fresh", "-t", "30", "https://claude.ai/"]
+    assert "--url" not in first and "open" not in [c[0] for c in rec.calls]
+    if answer == "kill":
+        assert rec.calls[1:] == [["reap-owned"]]  # the killed run's tab
+    else:
+        assert len(rec.calls) == 1
+
+
+def test_claude_login_by_hand_is_login_anthropic_expect(monkeypatch):
+    seen: list[tuple] = []
+
+    def fake_run(*args, timeout_s, capture=False, quiet=False):
+        del capture, quiet
+        seen.append((args, timeout_s))
+        return jobs.BrowserRun(0, False, "", 0.0)
+
+    monkeypatch.setattr(claude, "run_browser", fake_run)
+    claude.claude_login_by_hand("anthropic-private")
+    want = claude.CLAUDE_ACCOUNTS["anthropic-private"].lower()
+    assert seen == [(("login", "anthropic", "-e", want), None)]
+
+
+def test_a_killed_run_is_followed_by_reap_owned(monkeypatch):
+    rec = _Recorder(["kill", (0, "")])
+    monkeypatch.setattr(subprocess, "run", rec)
+    run = jobs.run_browser("logged-in", "x", timeout_s=1.0)
+    assert run.killed
+    assert rec.calls == [["logged-in", "x"], ["reap-owned"]]
+
+
+def test_a_killed_reap_is_not_reaped_again(monkeypatch):
+    rec = _Recorder(["kill"])
+    monkeypatch.setattr(subprocess, "run", rec)
+    assert jobs.reap_owned_tabs() is None
+    assert rec.calls == [["reap-owned"]]
+
+
+def test_runner_budgets_for_the_new_commands():
+    assert jobs.browser_timeout("eval-fresh") == 60
+    assert jobs.browser_timeout("reap-owned") == 60

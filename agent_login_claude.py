@@ -9,7 +9,6 @@ from __future__ import annotations
 import contextlib
 import json
 import os
-import time
 from collections.abc import Iterator
 
 from agent_login_jobs import _browser, browser_mode, browser_timeout, run_browser
@@ -64,49 +63,45 @@ def browser_site(site: str) -> str:
 
 
 def claude_account_email() -> str | None:
-    """Email of the claude.ai account the shared Chromium is logged into, or None."""
-    for attempt in range(2):
-        run = run_browser(
-            "eval",
-            "--url",
-            "claude.ai",
-            "-t",
-            "30",
-            _CLAUDE_ACCOUNT_JS,
-            timeout_s=browser_timeout("eval"),
-            capture=True,
-        )
-        if run.rc == 0:
-            lines = run.stdout.strip().splitlines()
-            try:
-                email = json.loads(lines[-1]) if lines else ""
-            except ValueError:
-                email = ""
-            return str(email).lower() or None
-        if attempt == 0:  # no claude.ai tab yet
-            _browser(
-                "open",
-                "https://claude.ai/",
-                quiet=True,
-                timeout_s=browser_timeout("open"),
-            )
-            time.sleep(5)
-    return None
+    """Email of the claude.ai account the shared Chromium is logged into, or None.
+
+    Asked in a fresh tab of its own (`browser.py eval-fresh`, tp#845): it is
+    created, loaded, evaluated and closed inside that one run — no tab picked
+    by URL, none left behind. None on any failure: exit != 0 (incl. 75 busy),
+    a killed run, or a last stdout line that is not a JSON string.
+    """
+    run = run_browser(
+        "eval-fresh",
+        "-t",
+        "30",
+        "https://claude.ai/",
+        _CLAUDE_ACCOUNT_JS,
+        timeout_s=browser_timeout("eval-fresh"),
+        capture=True,
+    )
+    if run.killed or run.rc != 0:
+        return None
+    lines = run.stdout.strip().splitlines()
+    if not lines:
+        return None
+    try:
+        email = json.loads(lines[-1])
+    except ValueError:
+        return None
+    if not isinstance(email, str):
+        return None
+    return email.strip().lower() or None
 
 
 def claude_login_by_hand(site: str) -> None:
-    """Open claude.ai/login in the shown window and wait until the account is
-    `site`'s (browser.py's own login waits for the Team admin page instead)."""
-    _browser(
-        "open", "https://claude.ai/login", quiet=True, timeout_s=browser_timeout("open")
-    )
+    """Log the shown window into `site`'s claude.ai account (inside
+    `guided_window`): `browser.py login anthropic -e EMAIL` opens its own tab,
+    brings it to the front under the headed lease, waits (≤ 15 min) until
+    claude.ai says the account is EMAIL, and closes the tab again (tp#845)."""
     want = CLAUDE_ACCOUNTS[site].lower()
     print(
         f"👤 In the Chromium window: log in to claude.ai as {want} (email code). "
         f"Waiting up to {CLAUDE_LOGIN_WAIT_S // 60} min …"
     )
-    deadline = time.monotonic() + CLAUDE_LOGIN_WAIT_S
-    while time.monotonic() < deadline:
-        time.sleep(10)
-        if claude_account_email() == want:
-            return
+    # Guided: browser.py bounds the wait itself (CLAUDE_LOGIN_WAIT_S) — no limit.
+    run_browser("login", "anthropic", "-e", want, timeout_s=None)

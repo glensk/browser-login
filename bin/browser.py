@@ -151,6 +151,7 @@ import json
 import os
 import queue
 import re
+import secrets
 import shutil
 import signal
 import socket
@@ -389,8 +390,8 @@ def _add_open_eval_parsers(sub: Any) -> None:
         help=(
             "Navigate an existing tab already on this URL (compared without "
             "query/fragment) instead of opening a new tab. Picks the oldest "
-            "match — the same tab `eval --url` targets. Mutually exclusive "
-            "with -N."
+            "match. For manual use only — tools open their own tab with -N "
+            "(tp#786/tp#845). Mutually exclusive with -N."
         ),
     )
     pog.add_argument(
@@ -410,8 +411,9 @@ def _add_open_eval_parsers(sub: Any) -> None:
     peg.add_argument(
         "--url",
         default=None,
-        help="Substring to pick the target tab (default: first/active tab). "
-        "Exits 1 when no tab matches — never evaluates in another tab.",
+        help="Substring to pick the target tab (default: the most recent content "
+        "tab). Evaluates only — never navigates it. Exits 1 when no tab "
+        "matches — never evaluates in another tab.",
     )
     peg.add_argument(
         "-T",
@@ -434,6 +436,26 @@ def _add_open_eval_parsers(sub: Any) -> None:
         help=f"hard deadline for the whole eval, attach included (default "
         f"{EVAL_TIMEOUT_S:g}). On expiry: a ❌ line and exit 1. JS already "
         "running in the page is NOT stopped.",
+    )
+    pef = sub.add_parser(
+        "eval-fresh",
+        help="Open URL in a fresh background tab of its own, wait until it has "
+        "loaded (readyState complete, ≤15 s), evaluate JS, print the JSON "
+        "result, close the tab again. Exit 0 ok, 1 not ready / JS error, 2 a "
+        "non-http(s) URL, 75 busy (a guided login owns the browser), 124/125 "
+        "its deadline fired (tab closed / not confirmed).",
+    )
+    pef.add_argument("url", help="http(s) URL to load in the fresh tab.")
+    pef.add_argument("js", help="JavaScript expression to evaluate there.")
+    pef.add_argument(
+        "-t",
+        "--timeout",
+        type=_positive_seconds,
+        default=EVAL_TIMEOUT_S,
+        metavar="SECONDS",
+        help=f"one deadline for the whole command (default {EVAL_TIMEOUT_S:g}); "
+        "on expiry the tab is closed and the exit is 124 (125: close not "
+        "confirmed).",
     )
 
 
@@ -526,6 +548,51 @@ def _add_guided_parsers(sub: Any) -> None:
     )
 
 
+def _add_reap_parser(sub: Any) -> None:
+    """`reap-owned`: close the tabs crashed browser.py processes left (tp#845)."""
+    pro = sub.add_parser(
+        "reap-owned",
+        help="Close the tabs that browser.py processes which died (crash, kill) "
+        "left open — only those of PROVEN-dead owners in the owned-tab ledger "
+        "(<cache>/owned), descendants (popups) first. Live or unknown owners and "
+        "`open -N` tabs are never touched. Exit 0 nothing left open (also: "
+        "another reaper is running), 1 a tab could not be closed, 75 busy.",
+    )
+    pro.add_argument(
+        "-n",
+        "--dry-run",
+        action="store_true",
+        help="only print what would be closed (`would close:` per tab); close "
+        "nothing, change no ledger.",
+    )
+
+
+def _add_login_parsers(sub: Any) -> None:
+    """`login SITE [-e EMAIL]` and `logged-in SITE`."""
+    pl = sub.add_parser(
+        "login", help="Ensure SITE is logged in (automated or assisted)."
+    )
+    pl.add_argument(
+        "site",
+        help="Site to log into (e.g. cscs, anthropic/claude, openai/chatgpt, "
+        "slack, notion, biopolwifi, switch).",
+    )
+    pl.add_argument(
+        "-e",
+        "--expect-account",
+        metavar="EMAIL",
+        default=None,
+        help="anthropic only (else exit 2): the guided, assisted login of THIS "
+        "claude.ai account — needs the headed lease of a guided login (else "
+        "exit 4); waits up to 15 min until /api/account says EMAIL (exit 0), "
+        "exit 2 when another account logged in.",
+    )
+    pli = sub.add_parser(
+        "logged-in", help="Exit 0 if SITE is logged in, 2 if not (no login)."
+    )
+    pli.add_argument("site", help="Site to check.")
+
+
 def _add_close_parser(sub: Any) -> argparse.ArgumentParser:
     """The `close` subparser; returned so `parse_args` can reject bad mixes."""
     pcl: argparse.ArgumentParser = sub.add_parser(
@@ -606,6 +673,8 @@ def parse_args() -> argparse.Namespace:
             "  ./browser.py eval -t 20 'document.title'\n"
             "  ./browser.py open -N https://example.org/   # own tab → target=<id>\n"
             "  ./browser.py eval -T <id> 'location.host'   # eval in exactly that tab\n"
+            "  ./browser.py eval-fresh -t 30 https://claude.ai/ 'location.host'  # own tab\n"
+            "  ./browser.py reap-owned -n      # tabs crashed browser.py runs left (dry run)\n"
             "  ./browser.py close -i <id>      # close the tab you opened\n"
             "  ./browser.py close -n https://app.example.com/login  # dry run, by URL\n"
             "  ./browser.py status -p          # + mark tabs that answer no CDP\n"
@@ -752,19 +821,7 @@ def parse_args() -> argparse.Namespace:
         help="Delete the CSCS credentials stored in the macOS keychain.",
     )
 
-    # --- generic multi-site login (SITE = cscs | anthropic | …) ---
-    pl = sub.add_parser(
-        "login", help="Ensure SITE is logged in (automated or assisted)."
-    )
-    pl.add_argument(
-        "site",
-        help="Site to log into (e.g. cscs, anthropic/claude, openai/chatgpt, "
-        "slack, notion, biopolwifi, switch).",
-    )
-    pli = sub.add_parser(
-        "logged-in", help="Exit 0 if SITE is logged in, 2 if not (no login)."
-    )
-    pli.add_argument("site", help="Site to check.")
+    _add_login_parsers(sub)
     pll = sub.add_parser(
         "login-log",
         help="How often a real login was needed. No SITE = live aggregate across "
@@ -811,6 +868,7 @@ def parse_args() -> argparse.Namespace:
         help="only list the cookies that would be copied (names, never values)",
     )
     _add_guided_parsers(sub)
+    _add_reap_parser(sub)
     sub.add_parser(
         "login-cscs-assisted",
         help="Human-only: the pre-broker CSCS login (keychain / 1Password), "
@@ -966,8 +1024,8 @@ def _ensure_page_target(port: int, timeout: float = 5.0) -> None:
     and ``connect_over_cdp`` then fails for EVERY consumer with "Protocol error
     (Browser.setDownloadBehavior): Browser context management is not supported"
     — Playwright finds no browser context to adopt. One blank tab restores it
-    (tp#317). It is not litter: `cmd_open` and `_pick_page` prefer reusing a
-    blank tab (`_is_blank`) over creating another one. Best effort — if the tab
+    (tp#317). It is not litter: `cmd_open` prefers reusing a blank tab
+    (`_is_blank`) over creating another one. Best effort — if the tab
     cannot be created we fall through and let `connect_over_cdp` raise the real
     error rather than masking it with one of our own.
     """
@@ -1147,10 +1205,19 @@ def _cdp_create_background_target(
     ``Target.createTarget`` with ``background: true`` — the raw counterpart of
     `_open_background_tab`, so no Playwright attach (which waits for every
     page target, tp#693/tp#786) is involved. None on any failure.
+
+    Headless: also ``newWindow: true``. A background tab in the shared window
+    is ``visibilityState: hidden`` (no animation frames — SPAs such as Notion
+    may never render their sentinel, and a throwaway CfT 153 froze such tabs
+    outright), and a foreground tab would hide the tab that was active (the
+    guided-login viewer's screencast). Its own invisible window keeps both
+    visible. Headed (a mode-A guided login): no new window — it would appear.
     """
-    res = _cdp_ws_call(
-        ws_url, "Target.createTarget", {"url": url, "background": True}, budget_s
-    )
+    params: dict[str, Any] = {"url": url, "background": True}
+    port = urllib.parse.urlsplit(ws_url).port
+    if port is not None and _browser_mode(port) == "headless":
+        params["newWindow"] = True
+    res = _cdp_ws_call(ws_url, "Target.createTarget", params, budget_s)
     if res.status != "ok" or res.error:
         return None
     tid = (res.result or {}).get("targetId")
@@ -3386,8 +3453,9 @@ MAINTENANCE_HEARTBEAT_S = 10.0
 MAINTENANCE_HUNG_S = 120.0
 # Exit code of a login that needs Albert (same meaning as the broker's 4).
 NEEDS_ALBERT_RC = 4
-# `logged-in` runs its active check in a fresh background tab, never a picked
-# one, when this is "1" (the guided login's own probes set it).
+# Set to "1" by the guided login's own probes. Since tp#845 every `logged-in`
+# check runs in a fresh owned background tab anyway, so it no longer changes
+# anything; kept so older callers that set it stay valid.
 PROBE_BACKGROUND_ENV = "CLAUDE_BROWSER_PROBE_BACKGROUND"
 # Exit code while a guided login owns the browser (EX_TEMPFAIL): "busy, retry
 # later" — never "not logged in" (2), so checks skip instead of logging in.
@@ -3421,6 +3489,7 @@ _PREFLIGHT_SKIP_CMDS = frozenset(
         "doctor",
         "close-hung",
         "close",
+        "reap-owned",
         "maintenance-watchdog",
     }
 )
@@ -4876,7 +4945,13 @@ def _attach_timeout_message(port: int) -> str:
 
 
 def _is_blank(url: str) -> bool:
-    """True for an empty/new-tab/blank page that's safe to reuse."""
+    """True for an empty/new-tab/blank page that's safe to reuse.
+
+    An owned tab's marker (``about:blank#owned-…``) is NOT blank: that tab
+    belongs to another process (tp#845).
+    """
+    if _is_owned_marker(url):
+        return False
     return not url or url == "about:blank" or url.startswith("chrome://")
 
 
@@ -4928,33 +5003,30 @@ def _open_background_tab(port: int, browser, url: str) -> dict:
     return {"url": info.get("url", url), "title": info.get("title", ""), "id": tid}
 
 
-def _pick_page(browser, url_substr: str | None, *, require_match: bool = False):
-    """Return ``(ctx, page)`` (optionally matching url_substr), creating one if needed.
+def _match_page(browser, url_substr: str | None):
+    """`eval --url`'s tab: ``(ctx, page)``, or ``(ctx, None)`` when none fits.
 
-    With ``require_match`` the caller gets ``(ctx, None)`` when no tab matches,
-    instead of an arbitrary other tab. That is what `eval --url` needs: falling
-    back silently ran a SharePoint query inside a Slack tab and returned Slack's
-    HTML, which reads like an API error rather than a wrong-tab result (tp#317).
-    The in-repo site flows keep the default fallback on purpose — they pick a
-    reusable tab and then NAVIGATE it to their own URL.
+    Reserved for `eval` (tp#845): it EVALUATES in the tab it finds and never
+    navigates it — no in-repo check or login selects a tab by URL any more
+    (they use `_owned_background_page`). With `url_substr`: the first tab
+    whose URL contains it — never another tab (tp#317: falling back silently
+    ran a SharePoint query inside a Slack tab). Without: the most recent
+    content tab, else the most recent tab at all. Tabs still on an owned-tab
+    marker URL (``about:blank#owned-…``, another process's check or login)
+    are never a match.
     """
-    ctx = browser.contexts[0] if browser.contexts else browser.new_context()
-    pages = list(ctx.pages)
+    ctx = browser.contexts[0] if browser.contexts else None
+    pages = [
+        pg
+        for pg in (ctx.pages if ctx is not None else [])
+        if not _is_owned_marker(pg.url)
+    ]
     if url_substr:
-        for pg in pages:
-            if url_substr in pg.url:
-                return ctx, pg
-        if require_match:
-            return ctx, None
-    # Default: prefer a real content tab over an empty new-tab/chrome:// page.
+        return ctx, next((pg for pg in pages if url_substr in pg.url), None)
     content = [pg for pg in pages if not _is_blank(pg.url)]
     if content:
         return ctx, content[-1]
-    if pages:
-        return ctx, pages[-1]
-    # Zero pages only happens right after launch, when Chrome is already
-    # frontmost anyway — the focusing new_page() is fine here.
-    return ctx, ctx.new_page()
+    return ctx, (pages[-1] if pages else None)
 
 
 def _strip_query(url: str) -> str:
@@ -5204,7 +5276,7 @@ def _eval_attached(port: int, js: str, url_substr: str | None) -> int:
     """`eval`'s attach-pick-evaluate body (the watchdog is the caller's)."""
     pw, browser = _connect(port)
     try:
-        ctx, page = _pick_page(browser, url_substr, require_match=True)
+        ctx, page = _match_page(browser, url_substr)
         if page is None:
             # Tabs are named by origin only (tp#337): the path, query, fragment
             # and userinfo of a reset/magic-link/data: tab are secrets, and this
@@ -5212,7 +5284,7 @@ def _eval_attached(port: int, js: str, url_substr: str | None) -> int:
             # (first-appearance order, ×N per repeated origin), THEN cap at 8 —
             # the "+N more" unit is origins, not tabs.
             counts: dict[str, int] = {}
-            for pg in ctx.pages:
+            for pg in ctx.pages if ctx is not None else []:
                 hint = _tab_hint(pg.url)
                 counts[hint] = counts.get(hint, 0) + 1
             hints = [h if n == 1 else f"{h} ×{n}" for h, n in counts.items()]
@@ -5229,6 +5301,72 @@ def _eval_attached(port: int, js: str, url_substr: str | None) -> int:
     finally:
         browser.close()
         pw.stop()
+
+
+# `eval-fresh`: how long the fresh tab may take to reach readyState "complete".
+EVAL_FRESH_READY_S = 15.0
+EVAL_FRESH_POLL_S = 0.25
+
+
+def _eval_fresh_in(page, js: str) -> tuple[str, object]:
+    """`eval-fresh`'s body in its own tab: ``("ok", value)``, ``("not-ready",
+    None)`` or ``("error", one printable line)``."""
+    from playwright.sync_api import Error as PlaywrightError
+
+    deadline = time.monotonic() + EVAL_FRESH_READY_S
+    while True:
+        try:
+            state = page.evaluate("() => document.readyState")
+        except PlaywrightError:
+            state = ""  # mid-navigation: the context was replaced
+        if state == "complete":
+            break
+        if time.monotonic() >= deadline:
+            return "not-ready", None
+        page.wait_for_timeout(EVAL_FRESH_POLL_S * 1000)
+    try:
+        return "ok", page.evaluate(f"() => ({js})")
+    except PlaywrightError as exc:
+        line = (str(exc).splitlines() or ["JS error"])[0]
+        return "error", "".join(c if c.isprintable() else "?" for c in line)[:200]
+
+
+def cmd_eval_fresh(
+    port: int, url: str, js: str, timeout_s: float = EVAL_TIMEOUT_S
+) -> int:
+    """`eval-fresh URL JS`: evaluate in a fresh tab of its own, then close it.
+
+    The tab is created, loaded, evaluated and closed inside this one process
+    (`_background_page_run`: owned, ledgered, closed over raw CDP), under a
+    `LoginDeadline` of `timeout_s` armed even inside a guided login (its -t
+    is a promise). Exit 0 + the JSON result; 1 not ready within
+    EVAL_FRESH_READY_S, a JS error or no tab; 2 a non-http(s) URL; 75 busy;
+    124/125 the deadline fired. Never selects or navigates another tab.
+    """
+    try:
+        scheme = urllib.parse.urlsplit(url).scheme
+    except ValueError:
+        scheme = ""
+    if scheme not in ("http", "https"):
+        print("❌ eval-fresh: URL must be http(s)", file=sys.stderr)
+        return 2
+    hint = _tab_hint(url)
+    with _login_deadline(port, "eval-fresh", hint, timeout_s, always=True):
+        res = _background_page_run(
+            port, url, None, functools.partial(_eval_fresh_in, js=js)
+        )
+    if res is None:
+        return _fail(f"eval-fresh: could not load {hint} in a fresh background tab")
+    kind, value = res
+    if kind == "not-ready":
+        return _fail(
+            f"eval-fresh: {hint} did not finish loading within "
+            f"{EVAL_FRESH_READY_S:g}s — nothing evaluated"
+        )
+    if kind == "error":
+        return _fail(f"eval-fresh: {value}")
+    print(json.dumps(value, indent=2, default=str))
+    return 0
 
 
 # ---------------------------------------------------------------------------
@@ -5966,6 +6104,7 @@ def cmd_doctor(port: int) -> int:
         return 1
     _doctor_mode(log, port)
     _doctor_coordination(log, port)
+    _doctor_owned_ledgers(log)
     before = _doctor_windows_before(log)
     release = _registry_register("browser.py", _purpose(), port)
     try:
@@ -6096,74 +6235,38 @@ def _capture_and_cache_token(ctx, page) -> int:
     return 0
 
 
-def _pick_portal_page(browser):
-    """Return ``(ctx, page)`` preferring a settled, logged-in portal app tab.
-
-    Skips the transient OAuth-callback tabs that a naive ``portal.cscs.ch``
-    substring match would grab (they redirect away mid-evaluate — see
-    ``_on_portal``). Falls back to a ``cscs.ch`` tab (e.g. Keycloak) or any
-    reusable tab when no settled app tab exists; the caller then navigates it.
-    """
-    ctx = browser.contexts[0] if browser.contexts else browser.new_context()
-    for pg in ctx.pages:
-        if _on_portal(pg):
-            return ctx, pg
-    return _pick_page(browser, "cscs.ch")
-
-
-def _close_stale_cscs_tabs(ctx, keep=None) -> int:
-    """Close leftover CSCS OAuth-callback / stale Keycloak tabs; return the count.
-
-    The SSO flow leaves transient ``oauth_login_completed`` and
-    ``api-auth/keycloak/complete`` tabs, plus old ``auth.cscs.ch`` login tabs,
-    that never close themselves. They pile up and slow EVERY ``connect_over_cdp``
-    (which re-attaches to all open tabs) — the usual cause of a sluggish or
-    "hanging" login. They are dead redirect stubs, so closing them is safe; the
-    live ``keep`` page and all non-CSCS tabs are left untouched.
-    """
-    from playwright.sync_api import Error as PlaywrightError
-
-    markers = (
-        "/oauth_login_completed/",
-        "/api-auth/keycloak/complete/",
-        "auth.cscs.ch",
-    )
-    closed = 0
-    for pg in list(ctx.pages):
-        if pg is keep:
-            continue
-        try:
-            if any(m in pg.url for m in markers):
-                pg.close()
-                closed += 1
-        except PlaywrightError:
-            continue
-    return closed
+def _token_in_page(page) -> int:
+    """`cmd_token`'s check, in its own fresh tab: portal → token, Keycloak → 2."""
+    _deadline_step("token:goto")
+    page.goto(PORTAL_PROFILE_URL, wait_until="domcontentloaded")
+    page.wait_for_timeout(1500)
+    if "auth.cscs.ch" in page.url:  # portal bounced us to Keycloak → not logged in
+        _fail(
+            "Not logged in — the portal redirected to Keycloak.\n"
+            "Run: browser.py login cscs   (then re-run: browser.py token)"
+        )
+        return 2  # distinct code: caller maps this to a 'needs login' hint
+    _deadline_step("token:scan")
+    return _capture_and_cache_token(page.context, page)
 
 
 def cmd_token(port: int) -> int:
-    """Read the 40-hex Waldur token from the portal tab and cache it."""
-    _deadline_step("token:pick")
-    pw, browser = _connect(port)
-    try:
-        ctx, page = _pick_portal_page(browser)
-        if not _on_portal(page):
-            _deadline_step("token:goto")
-            page.goto(PORTAL_PROFILE_URL, wait_until="domcontentloaded")
-            page.wait_for_timeout(1500)
-        if "auth.cscs.ch" in page.url:  # portal bounced us to Keycloak → not logged in
-            _fail(
-                "Not logged in — the portal redirected to Keycloak.\n"
-                "Run: browser.py login cscs   (then re-run: browser.py token)"
-            )
-            return 2  # distinct code: caller maps this to a 'needs login' hint
-        _deadline_step("token:scan")
-        rc = _capture_and_cache_token(ctx, page)
-        _close_stale_cscs_tabs(ctx, keep=page)  # clear dead OAuth/login stubs
-        return rc
-    finally:
-        browser.close()
-        pw.stop()
+    """Read the 40-hex Waldur token from the CSCS portal and cache it.
+
+    In a fresh background tab of its own, closed again (tp#845) — never a
+    picked portal tab; lease-free like every check. Run directly (not as
+    `logged-in cscs`) it is bounded by its own LoginDeadline.
+    """
+    with _login_deadline(port, "token", "cscs", LOGGED_IN_TIMEOUT_S):
+        rc = _background_page_run(
+            port, "about:blank", _broker_probe_viewport, _token_in_page
+        )
+    if rc is None:
+        return _fail(
+            "could not read the CSCS portal in a fresh background tab — retry: "
+            "browser.py token"
+        )
+    return int(rc)
 
 
 def _kc_account() -> str:
@@ -6921,81 +7024,72 @@ def cmd_cscs_login(port: int, allow_op: bool = False) -> int:
     up (``cscs-store-creds``, no fingerprint); only with `allow_op` (the
     human-only ``login-cscs-assisted``) else from the single ``op`` item
     (Touch-ID-gated; vault never exposed to the browser). Captures the API token
-    from the SAME connection (no second ``connect_over_cdp``). Idempotent: if
-    already logged in, it skips the login form and just refreshes the token.
+    from the SAME tab. Idempotent: if already logged in, it skips the login
+    form and just refreshes the token.
 
-    Everything that drives the page happens under the INTERACTION lease, so it
-    can never interleave with another tool's clicks (it waits, then fails loud
-    naming the holder).
+    Runs in a fresh background tab it owns (tp#845), closed again with every
+    popup of the SSO flow — never a picked tab. That tab is navigated only
+    under the INTERACTION lease, so it can never interleave with another
+    tool's clicks (it waits, then fails loud naming the holder).
     """
-    pw, browser = _connect(port)
     try:
-        with _interaction_lease("login cscs"):
-            # Prefer a settled portal app tab (already logged in) so we skip a full
-            # SPA reload — the slow part of a repeated `cscs-login`. _pick_portal_page
-            # ignores transient OAuth-callback tabs; only navigate when there is no
-            # settled app tab yet (cold session / Keycloak tab).
-            ctx, page = _pick_portal_page(browser)
-            if not _on_portal(page):
-                # Prune dead OAuth/Keycloak stubs (e.g. an `authentication_expired`
-                # callback left over from a failed run) BEFORE navigating: they
-                # slow every connect_over_cdp and confuse a later tab pick.
-                _close_stale_cscs_tabs(ctx, keep=page)
-                page.goto(PORTAL_PROFILE_URL, wait_until="domcontentloaded")
-                page.wait_for_timeout(1500)
-            if _on_portal(page):
-                print("✓ Already logged into CSCS.")
-            elif "auth.cscs.ch" not in page.url:
+        with _owned_background_page(port) as page:
+            with _interaction_lease("login cscs"):
+                return _cscs_login_owned(page, allow_op)
+    except OwnedTabError as exc:
+        return _fail(f"login cscs: {exc}")
+
+
+def _cscs_login_owned(page, allow_op: bool) -> int:
+    """`cmd_cscs_login` in its owned tab, under the lease."""
+    page.goto(PORTAL_PROFILE_URL, wait_until="domcontentloaded")
+    page.wait_for_timeout(1500)
+    if _on_portal(page):
+        print("✓ Already logged into CSCS.")
+    elif "auth.cscs.ch" not in page.url:
+        return _fail(
+            f"Unexpected page (not portal, not Keycloak): {_tab_hint(page.url)}"
+        )
+    else:
+        cscs_login_mode = "keychain"
+        for attempt in (1, 2):
+            creds, cscs_login_mode = _cscs_creds(
+                announce=attempt == 1, allow_op=allow_op
+            )
+            if creds is None:
                 return _fail(
-                    f"Unexpected page (not portal, not Keycloak): {_tab_hint(page.url)}"
+                    "No CSCS credentials in the macOS keychain. Run "
+                    "`browser.py cscs-store-creds` once (keychain, no "
+                    "fingerprint) — an unattended login never falls back "
+                    "to 1Password/Touch ID."
                 )
-            else:
-                cscs_login_mode = "keychain"
-                for attempt in (1, 2):
-                    creds, cscs_login_mode = _cscs_creds(
-                        announce=attempt == 1, allow_op=allow_op
-                    )
-                    if creds is None:
-                        return _fail(
-                            "No CSCS credentials in the macOS keychain. Run "
-                            "`browser.py cscs-store-creds` once (keychain, no "
-                            "fingerprint) — an unattended login never falls back "
-                            "to 1Password/Touch ID."
-                        )
-                    if _submit_keycloak_login(page, creds):
-                        break
-                    # Only a stale Keycloak auth session earns a retry; a wrong
-                    # password must still fail on the first attempt (retrying it
-                    # would burn a second try toward the account lockout).
-                    if attempt == 2 or not _keycloak_flow_expired(page):
-                        return _fail(
-                            "Login did not reach the portal — wrong "
-                            "username/password/OTP, or an unexpected page "
-                            f"({_tab_hint(page.url)})."
-                        )
-                    print(
-                        "Keycloak aborted the flow (authentication_expired) — "
-                        "restarting the login once from a fresh page."
-                    )
-                    _close_stale_cscs_tabs(ctx, keep=page)
-                    page.goto(PORTAL_PROFILE_URL, wait_until="domcontentloaded")
-                    page.wait_for_timeout(1500)
-                    if _on_portal(page):
-                        break  # the fresh authorization request re-used the SSO session
-                    if "auth.cscs.ch" not in page.url:
-                        return _fail(
-                            f"Retry did not reach the Keycloak form ({_tab_hint(page.url)})."
-                        )
-                print("✓ Logged into CSCS.")
-                _record_login_event("cscs", cscs_login_mode)
-            # Capture the token from THIS connection — no second connect_over_cdp
-            # (cmd_token would re-attach to every open tab again, costing seconds).
-            rc = _capture_and_cache_token(ctx, page)
-            _close_stale_cscs_tabs(ctx, keep=page)  # clear dead OAuth/login stubs
-            return rc
-    finally:
-        browser.close()
-        pw.stop()
+            if _submit_keycloak_login(page, creds):
+                break
+            # Only a stale Keycloak auth session earns a retry; a wrong
+            # password must still fail on the first attempt (retrying it
+            # would burn a second try toward the account lockout).
+            if attempt == 2 or not _keycloak_flow_expired(page):
+                return _fail(
+                    "Login did not reach the portal — wrong "
+                    "username/password/OTP, or an unexpected page "
+                    f"({_tab_hint(page.url)})."
+                )
+            print(
+                "Keycloak aborted the flow (authentication_expired) — "
+                "restarting the login once from a fresh page."
+            )
+            page.goto(PORTAL_PROFILE_URL, wait_until="domcontentloaded")
+            page.wait_for_timeout(1500)
+            if _on_portal(page):
+                break  # the fresh authorization request re-used the SSO session
+            if "auth.cscs.ch" not in page.url:
+                return _fail(
+                    f"Retry did not reach the Keycloak form ({_tab_hint(page.url)})."
+                )
+        print("✓ Logged into CSCS.")
+        _record_login_event("cscs", cscs_login_mode)
+    # The token from THIS tab — no second attach, no second page load.
+    return _capture_and_cache_token(page.context, page)
 
 
 def cmd_cscs_store_creds() -> int:
@@ -7794,116 +7888,207 @@ def _claude_wait_for_login(page, timeout_s: int = 300) -> bool:
     return False
 
 
-def cmd_anthropic_login(port: int) -> int:
+def cmd_anthropic_login(port: int, expect: str | None = None) -> int:
     """Ensure claude.ai is logged in. Idempotent (a warm session just returns 0).
 
     If $ANTHROPIC_LOGIN_EMAIL is set AND himalaya is available, logs in FULLY
     AUTOMATICALLY: triggers the magic-link email, reads it via himalaya, opens the
     link — no password, no manual code. Otherwise (or if that fails) falls back to
     ASSISTED: you complete the email login in the shared window; it auto-detects.
-    Held under the INTERACTION lease — no other tool clicks in the meantime."""
-    pw, browser = _connect(port)
+
+    Everything happens in a fresh background tab this process owns, closed
+    again afterwards (tp#845): the warm probe outside the lease, the login
+    under the INTERACTION lease — no other tool clicks in the meantime.
+    `expect` (``login anthropic -e EMAIL``): see `_anthropic_login_expect`.
+    """
+    if expect is not None:
+        return _anthropic_login_expect(port, expect)
     try:
-        # Warm probe FIRST, outside the lease — the same read-only check
-        # `logged-in` does lease-free, so an ensure-login call with a warm
-        # session never waits behind another tool's interaction.
-        _ctx, page = _pick_page(browser, "claude.ai")
-        if _claude_logged_in(page):
-            print("✓ Already logged into Claude (claude.ai).")
-            return 0
-        with _interaction_lease("login anthropic"):
-            from playwright.sync_api import Error as PlaywrightError
+        with _owned_background_page(port) as page:
+            return _anthropic_login_owned(port, page)
+    except OwnedTabError as exc:
+        return _fail(f"login anthropic: {exc}")
 
-            try:
-                page.goto(CLAUDE_LOGIN_URL, wait_until="domcontentloaded")
-                _bring_to_front(page, "login anthropic", port)
-            except PlaywrightError:
-                pass
 
-            himalaya = _himalaya_bin()
-            auto_attempted = False  # True once auto-login submitted the email
-            if ANTHROPIC_LOGIN_EMAIL and himalaya:
-                print(
-                    f"Automatic login for {ANTHROPIC_LOGIN_EMAIL} (magic-link via himalaya)…",
-                    file=sys.stderr,
-                )
-                result = _claude_auto_login(page, ANTHROPIC_LOGIN_EMAIL, himalaya)
-                if result == "ok":
-                    print("✓ Logged into Claude (claude.ai).")
-                    _record_login_event("anthropic", "auto")
-                    return 0
-                auto_attempted = result == "submitted"
-                print(
-                    "  Automatic login didn't complete — falling back to assisted.",
-                    file=sys.stderr,
-                )
+def _anthropic_login_owned(port: int, page) -> int:
+    """`cmd_anthropic_login` in its owned tab."""
+    # Warm probe FIRST, outside the lease — the same read-only check
+    # `logged-in` does lease-free, so an ensure-login call with a warm
+    # session never waits behind another tool's interaction.
+    if _claude_logged_in(page):
+        print("✓ Already logged into Claude (claude.ai).")
+        return 0
+    with _interaction_lease("login anthropic"):
+        from playwright.sync_api import Error as PlaywrightError
 
-            # Assisted fallback — needs a human at a real window (the automatic
-            # magic-link path above works fine headless, so it is NOT gated).
-            if not _guided_login_allowed(port, "anthropic", "claude.ai"):
-                return NEEDS_ALBERT_RC
-            # If auto already triggered the email, don't re-send.
-            if ANTHROPIC_LOGIN_EMAIL and not auto_attempted:
-                _claude_fill_email_and_continue(page, ANTHROPIC_LOGIN_EMAIL)
-            hint = (
-                "set $ANTHROPIC_LOGIN_EMAIL and install himalaya to fully automate this"
-                if not (ANTHROPIC_LOGIN_EMAIL and himalaya)
-                else "open the login link Anthropic just emailed you"
-            )
+        try:
+            page.goto(CLAUDE_LOGIN_URL, wait_until="domcontentloaded")
+            _bring_to_front(page, "login anthropic", port)
+        except PlaywrightError:
+            pass
+
+        himalaya = _himalaya_bin()
+        auto_attempted = False  # True once auto-login submitted the email
+        if ANTHROPIC_LOGIN_EMAIL and himalaya:
             print(
-                "\n🔐 Claude (claude.ai) needs a login.\n"
-                "   In the shared Chrome window (now in front):\n"
-                "     1. Continue with email"
-                + (
-                    f" (pre-filled: {ANTHROPIC_LOGIN_EMAIL})"
-                    if ANTHROPIC_LOGIN_EMAIL
-                    else ""
-                )
-                + ".\n"
-                "     2. Open the login link Anthropic emails you (or enter the code).\n"
-                "     3. Make sure the org switcher shows 'SDSC · Team plan'.\n"
-                f"   I'll detect success automatically. Tip: {hint}.\n",
+                f"Automatic login for {ANTHROPIC_LOGIN_EMAIL} (magic-link via himalaya)…",
                 file=sys.stderr,
             )
-            if not _claude_wait_for_login(page, timeout_s=300):
-                return _fail(
-                    "Claude login not detected within 5 min. Finish the email login in "
-                    "the shared browser, then re-run: browser.py login anthropic"
-                )
-            print("✓ Logged into Claude (claude.ai).")
+            result = _claude_auto_login(page, ANTHROPIC_LOGIN_EMAIL, himalaya)
+            if result == "ok":
+                print("✓ Logged into Claude (claude.ai).")
+                _record_login_event("anthropic", "auto")
+                return 0
+            auto_attempted = result == "submitted"
+            print(
+                "  Automatic login didn't complete — falling back to assisted.",
+                file=sys.stderr,
+            )
+
+        # Assisted fallback — needs a human at a real window (the automatic
+        # magic-link path above works fine headless, so it is NOT gated).
+        if not _guided_login_allowed(port, "anthropic", "claude.ai"):
+            return NEEDS_ALBERT_RC
+        # If auto already triggered the email, don't re-send.
+        if ANTHROPIC_LOGIN_EMAIL and not auto_attempted:
+            _claude_fill_email_and_continue(page, ANTHROPIC_LOGIN_EMAIL)
+        hint = (
+            "set $ANTHROPIC_LOGIN_EMAIL and install himalaya to fully automate this"
+            if not (ANTHROPIC_LOGIN_EMAIL and himalaya)
+            else "open the login link Anthropic just emailed you"
+        )
+        print(
+            "\n🔐 Claude (claude.ai) needs a login.\n"
+            "   In the shared Chrome window (now in front):\n"
+            "     1. Continue with email"
+            + (
+                f" (pre-filled: {ANTHROPIC_LOGIN_EMAIL})"
+                if ANTHROPIC_LOGIN_EMAIL
+                else ""
+            )
+            + ".\n"
+            "     2. Open the login link Anthropic emails you (or enter the code).\n"
+            "     3. Make sure the org switcher shows 'SDSC · Team plan'.\n"
+            f"   I'll detect success automatically. Tip: {hint}.\n",
+            file=sys.stderr,
+        )
+        if not _claude_wait_for_login(page, timeout_s=300):
+            return _fail(
+                "Claude login not detected within 5 min. Finish the email login in "
+                "the shared browser, then re-run: browser.py login anthropic"
+            )
+        print("✓ Logged into Claude (claude.ai).")
+        _record_login_event("anthropic", "assisted")
+        return 0
+
+
+# `login anthropic -e EMAIL`: how long it waits for Albert, and how often it asks
+# claude.ai which account the tab is logged into.
+EXPECT_ACCOUNT_WAIT_S = 900.0
+EXPECT_ACCOUNT_POLL_S = 10.0
+_CLAUDE_ACCOUNT_JS = (
+    "() => fetch('/api/account').then(r => r.ok ? r.json() : {})"
+    ".then(a => (a && a.email_address) || '').catch(() => '')"
+)
+
+
+def _mask_email(email: str) -> str:
+    """An email reduced to its domain (``…@example.org``) for output lines."""
+    domain = email.rsplit("@", 1)[-1] if "@" in email else ""
+    domain = "".join(ch for ch in domain if ch.isprintable())[:80]
+    return f"…@{domain}" if domain else "another account"
+
+
+def _claude_account(page) -> str:
+    """The email of the claude.ai account the owned tab is logged into, or ''."""
+    from playwright.sync_api import Error as PlaywrightError
+
+    try:
+        email = page.evaluate(_CLAUDE_ACCOUNT_JS)
+    except PlaywrightError:
+        return ""
+    return str(email).strip().lower() if isinstance(email, str) else ""
+
+
+def _anthropic_login_expect(port: int, expect: str) -> int:
+    """`login anthropic -e EMAIL`: assisted only, until the account is EMAIL.
+
+    The guided login of a claude.ai account in its own browser instance
+    (agent-login.py's private account): needs the headed lease
+    (`_guided_login_allowed`, else exit 4), never the magic-link auto path.
+    An owned tab on the login page, brought to the front, EMAIL pre-filled;
+    every EXPECT_ACCOUNT_POLL_S ``/api/account`` is asked IN THAT TAB, for
+    at most EXPECT_ACCOUNT_WAIT_S. Exit 0 once it is EMAIL, 2 when another
+    account logged in (named by its domain only), 1 on timeout.
+    """
+    want = expect.strip().lower()
+    if not _guided_login_allowed(port, "anthropic", "claude.ai"):
+        return NEEDS_ALBERT_RC
+    try:
+        with _owned_background_page(port) as page:
+            with _interaction_lease("login anthropic"):
+                return _anthropic_expect_owned(port, page, want)
+    except OwnedTabError as exc:
+        return _fail(f"login anthropic: {exc}")
+
+
+def _anthropic_expect_owned(port: int, page, want: str) -> int:
+    """`_anthropic_login_expect` in its owned tab, under the lease."""
+    from playwright.sync_api import Error as PlaywrightError
+
+    with contextlib.suppress(PlaywrightError):
+        page.goto(CLAUDE_LOGIN_URL, wait_until="domcontentloaded")
+    with contextlib.suppress(PlaywrightError):
+        _bring_to_front(page, "login anthropic", port)
+    deadline = time.monotonic() + EXPECT_ACCOUNT_WAIT_S
+    current = _claude_account(page)
+    if not current:
+        _claude_fill_email_and_continue(page, want)
+        print(
+            f"👤 In the Chromium window: log in to claude.ai as {want} (email "
+            f"code). Waiting up to {int(EXPECT_ACCOUNT_WAIT_S) // 60} min …",
+            file=sys.stderr,
+        )
+    while True:
+        if current == want:
+            print(f"✓ Logged into Claude (claude.ai) as {want}.")
             _record_login_event("anthropic", "assisted")
             return 0
-    finally:
-        browser.close()
-        pw.stop()
+        if current:
+            print(
+                f"❌ claude.ai is logged into another account ({_mask_email(current)}), "
+                f"not {_mask_email(want)} — log it out first (claude.ai → Log out).",
+                file=sys.stderr,
+            )
+            return 2
+        if time.monotonic() >= deadline:
+            return _fail(
+                f"claude.ai login as {_mask_email(want)} not detected within "
+                f"{int(EXPECT_ACCOUNT_WAIT_S) // 60} min."
+            )
+        try:
+            page.wait_for_timeout(EXPECT_ACCOUNT_POLL_S * 1000)
+        except PlaywrightError:
+            time.sleep(EXPECT_ACCOUNT_POLL_S)
+        current = _claude_account(page)
 
 
-def _logged_in_page_check(
-    port: int, url_substr: str, check: Callable[[Any], bool]
-) -> bool:
+def _logged_in_page_check(port: int, check: Callable[[Any], bool]) -> bool:
     """Run an ACTIVE logged-in `check(page)` (it navigates the page itself).
 
-    Normally on the tab `_pick_page` finds for `url_substr`. While a guided
-    login is live, ONLY in a fresh background tab of its own: the picked tab
-    could be the guided login's OWNED login tab (or its OAuth popup), and the
-    check's navigation would reload Albert's half-typed login every 5 s. The
-    guided login's own probes always run that way ($PROBE_BACKGROUND_ENV),
-    the one before the transaction too: it must not leave or reuse a tab.
+    ALWAYS in a fresh background tab of its own (tp#845), sized like the
+    broker's page (BROKER_PROBE_VIEWPORT) and closed again — never a tab
+    picked by URL: that could be another client's tab, or a guided login's
+    owned login tab, which the check's navigation would reload under Albert.
     """
-    if _maint_live() is not None or os.environ.get(PROBE_BACKGROUND_ENV) == "1":
-        return bool(_with_background_page(port, "about:blank", check))
-    pw, browser = _connect(port)
-    try:
-        _ctx, page = _pick_page(browser, url_substr)
-        return bool(check(page))
-    finally:
-        browser.close()
-        pw.stop()
+    return bool(
+        _background_page_run(port, "about:blank", _broker_probe_viewport, check)
+    )
 
 
 def cmd_anthropic_logged_in(port: int) -> int:
     """Exit 0 if claude.ai is logged in (billing surface reachable), else 2."""
-    if _logged_in_page_check(port, "claude.ai", _claude_logged_in):
+    if _logged_in_page_check(port, _claude_logged_in):
         print("✓ Logged into Claude (claude.ai).")
         return 0
     print("Not logged into Claude (claude.ai).", file=sys.stderr)
@@ -7977,52 +8162,56 @@ def cmd_openai_login(port: int) -> int:
     warm session just returns 0). ChatGPT logs in via Google SSO + 2FA, which
     can't be replayed from stored credentials — a cold session is ASSISTED: you
     complete the SSO once in the shared window; the session then persists. Held
-    under the INTERACTION lease — no other tool clicks in the meantime."""
-    pw, browser = _connect(port)
+    under the INTERACTION lease — no other tool clicks in the meantime. In a
+    fresh background tab this process owns, closed again (tp#845)."""
     try:
-        # Warm probe + guided-login gate FIRST, outside the lease (both are the
-        # read-only checks `logged-in` does lease-free); only the assisted
-        # interaction below needs the exclusive lease.
-        _ctx, page = _pick_page(browser, "chatgpt.com")
-        if _chatgpt_logged_in(page):
-            print("✓ Already logged into ChatGPT (chatgpt.com).")
-            return 0
-        # A cold session needs Albert — only inside a guided login (exit 4).
-        if not _guided_login_allowed(port, "openai", "chatgpt.com"):
-            return NEEDS_ALBERT_RC
-        with _interaction_lease("login openai"):
-            from playwright.sync_api import Error as PlaywrightError
+        with _owned_background_page(port) as page:
+            return _openai_login_owned(port, page)
+    except OwnedTabError as exc:
+        return _fail(f"login openai: {exc}")
 
-            try:
-                _bring_to_front(page, "login openai", port)
-            except PlaywrightError:
-                pass
-            print(
-                "\n🔐 ChatGPT (chatgpt.com) needs a login.\n"
-                "   In the shared Chrome window (now in front):\n"
-                "     1. Log in on the page that opened (Google SSO + 2FA).\n"
-                "        If Google refuses ('this browser may not be secure'), use\n"
-                "        the account's email+password login instead of the SSO button.\n"
-                "     2. Land anywhere on chatgpt.com — success is auto-detected and\n"
-                "        admin access confirmed on chatgpt.com/admin/members.\n",
-                file=sys.stderr,
+
+def _openai_login_owned(port: int, page) -> int:
+    """`cmd_openai_login` in its owned tab."""
+    # Warm probe + guided-login gate FIRST, outside the lease (both are the
+    # read-only checks `logged-in` does lease-free); only the assisted
+    # interaction below needs the exclusive lease.
+    if _chatgpt_logged_in(page):
+        print("✓ Already logged into ChatGPT (chatgpt.com).")
+        return 0
+    # A cold session needs Albert — only inside a guided login (exit 4).
+    if not _guided_login_allowed(port, "openai", "chatgpt.com"):
+        return NEEDS_ALBERT_RC
+    with _interaction_lease("login openai"):
+        from playwright.sync_api import Error as PlaywrightError
+
+        try:
+            _bring_to_front(page, "login openai", port)
+        except PlaywrightError:
+            pass
+        print(
+            "\n🔐 ChatGPT (chatgpt.com) needs a login.\n"
+            "   In the shared Chrome window (now in front):\n"
+            "     1. Log in on the page that opened (Google SSO + 2FA).\n"
+            "        If Google refuses ('this browser may not be secure'), use\n"
+            "        the account's email+password login instead of the SSO button.\n"
+            "     2. Land anywhere on chatgpt.com — success is auto-detected and\n"
+            "        admin access confirmed on chatgpt.com/admin/members.\n",
+            file=sys.stderr,
+        )
+        if not _chatgpt_wait_for_login(page, timeout_s=300):
+            return _fail(
+                "ChatGPT login not detected within 5 min. Finish the SSO login in "
+                "the shared browser, then re-run: browser.py login openai"
             )
-            if not _chatgpt_wait_for_login(page, timeout_s=300):
-                return _fail(
-                    "ChatGPT login not detected within 5 min. Finish the SSO login in "
-                    "the shared browser, then re-run: browser.py login openai"
-                )
-            print("✓ Logged into ChatGPT (chatgpt.com).")
-            _record_login_event("openai", "assisted")
-            return 0
-    finally:
-        browser.close()
-        pw.stop()
+        print("✓ Logged into ChatGPT (chatgpt.com).")
+        _record_login_event("openai", "assisted")
+        return 0
 
 
 def cmd_openai_logged_in(port: int) -> int:
     """Exit 0 if chatgpt.com admin is logged in ('Invite member' reachable), else 2."""
-    if _logged_in_page_check(port, "chatgpt.com", _chatgpt_logged_in):
+    if _logged_in_page_check(port, _chatgpt_logged_in):
         print("✓ Logged into ChatGPT (chatgpt.com).")
         return 0
     print("Not logged into ChatGPT (chatgpt.com).", file=sys.stderr)
@@ -8162,94 +8351,98 @@ def cmd_slack_login(port: int) -> int:
     `slack_api.py` reuses it via `browser.py slack-session`. The wait is PASSIVE
     (10 min) — the page is NOT reloaded while you type, and $SLACK_LOGIN_EMAIL is
     pre-filled when set. Held under the INTERACTION lease throughout, so no other
-    tool clicks in the shared window while you sign in."""
-    pw, browser = _connect(port)
+    tool clicks in the shared window while you sign in. In a fresh background
+    tab this process owns, closed again (tp#845)."""
     try:
-        # Warm probe + guided-login gate FIRST, outside the lease (read-only, the
-        # same checks `logged-in` does lease-free).
-        _ctx, page = _pick_page(browser, "slack.com")
-        if _slack_logged_in(page):
-            print("✓ Already logged into Slack — session persists; nothing to do.")
-            return 0
-        # A cold session needs Albert — only inside a guided login (exit 4).
-        if not _guided_login_allowed(port, "slack", "Slack"):
-            return NEEDS_ALBERT_RC
-        with _interaction_lease("login slack"):
-            from playwright.sync_api import Error as PlaywrightError
+        with _owned_background_page(port) as page:
+            return _slack_login_owned(port, page)
+    except OwnedTabError as exc:
+        return _fail(f"login slack: {exc}")
 
-            # Land straight on the SDSC workspace sign-in (skips the workspace picker).
-            try:
-                page.goto(SLACK_WORKSPACE_URL, wait_until="domcontentloaded")
-                _bring_to_front(page, "login slack", port)
-                page.wait_for_timeout(1500)
-                _slack_prefill_email(page)
-            except PlaywrightError:
-                pass
-            email_note = (
-                f" (email pre-filled: {SLACK_LOGIN_EMAIL})"
-                if SLACK_LOGIN_EMAIL
-                else " (tip: export SLACK_LOGIN_EMAIL=albert.glensk@epfl.ch to pre-fill it)"
+
+def _slack_login_owned(port: int, page) -> int:
+    """`cmd_slack_login` in its owned tab."""
+    # Warm probe + guided-login gate FIRST, outside the lease (read-only, the
+    # same checks `logged-in` does lease-free).
+    if _slack_logged_in(page):
+        print("✓ Already logged into Slack — session persists; nothing to do.")
+        return 0
+    # A cold session needs Albert — only inside a guided login (exit 4).
+    if not _guided_login_allowed(port, "slack", "Slack"):
+        return NEEDS_ALBERT_RC
+    with _interaction_lease("login slack"):
+        from playwright.sync_api import Error as PlaywrightError
+
+        # Land straight on the SDSC workspace sign-in (skips the workspace picker).
+        try:
+            page.goto(SLACK_WORKSPACE_URL, wait_until="domcontentloaded")
+            _bring_to_front(page, "login slack", port)
+            page.wait_for_timeout(1500)
+            _slack_prefill_email(page)
+        except PlaywrightError:
+            pass
+        email_note = (
+            f" (email pre-filled: {SLACK_LOGIN_EMAIL})"
+            if SLACK_LOGIN_EMAIL
+            else " (tip: export SLACK_LOGIN_EMAIL=albert.glensk@epfl.ch to pre-fill it)"
+        )
+        print(
+            "\n🔐 Slack needs a ONE-TIME login (the session then persists).\n"
+            f"   In the shared Chrome window (now in front){email_note}:\n"
+            f"     1. Workspace: swiss-data-science ({SLACK_WORKSPACE_URL}).\n"
+            "     2. Sign in (email code or SSO) as an Owner/Admin.\n"
+            "     3. Land in the workspace — I detect success automatically.\n"
+            "   Take your time — the page is NOT reloaded while you type.\n",
+            file=sys.stderr,
+        )
+        if not _slack_wait_for_login(page, timeout_s=600):
+            return _fail(
+                "Slack login not detected within 10 min. Finish it in the shared "
+                "browser, then re-run: browser.py login slack"
             )
-            print(
-                "\n🔐 Slack needs a ONE-TIME login (the session then persists).\n"
-                f"   In the shared Chrome window (now in front){email_note}:\n"
-                f"     1. Workspace: swiss-data-science ({SLACK_WORKSPACE_URL}).\n"
-                "     2. Sign in (email code or SSO) as an Owner/Admin.\n"
-                "     3. Land in the workspace — I detect success automatically.\n"
-                "   Take your time — the page is NOT reloaded while you type.\n",
-                file=sys.stderr,
-            )
-            if not _slack_wait_for_login(page, timeout_s=600):
-                return _fail(
-                    "Slack login not detected within 10 min. Finish it in the shared "
-                    "browser, then re-run: browser.py login slack"
-                )
-            print("✓ Logged into Slack — session saved in the shared profile.")
-            _record_login_event("slack", "assisted")
-            return 0
-    finally:
-        browser.close()
-        pw.stop()
+        print("✓ Logged into Slack — session saved in the shared profile.")
+        _record_login_event("slack", "assisted")
+        return 0
 
 
 def cmd_slack_logged_in(port: int) -> int:
     """Exit 0 if app.slack.com is logged in, 2 if not."""
-    if _logged_in_page_check(port, "slack.com", _slack_logged_in):
+    if _logged_in_page_check(port, _slack_logged_in):
         print("✓ Logged into Slack (app.slack.com).")
         return 0
     print("Not logged into Slack (app.slack.com).", file=sys.stderr)
     return 2
 
 
+def _slack_session_in_page(page) -> tuple[str, dict | None]:
+    """`cmd_slack_session`'s check + read, in its own fresh tab."""
+    if not _slack_logged_in(page):
+        return "logged-out", None
+    creds = _slack_session_from_page(page.context, page)
+    return ("ok", creds) if creds else ("no-creds", None)
+
+
 def cmd_slack_session(port: int) -> int:
     """Print the live Slack session creds as JSON `{token, cookie, team_domain}`
     for a consumer (slack_api.py) to make admin API calls. These are BEARER
     credentials — emitted to stdout only (like `token` for CSCS), never cached to
-    disk (xoxc rotates) or logged. Exits 2 (with a hint) when not logged in."""
-    pw, browser = _connect(port)
-    try:
-        _ctx, page = _pick_page(browser, "slack.com")
-        if not _slack_logged_in(page):
-            print(
-                "Not logged into Slack. Run: browser.py login slack",
-                file=sys.stderr,
-            )
-            return 2
-        creds = _slack_session_from_page(page.context, page)
-        if not creds:
-            return _fail(
-                "Logged in, but no xoxc token / d cookie found in the Slack tab."
-            )
-        print(json.dumps(creds))
-        return 0
-    finally:
-        browser.close()
-        pw.stop()
-
-
-# ---------------------------------------------------------------------------
-# Biopol WiFi (cloudpath.edificom.cloud) — unattended keychain email+password
-# ---------------------------------------------------------------------------
+    disk (xoxc rotates) or logged. Exits 2 (with a hint) when not logged in.
+    Read in a fresh background tab of its own, closed again (tp#845), under
+    its own LoginDeadline."""
+    with _login_deadline(port, "slack-session", "slack", LOGGED_IN_TIMEOUT_S):
+        res = _background_page_run(
+            port, "about:blank", _broker_probe_viewport, _slack_session_in_page
+        )
+    if res is None:
+        return _fail("could not read Slack in a fresh background tab — retry.")
+    state, creds = res
+    if state == "logged-out":
+        print("Not logged into Slack. Run: browser.py login slack", file=sys.stderr)
+        return 2
+    if creds is None:
+        return _fail("Logged in, but no xoxc token / d cookie found in the Slack tab.")
+    print(json.dumps(creds))
+    return 0
 
 
 def _biopolwifi_logged_in(page) -> bool:
@@ -8281,96 +8474,98 @@ def cmd_biopolwifi_login(port: int) -> int:
     submit — no SSO, no 1Password fallback for this site. Idempotent: a warm
     session (the 'SDSC - Biopole' / 'Properties' sentinel already present) just
     returns 0. No token is extracted; this only keeps the GUI logged in. Held
-    under the INTERACTION lease — no other tool clicks in the meantime."""
-    pw, browser = _connect(port)
+    under the INTERACTION lease — no other tool clicks in the meantime. In a
+    fresh background tab this process owns, navigated only under that lease and
+    closed again (tp#845)."""
     try:
-        with _interaction_lease("login biopolwifi"):
-            from playwright.sync_api import Error as PlaywrightError
+        with _owned_background_page(port) as page:
+            return _biopolwifi_login_owned(page)
+    except OwnedTabError as exc:
+        return _fail(f"login biopolwifi: {exc}")
 
-            _ctx, page = _pick_page(browser, "cloudpath.edificom.cloud")
-            # If the picked tab isn't already on the portal (cold session reuses
-            # whatever content tab _pick_page returned), navigate there and settle.
-            if "cloudpath.edificom.cloud" not in page.url:
-                try:
-                    page.goto(BIOPOLWIFI_PORTAL_URL, wait_until="domcontentloaded")
-                    page.wait_for_timeout(2000)  # let the Vue SPA render
-                except PlaywrightError:
-                    pass
-            # The Vue login form can render a beat after domcontentloaded — WAIT for
-            # the email field before deciding which state we're in (query_selector
-            # right away races the render and returns None). Skip the wait entirely
-            # when the logged-in sentinel is already present (warm session).
-            email_sel = 'input[placeholder="Email Address"]'
-            pass_sel = 'input[placeholder="Password"]'
-            form_ready = False
-            if not _biopolwifi_logged_in(page):
-                try:
-                    page.wait_for_selector(email_sel, timeout=15000, state="visible")
-                    form_ready = True
-                except PlaywrightError:
-                    form_ready = False
-            if not form_ready:
-                # No login form — either already logged in (sentinel) or a stray page.
-                if _biopolwifi_logged_in(page):
-                    print("✓ Already logged into the Cloudpath MDU portal (edificom).")
-                    return 0
-                return _fail(
-                    "Cloudpath portal showed neither the login form nor the logged-in "
-                    f"sentinel — unexpected page ({page.url})."
-                )
-            email = _keychain_get(KEYCHAIN_SVC_BIOPOL_EMAIL)
-            password = _keychain_get(KEYCHAIN_SVC_BIOPOL_PASS)
-            if not (email and password):
-                return _fail(
-                    "No Cloudpath portal credentials in the keychain. "
-                    "Run: browser.py store-creds biopolwifi"
-                )
+
+def _biopolwifi_login_owned(page) -> int:
+    """`cmd_biopolwifi_login` in its owned tab."""
+    with _interaction_lease("login biopolwifi"):
+        from playwright.sync_api import Error as PlaywrightError
+
+        try:
+            page.goto(BIOPOLWIFI_PORTAL_URL, wait_until="domcontentloaded")
+            page.wait_for_timeout(2000)  # let the Vue SPA render
+        except PlaywrightError:
+            pass
+        # The Vue login form can render a beat after domcontentloaded — WAIT for
+        # the email field before deciding which state we're in (query_selector
+        # right away races the render and returns None). Skip the wait entirely
+        # when the logged-in sentinel is already present (warm session).
+        email_sel = 'input[placeholder="Email Address"]'
+        pass_sel = 'input[placeholder="Password"]'
+        form_ready = False
+        if not _biopolwifi_logged_in(page):
             try:
-                page.fill(email_sel, email)
-                page.fill(pass_sel, password)
-                page.click('button:has-text("Login")')
-            except PlaywrightError as exc:
-                return _fail(f"Could not submit the Cloudpath login form: {exc}")
-            # Poll up to ~20s for the logged-in sentinel.
-            for _ in range(40):
-                if _biopolwifi_logged_in(page):
-                    print("✓ Logged into the Cloudpath MDU portal (edificom).")
-                    _record_login_event("biopolwifi", "keychain")
-                    return 0
-                page.wait_for_timeout(500)
+                page.wait_for_selector(email_sel, timeout=15000, state="visible")
+                form_ready = True
+            except PlaywrightError:
+                form_ready = False
+        if not form_ready:
+            # No login form — either already logged in (sentinel) or a stray page.
+            if _biopolwifi_logged_in(page):
+                print("✓ Already logged into the Cloudpath MDU portal (edificom).")
+                return 0
             return _fail(
-                "Cloudpath login did not reach the properties page — wrong "
-                f"email/password, or an unexpected page ({page.url})."
+                "Cloudpath portal showed neither the login form nor the logged-in "
+                f"sentinel — unexpected page ({_tab_hint(page.url)})."
             )
-    finally:
-        browser.close()
-        pw.stop()
+        email = _keychain_get(KEYCHAIN_SVC_BIOPOL_EMAIL)
+        password = _keychain_get(KEYCHAIN_SVC_BIOPOL_PASS)
+        if not (email and password):
+            return _fail(
+                "No Cloudpath portal credentials in the keychain. "
+                "Run: browser.py store-creds biopolwifi"
+            )
+        try:
+            page.fill(email_sel, email)
+            page.fill(pass_sel, password)
+            page.click('button:has-text("Login")')
+        except PlaywrightError as exc:
+            return _fail(f"Could not submit the Cloudpath login form: {exc}")
+        # Poll up to ~20s for the logged-in sentinel.
+        for _ in range(40):
+            if _biopolwifi_logged_in(page):
+                print("✓ Logged into the Cloudpath MDU portal (edificom).")
+                _record_login_event("biopolwifi", "keychain")
+                return 0
+            page.wait_for_timeout(500)
+        return _fail(
+            "Cloudpath login did not reach the properties page — wrong "
+            f"email/password, or an unexpected page ({_tab_hint(page.url)})."
+        )
+
+
+def _biopolwifi_check(page) -> bool:
+    """`logged-in biopolwifi`'s ACTIVE check: load the portal, read the sentinel."""
+    from playwright.sync_api import Error as PlaywrightError
+
+    try:
+        page.goto(BIOPOLWIFI_PORTAL_URL, wait_until="domcontentloaded")
+        page.wait_for_timeout(2500)
+    except PlaywrightError:
+        pass
+    return _biopolwifi_logged_in(page)
 
 
 def cmd_biopolwifi_logged_in(port: int) -> int:
     """Exit 0 if the Cloudpath MDU portal is logged in, 2 if not (no login).
 
-    PASSIVE check: navigate to the portal, settle, and confirm the 'SDSC - Biopole'
-    / 'Properties' sentinel on the properties surface (never merely 'the URL isn't
-    the login form')."""
-    pw, browser = _connect(port)
-    try:
-        from playwright.sync_api import Error as PlaywrightError
-
-        _ctx, page = _pick_page(browser, "cloudpath.edificom.cloud")
-        try:
-            page.goto(BIOPOLWIFI_PORTAL_URL, wait_until="domcontentloaded")
-            page.wait_for_timeout(2500)
-        except PlaywrightError:
-            pass
-        if _biopolwifi_logged_in(page):
-            print("✓ Logged into the Cloudpath MDU portal (edificom).")
-            return 0
-        print("Not logged into the Cloudpath MDU portal (edificom).", file=sys.stderr)
-        return 2
-    finally:
-        browser.close()
-        pw.stop()
+    ACTIVE check in a fresh background tab of its own (`_logged_in_page_check`,
+    tp#845): navigate to the portal, settle, and confirm the 'SDSC - Biopole' /
+    'Properties' sentinel on the properties surface (never merely 'the URL
+    isn't the login form')."""
+    if _logged_in_page_check(port, _biopolwifi_check):
+        print("✓ Logged into the Cloudpath MDU portal (edificom).")
+        return 0
+    print("Not logged into the Cloudpath MDU portal (edificom).", file=sys.stderr)
+    return 2
 
 
 def cmd_biopolwifi_store_creds() -> int:
@@ -8496,7 +8691,7 @@ def _switch_page_verdict(page) -> str:
     return verdict
 
 
-def _switch_page_by_target(browser, tid: str):
+def _page_by_target(browser, tid: str):
     """The Playwright page whose CDP target id is `tid`, or None.
 
     `doctor` finds its probe tab by URL; that is NOT acceptable here — a stale,
@@ -8521,6 +8716,10 @@ def _switch_page_by_target(browser, tid: str):
                     with contextlib.suppress(PlaywrightError):
                         session.detach()
     return None
+
+
+# The pre-tp#845 name (kept for callers outside this file).
+_switch_page_by_target = _page_by_target
 
 
 def _switch_close_target(browser, tid: str) -> None:
@@ -8565,7 +8764,7 @@ def _switch_probe(port: int) -> tuple[str, str]:
     page = None
     url = ""
     try:
-        page = _switch_page_by_target(browser, tid)
+        page = _page_by_target(browser, tid)
         if page is None:
             return ("unknown", "")
         page.wait_for_load_state("domcontentloaded", timeout=10_000)
@@ -8731,72 +8930,63 @@ def cmd_switch_login(port: int) -> int:
     Otherwise (or if that fails) the click runs in the shared window (mode
     ``sso``), and when it lands on login.eduid.ch the run becomes ASSISTED — you
     finish the edu-ID login once there. The interactive part is held under the
-    INTERACTION lease, so no other tool clicks in the meantime.
+    INTERACTION lease, so no other tool clicks in the meantime. The window flow
+    runs in a fresh tab this process owns (brought to the front only under the
+    headed lease), closed again afterwards (tp#845).
     """
-    from playwright.sync_api import Error as PlaywrightError
-
     # Warm probe + guided-login gate FIRST, outside the lease (both are read-only,
     # exactly what `logged-in` does lease-free).
     if _switch_warm_or_via_broker(port):
         return 0
     if not _guided_login_allowed(port, "switch", "Switch Cloud Portal"):
         return NEEDS_ALBERT_RC
-    pw, browser = _connect(port)
     try:
-        with _interaction_lease("login switch"):
-            ctx = browser.contexts[0] if browser.contexts else browser.new_context()
-            page = next((pg for pg in ctx.pages if "cloud.switch.ch" in pg.url), None)
-            if page is None:
-                # Allowed here and nowhere else in this site: the flow is
-                # interactive and the window is headed by the guard above.
-                page = ctx.new_page()
-            try:
-                page.goto(
-                    SWITCH_ORIGIN + SWITCH_LOGIN_PATH, wait_until="domcontentloaded"
-                )
-            except PlaywrightError as exc:
-                return _fail(
-                    f"could not open {SWITCH_ORIGIN}{SWITCH_LOGIN_PATH} in the shared "
-                    f"browser: {exc}"
-                )
-            with contextlib.suppress(PlaywrightError):
-                _bring_to_front(page, "login switch", port)
-            # A failed click is not fatal: it just means no sign-in form was
-            # there (already mid-flow, or already logged in) — fall through to
-            # the wait, which decides on evidence.
-            with contextlib.suppress(PlaywrightError):
-                page.click(SWITCH_SIGN_IN_BUTTON_SELECTOR, timeout=10_000)
-            if _switch_wait_for_login(page, timeout_s=15):
-                print("✓ Logged into Switch Cloud Portal (SSO, no password needed).")
-                _record_login_event("switch", "sso")
-                return 0
-            print(
-                "\n🔐 Switch Cloud Portal (cloud.switch.ch) needs a login.\n"
-                "   In the shared Chrome window (now in front):\n"
-                "     1. Sign in with your SWITCH edu-ID on the page that opened (email,\n"
-                "        password, and the 2-step code unless this browser is remembered).\n"
-                "     2. Land back on cloud.switch.ch — success is auto-detected.\n",
-                file=sys.stderr,
-            )
-            if not _switch_wait_for_login(
-                page, timeout_s=300, poll_s=2.0, heartbeat=True
-            ):
-                return _fail(
-                    "Switch Cloud Portal login not detected within 5 min. Finish the "
-                    "edu-ID login in the shared browser, then re-run: "
-                    "browser.py login switch"
-                )
-            print("✓ Logged into Switch Cloud Portal (cloud.switch.ch).")
-            _record_login_event("switch", "assisted")
-            return 0
-    finally:
-        browser.close()
-        pw.stop()
+        with _owned_background_page(port) as page:
+            with _interaction_lease("login switch"):
+                return _switch_login_owned(port, page)
+    except OwnedTabError as exc:
+        return _fail(f"login switch: {exc}")
 
 
-# ---------------------------------------------------------------------------
-# Login-frequency log (how often a real login was actually needed)
-# ---------------------------------------------------------------------------
+def _switch_login_owned(port: int, page) -> int:
+    """`cmd_switch_login`'s window flow in its owned tab, under the lease."""
+    from playwright.sync_api import Error as PlaywrightError
+
+    try:
+        page.goto(SWITCH_ORIGIN + SWITCH_LOGIN_PATH, wait_until="domcontentloaded")
+    except PlaywrightError as exc:
+        return _fail(
+            f"could not open {SWITCH_ORIGIN}{SWITCH_LOGIN_PATH} in the shared "
+            f"browser: {exc}"
+        )
+    with contextlib.suppress(PlaywrightError):
+        _bring_to_front(page, "login switch", port)
+    # A failed click is not fatal: it just means no sign-in form was
+    # there (already mid-flow, or already logged in) — fall through to
+    # the wait, which decides on evidence.
+    with contextlib.suppress(PlaywrightError):
+        page.click(SWITCH_SIGN_IN_BUTTON_SELECTOR, timeout=10_000)
+    if _switch_wait_for_login(page, timeout_s=15):
+        print("✓ Logged into Switch Cloud Portal (SSO, no password needed).")
+        _record_login_event("switch", "sso")
+        return 0
+    print(
+        "\n🔐 Switch Cloud Portal (cloud.switch.ch) needs a login.\n"
+        "   In the shared Chrome window (now in front):\n"
+        "     1. Sign in with your SWITCH edu-ID on the page that opened (email,\n"
+        "        password, and the 2-step code unless this browser is remembered).\n"
+        "     2. Land back on cloud.switch.ch — success is auto-detected.\n",
+        file=sys.stderr,
+    )
+    if not _switch_wait_for_login(page, timeout_s=300, poll_s=2.0, heartbeat=True):
+        return _fail(
+            "Switch Cloud Portal login not detected within 5 min. Finish the "
+            "edu-ID login in the shared browser, then re-run: "
+            "browser.py login switch"
+        )
+    print("✓ Logged into Switch Cloud Portal (cloud.switch.ch).")
+    _record_login_event("switch", "assisted")
+    return 0
 
 
 def _record_login_event(site_name: str, mode: str) -> None:
@@ -9183,11 +9373,12 @@ class LoginDeadline:  # pylint: disable=too-many-instance-attributes
         _journal("owned_target", op="add", tid=tid, command=self.cmd, site=self.site)
 
     def drop_owned(self, tid: str) -> None:
-        """A target confirmed gone."""
+        """A target confirmed gone (it leaves this process's tab ledger too)."""
         with self.lock:
             if tid not in self.owned:
                 return
             self.owned.discard(tid)
+        _ledger_forget([tid])
         _journal("owned_target", op="close", tid=tid, command=self.cmd, site=self.site)
 
     def owned_ids(self) -> list[str]:
@@ -9237,6 +9428,11 @@ class LoginDeadline:  # pylint: disable=too-many-instance-attributes
                 f"{step} (a Playwright call never returned)\n"
             )
             sys.stderr.flush()
+            if snapshot:  # popups of the owned tabs go too, leaves first (tp#845)
+                infos = _target_snapshot(self.port) or []
+                for kid, _parent, _depth in _page_descendants(infos, snapshot):
+                    self.add_owned(kid)
+                snapshot = _leaves_first(infos, snapshot)
             gone, confirmed = _close_owned_targets(
                 self.port,
                 snapshot,
@@ -9324,12 +9520,14 @@ def _login_deadline(  # pylint: disable=too-many-arguments
     timeout_s: float,
     *,
     end_event: str | None = None,
+    always: bool = False,
 ) -> Iterator[LoginDeadline | None]:
-    """Arm a `LoginDeadline` for the block — unless this process owns the live
-    guided-login record (a human-waiting flow is never bounded) or one is
-    already active. On every exit: disarm, then close whatever the command
+    """Arm a `LoginDeadline` for the block — unless one is already active, or
+    this process owns the live guided-login record (a human-waiting flow is
+    never bounded) and the caller did not ask for `always` (`eval-fresh`: its
+    -t is a promise). On every exit: disarm, then close whatever the command
     still owns (bounded by DEADLINE_CLEANUP_S; ⚠ when unconfirmed)."""
-    if _active_deadline() is not None or _maint_owner():
+    if _active_deadline() is not None or (_maint_owner() and not always):
         yield _active_deadline()
         return
     dl = LoginDeadline(port, cmd, site, timeout_s, end_event=end_event)
@@ -9387,82 +9585,809 @@ def _background_page_run(
     prepare: Callable[[Any], None] | None,
     fn: Callable[[Any], Any],
 ) -> Any:
-    """Shared body of the two background-page helpers (None on any failure).
+    """Shared body of the background-page helpers (None on any failure).
 
-    The tab is created and closed over raw CDP by its target id (bounded, no
-    Playwright attach involved) and is owned by the active `LoginDeadline`
-    from the moment it exists; the whole helper runs under one step deadline
-    (BG_PAGE_STEP_S) whose breadcrumbs ``bg:*`` name the call that hung.
-    """
-    with _deadline_push(BG_PAGE_STEP_S, "background_page"):
-        _deadline_step("bg:create")
-        if not _is_up(port):
-            sys.exit("Shared browser is down. Run: browser.py up")
-        _ensure_page_target(port)  # zero tabs: createTarget may open a window
-        # Registered BEFORE the tab exists, like `open -N`: a guided login's
-        # record refuses us here, before we touch its browser.
-        release = _registry_register("browser.py", _purpose(), port)
-        try:
-            ws_url = _browser_ws_url(port)
-            start = "about:blank" if prepare is not None else url
-            tid = _cdp_create_background_target(ws_url, start, 5.0) if ws_url else None
-            if not tid:
-                return None
-            dl = _active_deadline()
-            if dl is not None:
-                dl.add_owned(tid)
-            try:
-                return _background_page_attached(port, tid, url, prepare, fn)
-            finally:
-                _deadline_step("bg:close")
-                _, confirmed = _close_owned_targets(
-                    port, [tid], budget_s=5.0, journal_event=None
-                )
-                if confirmed and dl is not None:
-                    dl.drop_owned(tid)  # else the command's final cleanup retries
-        finally:
-            release()
-
-
-def _background_page_attached(
-    port: int,
-    tid: str,
-    url: str,
-    prepare: Callable[[Any], None] | None,
-    fn: Callable[[Any], Any],
-) -> Any:
-    """Attach, adopt target `tid`, (prepare +) load `url`, run `fn` — detach.
-
-    Closing the tab is the caller's job (raw CDP by id), never ``page.close()``.
+    One owned tab (`_owned_background_page`, tp#845) under one step deadline
+    (BG_PAGE_STEP_S, the tab's close included) whose breadcrumbs ``bg:*`` name
+    the call that hung: ``prepare(page)`` runs on the blank marker tab, then
+    the tab loads `url` (``about:blank`` = stay blank: `fn` navigates itself)
+    and ``fn(page)`` decides. Returns ``fn``'s result, or None on any
+    `Exception` — never on `SystemExit` (75: a guided login owns the browser)
+    and never on `BrowserAttachTimeout` (a wedged tab is "cannot tell", which
+    `main` reports, not "logged out").
     """
     from playwright.sync_api import Error as PlaywrightError
 
-    _deadline_step("bg:adopt")
-    pw, browser = _connect(port)
-    try:
-        page = _switch_page_by_target(browser, tid)
-        if page is None:
+    with _deadline_push(BG_PAGE_STEP_S, "background_page"):
+        _deadline_step("bg:create")
+        try:
+            with _owned_background_page(port, prepare=prepare) as page:
+                if url != "about:blank":
+                    _deadline_step("bg:goto")
+                    page.goto(url, wait_until="domcontentloaded", timeout=15_000)
+                    _deadline_step("bg:load")
+                    with contextlib.suppress(PlaywrightError):
+                        page.wait_for_load_state("load", timeout=10_000)
+                _deadline_step("bg:fn")
+                return fn(page)
+        except BrowserAttachTimeout:
+            raise
+        except Exception:  # pylint: disable=broad-exception-caught
             return None
+
+
+# ---------------------------------------------------------------------------
+# Owned tabs (tp#845): a check or a login drives only a tab it created itself
+# ---------------------------------------------------------------------------
+# Three kinds of target, three owners:
+#
+#   1. MAINTENANCE-owned — a guided login's `tx.owned` (its `open -N` login tab
+#      and the relay's popups); closed by the transaction and its watchdog.
+#   2. IN-PROCESS EPHEMERAL — `_owned_background_page`: created, driven and
+#      closed inside ONE process. Recorded in that process's OWNED-TAB LEDGER
+#      (`<cache>/owned/<pid>-<rand>.json`) so a crash cannot leak it.
+#   3. PUBLIC `open -N` HANDOFFS — the creator exits and the CALLER owns the
+#      target id. Never ledgered: a pid ledger would reap a live handed-off tab.
+#
+# The ledger is TWO-PHASE: the entry is written with a random MARKER before
+# ``Target.createTarget`` is sent (the tab is created on
+# ``about:blank#owned-<marker>``), and bound to the target id the moment the
+# reply arrives. A crash between the two is still recoverable: the reaper finds
+# the tab by its exact marker URL. The tab is navigated only after the bind.
+#
+# Liveness of a ledger is TRI-STATE (`_owner_state`): ``live`` (the owner's
+# flock on ``<stem>.lock`` is held, or its pid runs with the recorded start
+# time), ``dead`` (flock free and the pid gone or reused), ``unknown``
+# (anything unreadable — never reaped). Only `reap-owned`, the guided-login
+# transaction's start, `_guided_a`'s finally and the maintenance watchdog reap,
+# each under exclusive coordination — never `_preflight`, never `status`.
+#
+# The ledger data is written atomically (tmp + rename, which swaps the inode),
+# so the owner's lifetime flock lives on a sidecar ``<stem>.lock`` that is never
+# replaced. A ledger whose entries are all gone is deleted at once; the next
+# owned tab of the process starts a new stem (a reaper that claimed the old
+# stem can never touch the new one).
+
+OWNED_MARKER_PREFIX = "about:blank#owned-"
+# The ledger directory and the global reaper lock, relative to CACHE_DIR (read
+# at call time, so a disposable instance and the tests get their own).
+OWNED_DIR_NAME = "owned"
+OWNED_REAPER_LOCK_NAME = "owned-reaper.lock"
+# `reap-owned`: one budget for closing a dead owner's tabs.
+REAP_CLOSE_BUDGET_S = 30.0
+# How long a gate-exclusive caller (the watchdog) waits for the gate to reap.
+REAP_GATE_WAIT_S = 5.0
+# How long the deadline watcher thread waits for the ledger's in-process lock.
+LEDGER_LOCK_WAIT_S = 2.0
+
+
+class OwnedTabError(Exception):
+    """An owned background tab could not be recorded, created or adopted."""
+
+
+def _owned_dir() -> Path:
+    """Where the owned-tab ledgers live (`<cache>/owned`)."""
+    return CACHE_DIR / OWNED_DIR_NAME
+
+
+def _owned_marker_url(marker: str) -> str:
+    """The exact URL an owned tab is created on (``about:blank#owned-<marker>``)."""
+    return f"{OWNED_MARKER_PREFIX}{marker}"
+
+
+def _is_owned_marker(url: object) -> bool:
+    """True for a tab still on an owned-tab marker URL (somebody else's tab)."""
+    return isinstance(url, str) and url.startswith(OWNED_MARKER_PREFIX)
+
+
+class OwnedLedger:
+    """This process's owned-tab ledger (see the section comment above).
+
+    Every write runs under an in-process lock (the deadline's watcher thread
+    drops entries too) and, by construction, under the file flock the owner
+    holds from the ledger's creation until it is deleted.
+    """
+
+    def __init__(self, directory: Path) -> None:
+        self.dir = directory
+        self.lock = threading.Lock()
+        self.pid = os.getpid()
+        self.stem: str | None = None
+        self.fd: int | None = None
+        self.lstart: str | None = None
+        self.entries: list[dict[str, object]] = []
+
+    # -- file plumbing (callers hold self.lock) --
+    def _open(self) -> None:
+        """Create ``<stem>.lock`` (O_EXCL) and flock it BEFORE any data exists."""
+        self.dir.mkdir(parents=True, exist_ok=True)
+        while True:
+            stem = f"{self.pid}-{secrets.token_hex(4)}"
+            try:
+                fd = os.open(
+                    str(self.dir / f"{stem}.lock"),
+                    os.O_CREAT | os.O_EXCL | os.O_RDWR,
+                    0o600,
+                )
+                break
+            except FileExistsError:
+                continue
+        # Blocking on purpose: only a reaper probing the brand-new stem (it
+        # reads `unknown` — no data yet, live pid — and lets go) can hold it.
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        self.stem, self.fd = stem, fd
+        self.lstart = _proc_lstart(self.pid)
+
+    def _write(self) -> None:
+        assert self.stem is not None
+        _json_write_atomic(
+            self.dir / f"{self.stem}.json",
+            {
+                "pid": self.pid,
+                "pid_start_time": self.lstart,
+                "entries": self.entries,
+            },
+        )
+
+    def _close_if_empty(self) -> None:
+        """No entry left: delete the ledger (data first, then its lock)."""
+        if self.entries or self.stem is None:
+            return
+        for suffix in (".json", ".lock"):
+            with contextlib.suppress(OSError):
+                (self.dir / f"{self.stem}{suffix}").unlink(missing_ok=True)
+        if self.fd is not None:
+            with contextlib.suppress(OSError):
+                os.close(self.fd)  # drops the flock
+        self.stem, self.fd = None, None
+
+    @contextlib.contextmanager
+    def _locked(self, wait_s: float | None = None) -> Iterator[bool]:
+        got = self.lock.acquire(timeout=-1 if wait_s is None else wait_s)
+        try:
+            yield got
+        finally:
+            if got:
+                self.lock.release()
+
+    # -- the API --
+    def pending(self, marker: str) -> None:
+        """Phase 1: record `marker` (no target id yet). OSError propagates."""
+        with self._locked():
+            if self.stem is None:
+                self._open()
+            self.entries.append(
+                {
+                    "marker": marker,
+                    "tid": None,
+                    "parent": None,
+                    "created": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+                }
+            )
+            try:
+                self._write()
+            except OSError:
+                self.entries.pop()
+                self._close_if_empty()
+                raise
+
+    def bind(self, marker: str, tid: str) -> None:
+        """Phase 2: the target id `marker`'s ``createTarget`` answered."""
+        with self._locked():
+            for entry in self.entries:
+                if entry.get("marker") == marker:
+                    entry["tid"] = tid
+            self._write()
+
+    def add_children(self, parent: str, tids: Sequence[str]) -> None:
+        """Record popups (page descendants) of `parent` before they are closed."""
+        with self._locked():
+            if self.stem is None:
+                return
+            known = {e.get("tid") for e in self.entries}
+            for tid in tids:
+                if tid not in known:
+                    self.entries.append(
+                        {
+                            "marker": None,
+                            "tid": tid,
+                            "parent": parent,
+                            "created": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+                        }
+                    )
+            with contextlib.suppress(OSError):
+                self._write()
+
+    def drop(self, tids: Sequence[str], markers: Sequence[str] = ()) -> None:
+        """Forget targets confirmed gone (and markers that never became one).
+
+        Never raises: the deadline's watcher thread calls it too, so it waits
+        at most LEDGER_LOCK_WAIT_S for the lock (a missed drop only leaves
+        an entry a reaper re-checks).
+        """
+        gone, marks = set(tids), set(markers)
+        with self._locked(LEDGER_LOCK_WAIT_S) as got:
+            if not got or self.stem is None:
+                return
+            keep = [
+                e
+                for e in self.entries
+                if e.get("tid") not in gone
+                and not (e.get("tid") is None and e.get("marker") in marks)
+            ]
+            if len(keep) == len(self.entries):
+                return
+            self.entries = keep
+            if keep:
+                with contextlib.suppress(OSError):
+                    self._write()
+            else:
+                self._close_if_empty()
+
+    def tids(self) -> list[str]:
+        """The target ids recorded right now."""
+        with self._locked(LEDGER_LOCK_WAIT_S):
+            return [str(e["tid"]) for e in self.entries if e.get("tid")]
+
+
+# One ledger per (process, cache dir): a forked child or a test that moves
+# CACHE_DIR gets its own, never its parent's.
+_LEDGERS: dict[tuple[int, str], OwnedLedger] = {}
+_LEDGERS_LOCK = threading.Lock()
+
+
+def _owned_ledger(create: bool = True) -> OwnedLedger | None:
+    """This process's owned-tab ledger (lazily created); None if absent and
+    not `create`."""
+    directory = _owned_dir()
+    key = (os.getpid(), str(directory))
+    with _LEDGERS_LOCK:
+        ledger = _LEDGERS.get(key)
+        if ledger is None and create:
+            ledger = _LEDGERS[key] = OwnedLedger(directory)
+        return ledger
+
+
+def _ledger_forget(tids: Sequence[str]) -> None:
+    """Drop `tids` from this process's ledger, if it has one (never raises)."""
+    ledger = _owned_ledger(create=False)
+    if ledger is not None and tids:
+        ledger.drop(tids)
+
+
+def _ledger_stems(directory: Path) -> list[str]:
+    """Every ledger stem in `directory`: from data, lock and orphaned tmp files."""
+    stems: set[str] = set()
+    try:
+        names = [p.name for p in directory.iterdir()]
+    except OSError:
+        return []
+    for name in names:
+        if name.startswith(".") and name.endswith(".tmp") and ".json." in name:
+            stems.add(name[1:].split(".json.", 1)[0])
+        elif name.endswith(".json") or name.endswith(".lock"):
+            stems.add(name.rsplit(".", 1)[0])
+    return sorted(s for s in stems if s and not s.startswith("."))
+
+
+def _stem_pid(stem: str) -> int | None:
+    head = stem.split("-", 1)[0]
+    return int(head) if head.isdigit() and int(head) > 0 else None
+
+
+def _ledger_pid_state(path: Path) -> str:
+    """The pid half of `_owner_state` for the ledger data at `path`."""
+    rec: dict | None = {}
+    if path.exists():
+        rec = _read_json_dict(path)
+        if rec is None:
+            return "unknown"
+    pid = rec.get("pid") if rec else _stem_pid(path.name[: -len(".json")])
+    if not isinstance(pid, int) or isinstance(pid, bool) or pid <= 0:
+        return "unknown"
+    if not _pid_alive(pid):
+        return "dead"
+    current = _proc_lstart(pid)
+    want = rec.get("pid_start_time") if rec else None
+    if current is None or not want:
+        return "unknown"  # `ps` failed, or the start time was never known
+    return "live" if current == want else "dead"
+
+
+def _owner_state(path: Path) -> str:
+    """``live`` / ``dead`` / ``unknown`` for the ledger whose data is `path`.
+
+    Live: the owner's flock on the sidecar ``.lock`` is held — whatever `ps`
+    says — or its pid runs with the recorded start time. Dead: the flock is
+    free and the pid is gone or reused. Unknown: anything unreadable (``ps``
+    failed, garbage data) — never reaped. Read-only: a probe lock is dropped
+    again at once.
+    """
+    lock = path.with_suffix(".lock")
+    try:
+        fd = os.open(str(lock), os.O_RDONLY)
+    except FileNotFoundError:
+        fd = None
+    except OSError:
+        return "unknown"
+    if fd is not None:
+        try:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_SH | fcntl.LOCK_NB)
+            except OSError:
+                return "live"
+            fcntl.flock(fd, fcntl.LOCK_UN)
+        finally:
+            os.close(fd)
+    return _ledger_pid_state(path)
+
+
+def _target_snapshot(port: int, budget_s: float = 3.0) -> list[dict] | None:
+    """One snapshot of the browser's targets: ``[{targetId, type, url,
+    openerId}]`` from ``Target.getTargets`` (raw CDP) — or, when that cannot be
+    read, from ``/json/list`` without opener ids. None when neither answers."""
+    ws_url = _browser_ws_url(port, timeout=min(2.0, budget_s))
+    if ws_url is not None:
+        res = _cdp_ws_call(ws_url, "Target.getTargets", {}, budget_s)
+        infos = (res.result or {}).get("targetInfos") if res.status == "ok" else None
+        if isinstance(infos, list) and not res.error:
+            return [i for i in infos if isinstance(i, dict)]
+    listing = _cdp_get(port, "/json/list", timeout=min(2.0, budget_s))
+    if not isinstance(listing, list):
+        return None
+    return [
+        {"targetId": t.get("id"), "type": t.get("type"), "url": t.get("url")}
+        for t in listing
+        if isinstance(t, dict)
+    ]
+
+
+def _page_descendants(
+    infos: Sequence[dict], roots: Sequence[str]
+) -> list[tuple[str, str, int]]:
+    """``(tid, parent, depth)`` of every PAGE target opened, transitively, by
+    one of `roots` (``openerId``); iframes/workers are never part of it."""
+    depth = {r: 0 for r in roots}
+    found: list[tuple[str, str, int]] = []
+    changed = True
+    while changed:
+        changed = False
+        for info in infos:
+            tid, opener = info.get("targetId"), info.get("openerId")
+            if info.get("type") != "page" or not isinstance(tid, str) or not tid:
+                continue
+            if tid in depth or not isinstance(opener, str) or opener not in depth:
+                continue
+            depth[tid] = depth[opener] + 1
+            found.append((tid, opener, depth[tid]))
+            changed = True
+    return found
+
+
+def _leaves_first(infos: Sequence[dict], tids: Sequence[str]) -> list[str]:
+    """Close order for `tids` and their page descendants: deepest first.
+
+    The depth is the length of the ``openerId`` chain WITHIN the set, so the
+    order holds also when popups are already recorded next to their opener
+    (a reaper's second pass). Ties keep their order; roots go last.
+    """
+    members = list(
+        dict.fromkeys([*tids, *(k for k, _p, _d in _page_descendants(infos, tids))])
+    )
+    inside = set(members)
+    opener = {
+        i.get("targetId"): i.get("openerId") for i in infos if isinstance(i, dict)
+    }
+
+    def depth(tid: str) -> int:
+        seen: set[str] = set()
+        while opener.get(tid) in inside and tid not in seen:
+            seen.add(tid)
+            tid = str(opener[tid])
+        return len(seen)
+
+    return sorted(members, key=lambda t: -depth(t))
+
+
+def _marker_target(port: int, marker: str) -> str | None:
+    """The target id listed on exactly `marker`'s URL, or None."""
+    url = _owned_marker_url(marker)
+    for info in _target_snapshot(port) or []:
+        if info.get("url") == url and isinstance(info.get("targetId"), str):
+            return str(info["targetId"])
+    return None
+
+
+@contextlib.contextmanager
+def _owned_background_page(
+    port: int, *, prepare: Callable[[Any], None] | None = None
+) -> Iterator[Any]:
+    """A fresh BACKGROUND tab this process owns, adopted by Playwright (tp#845).
+
+    In order: register (a guided login's record refuses with SystemExit 75
+    here — before anything is sent to the browser) → ledger entry with a
+    random marker → raw ``Target.createTarget {url: about:blank#owned-<marker>,
+    background: true}`` in the DEFAULT browser context (so the tab sees the
+    profile's cookies and storage) → bind the target id → attach and adopt
+    the tab by id → ``prepare(page)`` → yield the page, still on its marker
+    URL (callers navigate only after this). No body deadline: a human login
+    may wait in it. On every exit: one ``Target.getTargets`` snapshot, its
+    page descendants (popups, via ``openerId``) recorded, then everything
+    closed leaves-first over raw CDP (`_close_owned_targets`, never
+    ``page.close()``); only confirmed-gone ids leave the ledger. Raises
+    `OwnedTabError` when the tab cannot be recorded, created or adopted.
+    """
+    if not _is_up(port):
+        sys.exit("Shared browser is down. Run: browser.py up")
+    release = _registry_register("browser.py", _purpose(), port)
+    tid: str | None = None
+    marker = secrets.token_hex(16)
+    ledger = _owned_ledger()
+    assert ledger is not None
+    dl = _active_deadline()
+    pw: Any = None
+    browser: Any = None
+    try:
+        _ensure_page_target(port)  # zero tabs: createTarget may open a window
+        tid, lost_reply = _create_owned_target(port, marker, ledger)
+        if dl is not None:
+            dl.add_owned(tid)
+        try:
+            ledger.bind(marker, tid)
+        except OSError as exc:  # the finally still closes it (by its id)
+            raise OwnedTabError(f"cannot record the owned tab: {exc}") from None
+        if lost_reply:  # bound, so the finally closes it — never used
+            raise OwnedTabError("Target.createTarget did not answer in time")
+        _deadline_step("bg:adopt")
+        pw, browser = _connect(port)
+        page = _page_by_target(browser, tid)
+        if page is None:
+            raise OwnedTabError("could not adopt the new background tab")
         if prepare is not None:
             _deadline_step("bg:prepare")
             prepare(page)
-            _deadline_step("bg:goto")
-            page.goto(url, wait_until="domcontentloaded", timeout=15_000)
-        else:
-            _deadline_step("bg:load")
-            page.wait_for_load_state("domcontentloaded", timeout=15_000)
-        _deadline_step("bg:load")
-        with contextlib.suppress(PlaywrightError):
-            page.wait_for_load_state("load", timeout=10_000)
-        _deadline_step("bg:fn")
-        return fn(page)
-    except PlaywrightError:
-        return None
+        yield page
     finally:
-        _deadline_step("bg:teardown")
-        with contextlib.suppress(PlaywrightError):
-            browser.close()  # detaches CDP; the real browser keeps running
-        pw.stop()
+        _deadline_step("bg:close")
+        with contextlib.suppress(Exception):
+            _close_owned_tab(port, tid, marker, ledger, dl)
+        if browser is not None:
+            with contextlib.suppress(Exception):
+                browser.close()  # detaches CDP; the real browser keeps running
+        if pw is not None:
+            with contextlib.suppress(Exception):
+                pw.stop()
+        release()
+
+
+def _create_owned_target(
+    port: int, marker: str, ledger: OwnedLedger
+) -> tuple[str, bool]:
+    """Phase 1 + create: the ledger entry, then ``Target.createTarget`` on the
+    marker URL → ``(tid, lost_reply)``. A lost reply is recovered by the marker
+    (``lost_reply`` True: the caller binds and closes that tab, never uses it);
+    no tab at all → the entry is dropped and `OwnedTabError` raised."""
+    _deadline_step("bg:ledger")
+    try:
+        ledger.pending(marker)
+    except OSError as exc:
+        raise OwnedTabError(f"cannot record the owned tab: {exc}") from None
+    _deadline_step("bg:create")
+    ws_url = _browser_ws_url(port)
+    url = _owned_marker_url(marker)
+    tid = _cdp_create_background_target(ws_url, url, 5.0) if ws_url else None
+    if tid is not None:
+        return tid, False
+    tid = _marker_target(port, marker)  # created after all, reply lost?
+    if tid is None:
+        ledger.drop([], markers=[marker])
+        raise OwnedTabError("could not create a background tab")
+    return tid, True
+
+
+def _close_owned_tab(
+    port: int,
+    tid: str | None,
+    marker: str,
+    ledger: OwnedLedger,
+    dl: "LoginDeadline | None",
+) -> None:
+    """`_owned_background_page`'s cleanup: popups recorded, all closed
+    leaves-first, confirmed-gone ids dropped (the rest stay owned)."""
+    if tid is None:
+        return
+    infos = _target_snapshot(port) or []
+    for kid, parent, _depth in _page_descendants(infos, [tid]):
+        ledger.add_children(parent, [kid])
+        if dl is not None:
+            dl.add_owned(kid)
+    gone, _confirmed = _close_owned_targets(
+        port,
+        _leaves_first(infos, [tid]),
+        budget_s=DEADLINE_CLEANUP_S,
+        journal_event="owned_tab",
+    )
+    ledger.drop(gone, markers=[marker] if tid in gone else [])
+    if dl is not None:
+        for gid in gone:
+            dl.drop_owned(gid)  # else the command's final cleanup retries
+
+
+# --- reaping the tabs of dead owners -------------------------------------------
+
+
+@dataclass
+class ReapReport:
+    """What one `_reap_owned` pass did (or, dry run, would do)."""
+
+    busy: bool = False
+    owners: list[str] = dataclasses.field(default_factory=list)
+    closed: list[str] = dataclasses.field(default_factory=list)
+    left: list[str] = dataclasses.field(default_factory=list)
+    would_close: list[str] = dataclasses.field(default_factory=list)
+    skipped: dict[str, str] = dataclasses.field(default_factory=dict)
+
+
+@dataclass
+class _Claim:
+    """A dead owner's ledger, claimed by this reaper (its lock fd held)."""
+
+    stem: str
+    fd: int
+    rec: dict
+
+
+def _claim_ledger(directory: Path, stem: str) -> "_Claim | str":
+    """Claim `stem` iff its owner is proven dead; else its state (or "gone").
+
+    The claim is a non-blocking flock on the ledger's ``.lock``, KEPT until
+    the reaper is done — a second reaper (or a killed one's successor) can
+    claim the ledger only once this one let go.
+    """
+    lock = directory / f"{stem}.lock"
+    created = False
+    try:
+        fd = os.open(str(lock), os.O_RDWR)
+    except FileNotFoundError:
+        # Only a reaper deletes a lock (data first): what is left (data or
+        # temp files) belongs to a dead owner's ledger — claim it by a new lock.
+        try:
+            fd = os.open(str(lock), os.O_RDWR | os.O_CREAT | os.O_EXCL, 0o600)
+            created = True
+        except OSError:
+            return "gone"
+    except OSError:
+        return "unknown"
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        os.close(fd)
+        return "live"
+    try:
+        here, held = os.stat(str(lock)), os.fstat(fd)
+        same = (here.st_dev, here.st_ino) == (held.st_dev, held.st_ino)
+    except OSError:
+        same = False
+    state = _ledger_pid_state(directory / f"{stem}.json") if same else "gone"
+    if state != "dead":
+        if created:
+            with contextlib.suppress(OSError):
+                lock.unlink()
+        os.close(fd)  # drops the probe lock
+        return state
+    rec = _read_json_dict(directory / f"{stem}.json") or {}
+    return _Claim(stem, fd, rec)
+
+
+def _claim_entries(claim: _Claim) -> list[dict]:
+    entries = claim.rec.get("entries")
+    return (
+        [e for e in entries if isinstance(e, dict)] if isinstance(entries, list) else []
+    )
+
+
+def _claim_write(directory: Path, claim: _Claim, entries: list[dict]) -> None:
+    """Persist a claimed ledger's entries — or delete it when none are left."""
+    if entries:
+        _json_write_atomic(
+            directory / f"{claim.stem}.json", {**claim.rec, "entries": entries}
+        )
+        return
+    for path in directory.glob(f".{claim.stem}.json.*.tmp"):
+        with contextlib.suppress(OSError):
+            path.unlink()
+    for suffix in (".json", ".lock"):
+        with contextlib.suppress(OSError):
+            (directory / f"{claim.stem}{suffix}").unlink(missing_ok=True)
+
+
+def _reap_claim(
+    port: int,
+    directory: Path,
+    claim: _Claim,
+    snapshot: list[dict] | None,
+    *,
+    report: ReapReport,
+    dry_run: bool,
+) -> None:
+    """Close one dead owner's tabs (descendants first), keep what stays open."""
+    entries = _claim_entries(claim)
+    if snapshot is None:
+        if not _port_refuses(port, 1.0):  # cannot see the tabs: touch nothing
+            report.left += [
+                f"{claim.stem}:{e.get('tid') or e.get('marker')}" for e in entries
+            ]
+            return
+        snapshot = []  # the browser is down: every tab of it is gone
+    by_url = {str(i.get("url")): i.get("targetId") for i in snapshot}
+    for entry in entries:  # phase-1 entries: resolve by their exact marker URL
+        if not entry.get("tid") and entry.get("marker"):
+            tid = by_url.get(_owned_marker_url(str(entry["marker"])))
+            if isinstance(tid, str) and tid:
+                entry["tid"] = tid
+    listed = {i.get("targetId") for i in snapshot}
+    roots = [str(e["tid"]) for e in entries if e.get("tid") in listed]
+    kids = _page_descendants(snapshot, roots)
+    known = {e.get("tid") for e in entries}
+    entries += [
+        {"marker": None, "tid": kid, "parent": parent, "created": None}
+        for kid, parent, _d in kids
+        if kid not in known
+    ]
+    order = _leaves_first(snapshot, roots)
+    if dry_run:
+        report.would_close += order
+        return
+    if order:
+        _claim_write(directory, claim, entries)  # descendants on record first
+        gone, _confirmed = _close_owned_targets(
+            port, order, budget_s=REAP_CLOSE_BUDGET_S, journal_event=None
+        )
+    else:
+        gone = []
+    remaining = [
+        e for e in entries if e.get("tid") in order and e.get("tid") not in gone
+    ]
+    _claim_write(directory, claim, remaining)
+    report.closed += gone
+    report.left += [str(e["tid"]) for e in remaining]
+    _journal(
+        "reap_owned",
+        owner=claim.stem,
+        closed=len(gone),
+        left=len(remaining),
+    )
+
+
+def _reap_owned(
+    port: int, *, dry_run: bool = False, coordinated: bool = True
+) -> ReapReport:
+    """Close the tabs of proven-DEAD owners' ledgers; the report.
+
+    `coordinated` = the caller already holds the coordination this needs (the
+    guided-login transaction: record + interaction lease; the watchdog: the
+    gate exclusively). Otherwise (`reap-owned`) it registers first — a foreign
+    guided login refuses with 75 — and takes the interaction lease. Either
+    way a global non-blocking reaper lock makes a concurrent pass a no-op
+    (``busy``). Never called from `_preflight` or `status`.
+    """
+    if not coordinated:
+        release = _registry_register("browser.py", _purpose(), port)
+        try:
+            with _interaction_lease("reap-owned"):
+                return _reap_owned(port, dry_run=dry_run, coordinated=True)
+        finally:
+            release()
+    report = ReapReport()
+    directory = _owned_dir()
+    if not directory.is_dir():
+        return report
+    lock_path = CACHE_DIR / OWNED_REAPER_LOCK_NAME
+    gate = os.open(str(lock_path), os.O_RDWR | os.O_CREAT, 0o600)
+    try:
+        try:
+            fcntl.flock(gate, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            report.busy = True
+            return report
+        claims: list[_Claim] = []
+        try:
+            for stem in _ledger_stems(directory):
+                got = _claim_ledger(directory, stem)
+                if isinstance(got, _Claim):
+                    claims.append(got)
+                    report.owners.append(stem)
+                elif got != "gone":
+                    report.skipped[stem] = got
+            if claims:
+                snapshot = _target_snapshot(port)
+                for claim in claims:
+                    _reap_claim(
+                        port, directory, claim, snapshot, report=report, dry_run=dry_run
+                    )
+        finally:
+            for claim in claims:
+                with contextlib.suppress(OSError):
+                    os.close(claim.fd)
+    finally:
+        os.close(gate)
+    return report
+
+
+def _reap_quietly(port: int, why: str) -> None:
+    """`_reap_owned` (coordinated) for the guided login and its watchdog: never
+    raises (SystemExit included — a coordinated pass does not register), one
+    line when it closed or left something."""
+    try:
+        report = _reap_owned(port, coordinated=True)
+    except Exception as exc:  # pylint: disable=broad-exception-caught
+        print(f"⚠ reaping dead owners' tabs failed ({why}): {exc}", file=sys.stderr)
+        return
+    if report.closed or report.left:
+        print(
+            f"ℹ️  closed {len(report.closed)} tab(s) of dead owner(s) ({why})"
+            + (f"; {len(report.left)} still open" if report.left else ""),
+            file=sys.stderr,
+        )
+
+
+def cmd_reap_owned(port: int, dry_run: bool = False) -> int:
+    """`reap-owned`: close the tabs that crashed `browser.py` processes left.
+
+    Exit 0 when nothing of a dead owner is left open (also: another reaper
+    is running, nothing to reap), 1 when a tab could not be closed (its
+    ledger stays, to be reaped again), 75 while a guided login owns the
+    browser. Live and unknown owners are never touched.
+    """
+    report = _reap_owned(port, dry_run=dry_run, coordinated=False)
+    if report.busy:
+        print("✅ another reaper is running — nothing to do")
+        return 0
+    for stem, state in report.skipped.items():
+        print(f"   {stem}: owner {state} — left alone")
+    if dry_run:
+        for tid in report.would_close:
+            print(f"would close: {_id8(tid)}")
+        print(
+            f"✅ dry run: {len(report.owners)} dead owner(s), "
+            f"{len(report.would_close)} tab(s) would be closed"
+        )
+        return 0
+    if report.left:
+        print(
+            f"❌ {len(report.left)} tab(s) of dead owners still open — retry "
+            "`browser.py reap-owned` (journal: reap_owned)",
+            file=sys.stderr,
+        )
+        return 1
+    print(
+        f"✅ reaped {len(report.owners)} dead owner(s), closed "
+        f"{len(report.closed)} tab(s)"
+    )
+    return 0
+
+
+def _doctor_owned_ledgers(log: list[str]) -> None:
+    """Doctor's read-only ledger line: dead/unknown owners are ⚠ (never closed)."""
+    directory = _owned_dir()
+    stems = _ledger_stems(directory) if directory.is_dir() else []
+    states = {s: _owner_state(directory / f"{s}.json") for s in stems}
+    bad = {s: st for s, st in states.items() if st != "live"}
+    if not bad:
+        _doctor_add(
+            log,
+            "ok",
+            "owned-tab ledgers",
+            f"{len(states)} live" if states else "none",
+        )
+        return
+    listing = ", ".join(f"{s} ({st})" for s, st in sorted(bad.items()))
+    _doctor_add(
+        log,
+        "warn",
+        "owned-tab ledgers",
+        f"{len(bad)} not live: {listing} — run `browser.py reap-owned`",
+    )
 
 
 def _broker_fail(rc: int, msg: str) -> int:
@@ -10093,9 +11018,8 @@ def cmd_notion_login(port: int) -> int:
     just returns 0). Notion logs in by e-mail code or SSO, which can't be
     replayed from stored credentials — a cold session is ASSISTED: you sign in
     once in the shared window; the session then persists. Held under the
-    INTERACTION lease — no other tool clicks in the meantime."""
-    from playwright.sync_api import Error as PlaywrightError
-
+    INTERACTION lease — no other tool clicks in the meantime. The window flow
+    runs in a fresh tab this process owns, closed again afterwards (tp#845)."""
     # Warm probe + guided-login gate FIRST, outside the lease (both are the
     # read-only checks `logged-in` does lease-free).
     if _notion_probe(port):
@@ -10103,42 +11027,40 @@ def cmd_notion_login(port: int) -> int:
         return 0
     if not _guided_login_allowed(port, "notion", "Notion"):
         return NEEDS_ALBERT_RC
-    pw, browser = _connect(port)
     try:
-        with _interaction_lease("login notion"):
-            ctx = browser.contexts[0] if browser.contexts else browser.new_context()
-            # Interactive and headed (guard above): a new tab in the window is
-            # what the human works in; it stays open afterwards.
-            page = ctx.new_page()
-            try:
-                page.goto(NOTION_LOGIN_URL, wait_until="domcontentloaded")
-            except PlaywrightError as exc:
-                return _fail(
-                    f"could not open {NOTION_LOGIN_URL} in the shared browser: {exc}"
-                )
-            with contextlib.suppress(PlaywrightError):
-                _bring_to_front(page, "login notion", port)
-            print(
-                "\n🔐 Notion (app.notion.com) needs a login.\n"
-                "   In the shared Chrome window (now in front):\n"
-                "     1. Log in on the page that opened (e-mail code, or SSO).\n"
-                "     2. Land in the workspace — success is auto-detected once the\n"
-                "        sidebar shows.\n",
-                file=sys.stderr,
-            )
-            if not _notion_wait_for_login(
-                page, timeout_s=300, poll_s=2.0, heartbeat=True
-            ):
-                return _fail(
-                    "Notion login not detected within 5 min. Finish the login in "
-                    "the shared browser, then re-run: browser.py login notion"
-                )
-            print("✓ Logged into Notion (app.notion.com).")
-            _record_login_event("notion", "assisted")
-            return 0
-    finally:
-        browser.close()
-        pw.stop()
+        with _owned_background_page(port) as page:
+            with _interaction_lease("login notion"):
+                return _notion_login_owned(port, page)
+    except OwnedTabError as exc:
+        return _fail(f"login notion: {exc}")
+
+
+def _notion_login_owned(port: int, page) -> int:
+    """`cmd_notion_login`'s window flow in its owned tab, under the lease."""
+    from playwright.sync_api import Error as PlaywrightError
+
+    try:
+        page.goto(NOTION_LOGIN_URL, wait_until="domcontentloaded")
+    except PlaywrightError as exc:
+        return _fail(f"could not open {NOTION_LOGIN_URL} in the shared browser: {exc}")
+    with contextlib.suppress(PlaywrightError):
+        _bring_to_front(page, "login notion", port)
+    print(
+        "\n🔐 Notion (app.notion.com) needs a login.\n"
+        "   In the shared Chrome window (now in front):\n"
+        "     1. Log in on the page that opened (e-mail code, or SSO).\n"
+        "     2. Land in the workspace — success is auto-detected once the\n"
+        "        sidebar shows.\n",
+        file=sys.stderr,
+    )
+    if not _notion_wait_for_login(page, timeout_s=300, poll_s=2.0, heartbeat=True):
+        return _fail(
+            "Notion login not detected within 5 min. Finish the login in "
+            "the shared browser, then re-run: browser.py login notion"
+        )
+    print("✓ Logged into Notion (app.notion.com).")
+    _record_login_event("notion", "assisted")
+    return 0
 
 
 def cmd_notion_logged_in(port: int) -> int:
@@ -10280,18 +11202,9 @@ def _test_site_logged_in(port: int, site: str, entry: dict) -> int:
     """`logged-in` for a test-hook site: its sentinel on its check URL."""
     url = str(entry.get("check_url") or "")
     sel = str(entry.get("logged_in_selector") or "")
-
-    def check(page: Any) -> bool:  # an ACTIVE check, like the built-in sites'
-        page.goto(url, wait_until="domcontentloaded", timeout=15_000)
-        return _broker_wait_sentinel(page, sel)
-
     if not (url and sel):
         ok = False
-    elif entry.get("probe") == "pick":
-        # Like slack/openai/claude: the tab `_pick_page` finds — except during
-        # a guided login (`_logged_in_page_check`), which the tests pin.
-        ok = _logged_in_page_check(port, _url_origin(url), check)
-    else:
+    else:  # a fresh owned tab, like every built-in check (tp#845)
         ok = bool(
             _with_background_page(
                 port, url, lambda page: _broker_wait_sentinel(page, sel)
@@ -10713,6 +11626,9 @@ def _maintenance(
                     tx.note(watchdog_pid=_spawn_watchdog(port, nonce))
                     _pause_clients(tx)
                     _maint_take_gate(tx, stack, force)
+                    # Lease held, foreign registrations refused: reap what dead
+                    # owners left before the login starts (tp#845).
+                    _reap_quietly(port, "guided login start")
                     # The lease is ours: children that take it must not wait on us.
                     os.environ["CLAUDE_BROWSER_LEASE_HELD"] = "1"
                     yield tx
@@ -10774,6 +11690,14 @@ def _watchdog_recover(port: int, rec: dict, state: str) -> int:
         if owned
         else ([], True)
     )
+    # The dead owner's `login` children may have left ledgered tabs: reap them
+    # holding the gate exclusively (raw CDP only — never registers, tp#845).
+    gate = _gate_acquire(fcntl.LOCK_EX, REAP_GATE_WAIT_S)
+    if gate is not None:
+        try:
+            _reap_quietly(port, "watchdog")
+        finally:
+            _gate_release(gate)
     reverted: object = "headless"
     if _browser_mode(port) == "headed":
         with _stdout_to_stderr():
@@ -11043,6 +11967,9 @@ def _guided_a(
         _close_owned_targets(tx.port, list(tx.owned), budget_s=MAINT_CLOSE_BUDGET_S)
         tx.owned.clear()
         tx.note(owned_targets=[])
+        # A `login SITE` child killed by its timeout left its owned tab in its
+        # ledger: we hold the lease and strangers get 75 — reap it (tp#845).
+        _reap_quietly(tx.port, "guided login")
         _ensure_headless(tx.port)
 
 
@@ -11366,17 +12293,33 @@ def _resolve_site(name: str, *, for_login: bool = False) -> Site:
     sys.exit(2)
 
 
-def cmd_login(port: int, site_name: str) -> int:
+def cmd_login(port: int, site_name: str, expect: str | None = None) -> int:
     """Ensure SITE is logged in (automated or assisted, per the site).
 
     Bounded by a `LoginDeadline` (LOGIN_TIMEOUT_S → exit 124/125), armed before
     anything else — `_resolve_site` already talks to the broker — unless this
     process owns the live guided-login record (a guided login waits for a
-    human; its children carry $CLAUDE_BROWSER_MAINTENANCE).
+    human; its children carry $CLAUDE_BROWSER_MAINTENANCE). `expect` (`-e`):
+    anthropic only, see `_anthropic_login_expect`.
     """
     key = site_name.strip().lower()
     with _login_deadline(port, "login", key, LOGIN_TIMEOUT_S, end_event="login"):
+        if expect is not None:
+            return _cmd_login_expect(port, site_name, expect)
         return _cmd_login(port, site_name)
+
+
+def _cmd_login_expect(port: int, site_name: str, expect: str) -> int:
+    """`login SITE -e EMAIL`: only claude.ai knows which account it holds."""
+    site = _resolve_site(site_name)
+    if site.name != "anthropic":
+        print(
+            f"❌ -e/--expect-account is for anthropic only, not {site.name!r}",
+            file=sys.stderr,
+        )
+        return 2
+    _journal_note(site=site.name, flow="expect-account")
+    return cmd_anthropic_login(port, expect=expect)
 
 
 def _cmd_login(port: int, site_name: str) -> int:
@@ -11569,12 +12512,19 @@ def _dispatch(args: argparse.Namespace, port: int) -> int:
         return cmd_eval(
             port, args.js, args.url, timeout_s=args.timeout, target=args.target
         )
+    if args.cmd == "eval-fresh":
+        return cmd_eval_fresh(port, args.url, args.js, timeout_s=args.timeout)
+    if args.cmd == "reap-owned":
+        return cmd_reap_owned(port, dry_run=args.dry_run)
     if args.cmd == "token":
         return cmd_token(port)
     if args.cmd == "slack-session":
         return cmd_slack_session(port)
     # Generic multi-site commands.
     if args.cmd == "login":
+        expect = getattr(args, "expect_account", None)
+        if expect is not None:
+            return cmd_login(port, args.site, expect=expect)
         return cmd_login(port, args.site)
     if args.cmd == "logged-in":
         return cmd_logged_in(port, args.site)

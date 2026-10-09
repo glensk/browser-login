@@ -41,6 +41,10 @@ class FakeTarget:
     eval_value: object = 1
     eval_exception: str | None = None
     received: list = field(default_factory=list)
+    # CDP target type (page | iframe | service_worker …) and the target that
+    # opened it (``openerId`` in ``Target.getTargets``; tp#845 popups).
+    type: str = "page"
+    opener: str | None = None
 
 
 def _ws_accept(key: str) -> str:
@@ -89,6 +93,10 @@ class FakeCdp:
         self.list_reads = 0
         self.create_fail = False  # Target.createTarget answers with a CDP error
         self.create_stall = False  # Target.createTarget is never answered
+        # Target.createTarget creates the target but its reply never arrives.
+        self.create_lose_reply = False
+        self.get_targets_fail = False  # Target.getTargets answers with an error
+        self.create_params: list[dict] = []
         self.created: list[str] = []
         self.browser_log: list[dict] = []
         self.closed: list[str] = []
@@ -160,11 +168,27 @@ class FakeCdp:
         base = self.raw_base if t.mode.startswith("raw-") else self.ws_base
         return {
             "id": t.tid,
-            "type": "page",
+            "type": t.type,
             "url": t.url,
             "title": t.title,
             "webSocketDebuggerUrl": f"{base}/devtools/page/{t.tid}",
         }
+
+    @staticmethod
+    def info(t: FakeTarget) -> dict:
+        """One ``Target.getTargets`` entry."""
+        out = {
+            "targetId": t.tid,
+            "type": t.type,
+            "title": t.title,
+            "url": t.url,
+            "attached": False,
+            "canAccessOpener": False,
+            "browserContextId": "CTX",
+        }
+        if t.opener:
+            out["openerId"] = t.opener
+        return out
 
     def close(self) -> None:
         self._stop.set()
@@ -260,15 +284,11 @@ class FakeCdp:
                             "canAccessOpener": False,
                         }
                     }
-                elif method == "Target.closeTarget":
-                    tid = str(params.get("targetId"))
-                    self.closed.append(tid)
-                    self.targets.pop(tid, None)
-                    result = {"success": True}
-                elif method == "Target.createTarget":
-                    if self.create_stall:
-                        continue  # no reply, no target
-                    if self.create_fail:
+                elif method in self.TARGET_CALLS:
+                    outcome, result = self._target_call(str(method), params)
+                    if outcome == "none":
+                        continue  # no reply at all
+                    if outcome == "error":
                         conn.send(
                             json.dumps(
                                 {
@@ -278,17 +298,42 @@ class FakeCdp:
                             )
                         )
                         continue
-                    with self._lock:
-                        tid = f"NEW{len(self.created):05d}"
-                        self.created.append(tid)
-                    self.add(tid, str(params.get("url") or "about:blank"))
-                    result = {"targetId": tid}
                 conn.send(json.dumps({"id": msg["id"], "result": result}))
                 if method == "Target.setAutoAttach":
                     for n, t in enumerate(list(self.targets.values())):
                         conn.send(json.dumps(self._attached_event(t, n)))
         except ConnectionClosed:
             pass
+
+    TARGET_CALLS = ("Target.closeTarget", "Target.getTargets", "Target.createTarget")
+
+    def _target_call(self, method: str, params: dict) -> tuple[str, dict]:
+        """``("ok", result)``, ``("error", {})`` or ``("none", {})`` (no reply)."""
+        if method == "Target.closeTarget":
+            tid = str(params.get("targetId"))
+            self.closed.append(tid)
+            self.targets.pop(tid, None)
+            return "ok", {"success": True}
+        if method == "Target.getTargets":
+            if self.get_targets_fail:
+                return "error", {}
+            return "ok", {"targetInfos": [self.info(t) for t in self.targets.values()]}
+        return self._create_target(params)
+
+    def _create_target(self, params: dict) -> tuple[str, dict]:
+        """``Target.createTarget`` (see `_target_call`)."""
+        self.create_params.append(dict(params))
+        if self.create_stall:
+            return "none", {}  # no reply, no target
+        if self.create_fail:
+            return "error", {}
+        with self._lock:
+            tid = f"NEW{len(self.created):05d}"
+            self.created.append(tid)
+        self.add(tid, str(params.get("url") or "about:blank"))
+        if self.create_lose_reply:
+            return "none", {}  # the target exists, the reply never comes
+        return "ok", {"targetId": tid}
 
     @staticmethod
     def _attached_event(t: FakeTarget, n: int) -> dict:

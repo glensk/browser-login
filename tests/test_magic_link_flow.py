@@ -271,14 +271,6 @@ def test_assisted_fallback_submits_only_when_auto_did_not(
 ):
     fills: list[str] = []
 
-    class _Browser:
-        def close(self):
-            return None
-
-    class _Pw:
-        def stop(self):
-            return None
-
     class _LoginPage:
         def goto(self, url, **kwargs):
             return None
@@ -286,9 +278,13 @@ def test_assisted_fallback_submits_only_when_auto_did_not(
         def bring_to_front(self):
             return None
 
+    @contextlib.contextmanager
+    def owned(port, *, prepare=None):  # the fresh owned tab (tp#845)
+        yield _LoginPage()
+
     logged_in = iter([False])
-    monkeypatch.setattr(browser, "_connect", lambda port: (_Pw(), _Browser()))
-    monkeypatch.setattr(browser, "_pick_page", lambda b, host: (None, _LoginPage()))
+    monkeypatch.setattr(browser, "_connect", pytest.fail)  # never a picked tab
+    monkeypatch.setattr(browser, "_owned_background_page", owned)
     monkeypatch.setattr(browser, "_claude_logged_in", lambda p: next(logged_in))
     monkeypatch.setattr(
         browser, "_interaction_lease", lambda name: contextlib.nullcontext()

@@ -93,9 +93,9 @@ deadline.
 
 ## Steps
 
-- [ ] **0. Worktree, after tp#843 has merged** (AGENTS.md forbids editing bin/browser.py
+- [x] **0. Worktree, after tp#843 has merged** (AGENTS.md forbids editing bin/browser.py
       in place).
-- [ ] **1. Owned-tab ledger** (`bin/browser.py`, next to the maintenance helpers).
+- [x] **1. Owned-tab ledger** (`bin/browser.py`, next to the maintenance helpers).
   - File `<CACHE_DIR>/owned/<pid>.json`: `{pid, pid_start_time, entries: [{marker,
     tid|null, parent|null, created}]}`.
   - The owner creates the file and takes and holds its flock for its whole life, before
@@ -108,7 +108,7 @@ deadline.
     - `live` — flock held, or pid alive with a matching `_proc_lstart`;
     - `dead` — flock free and (pid gone or start time differs);
     - `unknown` — anything unreadable.
-- [ ] **2. `@contextmanager _owned_background_page(port, *, prepare=None)`** — no body
+- [x] **2. `@contextmanager _owned_background_page(port, *, prepare=None)`** — no body
       deadline (human logins wait). In order:
   1. `release = _registry_register(...)` — `SystemExit(75)` propagates, so
      `createTarget` is never sent;
@@ -130,33 +130,33 @@ deadline.
 
   Catch `Exception` only, never `BaseException`; `SystemExit` is re-raised.
   `page.close()` is never called.
-- [ ] **3. `_background_page_run(port, url, prepare, fn)`** = `with
+- [x] **3. `_background_page_run(port, url, prepare, fn)`** = `with
       dl.push(BG_PAGE_STEP_S, "background_page"): with _owned_background_page(...) as
       page:` → `goto url` (15 s) → load (10 s) → `fn`. Keep tp#843's `step_to`
       breadcrumbs (+ `bg:ledger`). Returns None on `Exception`; `SystemExit` passes
       through. `_with_background_page` and `_with_prepared_background_page` stay as
       wrappers.
-- [ ] **4. Checks.** `_logged_in_page_check(port, check)` as in the inventory
+- [x] **4. Checks.** `_logged_in_page_check(port, check)` as in the inventory
       (`_guided_probe` may keep setting `PROBE_BACKGROUND_ENV`; no effect now).
       `cmd_token` and `cmd_slack_session` as in the inventory; run directly (not via
       `cmd_logged_in`) they arm `LoginDeadline(LOGGED_IN_TIMEOUT_S)`.
       `cmd_biopolwifi_logged_in` → `_logged_in_page_check`.
-- [ ] **5. Logins.**
+- [x] **5. Logins.**
   - cscs, biopolwifi, switch-window, notion: `with _owned_background_page(port) as page:`
     → `_interaction_lease` → first non-blank `goto`.
   - anthropic, openai, slack: warm probe in the owned tab before the lease; cold path →
     lease → `goto`.
   - Delete `_pick_portal_page`, `_close_stale_cscs_tabs`, the `probe:"pick"` branch and
     `_pick_page`; add `_match_page` (eval only).
-- [ ] **6. `login -e/--expect-account EMAIL`** (`cmd_anthropic_login(port, expect=…)`):
+- [x] **6. `login -e/--expect-account EMAIL`** (`cmd_anthropic_login(port, expect=…)`):
       requires `_guided_login_allowed`; pre-fills EMAIL; `_bring_to_front` on the owned
       page; polls `fetch("/api/account")` in that page every 10 s for ≤ 900 s; 0 on a
       match; a different account → exit 2 with the email masked to its domain.
-- [ ] **7. `eval-fresh`.** Parser `-t/--timeout`, `-h`; `cmd_eval_fresh` arms
+- [x] **7. `eval-fresh`.** Parser `-t/--timeout`, `-h`; `cmd_eval_fresh` arms
       `LoginDeadline(timeout)` and calls `_background_page_run`; `fn` polls
       `document.readyState === "complete"` for ≤ 15 s, then `page.evaluate`, and prints
       JSON like `eval`. JS error / not ready → ❌ exit 1; deadline → 124/125.
-- [ ] **8. `reap-owned` (`-n/--dry-run`).**
+- [x] **8. `reap-owned` (`-n/--dry-run`).**
   1. Register (a foreign maintenance → 75); take `_interaction_lease("reap-owned")`.
   2. Non-blocking global `<CACHE_DIR>/owned-reaper.lock`; if held: "another reaper is
      running", exit 0.
@@ -173,9 +173,9 @@ deadline.
   transaction start, `_guided_a`'s `finally` (it holds the lease; strangers get 75) and
   `cmd_maintenance_watchdog` (gate exclusive). Never from `_preflight`, never from
   `status`.
-- [ ] **9. Doctor:** a read-only "owned-tab ledgers" line; each `dead`/`unknown` ledger →
+- [x] **9. Doctor:** a read-only "owned-tab ledgers" line; each `dead`/`unknown` ledger →
       ⚠ with the hint "browser.py reap-owned". It never closes anything.
-- [ ] **10. Runner** (agent_login_jobs.py, agent_login_claude.py, agent-login.py).
+- [x] **10. Runner** (agent_login_jobs.py, agent_login_claude.py, agent-login.py).
   - `browser_timeout`: `eval-fresh` = 60, `reap-owned` = 60.
   - `claude_account_email` and `claude_login_by_hand` as in the inventory;
     `claude_account_email` validates that the last stdout line is JSON (else None) and
@@ -184,7 +184,7 @@ deadline.
     `run_browser("reap-owned", timeout_s=browser_timeout("reap-owned"))`.
   - tp#843's AST allowlist for `timeout_s=None` gains the `login anthropic -e` call
     inside `guided_window`.
-- [ ] **11. Tests — new `tests/test_owned_tabs_tp845.py`** (fakes).
+- [x] **11. Tests — new `tests/test_owned_tabs_tp845.py`** (fakes).
   - Checks with no record (logged-in anthropic, openai, slack, biopolwifi, token, plus
     slack-session): `_connect` outside the helper → `pytest.fail`; the helper received the
     viewport `prepare`.
@@ -202,7 +202,7 @@ deadline.
     gone; no `browserContextId` literal.
   - Opt-in `launches_chrome`: a cookie + origin localStorage seeded in one target are
     readable from a fresh owned target; the marker URL round-trips in `/json/list`.
-- [ ] **12. Tests — new `tests/test_owned_ledger.py`.**
+- [x] **12. Tests — new `tests/test_owned_ledger.py`.**
   - O9 crash points: kill after the CDP reply but before the tid write; kill with only
     the temp file written → both reaped by marker, nothing else touched.
   - O10: owner flock held → live even when the fake `ps` says dead; `ps` failure →
@@ -213,7 +213,7 @@ deadline.
   - An `open -N` tid survives a reap pass after its creator exited.
   - `reap-owned` under a foreign record → 75; `-n` closes nothing; `status` and
     `_preflight` never call `_reap_owned`.
-- [ ] **13. Update existing tests.**
+- [x] **13. Update existing tests.**
   - `test_tab_selection.py` → `_match_page`; delete the site-flow fallback test.
   - Replace `_pick_page`/`_pick_portal_page` fakes with a fake
     `_owned_background_page`/`_background_page_run`: `test_token_verify.py` env fixture,
@@ -227,7 +227,7 @@ deadline.
     kill.
   - `test_login_timeout.py` (tp#843): `_background_page_run` still fires 124 inside the
     helper and still closes over raw CDP.
-- [ ] **14. Docs.**
+- [x] **14. Docs.**
   - README: Quick start (`eval --url` "evaluates only, never navigates"; `eval-fresh`;
     `reap-owned`; `login -e`); every logged-in/login row → "fresh owned background tab,
     closed again"; the ledger, reaping, and "`status` is never destructive"; exit-table
@@ -240,6 +240,85 @@ deadline.
 - [ ] **15. Deploy.** `browser.py doctor` on a disposable instance; on live: `logged-in
       openai`, then `reap-owned -n` and `status` show no leftover chatgpt tab (tp#845
       acceptance). File the follow-up tp for `open` blank-tab reuse.
+
+## Implementation notes (steps 0–14, worktree build)
+
+Built on main at 67d4660 (tp#843 3cd1dc2 and the PAC commit 8c7d787 included).
+
+Review addition (orchestrator): in headless mode `_cdp_create_background_target`
+adds `newWindow: true`. Measured on the live browser 2026-10-09: a
+`background: true` tab in the shared window is `visibilityState: hidden` (no
+animation frames; the Notion sidebar check timed out), and a throwaway CfT 153
+froze such tabs outright (the opt-in `launches_chrome` test failed); a
+`background: false` tab hides the previously active tab (the guided-login
+viewer's screencast). Its own invisible window keeps both `visible`; the opt-in
+test passes with it. Headed (mode A) keeps the old payload — a new window would
+appear.
+
+Deviations from the text above, each keeping the plan's guarantees:
+
+- **Ledger files.** Data `<cache>/owned/<pid>-<rand>.json` (written with
+  `_json_write_atomic`) plus a sidecar `<pid>-<rand>.lock` that carries the
+  owner's lifetime flock: `os.replace` swaps the data file's inode, so a flock
+  on the data file would be lost at the first write. The random suffix: a ledger
+  is deleted as soon as it is empty and the next owned tab starts a new stem, so
+  a reaper that claimed the old stem can never touch the new one (and pid reuse
+  cannot collide). Orphaned `.<stem>.json.*.tmp` files are part of the stem.
+- **`_background_page_run`** returns None on `Exception` but re-raises
+  `BrowserAttachTimeout`: a wedged tab is "cannot tell" (`main` → ❌ exit 1, as
+  before tp#845) — None would read as "not logged in" and trigger a login.
+  `url == "about:blank"` means no `goto` (the check navigates itself).
+- **Lost createTarget reply**: the marker tab is found by its exact URL, bound,
+  and closed (`OwnedTabError`) — never used.
+- **Registration first, then `_ensure_page_target`**: under a foreign guided
+  login nothing reaches the browser, not even the zero-tab `PUT /json/new`.
+- **Viewport**: `token` and `slack-session` also get the probe viewport (step 11's
+  test asks it of every check; the inventory said `None` for `token`).
+- **`eval-fresh`** arms its `LoginDeadline` with `_login_deadline(always=True)`:
+  bounded even inside a guided login (its `-t` is a promise).
+- **The tp#843 watcher**: `LoginDeadline.drop_owned` also drops the ledger entry
+  (the ledger's lock is taken with a 2 s timeout from the watcher thread), and
+  `_fire` closes the owned tabs' page descendants too, leaves first.
+- **Leaves-first** is computed from the `openerId` chain within the set
+  (`_leaves_first(infos, tids)`), so it also holds on a reaper's second pass,
+  when popups are already recorded next to their opener.
+- **`_reap_owned(port, *, dry_run, coordinated)`**: `coordinated=False` is the
+  CLI path (registers → 75 under a foreign record; takes the lease); the
+  transaction and the watchdog call `_reap_quietly` (coordinated, never raises).
+  The watchdog takes the gate exclusively for `REAP_GATE_WAIT_S` (5 s) and skips
+  the reap when it cannot. `reap-owned` is in `_PREFLIGHT_SKIP_CMDS` (a recovery
+  tool, like `close`/`close-hung`).
+- **Runner**: `run_browser` itself runs `reap-owned` after any killed run (except
+  a killed `reap-owned`) — one place for every `BrowserRun.killed`;
+  `reap_owned_tabs()` in agent_login_jobs.py. `-c` reaps right after the
+  browser is up.
+- **`login anthropic -e`**: `_claude_fill_email_and_continue` (the assisted path's
+  own helper) runs only when the tab is not logged in yet; an account already
+  logged in that is not EMAIL → exit 2 at once (domain only); timeout → 1.
+- **`_match_page`** has no zero-tab `new_page()` fallback any more: no tab → exit 1
+  (`eval` never creates a tab).
+- **Step 13's SIGKILL E2E for a mode-A login child** is a fake-CDP test with a
+  real SIGKILLed child (`test_guided_a_reaps_the_ledger_of_its_killed_login_child`
+  in tests/test_owned_ledger.py), not a real-Chrome E2E — see the finding below.
+- **Not converted**: `_switch_probe` (`logged-in switch`) already creates its own
+  tab by id (never picks), but is not ledgered and closes it with `page.close()`;
+  not in the inventory — follow-up candidate.
+- tests/fake_cdp.py: `Target.getTargets` (with `type`/`openerId`), recorded
+  `create_params`, `create_lose_reply`, `get_targets_fail`.
+
+**Finding for step 15 (verify FIRST on live).** In a DISPOSABLE headless Chrome for
+Testing 153 (chromium-1243) launched by this repo's `up` (same flags as the live
+browser), a target created with `Target.createTarget {background: true}` answers
+no CDP command until it is activated (raw CDP, code-independent: background →
+`Runtime.evaluate` times out; `background: false` → answers; after
+`Target.activateTarget` → answers). A Playwright attach then times out on it
+(the tp#693 signature), so the opt-in `test_e2e_fresh_owned_tab_sees_the_profiles_session`
+fails in a disposable browser for that reason. The live tp#843 verification
+(12:42, same binary) adopted background tabs fine, so the live browser behaves
+differently for a reason not found (profile state?). If live `logged-in openai`
+ends in "Playwright could not attach … (untitled) → about:…", every owned tab is
+affected; a headless-only `background: false` (no window, nothing to focus) or an
+activation right after the create would be the fix to decide.
 
 ## Debate
 

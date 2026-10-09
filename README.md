@@ -73,8 +73,8 @@ browser.py clients            # who is attached over CDP (registered + unknown c
 browser.py journal [-n N] [-e EVENT] [-j]  # who launched/switched/stopped it, logins, window raises
 browser.py doctor             # full health check on a disposable tab (never touches real tabs)
 browser.py open https://…     # navigate a tab (opens in the BACKGROUND — no focus steal)
-browser.py open -r https://…  # --reuse: navigate an existing same-URL tab (no duplicate tabs;
-                              #   matches sans query/fragment, oldest first = eval's pick)
+browser.py open -r https://…  # --reuse: navigate an existing same-URL tab (manual use only —
+                              #   tools open their own tab with -N; matches sans query/fragment)
 browser.py open -N https://…  # --new: ALWAYS a new background tab (raw CDP, no Playwright
                               #   attach); prints `target=<id>` — the tab you own (tp#786)
 browser.py eval -T <id> 'location.host'  # --target: eval in exactly that tab over raw CDP;
@@ -84,13 +84,23 @@ browser.py close -i <id>…     # close the tab(s) you opened (lease, re-check, 
 browser.py close [-n] URL…    # manual cleanup of leftover tabs by exact URL (query/fragment and
                               #   trailing slash ignored; http(s) only); -n = dry run;
                               #   -w lease wait (30 s), -d overall deadline (20 s)
-browser.py eval 'document.title' [--url SUBSTR]   # run JS in the active/matched tab → JSON
-                              #   --url with no matching tab exits 1 (it never falls back to
-                              #   another tab; the error names the open tabs by origin only —
-                              #   no path, query or fragment); zero tabs → a blank one is created;
+browser.py eval 'document.title' [--url SUBSTR]   # run JS in the most recent/matched tab → JSON
+                              #   evaluates only, never navigates; --url with no matching tab
+                              #   exits 1 (it never falls back to another tab; the error names
+                              #   the open tabs by origin only — no path, query or fragment);
+                              #   another process's owned tab (about:blank#owned-…) never matches;
                               #   -t/--timeout SECONDS (default 60) is a hard deadline, attach
                               #   included: ❌ + exit 1 on expiry — JS already running in the
                               #   page is NOT stopped
+browser.py eval-fresh -t 30 https://claude.ai/ 'location.host'  # JS in a FRESH tab of its own:
+                              #   created, loaded (readyState complete, ≤15 s), evaluated and
+                              #   closed in one run → JSON; exit 1 not ready / JS error, 2 a
+                              #   non-http(s) URL, 75 busy, 124/125 its -t deadline fired
+browser.py reap-owned [-n]    # close the tabs crashed/killed browser.py runs left (owned-tab
+                              #   ledger, proven-dead owners only; -n = dry run); exit 0 nothing
+                              #   left, 1 a tab could not be closed, 75 busy
+browser.py login anthropic -e EMAIL  # (inside a guided login) assisted claude.ai login until
+                              #   /api/account is EMAIL (≤15 min); 2 = another account
 browser.py down [-f]          # quit the shared browser (graceful CDP close → validated escalation);
                               #   refuses while a registered client (MCP server) stays attached —
                               #   -f/--force stops anyway; a stale record with no browser is cleared
@@ -103,6 +113,23 @@ persist — they live in Cookies/Local Storage, not the session files). `open`
 likewise reuses a blank tab or creates new tabs via CDP `Target.createTarget`
 with `background: true`. The only time a window exists is the FALLBACK of a
 guided login you start yourself (`agent-login.py -g SITE`; see "Guided login").
+
+**Every check and login runs in a fresh tab it owns** (tp#845): `logged-in SITE`,
+`token`, `slack-session`, `eval-fresh` and every built-in `login SITE` create
+their own background tab (raw `Target.createTarget {url, background}` in the
+default browser context, so the tab sees the profile's cookies and storage),
+drive it, and close it again with every popup it opened — never a tab picked
+by URL, which could be another client's tab or a guided login's login tab.
+Logins navigate that tab only under the interaction lease. Each such tab is
+recorded first in the process's **owned-tab ledger** (`<cache>/owned/`, a
+random marker URL `about:blank#owned-…` before the target id is known), so a
+crashed or killed run cannot leak it: `browser.py reap-owned` closes the tabs
+of PROVEN-dead owners only (the owner's flock is free and its pid gone or
+reused; anything unreadable is left alone), descendants first; the guided
+login reaps at its start, after a window-flow `login` child, and in its
+watchdog. `open -N` tabs are the caller's and are never ledgered or reaped.
+`status` is never destructive (it never reaps); `doctor` only reports dead
+ledgers (⚠, with the `reap-owned` hint).
 
 Env toggles: `CLAUDE_BROWSER_KEEP_TABS=1` keeps last session's tabs (skip the
 wipe); `CLAUDE_BROWSER_OPEN_LAUNCH=1` launches a HEADED (guided-login) browser via
@@ -339,9 +366,9 @@ cleared normally. Belt and braces: a PAUSED wrapper also resumes itself within
 2 s once the record FILE that paused it is gone or names another owner — not
 when the owner merely died (the watchdog needs the gate first), except after
 60 s of a dead record (watchdog presumed dead) — and the relay ends itself
-(`-M`) when the record or its owner disappears. While a guided login lives,
-`logged-in` checks never pick an existing tab (it could be the owned login
-tab): they run in a fresh background tab of their own.
+(`-M`) when the record or its owner disappears. `logged-in` checks never pick
+an existing tab (it could be the owned login tab): they always run in a fresh
+background tab of their own (tp#845), during a guided login and outside one.
 
 Known residuals: a paused client keeps its CDP socket, but a fallback-A switch
 restarts the browser, so a paused Playwright MCP finds its connection dropped
@@ -452,13 +479,13 @@ manual sign-in — actually happens.
 
 | Site                   | Login style                                                           |
 | :--------------------- | :------------------------------------------------------------------- |
-| `anthropic` (`claude`) | **Magic-link, fully automatic** when `ANTHROPIC_LOGIN_EMAIL` is set and `himalaya` reads that mailbox: triggers the email, extracts the `claude.ai/magic-link#<token>` URL, opens it — only if it passes the three login-CSRF guards below. Otherwise **assisted** (you finish the email login once). |
-| `cscs`                 | **Keycloak, unattended.** `store-creds cscs` caches username/password/TOTP-seed in the macOS keychain (from 1Password, one last Touch ID); thereafter login runs with no fingerprint. TOTP codes are generated locally with `pyotp` only once the OTP field appears (never before the password submit), waiting for the next 30 s step when the current one has under 5 s left; the 1Password fallback likewise fetches its live code at fill time. A flow Keycloak aborts with `authentication_expired` (stale `session_code` on a login page left open for hours) is retried once from a fresh page with a newly generated code; a wrong password still fails on the first attempt. After login the token is cached (0600) and checked against `/api/me/`; a network error or an unexpected answer exits 1 with a one-line reason, never a traceback. Through the login broker (`login cscs` whenever the broker lists `cscs`), the session bundle carries the portal's token for `portal.cscs.ch` localStorage: it is written by an init script BEFORE the portal app loads (a token-less portal sends the tab to Keycloak right after load, so a post-load write loses the race) and read back on the portal as proof. The broker path's logged-in check (before and after the injection) polls up to 8 s for that token while the tab is on the portal — being on `portal.cscs.ch` alone proves nothing. |
-| `openai` (`chatgpt`)   | **Assisted.** ChatGPT Business logs in via Google SSO + 2FA, which can't be replayed from a stored secret — you complete the SSO once in the shared window; the session persists. Logged-in sentinel: the 'Invite member' button on `chatgpt.com/admin/members`. |
-| `slack`                | **Assisted.** app.slack.com logs in via email-code / SSO; you sign in once and the session persists. Logged-in sentinel: a team with an `xoxc-` token in `localConfig_v2`. `browser.py slack-session` then prints `{token,cookie,team_domain}` (xoxc + httpOnly `d` cookie via CDP) so `slack-api` can call `users.admin.setInactive` on the Pro plan — where the API token is scope-blocked. Bearer creds → stdout only, never cached. |
-| `notion` (`notion.so`) | **Assisted.** Notion logs in by e-mail code or SSO, which can't be replayed from a stored secret — you sign in once in the shared window (`./agent-login.py -g notion`); the session persists. Logged-in sentinel: the workspace sidebar (`.notion-sidebar` / `.notion-sidebar-switcher`) on `app.notion.com` outside `/login` — notion.so and its `/login` both redirect to that host, so the URL alone proves nothing. `logged-in notion` probes a background tab it closes again. Aliases: `app.notion.com`, `notion.com`. |
-| `biopolwifi`           | **Keychain email+password, unattended.** SDSC Biopole WiFi units are managed via a Ruckus Cloudpath MDU portal (`cloudpath.edificom.cloud`, a plain Vue SPA). `store-creds biopolwifi` caches the portal email+password in the macOS keychain (the same items `sdsc/biopol-wifi/biopol-wifi.py` reads); login fills the form and confirms the `SDSC - Biopole` / `Properties` sentinel. No SSO, no TOTP, no token extracted. Aliases: `biopol`, `cloudpath`, `edificom`. |
-| `switch`               | **Broker edu-ID session + SSO click, assisted fallback.** `login switch` clicks the single SWITCH edu-ID button on `/auth/login` — passwordless while the browser's edu-ID IdP session lives. When the login broker lists an `eduid` item, `login switch` first runs `login eduid` (the bundle carries the live `login.eduid.ch` session) and then clicks in a BACKGROUND tab, so it needs no window and works headless (login-log mode `broker-sso`); `agent-login.py -t switch` therefore logs in instead of only checking. Without a usable `eduid` item, or when that path does not end logged in, it falls back to the click in the shown window, and you finish the edu-ID login there once (headed only). Logged-in sentinel: on `cloud.switch.ch` outside `/auth/` with NO `/auth/openid_connect_eduid_ch` sign-in form — the anonymous root renders that form with HTTP 200, so the URL alone proves nothing. `logged-in switch` probes a background tab it closes again (never focuses the window) and exits 2 when logged out OR when it cannot tell — the `infra/status` check `switch-portal-login` runs it every 30 min. No stored credential by design: edu-ID is Albert's primary federated identity. Aliases: `switch-cloud`, `cloud.switch.ch`, `scp`. |
+| `anthropic` (`claude`) | **Magic-link, fully automatic** when `ANTHROPIC_LOGIN_EMAIL` is set and `himalaya` reads that mailbox: triggers the email, extracts the `claude.ai/magic-link#<token>` URL, opens it — only if it passes the three login-CSRF guards below. Otherwise **assisted** (you finish the email login once). `login`/`logged-in` use a fresh owned background tab, closed again (tp#845). |
+| `cscs`                 | **Keycloak, unattended.** `store-creds cscs` caches username/password/TOTP-seed in the macOS keychain (from 1Password, one last Touch ID); thereafter login runs with no fingerprint. TOTP codes are generated locally with `pyotp` only once the OTP field appears (never before the password submit), waiting for the next 30 s step when the current one has under 5 s left; the 1Password fallback likewise fetches its live code at fill time. A flow Keycloak aborts with `authentication_expired` (stale `session_code` on a login page left open for hours) is retried once from a fresh page with a newly generated code; a wrong password still fails on the first attempt. After login the token is cached (0600) and checked against `/api/me/`; a network error or an unexpected answer exits 1 with a one-line reason, never a traceback. Through the login broker (`login cscs` whenever the broker lists `cscs`), the session bundle carries the portal's token for `portal.cscs.ch` localStorage: it is written by an init script BEFORE the portal app loads (a token-less portal sends the tab to Keycloak right after load, so a post-load write loses the race) and read back on the portal as proof. The broker path's logged-in check (before and after the injection) polls up to 8 s for that token while the tab is on the portal — being on `portal.cscs.ch` alone proves nothing. `login`/`logged-in` use a fresh owned background tab, closed again (tp#845). |
+| `openai` (`chatgpt`)   | **Assisted.** ChatGPT Business logs in via Google SSO + 2FA, which can't be replayed from a stored secret — you complete the SSO once in the shared window; the session persists. Logged-in sentinel: the 'Invite member' button on `chatgpt.com/admin/members`. `login`/`logged-in` use a fresh owned background tab, closed again (tp#845). |
+| `slack`                | **Assisted.** app.slack.com logs in via email-code / SSO; you sign in once and the session persists. Logged-in sentinel: a team with an `xoxc-` token in `localConfig_v2`. `browser.py slack-session` then prints `{token,cookie,team_domain}` (xoxc + httpOnly `d` cookie via CDP) so `slack-api` can call `users.admin.setInactive` on the Pro plan — where the API token is scope-blocked. Bearer creds → stdout only, never cached. `login`/`logged-in` use a fresh owned background tab, closed again (tp#845). |
+| `notion` (`notion.so`) | **Assisted.** Notion logs in by e-mail code or SSO, which can't be replayed from a stored secret — you sign in once in the shared window (`./agent-login.py -g notion`); the session persists. Logged-in sentinel: the workspace sidebar (`.notion-sidebar` / `.notion-sidebar-switcher`) on `app.notion.com` outside `/login` — notion.so and its `/login` both redirect to that host, so the URL alone proves nothing. `logged-in notion` probes a background tab it closes again. Aliases: `app.notion.com`, `notion.com`. `login`/`logged-in` use a fresh owned background tab, closed again (tp#845). |
+| `biopolwifi`           | **Keychain email+password, unattended.** SDSC Biopole WiFi units are managed via a Ruckus Cloudpath MDU portal (`cloudpath.edificom.cloud`, a plain Vue SPA). `store-creds biopolwifi` caches the portal email+password in the macOS keychain (the same items `sdsc/biopol-wifi/biopol-wifi.py` reads); login fills the form and confirms the `SDSC - Biopole` / `Properties` sentinel. No SSO, no TOTP, no token extracted. Aliases: `biopol`, `cloudpath`, `edificom`. `login`/`logged-in` use a fresh owned background tab, closed again (tp#845). |
+| `switch`               | **Broker edu-ID session + SSO click, assisted fallback.** `login switch` clicks the single SWITCH edu-ID button on `/auth/login` — passwordless while the browser's edu-ID IdP session lives. When the login broker lists an `eduid` item, `login switch` first runs `login eduid` (the bundle carries the live `login.eduid.ch` session) and then clicks in a BACKGROUND tab, so it needs no window and works headless (login-log mode `broker-sso`); `agent-login.py -t switch` therefore logs in instead of only checking. Without a usable `eduid` item, or when that path does not end logged in, it falls back to the click in the shown window, and you finish the edu-ID login there once (headed only). Logged-in sentinel: on `cloud.switch.ch` outside `/auth/` with NO `/auth/openid_connect_eduid_ch` sign-in form — the anonymous root renders that form with HTTP 200, so the URL alone proves nothing. `logged-in switch` probes a background tab it closes again (never focuses the window) and exits 2 when logged out OR when it cannot tell — the `infra/status` check `switch-portal-login` runs it every 30 min. No stored credential by design: edu-ID is Albert's primary federated identity. Aliases: `switch-cloud`, `cloud.switch.ch`, `scp`. `login`/`logged-in` use a fresh owned background tab, closed again (tp#845). |
 
 **claude.ai magic-link guards (login CSRF).** Opening a magic link signs the
 shared browser into *whatever account the link belongs to*, so auto-login opens
@@ -622,8 +649,13 @@ rc = subprocess.run(["browser.py", "login", "anthropic"], check=False).returncod
 | 3    | the login broker does not answer                                               |
 | 4    | needs Albert: `agent-login.py -g SITE`                                         |
 | 75   | busy: a guided login owns the browser right now — retry later; says NOTHING about the login state (`agent-login.py -c` skips such a site: no `login`, no failure mail) |
-| 124  | `login`/`logged-in` timed out; owned tabs closed; retried once by agent-login |
+| 124  | `login`/`logged-in`/`eval-fresh` timed out; owned tabs closed; retried once by agent-login |
 | 125  | timed out; tab cleanup unconfirmed; not retried                                |
+
+`reap-owned`: 0 nothing of a dead owner left open (also: another reaper is
+running, or nothing to reap), 1 a tab could not be closed (its ledger stays and
+is reaped again next time), 75 busy. agent-login runs it after every run it had
+to kill and at the start of the daily `-c` check.
 
 Resolution is **PATH-first**: with `bin/` on `$PATH`, `browser.py` is callable from
 anywhere. Tools that use the external-dependency convention resolve it as

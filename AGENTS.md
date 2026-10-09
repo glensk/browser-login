@@ -39,7 +39,22 @@ framework. It is a **provider**: other repos depend on it, not the reverse. See
 - **Consumers own tabs by target id** (tp#786): `open -N URL` → `eval -T <id>` →
   `close -i <id>` (in a `finally`). Never navigate "the oldest tab on this URL"
   or pick a tab by URL substring in new code — a redirect or a user's own tab on
-  the same URL defeats URL matching; the target id cannot be impersonated.
+  the same URL defeats URL matching; the target id cannot be impersonated. The
+  in-repo checks and logins obey it too (tp#845): they run in
+  `_owned_background_page` / `_background_page_run`; `_match_page` (evaluate
+  only, never navigate) is reserved for `eval --url`.
+- **Owned-tab ledger** (tp#845): three ownership kinds — maintenance-owned
+  (`tx.owned`), in-process ephemeral (`_owned_background_page`: recorded in
+  `<cache>/owned/<pid>-<rand>.json`, its flock on the sidecar `.lock` held for
+  the ledger's life) and `open -N` handoffs (the caller's; NEVER ledgered).
+  Two-phase marker: the entry (random marker) is written before
+  `Target.createTarget {url: about:blank#owned-<marker>, background}` — no
+  `browserContextId`, no `new_context()`; the target id is bound right after
+  the reply; the tab is navigated only after that. Liveness is tri-state
+  (`_owner_state`: live = flock held or pid+start time match; dead = flock free
+  and pid gone/reused; unknown = unreadable → never reaped). Reaping only via
+  `reap-owned`, the guided-login transaction (start, `_guided_a`'s finally) and
+  the maintenance watchdog — never `_preflight`, never `status`.
 - This repo declares **no** `EXTERNAL_DEPS` registry (extdeps package) — it is a
   provider, not a consumer. Its own external tools (`op`, `himalaya`, `security`, Playwright) are
   **optional** and degrade gracefully (assisted fallback); they are documented in
@@ -92,8 +107,9 @@ framework. It is a **provider**: other repos depend on it, not the reverse. See
   lease → record → resume. The detached `maintenance-watchdog` does the same
   when the owner dies. Everything is journaled. Owned targets come from
   `open -N` and the relay's target supervisor (popups whose `openerId` is
-  owned) — never a tab picked by URL, and while a record lives `logged-in`
-  checks run only in a fresh background tab (`_logged_in_page_check`).
+  owned) — never a tab picked by URL, and `logged-in` checks always run in a
+  fresh background tab (`_logged_in_page_check`), not only while a record
+  lives (tp#845).
 - **Tests never leave a real Chrome**: `tests/conftest.py` sets
   `CLAUDE_BROWSER_TEST_NO_LAUNCH=1`, so `_launch_browser` exits in the test
   process and every `browser.py` subprocess it starts; a test that must launch

@@ -163,7 +163,7 @@ def attach(monkeypatch):
         browser, "_connect", lambda port, purpose="": (FakePw(), FakeBrowser())
     )
     monkeypatch.setattr(
-        browser, "_switch_page_by_target", lambda _browser, _tid: state["page"]
+        browser, "_page_by_target", lambda _browser, _tid: state["page"]
     )
 
     def use(page: FakePage) -> None:
