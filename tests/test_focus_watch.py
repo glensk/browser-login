@@ -343,6 +343,76 @@ def test_summary_clean_log_is_green(tmp_path):
     assert "✅ no native-prompt events" in text
 
 
+def test_summary_off_display_window_is_not_counted(tmp_path):
+    def new(window, **extra):
+        return fw.make_record(
+            "window_new", app=CFT, pid=9, chrome=True, window=window, **extra
+        )
+
+    recs = [
+        # Created on screen but parked outside every display: informational.
+        new(1, on_screen=True, on_display=False, bounds=[-32000, -32000, 1280, 900]),
+        # On a display: counted.
+        new(2, on_screen=True, on_display=True),
+        # An old record without on_display keeps today's rule: counted.
+        new(3, on_screen=True),
+    ]
+    summary = fw.summarize(recs)
+    assert summary.chrome_events == 2
+    assert summary.chrome_offdisplay == 1
+    assert summary.chrome_offscreen == 0
+    assert [r["window"] for r in summary.flagged] == [2, 3]
+    text = fw.format_summary(summary, [tmp_path / "x.jsonl"])
+    assert "created outside every display (informational, never shown): 1" in text
+    # The off-display window's first window_shown counts, like an off-screen one.
+    recs.append(fw.make_record("window_shown", app=CFT, pid=9, chrome=True, window=1))
+    assert fw.summarize(recs).chrome_events == 3
+
+
+def test_ns_to_cg_rect_flips_against_the_primary_height():
+    # Primary 1440x900 at the Cocoa origin: identical in CG.
+    assert fw.ns_to_cg_rect((0, 0, 1440, 900), 900) == (0, 900 - 900, 1440, 900)
+    # A 1920x1080 display right of the primary, its bottom edge 100 pt above the
+    # primary's bottom: its CG top is 900 - (100 + 1080) = -280.
+    assert fw.ns_to_cg_rect((1440, 100, 1920, 1080), 900) == (1440, -280, 1920, 1080)
+    # A display BELOW the primary (Cocoa y negative) sits at CG y = 900.
+    assert fw.ns_to_cg_rect((0, -1080, 1920, 1080), 900) == (0, 900, 1920, 1080)
+    displays = fw.display_rects_cg(
+        [(0, 0, 1440, 900), (1440, 100, 1920, 1080)]  # primary first
+    )
+    assert displays == [(0, 0, 1440, 900), (1440, -280, 1920, 1080)]
+    assert fw.on_any_display((100, 100, 500, 400), displays) is True
+    assert fw.on_any_display((2000, -200, 300, 200), displays) is True  # secondary
+    assert fw.on_any_display((1300, 850, 500, 400), displays) is True  # partial
+    assert fw.on_any_display((-32000, -32000, 1280, 900), displays) is False
+    assert fw.on_any_display((1440, 0, 10, 10), [(0, 0, 1440, 900)]) is False  # edge
+    assert fw.on_any_display((0, 0, 10, 10), []) is None  # unknown
+
+
+def test_normalize_sets_on_display_for_chrome_windows_only():
+    calls = []
+
+    def displays():
+        calls.append(1)
+        return [(0.0, 0.0, 1440.0, 900.0)]
+
+    def at(number, owner, x, y):
+        rec = info(number, owner)
+        rec["kCGWindowBounds"] = {"X": x, "Y": y, "Width": 300, "Height": 200}
+        return rec
+
+    wins = fw.normalize_windows(
+        [at(1, CFT, 10, 10), at(2, CFT, -32000, -32000), at(3, "iTerm2", 10, 10)],
+        lambda _pid: None,
+        displays,
+    )
+    assert [w.on_display for w in wins] == [True, False, None]
+    assert calls == [1]  # display rects read once per snapshot
+    assert wins[1].fields()["on_display"] is False
+    assert "on_display" not in wins[2].fields()
+    assert "on_display" not in snap(info(4, CFT))[0].fields()  # no displays given
+
+
 def test_cmd_summary_exit_codes(tmp_path, capsys):
     path = tmp_path / "f.jsonl"
     path.write_text(json.dumps(fw.make_record("activate", app="Finder")) + "\n")

@@ -13,7 +13,10 @@ Cocoa run loop and appends one JSON line per event:
                     window (SecurityAgent, coreautha, …) that was never seen
                     before — on screen or not (field on_screen). Windows on
                     other Spaces / of hidden apps are found by a 1 s scan of
-                    ALL windows; on-screen ones on every poll.
+                    ALL windows; on-screen ones on every poll. Chrome windows
+                    also carry on_display: whether their bounds intersect any
+                    display at capture time (on_screen is also true for a
+                    window parked far outside every display).
   * window_shown  — a known Chrome / native-prompt window came (back) on
                     screen: unhide, unminimise, Space switch.
   * window_raise  — a Chrome-for-Testing window climbed the z-order: a window
@@ -85,6 +88,8 @@ TEXTEDIT_BUNDLE_ID = "com.apple.TextEdit"
 AGENT_LABEL = "com.albert.focus-watch"
 AGENT_PLIST = Path.home() / "Library" / "LaunchAgents" / f"{AGENT_LABEL}.plist"
 DEFAULT_INTERVAL_MS = 200
+# How long the NSScreen display rects (for on_display) are reused.
+DISPLAY_CACHE_S = 2.0
 MIN_INTERVAL_MS = 20
 ALL_WINDOWS_SCAN_S = 1.0
 KEEP_ROTATED = 3
@@ -354,6 +359,7 @@ class Win:  # pylint: disable=too-many-instance-attributes  # one field per datu
     chrome: bool
     native_prompt: bool
     on_screen: bool = True
+    on_display: bool | None = None  # Chrome only: bounds intersect a display
 
     @property
     def tracked(self) -> bool:
@@ -361,14 +367,17 @@ class Win:  # pylint: disable=too-many-instance-attributes  # one field per datu
         return self.chrome or self.native_prompt
 
     def fields(self) -> dict[str, Any]:
-        """Log fields describing this window."""
-        return {
+        """Log fields describing this window (``on_display`` only when known)."""
+        out: dict[str, Any] = {
             "window": self.number,
             "layer": self.layer,
             "bounds": list(self.bounds),
             "title": self.title,
             "on_screen": self.on_screen,
         }
+        if self.on_display is not None:
+            out["on_display"] = self.on_display
+        return out
 
 
 def _bounds(raw: Any) -> tuple[int, int, int, int]:
@@ -383,11 +392,55 @@ def _bounds(raw: Any) -> tuple[int, int, int, int]:
         return (0, 0, 0, 0)
 
 
+Rect = tuple[float, float, float, float]  # x, y, width, height
+
+
+def ns_to_cg_rect(frame: Rect, primary_height: float) -> Rect:
+    """An NSScreen frame (bottom-left origin, y up) in CG global coordinates.
+
+    CGWindow bounds use the top-left corner of the PRIMARY display as origin with
+    y growing downwards; Cocoa puts the origin at the primary display's
+    bottom-left corner with y growing upwards. x is shared; the top edge of a
+    Cocoa rect (``y + height``) is ``primary_height - (y + height)`` in CG.
+    """
+    x, y, width, height = frame
+    return (x, primary_height - (y + height), width, height)
+
+
+def rects_intersect(a: Rect, b: Rect) -> bool:
+    """True when the two rects share a positive area (touching edges do not)."""
+    ax, ay, aw, ah = a
+    bx, by, bw, bh = b
+    return ax < bx + bw and bx < ax + aw and ay < by + bh and by < ay + ah
+
+
+def on_any_display(bounds: Rect, displays: list[Rect]) -> bool | None:
+    """Whether CG `bounds` intersect any display rect (CG coords); None if unknown."""
+    if not displays:
+        return None
+    return any(rects_intersect(bounds, d) for d in displays)
+
+
+def display_rects_cg(ns_frames: list[Rect]) -> list[Rect]:
+    """NSScreen frames (``NSScreen.screens()`` order, primary first) in CG coords."""
+    if not ns_frames:
+        return []
+    primary_height = ns_frames[0][3]
+    return [ns_to_cg_rect(frame, primary_height) for frame in ns_frames]
+
+
 def normalize_windows(
-    infos: Iterable[Any], exe_for_pid: Callable[[int], str | None]
+    infos: Iterable[Any],
+    exe_for_pid: Callable[[int], str | None],
+    displays: Callable[[], list[Rect]] | None = None,
 ) -> list[Win]:
-    """CGWindowList dicts (in the order given) -> `Win`s."""
+    """CGWindowList dicts (in the order given) -> `Win`s.
+
+    `displays` (CG display rects, called at most once, and only when a Chrome
+    window is present) sets each Chrome window's ``on_display``.
+    """
     wins: list[Win] = []
+    display_cache: list[list[Rect]] = []
     for info in infos or []:
         try:
             number = int(info.get("kCGWindowNumber") or 0)
@@ -400,17 +453,25 @@ def normalize_windows(
         except (AttributeError, TypeError, ValueError):
             continue
         exe = exe_for_pid(pid) if pid else None
+        bounds = _bounds(info.get("kCGWindowBounds"))
+        chrome = is_chrome(owner, None, exe)
+        on_display: bool | None = None
+        if chrome and displays is not None:
+            if not display_cache:
+                display_cache.append(displays())
+            on_display = on_any_display(bounds, display_cache[0])
         wins.append(
             Win(
                 number=number,
                 owner=owner,
                 pid=pid,
                 layer=layer,
-                bounds=_bounds(info.get("kCGWindowBounds")),
+                bounds=bounds,
                 title=redact_title(str(title) if title else None),
-                chrome=is_chrome(owner, None, exe),
+                chrome=chrome,
                 native_prompt=is_native_prompt(owner, None),
                 on_screen=on_screen,
+                on_display=on_display,
             )
         )
     return wins
@@ -547,6 +608,7 @@ class Summary:  # pylint: disable=too-many-instance-attributes
     total: int
     first_ts: str | None
     last_ts: str | None
+    chrome_offdisplay: int = 0  # informational: window_new outside every display
 
 
 def summarize(records: list[dict[str, Any]]) -> Summary:
@@ -558,11 +620,15 @@ def summarize(records: list[dict[str, Any]]) -> Summary:
     A Chrome ``window_new`` created OFF screen (a headless or occluded Chrome's
     invisible window, a window on another Space) disturbs nobody and is only
     counted as informational; it fails the summary when that window first comes
-    on screen (its first ``window_shown``).
+    on screen (its first ``window_shown``). The same holds for a window created
+    on screen but OUTSIDE every display (``on_screen: true, on_display: false``
+    — a window parked at -32000,-32000); records without ``on_display`` (logs
+    written before that field existed) keep the on_screen-only rule.
     """
     counts: Counter[tuple[str, str]] = Counter()
     flagged: list[dict[str, Any]] = []
     chrome_events = chrome_shown = chrome_offscreen = native_events = ignored = 0
+    chrome_offdisplay = 0
     offscreen_windows: set[Any] = set()
     selftest_pids: set[int] = set()
     for rec in records:
@@ -582,6 +648,15 @@ def summarize(records: list[dict[str, Any]]) -> Summary:
         window = (rec.get("pid"), rec.get("window"))
         if is_chrome_event and event == "window_new" and rec.get("on_screen") is False:
             chrome_offscreen += 1
+            offscreen_windows.add(window)
+            continue
+        if (
+            is_chrome_event
+            and event == "window_new"
+            and rec.get("on_screen") is True
+            and rec.get("on_display") is False
+        ):
+            chrome_offdisplay += 1
             offscreen_windows.add(window)
             continue
         if is_chrome_event and event == "window_shown" and window in offscreen_windows:
@@ -606,6 +681,7 @@ def summarize(records: list[dict[str, Any]]) -> Summary:
         total=len(records),
         first_ts=stamps[0] if stamps else None,
         last_ts=stamps[-1] if stamps else None,
+        chrome_offdisplay=chrome_offdisplay,
     )
 
 
@@ -636,6 +712,7 @@ def _flag_detail(rec: dict[str, Any]) -> str:
         "source",
         "window",
         "on_screen",
+        "on_display",
         "layer",
         "bounds",
         "title",
@@ -704,6 +781,10 @@ def format_summary(summary: Summary, files: list[Path], bad_lines: int = 0) -> s
     lines.append(
         "Chrome windows created off screen (informational, never shown): "
         f"{summary.chrome_offscreen}"
+    )
+    lines.append(
+        "Chrome windows created outside every display (informational, never "
+        f"shown): {summary.chrome_offdisplay}"
     )
     if summary.native_events:
         lines.append(f"❌ {summary.native_events} native-prompt event(s)")
@@ -864,6 +945,22 @@ def load_pyobjc() -> ObjC:
         sys.exit(EXIT_MISSING_DEP)
 
 
+def ns_screen_frames(appkit: Any) -> list[Rect]:
+    """Every ``NSScreen`` frame (Cocoa coordinates), primary display first."""
+    frames: list[Rect] = []
+    for screen in appkit.NSScreen.screens() or []:
+        frame = screen.frame()
+        frames.append(
+            (
+                float(frame.origin.x),
+                float(frame.origin.y),
+                float(frame.size.width),
+                float(frame.size.height),
+            )
+        )
+    return frames
+
+
 def app_info(running_app: Any) -> dict[str, Any]:
     """Name / bundle id / pid / executable of an NSRunningApplication."""
     if running_app is None:
@@ -906,6 +1003,8 @@ class Watcher:  # pylint: disable=too-many-instance-attributes
         self.last_all_scan = 0.0
         self.last_std_check = 0.0
         self.exe_cache: dict[int, str | None] = {}
+        self._displays: list[Rect] = []
+        self._displays_at = -DISPLAY_CACHE_S
         self.records: list[dict[str, Any]] = []
         self.cond = threading.Condition()
         self.stop_requested = threading.Event()
@@ -970,6 +1069,14 @@ class Watcher:  # pylint: disable=too-many-instance-attributes
             self.exe_cache[pid] = exe_path_for_pid(pid)
         return self.exe_cache[pid]
 
+    def display_rects(self) -> list[Rect]:
+        """Every display's frame in CG coordinates (cached for DISPLAY_CACHE_S)."""
+        now = time.monotonic()
+        if now - self._displays_at >= DISPLAY_CACHE_S:
+            self._displays = display_rects_cg(ns_screen_frames(self.mods.appkit))
+            self._displays_at = now
+        return self._displays
+
     def on_screen_windows(self) -> list[Win]:
         """Every on-screen window, front to back."""
         quartz = self.mods.quartz
@@ -978,7 +1085,7 @@ class Watcher:  # pylint: disable=too-many-instance-attributes
             | quartz.kCGWindowListExcludeDesktopElements,
             quartz.kCGNullWindowID,
         )
-        return normalize_windows(infos or [], self._exe)
+        return normalize_windows(infos or [], self._exe, self.display_rects)
 
     def scan_all(self, describe_all: bool = False) -> tuple[set[int], list[Win]]:
         """Ids of ALL windows (any Space, hidden, minimised) + the new ones described."""
@@ -994,7 +1101,7 @@ class Watcher:  # pylint: disable=too-many-instance-attributes
         new_wins: list[Win] = []
         if new_ids:
             infos = quartz.CGWindowListCreateDescriptionFromArray(sorted(new_ids))
-            new_wins = normalize_windows(infos or [], self._exe)
+            new_wins = normalize_windows(infos or [], self._exe, self.display_rects)
         if ids:
             self.all_ids = ids
         return ids, new_wins
