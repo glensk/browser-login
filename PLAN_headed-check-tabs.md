@@ -118,7 +118,16 @@ Critic: fresh Opus subagent, 2026-10-09, 1 round (Codex seats capped).
 
 ## Steps
 
-- [ ] **0. Measurement gate** (idle-only, see Desktop constraint).
+- [x] **0. Measurement gate** (idle-only, see Desktop constraint).
+      **Verdict 2026-10-09 15:59–16:14 (`~/.local/state/tp871/gate-step0.json`): freeze NOT
+      reproduced.** V0 (today's headed payload `{url, background: true}`), 15 min on a
+      disposable headed CfT 153 (port 9371, Mac idle): 900/900 evaluates answered (max
+      2.08 s, 898 of them `hidden`), 0 `freeze` events, 180/180 Playwright
+      `connect_over_cdp` OK, 181 churn tabs OK; doctor's probe fine (its only ❌ was the
+      expected "HEADED without a live guided-login lease"). The matrix's headed-doctor attach
+      timeout happened at load average ~150, when attaches timed out on the live browser
+      too — the freeze is attributed to load, not to headed background tabs. Per this
+      plan: stop, no code ships (Steps 2–9 not needed).
   - `S=/Users/albert/.local/state/tp871`; disposable `CLAUDE_BROWSER_CACHE_DIR=$S/cache`,
     port 9371 (never 9222/9223), `CLAUDE_BROWSER_TEST_NO_LAUNCH` unset.
   - Launch headed in-process: `uv run python -c 'import sys; sys.path.insert(0,"bin");
@@ -167,13 +176,13 @@ Critic: fresh Opus subagent, 2026-10-09, 1 round (Codex seats capped).
     (popup segment excluded). Pick V1, else V2; if neither passes, ship F1 → (c)
     (Step 7) instead of Steps 2–4. Tear down: `browser.py --cdp-port 9371 down` (same
     env).
-- [ ] **1. focus_watch.** Record `on_display` at capture time (bounds intersect an
+- [x] **1. focus_watch.** (shipped anyway — useful for tp#836's acceptance runs; commit "off-display windows are informational") Record `on_display` at capture time (bounds intersect an
       `NSScreen` frame, converted to CG coordinates). In `summarize`, a Chrome
       `window_new` with `on_screen: true, on_display: false` is treated like the
       `on_screen: false` downgrade (`:583`) — informational until a `window_shown`. Old
       records without `on_display` keep today's rule. Test
       `test_summary_off_display_window_is_not_counted`.
-- [ ] **2. Check-tab creation.** New `_cdp_create_check_target(ws_url, url, budget_s)
+- [x] (not needed — freeze not reproduced) **2. Check-tab creation.** New `_cdp_create_check_target(ws_url, url, budget_s)
       -> CheckCreate(tid, rejected)`: headless → today's `{url, background,
       newWindow}`; headed → the winning payload from a pure
       `_background_target_params(mode, url, check=True)` with a `HEADED_CHECK_WINDOW`
@@ -184,7 +193,7 @@ Critic: fresh Opus subagent, 2026-10-09, 1 round (Codex seats capped).
       `check_window_clamped`, set the process flag `_HEADED_CHECKS_UNUSABLE`, return
       `rejected=True`. No repositioning. `_cdp_create_background_target` stays as is for
       handoffs and keep-alives.
-- [ ] **3. Thread it through.**
+- [x] (not needed — freeze not reproduced) **3. Thread it through.**
   - `_owned_background_page(..., check=False)` → `_create_owned_target(..., check)`; a
     `rejected` result raises `HeadedCheckUnavailable` WITHOUT `_marker_target` recovery
     (`browser.py:~10164-10171`); the ledger entry is dropped only once the target is
@@ -197,15 +206,15 @@ Critic: fresh Opus subagent, 2026-10-09, 1 round (Codex seats capped).
   - Popups: for a headed check tab a poll thread (raw `_target_snapshot` every 250 ms)
     finds page descendants via `openerId`; any whose window is not off-display is closed
     at once and journaled `check_popup_closed`.
-- [ ] **4. Human tabs.** `_guided_a` records `H` (`getWindowForTarget` of its first page)
+- [x] (not needed — freeze not reproduced) **4. Human tabs.** `_guided_a` records `H` (`getWindowForTarget` of its first page)
       in the transaction. `_guided_open_owned` and the headed `cmd_*_login` owned pages
       verify `windowId == H` after creation; on a mismatch or when `H` is gone: close the
       tab and recreate it with `newWindow: true` at `H`'s last bounds (default bounds if
       unknown), then `_activate_owned` — a visible window under the lease is allowed.
-- [ ] **5. Doctor.** If `_browser_mode(port) == "headed"`, `cmd_doctor` adds ⚠ "probe
+- [x] (not needed — freeze not reproduced) **5. Doctor.** If `_browser_mode(port) == "headed"`, `cmd_doctor` adds ⚠ "probe
       skipped: headed" and skips `_doctor_probe`; responsiveness and window checks still
       run. The headless `_doctor_open_probe` is unchanged.
-- [ ] **6. Tests (fakes).** `fake_cdp.py` answers `Browser.getWindowForTarget`
+- [x] (not needed — freeze not reproduced) **6. Tests (fakes).** `fake_cdp.py` answers `Browser.getWindowForTarget`
       (configurable bounds/windowId). New:
   - `tests/test_owned_tabs_tp845.py::test_created_target_payload_per_mode_and_kind`
     (headless / headed-check / headed `open -N` / headed direct `_owned_background_page`);
@@ -215,7 +224,7 @@ Critic: fresh Opus subagent, 2026-10-09, 1 round (Codex seats capped).
   - `tests/test_guided_login.py::test_human_tab_outside_human_window_is_recreated_in_new_window`;
   - `tests/test_connect_hang.py::test_doctor_headed_skips_the_probe_with_a_warning`;
   - Step 1's focus_watch test.
-- [ ] **7. Fallback — only if V1 and V2 fail.** F1: in `_guided_a_tab` the 5 s probe
+- [x] (not needed — freeze not reproduced) **7. Fallback — only if V1 and V2 fail.** F1: in `_guided_a_tab` the 5 s probe
       becomes a read-only raw-CDP `Runtime.evaluate` on the owned login tab's page
       websocket (never navigates): `try { [...document.querySelectorAll(SEL)]
       .some(visible) } catch { null }`, `SEL` = the site's broker `logged_in_selector`
@@ -227,10 +236,10 @@ Critic: fresh Opus subagent, 2026-10-09, 1 round (Codex seats capped).
       built-in window flows also move their final `_guided_probe` after
       `_ensure_headless`. Residual: check tabs during a failed revert stay unfixed; the
       doctor skip still applies.
-- [ ] **8. Re-measure** (idle-only): Step 0 against the implementation, the gate script
+- [x] (not needed — freeze not reproduced) **8. Re-measure** (idle-only): Step 0 against the implementation, the gate script
       driving the real helpers → `$S/gate-step6.json` + `$S/fw-step6.jsonl` (the Step-6
       verdict of record); doctor on the headed disposable: ⚠ skipped, no ❌.
-- [ ] **9. Docs:** docstrings; AGENTS.md "Owned-tab ledger" (payload per mode and kind,
+- [x] (not needed — freeze not reproduced) **9. Docs:** docstrings; AGENTS.md "Owned-tab ledger" (payload per mode and kind,
       the rejected rule); README "Why you never see the window"; plan results; a tp#871
       note with both verdict files.
 
