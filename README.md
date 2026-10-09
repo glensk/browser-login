@@ -244,6 +244,7 @@ A login only you can do (a human check, an email code, SSO with 2FA) runs as a
 
 ```bash
 ./agent-login.py -g slack                 # → browser.py assisted-login slack
+./agent-login.py -g notion -F             # → assisted-login notion -f (past unregistered clients)
 bin/browser.py assisted-login anibis -u https://www.anibis.ch/fr/user/searches
 bin/browser.py assisted-login slack -a    # skip the remote view: the window (A)
 ```
@@ -262,13 +263,21 @@ tab opens on the login URL (`open -N`), and `bin/login_viewer.py` — a loopback
 relay registered via `register-exec` under the guided login's token — streams it
 into a dedicated, extension-free Brave app window (`open -na "Brave Browser"
 --args --user-data-dir=<cache>/viewer-profile --app=<url>`; without Brave the
-default browser, with a ⚠). The link is also printed (OSC 8). You click, type,
-paste and use IME there; JS dialogs show in the view; the tab's viewport
-follows the view's size. OAuth popups (a new target whose `openerId` is an owned
+default browser — `ℹ️  opening the login view in your default browser`). The
+link is also printed (OSC 8). You click, type, paste and use IME there; JS
+dialogs show in the view; the tab's viewport follows the view's size. OAuth popups (a new target whose `openerId` is an owned
 tab) are followed and shown, and the view returns to the opener when they
-close; a tab without an owned opener is never shown. Every 5 s `logged-in SITE`
-(the site's own sentinel, in a separate background tab) decides; on ✅ the view
-closes by itself. Timeouts: 5 min with no view connected, 15 min overall.
+close; a tab without an owned opener is never shown (one that appears right
+after your input — in practice the `logged-in` probe tab below — is only noted
+on the terminal and as a `popup_unowned` event, never in the view). Every 5 s
+`logged-in SITE` (the site's own sentinel, in a separate background tab)
+decides; on ✅ the record's state turns `succeeded`, the relay (it polls the
+record every 0.5 s) shows **✅ Logged in to SITE — you can close this tab** and
+exits by itself within 3 s, then the normal cleanup runs. Any other end (timeout,
+owner gone, CDP lost, the transaction stopping the relay) leaves a final
+`<reason> — see the terminal` in the view; a plain disconnect says `reload
+within 10 s to reconnect; if the login already finished, check the terminal`.
+Timeouts: 5 min with no view connected, 15 min overall.
 
 **A — the window (fallback).** When the view meets something it cannot show —
 a passkey / security-key prompt (a modal WebAuthn `get`/`create`; passkey
@@ -298,9 +307,10 @@ the button is the way out.
    once, naming its pids: restart the Claude sessions that run the Playwright
    MCP.
 3. Take the client gate EXCLUSIVELY (20 s; the refusal names the holders);
-   refuse while UNREGISTERED CDP peers are attached (`lsof`; `-f/--force`
-   proceeds, they keep running unpaused); take the interaction lease (held for
-   the whole session); state `active`; release the gate so the transaction's own
+   refuse while UNREGISTERED CDP peers are attached (`lsof`; `-f/--force`, or
+   `agent-login.py -g SITE -F`, proceeds, they keep running unpaused); take the
+   interaction lease (held for the whole session); state `active` (`succeeded`
+   once B's login is done); release the gate so the transaction's own
    `browser.py` children (they carry the token) can register.
 4. On ANY exit — success, timeout, decline, error, Ctrl-C: close the owned
    targets → `switch headless` if headed (one retry, loud) → release the lease →
@@ -677,6 +687,7 @@ Examples:
 ./agent-login.py -t https://auth.cscs.ch   # SITE may also be a name or login address
 ./agent-login.py -g anibis    # guided login: confirm, then log in via the remote view
 ./agent-login.py -g anthropic # your login (email code) in the shown shared Chromium
+./agent-login.py -g notion -F # the same, even with unregistered CDP clients attached
 ./agent-login.py -P           # print the daily LaunchAgent (-I installs, -U removes)
 ./agent-login.py -j           # the same overview as JSON
 ```
@@ -688,6 +699,7 @@ Examples:
 | `-t`, `--test` `SITE` | real login test for SITE |
 | `-f`, `--fingerprint` `SITE` | length + 4 hex of the SHA-256 of the broker's password for SITE (no login) |
 | `-g`, `--guided` `SITE` | guided login by hand (browser.py assisted-login: confirm on the terminal, remote view of a headless tab; the window as fallback) |
+| `-F`, `--force` | with -g: start even with UNREGISTERED CDP clients attached (browser.py assisted-login -f; they are not paused and keep running) |
 | `-c`, `--check-all` | every usable site: logged in? if not, `browser.py login`; one line per site, exit 1 if any stays logged out |
 | `-m`, `-M`, `--mail` | with -c: mail `albert.glensk@gmail.com` (gog) when a site stays logged out |
 | `-r`, `--refresh` | ask the broker now (re-reads Bitwarden, ~40 s) instead of the snapshot |

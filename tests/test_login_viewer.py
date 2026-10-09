@@ -17,9 +17,14 @@ from __future__ import annotations
 
 # The allowlist pin repeats the module's set on purpose (duplicate-code).
 # pylint: disable=missing-function-docstring,import-error,duplicate-code
+import asyncio
 import importlib.util
+import json
+import os
 import sys
+import time
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -526,3 +531,142 @@ def test_translate_rejects_hostile_shapes_without_raising(msg):
     if result is not None:  # a huge int ack id is harmless; it must still pass the gate
         assert lv.method_allowed(result[0], result[1], OWNED)
     assert lv.translate({"t": ["unhashable"]}) is None
+
+
+# --- the end of a guided login in the view -------------------------------------------
+
+
+class _FakeViewer:
+    """A connected viewer socket: records what the relay sends it."""
+
+    def __init__(self) -> None:
+        self.sent: list[dict] = []
+
+    async def send(self, data: str) -> None:
+        self.sent.append(json.loads(data))
+
+
+def _relay(**over) -> Any:
+    return lv.Relay("http://127.0.0.1:9", "R", "tok", 60, 300.0, **over)
+
+
+def _record(path: Path, **over) -> None:
+    rec = {"owner_nonce": "abc", "pid": os.getpid(), "site": "notion"}
+    rec.update(over)
+    path.write_text(json.dumps(rec), encoding="utf-8")
+
+
+def test_maintenance_poll(tmp_path):
+    rec = tmp_path / "maintenance.json"
+    assert lv.maintenance_poll(rec, "abc") == ("gone", "")  # no record
+    _record(rec, state="active")
+    assert lv.maintenance_poll(rec, "abc") == ("live", "")
+    assert lv.owner_alive(rec, "abc")
+    assert lv.maintenance_poll(rec, "zzz") == ("gone", "")  # another owner's
+    _record(rec, state="succeeded")
+    assert lv.maintenance_poll(rec, "abc") == ("succeeded", "notion")
+    _record(rec, state="succeeded", pid=999999999)
+    assert lv.maintenance_poll(rec, "abc") == ("gone", "")  # owner died first
+
+
+def test_unowned_popup_is_not_shown_in_the_view(capsys):
+    """A page target without an opener right after input (in practice
+    browser.py's own `logged-in` probe tab): stderr + an event, never the view."""
+
+    async def run() -> list[dict]:
+        relay = _relay(events=True, owned=["R"])
+        relay.viewer = _FakeViewer()
+        relay.last_input = time.monotonic()
+        await relay._maybe_popup({"targetId": "P", "type": "page"})
+        assert "P" not in relay.owned
+        return list(relay.viewer.sent)
+
+    assert not asyncio.run(run())
+    out, err = capsys.readouterr()
+    assert json.loads(out) == {"ev": "popup_unowned", "target": "P"}
+    assert "popup target P (opener=unknown)" in err
+
+
+def test_success_record_ends_the_view_with_a_final_line(tmp_path, monkeypatch):
+    rec = tmp_path / "maintenance.json"
+    _record(rec, state="active")
+    monkeypatch.setattr(lv, "MAINT_POLL_S", 0.01)
+
+    async def run() -> Any:
+        relay = _relay(maint_file=rec, maint_nonce="abc")
+        relay.viewer = _FakeViewer()
+        watch = asyncio.create_task(relay.lifecycle_watch())
+        await asyncio.sleep(0.1)
+        assert not relay.done.is_set()  # active: the view stays
+        _record(rec, state="succeeded")
+        await asyncio.wait_for(watch, 5)
+        await relay.final_word()  # already said: no second end line
+        return relay
+
+    relay = asyncio.run(run())
+    assert relay.done.is_set() and relay.exit_code == 0
+    assert relay.viewer.sent == [
+        {
+            "t": "info",
+            "text": "✅ Logged in to notion — you can close this tab",
+            "end": True,
+        }
+    ]
+
+
+def test_record_gone_ends_the_relay(tmp_path, monkeypatch):
+    rec = tmp_path / "maintenance.json"
+    _record(rec, state="active")
+    monkeypatch.setattr(lv, "MAINT_POLL_S", 0.01)
+
+    async def run() -> Any:
+        relay = _relay(maint_file=rec, maint_nonce="abc")
+        watch = asyncio.create_task(relay.lifecycle_watch())
+        rec.unlink()
+        await asyncio.wait_for(watch, 5)
+        return relay
+
+    assert asyncio.run(run()).exit_reason == "the guided login ended"
+
+
+def test_any_other_end_tells_a_connected_view_once():
+    async def run() -> Any:
+        relay = _relay()
+        relay.viewer = _FakeViewer()
+        relay.finish("CDP connection lost: OSError", 1)
+        await relay.final_word()
+        await relay.final_word()
+        idle = _relay()
+        idle.finish("token burned")
+        await idle.final_word()  # no viewer: nothing to tell, no error
+        return relay
+
+    relay = asyncio.run(run())
+    assert relay.viewer.sent == [
+        {
+            "t": "info",
+            "text": "CDP connection lost: OSError — see the terminal",
+            "end": True,
+        }
+    ]
+
+
+def test_a_surface_end_is_not_repeated():
+    async def run() -> Any:
+        relay = _relay()
+        relay.viewer = _FakeViewer()
+        await relay.surface("requested")
+        await relay.final_word()
+        return relay
+
+    relay = asyncio.run(run())
+    assert len(relay.viewer.sent) == 1 and relay.viewer.sent[0]["end"] is True
+
+
+def test_viewer_page_keeps_the_final_text_and_explains_a_disconnect():
+    html = lv.VIEWER_HTML
+    assert "if (!ended) st.textContent = m.text" in html
+    assert (
+        "disconnected — reload within 10 s to reconnect; if the login already "
+        "finished, check the terminal"
+    ) in html

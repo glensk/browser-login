@@ -399,8 +399,8 @@ def test_run_test_switch_only_checks_without_eduid(monkeypatch, tmp_path) -> Non
 def test_guided_switch_is_the_window_login(monkeypatch) -> None:
     seen: list[str] = []
 
-    def fake_assisted_login(site: str) -> int:
-        seen.append(site)
+    def fake_assisted_login(site: str, force: bool = False) -> int:
+        seen.append(site if not force else f"{site} -F")
         return 0
 
     monkeypatch.setattr(al, "assisted_login", fake_assisted_login)

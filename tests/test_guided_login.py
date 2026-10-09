@@ -243,9 +243,12 @@ def test_maintenance_refuses_unregistered_peers_unless_forced(quiet_tx, monkeypa
     monkeypatch.setattr(
         browser, "_unknown_clients_verdict", lambda port: "1 unregistered CDP client"
     )
-    with pytest.raises(browser.MaintenanceRefused, match="unregistered"):
+    with pytest.raises(browser.MaintenanceRefused, match="unregistered") as exc:
         with browser._maintenance("slack", "B", port=59990):
             pytest.fail("must not start")
+    # The refusal names both ways to force it: browser.py's and agent-login's.
+    assert "-f/--force" in str(exc.value)
+    assert "agent-login.py -g slack -F" in str(exc.value)
     assert not browser.MAINTENANCE_FILE.exists()
     with browser._maintenance("slack", "B", port=59990, force=True) as tx:
         assert _record()["owner_nonce"] == tx.nonce
@@ -583,6 +586,103 @@ def test_path_a_order_headed_then_headless(quiet_tx, monkeypatch):
     assert calls[:3] == [("switch", "headed"), ("login", "slack"), ("headless",)]
 
 
+# --- the end of B: the view's last line -------------------------------------------
+
+# A stand-in relay: announces its URL, then waits for the record's state to
+# turn `succeeded` (what login_viewer.py's poll does) and exits by itself.
+FAKE_RELAY = """
+import json, sys, time
+rec_path, seen = sys.argv[1], sys.argv[2]
+print(json.dumps({"url": "http://127.0.0.1:1/tok/"}), flush=True)
+deadline = time.monotonic() + float(sys.argv[3])
+while time.monotonic() < deadline:
+    rec = json.loads(open(rec_path, encoding="utf-8").read())
+    if rec.get("state") == "succeeded":
+        open(seen, "w", encoding="utf-8").write(rec["site"])
+        sys.exit(0)
+    time.sleep(0.05)
+sys.exit(9)
+"""
+
+
+@pytest.fixture
+def b_stubs(quiet_tx, monkeypatch, tmp_path):
+    """`_guided_b` with a fake relay process and a stubbed wait loop."""
+    seen = tmp_path / "relay-saw"
+    stopped: list[int | None] = []
+    real_stop = browser._stop_viewer
+
+    def start(tx, tid):
+        return subprocess.Popen(
+            [PY, "-c", FAKE_RELAY, str(browser.MAINTENANCE_FILE), str(seen), "10"],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            text=True,
+        )
+
+    def stop(relay):
+        stopped.append(relay.poll())
+        real_stop(relay)
+
+    monkeypatch.setattr(browser, "_guided_open_owned", lambda tx, url: "T1")
+    monkeypatch.setattr(browser, "_start_viewer", start)
+    monkeypatch.setattr(browser, "_open_viewer_window", lambda url: "test-file")
+    monkeypatch.setattr(browser, "_stop_viewer", stop)
+    return seen, stopped
+
+
+def test_b_success_lets_the_relay_close_the_view_itself(b_stubs, monkeypatch):
+    """✅ → record state `succeeded` → the relay shows its last line and exits on
+    its own within VIEWER_FINAL_S, before the transaction's cleanup."""
+    seen, stopped = b_stubs
+    monkeypatch.setattr(browser, "_viewer_loop", lambda *a: ("ok", ""))
+    with browser._maintenance("notion", "B", port=59990) as tx:
+        out = browser._guided_b(tx, "notion", "http://x/login", time.monotonic() + 60)
+        assert out == ("ok", "")
+        assert _record()["state"] == "succeeded"
+    assert seen.read_text(encoding="utf-8") == "notion"
+    assert stopped == [0]  # it had already exited by itself, exit 0
+    assert not browser.MAINTENANCE_FILE.exists()
+
+
+def test_b_without_success_leaves_the_state_and_stops_the_relay(b_stubs, monkeypatch):
+    seen, stopped = b_stubs
+    monkeypatch.setattr(browser, "_viewer_loop", lambda *a: ("timeout", "no login"))
+    with browser._maintenance("notion", "B", port=59990) as tx:
+        out = browser._guided_b(tx, "notion", "http://x/login", time.monotonic() + 60)
+        assert out == ("timeout", "no login")
+        assert _record()["state"] == "active"
+    assert not seen.exists()
+    assert stopped == [None]  # still running: `_stop_viewer` ended it
+
+
+def test_relay_reads_the_success_the_transaction_writes(quiet_tx):
+    """The contract between browser.py's record and login_viewer.py's poll."""
+    lv = _load("login_viewer_contract_test", _REPO / "bin" / "login_viewer.py")
+    path = browser.MAINTENANCE_FILE
+    with browser._maintenance("notion", "B", port=59990) as tx:
+        assert lv.maintenance_poll(path, tx.nonce) == ("live", "")
+        tx.note(state="succeeded")
+        assert lv.maintenance_poll(path, tx.nonce) == ("succeeded", "notion")
+        assert lv.maintenance_poll(path, "x" * 32) == ("gone", "")
+        assert browser._maint_live() is not None  # still live until cleanup
+    assert lv.maintenance_poll(path, tx.nonce) == ("gone", "")
+
+
+def test_viewer_without_brave_is_an_info_line(cache, monkeypatch, tmp_path, capsys):
+    opened: list[list[str]] = []
+    monkeypatch.delenv(browser.TEST_VIEWER_URL_ENV, raising=False)
+    monkeypatch.setattr(browser, "BRAVE_APP", tmp_path / "no-brave.app")
+    monkeypatch.setattr(
+        browser.subprocess, "run", lambda argv, **k: opened.append(list(argv))
+    )
+    assert browser._open_viewer_window("http://127.0.0.1:1/tok/") == "default"
+    assert opened == [["open", "http://127.0.0.1:1/tok/"]]
+    err = capsys.readouterr().err
+    assert "ℹ️  opening the login view in your default browser" in err
+    assert "⚠" not in err
+
+
 # --- review fixes ----------------------------------------------------------------
 
 
@@ -805,12 +905,16 @@ def test_agent_login_g_routes_human_logins_to_assisted_login(monkeypatch):
     al = _load("agent_login_guided_test", _REPO / "agent-login.py")
     calls: list[tuple] = []
 
-    def cmd(site: str, start: str | None = None) -> int:
+    forced: list[bool] = []
+
+    def cmd(site: str, start: str | None = None, force: bool = False) -> int:
         calls.append((site, start))
+        forced.append(force)
         return 0
 
-    def window(site: str) -> int:
+    def window(site: str, force: bool = False) -> int:
         calls.append(("window", site))
+        forced.append(force)
         return 0
 
     monkeypatch.setattr(al, "assisted_login_cmd", cmd)
@@ -826,6 +930,34 @@ def test_agent_login_g_routes_human_logins_to_assisted_login(monkeypatch):
     al.manual_login("switch")
     assert calls[-1] == ("window", "switch")
     assert "anthropic" not in al.VIEWER_SITES and "notion" in al.VIEWER_SITES
+    assert not any(forced)
+    # -F: every route passes the force on (assisted-login -f / the transaction).
+    for site in ("anibis", "notion", "anthropic", "switch"):
+        al.manual_login(site, force=True)
+    assert forced[-4:] == [True] * 4
+
+
+def test_agent_login_force_appends_f_and_needs_g(monkeypatch, capsys):
+    sys.path.insert(0, str(_REPO))
+    al = _load("agent_login_force_test", _REPO / "agent-login.py")
+    assert al.assisted_login_argv("notion", None, True)[-3:] == [
+        "assisted-login",
+        "notion",
+        "-f",
+    ]
+    assert al.assisted_login_argv("anibis", "https://x/l")[-4:] == [
+        "assisted-login",
+        "anibis",
+        "-u",
+        "https://x/l",
+    ]
+    assert al.build_parser().parse_args(["-g", "notion", "-F"]).force is True
+    assert al.build_parser().parse_args(["-g", "notion", "--force"]).force is True
+    monkeypatch.setattr(sys, "argv", ["agent-login.py", "-F"])
+    with pytest.raises(SystemExit) as exc:
+        al.main()
+    assert exc.value.code == 2
+    assert "-F/--force only works together with -g/--guided" in capsys.readouterr().err
 
 
 # --- disposable browser end to end -------------------------------------------------
@@ -1159,6 +1291,10 @@ def test_e2e_guided_login_through_the_viewer(disposable):
             )
             _type_login(page)
             assert run.wait(90) == 0, run.out
+            # The view ends with a final line, not a bare "disconnected".
+            assert page.evaluate("document.getElementById('st').textContent") == (
+                "✅ Logged in to testsite — you can close this tab"
+            )
         assert "✅ testsite: logged in" in run.out
         _assert_cleaned_up(disposable, owned, child)
 

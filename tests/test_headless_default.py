@@ -20,7 +20,7 @@ from __future__ import annotations
 # Tests reach into browser.py's private helpers on purpose (it is a script, not
 # a package, so there is no public API).
 # pylint: disable=protected-access,missing-function-docstring,import-error
-# pylint: disable=redefined-outer-name,unused-argument
+# pylint: disable=redefined-outer-name,unused-argument,duplicate-code
 import contextlib
 import importlib.util
 import json
@@ -213,7 +213,7 @@ def test_revert_waiting_on_the_gate_spares_a_new_guided_login(cache, monkeypatch
     monkeypatch.setattr(browser, "_browser_mode", lambda port: "headed")
     calls = _switch_env(monkeypatch, lambda: _write_lease(_lease_rec()))
     assert browser._revert_headed(PORT, "`eval`") == 0
-    assert calls == []
+    assert not calls
     assert any(
         e["event"] == "revert_skipped" and e["reason"] == "lease"
         for e in _journal_events()
@@ -225,7 +225,7 @@ def test_switch_rechecks_the_mode_under_the_gate(cache, monkeypatch):
     monkeypatch.setattr(browser, "_browser_mode", lambda port: next(modes))
     calls = _switch_env(monkeypatch, lambda: None)
     assert browser.cmd_switch(PORT, "headless") == 0
-    assert calls == []
+    assert not calls
 
 
 def test_switch_without_change_meanwhile_does_switch(cache, monkeypatch):
@@ -489,7 +489,9 @@ def test_revert_headed_is_journaled(cache, monkeypatch, tmp_path):
     )
     assert browser._revert_headed(PORT, "`eval`") == 0
     journal = Path(os.environ["CLAUDE_BROWSER_JOURNAL_FILE"])
-    events = [json.loads(line) for line in journal.read_text().splitlines()]
+    events = [
+        json.loads(line) for line in journal.read_text(encoding="utf-8").splitlines()
+    ]
     assert [(e["event"], e["phase"]) for e in events] == [
         ("revert_headed", "start"),
         ("revert_headed", "end"),
@@ -564,7 +566,9 @@ class _Page:
 
 def _journal_events() -> list[dict]:
     journal = Path(os.environ["CLAUDE_BROWSER_JOURNAL_FILE"])
-    return [json.loads(line) for line in journal.read_text().splitlines()]
+    return [
+        json.loads(line) for line in journal.read_text(encoding="utf-8").splitlines()
+    ]
 
 
 def test_bring_to_front_without_lease_is_a_journaled_no_op(cache, monkeypatch):
@@ -684,9 +688,11 @@ def guided_env(monkeypatch):
 
         @staticmethod
         @contextlib.contextmanager
-        def _maintenance(site, mode):
+        def _maintenance(site, mode, force=False):
             assert mode == "A"
             log.append(("lease", site))
+            if force:
+                log.append(("force",))
             try:
                 yield types.SimpleNamespace(nonce="nonce")
             finally:
@@ -716,6 +722,13 @@ def test_guided_window_order(guided_env):
         ("switch", "headless"),
         ("release", "anibis"),
     ]
+
+
+def test_guided_window_passes_force_to_the_transaction(guided_env):
+    log, _rc, _owner = guided_env
+    with jobs.guided_window("slack", force=True):
+        pass
+    assert log[:2] == [("lease", "slack"), ("force",)]
 
 
 def test_guided_window_failed_switch_back_is_loud_and_retried(guided_env, capsys):

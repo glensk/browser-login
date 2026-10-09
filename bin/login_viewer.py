@@ -36,14 +36,20 @@ Guided-login integration (``browser.py assisted-login``, the maintenance
 transaction): the relay runs as a REGISTERED long-lived client (``register-exec``)
 under the transaction's owner token; ``-M FILE`` makes it refuse to start without
 that token and end as soon as the maintenance record is gone or its owner died
-(the watchdog then closes the owned targets). ``-E`` prints one JSON event per
-line on stdout for the transaction:
+(the watchdog then closes the owned targets), or once the owner marked the login
+``succeeded`` (the view then says ``✅ Logged in to SITE — you can close this
+tab``); the record is polled every 0.5 s. Whatever ends the relay (SIGTERM from
+the transaction included), a connected view gets one final ``end`` line first,
+so it never just says "disconnected". ``-E`` prints one JSON event per line on
+stdout for the transaction:
 
 * ``{"ev": "owned", "target", "opener"}`` — the TARGET SUPERVISOR followed a new
   target whose ``openerId`` is an owned one (an OAuth popup): it is owned now and
   shown in the viewer; ``{"ev": "released", "target"}`` — an owned target closed
   (the viewer returns to its opener). A target without an owned opener is never
-  selected (at most reported as ``opener=unknown``).
+  selected; ``{"ev": "popup_unowned", "target"}`` (plus a stderr line) when one
+  appears right after the human's input — usually browser.py's own background
+  ``logged-in`` probe tab. It is NOT shown in the view.
 * ``{"ev": "viewer", "connected"}`` — the human's view (dis)connected.
 * ``{"ev": "surface", "reason"}`` — something the view cannot do: a WebAuthn /
   passkey prompt (``navigator.credentials.get/create`` hook, conditional
@@ -71,6 +77,7 @@ import json
 import math
 import os
 import secrets
+import signal
 import sys
 import time
 import urllib.request
@@ -183,6 +190,10 @@ MAX_POPUPS = 20
 # A page target without openerId that appears within this many seconds of the
 # human's last input is reported as a possible popup (opener=unknown).
 POPUP_FOCUS_WINDOW_S = 3.0
+# How often (-M) the relay re-reads the guided login's maintenance record.
+MAINT_POLL_S = 0.5
+# The record state browser.py writes once the login succeeded.
+MAINT_SUCCEEDED = "succeeded"
 
 
 def osc8(url: str, text: str | None = None) -> str:
@@ -317,33 +328,52 @@ def hook_source(binding: str) -> str:
     )
 
 
-def maintenance_error(path: Path, nonce: str) -> str | None:
-    """Why the relay may not run under maintenance record `path`, or None."""
+def _record_error(path: Path, nonce: str) -> tuple[dict[str, Any], str | None]:
+    """(the record, why the relay may not run under it — None when it may)."""
     try:
         rec = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, ValueError):
-        return (
+        return {}, (
             f"no maintenance record at {path} (start it via browser.py assisted-login)"
         )
     if not isinstance(rec, dict) or not rec.get("owner_nonce"):
-        return f"invalid maintenance record at {path}"
+        return {}, f"invalid maintenance record at {path}"
     if not nonce or not hmac.compare_digest(str(rec["owner_nonce"]), nonce):
-        return "not the guided login's owner ($CLAUDE_BROWSER_MAINTENANCE)"
-    return None
+        return rec, "not the guided login's owner ($CLAUDE_BROWSER_MAINTENANCE)"
+    return rec, None
+
+
+def maintenance_error(path: Path, nonce: str) -> str | None:
+    """Why the relay may not run under maintenance record `path`, or None."""
+    return _record_error(path, nonce)[1]
+
+
+def maintenance_poll(path: Path, nonce: str) -> tuple[str, str]:
+    """One look at the guided login's record: ``("gone", "")`` (gone, another
+    owner's, or its owner pid died), ``("succeeded", SITE)`` (the owner marked
+    the login done) or ``("live", "")``."""
+    rec, err = _record_error(path, nonce)
+    if err is not None:
+        return "gone", ""
+    try:
+        os.kill(int(rec["pid"]), 0)
+    except ProcessLookupError:
+        return "gone", ""
+    except (OSError, KeyError, ValueError, TypeError):
+        pass  # EPERM / unreadable: never end a live session on a hiccup
+    if rec.get("state") == MAINT_SUCCEEDED:
+        return MAINT_SUCCEEDED, str(rec.get("site") or "")
+    return "live", ""
 
 
 def owner_alive(path: Path, nonce: str) -> bool:
     """The record still carries `nonce` and its owner pid exists."""
-    if maintenance_error(path, nonce) is not None:
-        return False
-    try:
-        pid = int(json.loads(path.read_text(encoding="utf-8")).get("pid"))
-        os.kill(pid, 0)
-    except ProcessLookupError:
-        return False
-    except (OSError, ValueError, TypeError):
-        return True  # EPERM / unreadable: never end a live session on a hiccup
-    return True
+    return maintenance_poll(path, nonce)[0] != "gone"
+
+
+def success_text(site: str) -> str:
+    """The view's last line after a successful guided login."""
+    return f"✅ Logged in to {site or 'the site'} — you can close this tab"
 
 
 def ownership_error(
@@ -671,6 +701,7 @@ class Relay:  # pylint: disable=too-many-instance-attributes
     popups: list[str] = field(default_factory=list)
     exit_reason: str = ""
     exit_code: int = 0
+    end_sent: bool = False  # the view got its final ``end`` line
     done: asyncio.Event = field(default_factory=asyncio.Event)
     events: bool = False
     maint_file: Path | None = None
@@ -963,14 +994,21 @@ class Relay:  # pylint: disable=too-many-instance-attributes
         )
         action = popup_decision(ti, self.owned, recent)
         tid = str(ti.get("targetId", ""))
-        if action == "ignore" or len(self.popups) >= MAX_POPUPS:
+        if action == "ignore":
+            return
+        if action == "report":
+            # Terminal + transaction only: in practice browser.py's own
+            # background `logged-in` probe tab, nothing the human must see.
+            print(
+                f"ℹ️  popup target {tid} (opener=unknown) — not owned, not shown",
+                file=sys.stderr,
+            )
+            self.emit(ev="popup_unowned", target=tid)
+            return
+        # Only followed popups count: probe tabs must not use up the cap.
+        if len(self.popups) >= MAX_POPUPS:
             return
         self.popups.append(tid)
-        if action == "report":
-            note = f"popup target {tid} (opener=unknown) — not owned, not shown"
-            print(f"ℹ️  {note}", file=sys.stderr)
-            await self._to_viewer({"t": "info", "text": note, "popup": tid})
-            return
         opener = str(ti.get("openerId", ""))
         self.owned.append(tid)
         self.openers[tid] = opener
@@ -1022,10 +1060,32 @@ class Relay:  # pylint: disable=too-many-instance-attributes
 
     async def _to_viewer(self, obj: dict[str, Any]) -> None:
         if self.viewer is not None:
+            if obj.get("end"):
+                self.end_sent = True
             try:
                 await self.viewer.send(json.dumps(obj))
             except Exception:  # pylint: disable=broad-exception-caught
                 pass
+
+    async def final_word(self) -> None:
+        """Tell a connected view why it ends (once; the page keeps that text)."""
+        if not self.end_sent:
+            text = f"{self.exit_reason} — see the terminal"
+            await self._to_viewer({"t": "info", "text": text, "end": True})
+
+    async def poll_maintenance(self) -> None:
+        """``-M``: end with the guided login — gone/dead owner, or succeeded."""
+        if self.maint_file is None:
+            return
+        state, site = await asyncio.to_thread(
+            maintenance_poll, self.maint_file, self.maint_nonce
+        )
+        if state == "gone":
+            self.finish("the guided login ended")
+        elif state == MAINT_SUCCEEDED:
+            text = success_text(site)
+            await self._to_viewer({"t": "info", "text": text, "end": True})
+            self.finish(f"logged in to {site}")
 
     # ---- viewer side -------------------------------------------------------------
 
@@ -1146,18 +1206,14 @@ class Relay:  # pylint: disable=too-many-instance-attributes
 
     async def lifecycle_watch(self) -> None:
         """Exit once the token is burned, after ``idle_timeout`` s with no viewer,
-        or (``-M``) once the guided login's record is gone or its owner died."""
-        last_maint = time.monotonic()
+        or (``-M``, every MAINT_POLL_S) once the guided login's record is gone,
+        its owner died, or the owner marked the login succeeded."""
         while not self.done.is_set():
-            await asyncio.sleep(0.5)
+            await asyncio.sleep(MAINT_POLL_S)
+            await self.poll_maintenance()
+            if self.done.is_set():
+                continue
             now = time.monotonic()
-            if self.maint_file is not None and now - last_maint >= 2.0:
-                last_maint = now
-                if not await asyncio.to_thread(
-                    owner_alive, self.maint_file, self.maint_nonce
-                ):
-                    self.finish("the guided login ended")
-                    continue
             if self.viewer is not None:
                 self.last_viewer = now
             elif self.auth.burned(now):
@@ -1238,10 +1294,10 @@ function answer(accept) { send({t: "dialog", accept, text: dval.value}); dlg.sty
 document.getElementById("dok").addEventListener("click", () => answer(true));
 document.getElementById("dno").addEventListener("click", () => answer(false));
 document.getElementById("fb").addEventListener("click", () => send({t: "fallback"}));
-ws.onclose = () => { if (!ended) st.textContent = "disconnected — reload within 10 s to reconnect"; };
+ws.onclose = () => { if (!ended) st.textContent = "disconnected — reload within 10 s to reconnect; if the login already finished, check the terminal"; };
 ws.onmessage = ev => {
   const m = JSON.parse(ev.data);
-  if (m.t === "info") { window.__viewerStats.info.push(m); st.textContent = m.text; if (m.end) ended = true; return; }
+  if (m.t === "info") { window.__viewerStats.info.push(m); if (!ended) st.textContent = m.text; if (m.end) ended = true; return; }
   if (m.t === "dialog") { dmsg.textContent = m.type + ": " + m.message; dval.value = m.prompt || "";
     dval.style.display = m.type === "prompt" ? "" : "none"; dlg.style.display = "block"; return; }
   if (m.t === "dialog-closed") { dlg.style.display = "none"; return; }
@@ -1403,6 +1459,7 @@ async def _amain(a: argparse.Namespace) -> int:
         maint_file=a.maintenance,
         maint_nonce=os.environ.get(MAINTENANCE_ENV, ""),
     )
+    _stop_on_signals(relay)
     try:
         await relay.attach()
     except (OSError, LookupError, RuntimeError, KeyError, asyncio.TimeoutError) as e:
@@ -1437,12 +1494,27 @@ async def _amain(a: argparse.Namespace) -> int:
             watcher = asyncio.create_task(relay.lifecycle_watch())
             await relay.done.wait()
             watcher.cancel()
+            await relay.final_word()  # before the server closes the socket
     finally:
         await relay.close()
     mark = "✅" if relay.exit_code == 0 else "❌"
     print(f"{mark} viewer relay ended: {relay.exit_reason}", file=sys.stderr)
     relay.emit(ev="end", reason=relay.exit_reason, code=relay.exit_code)
     return relay.exit_code
+
+
+def _stop_on_signals(relay: Relay) -> None:
+    """SIGTERM (the transaction's `_stop_viewer`, forwarded by register-exec)
+    and SIGINT end the relay through `finish`, so a connected view still gets
+    its final line instead of a bare "disconnected"."""
+    loop = asyncio.get_running_loop()
+    for sig in (signal.SIGTERM, signal.SIGINT):
+        try:
+            loop.add_signal_handler(
+                sig, relay.finish, "the guided login stopped the view", 128 + sig
+            )
+        except (NotImplementedError, RuntimeError, ValueError):
+            pass  # not the main thread / no signal support: default handling
 
 
 def bootstrap_venv() -> None:

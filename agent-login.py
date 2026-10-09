@@ -25,6 +25,7 @@ Examples:
   ./agent-login.py -t https://auth.cscs.ch   # SITE may also be a name or login address
   ./agent-login.py -g anibis    # guided login: confirm, then log in via the remote view
   ./agent-login.py -g anthropic # your login (email code) in the shown shared Chromium
+  ./agent-login.py -g notion -F # the same, even with unregistered CDP clients attached
   ./agent-login.py -P           # print the daily LaunchAgent (-I installs, -U removes)
   ./agent-login.py -j           # the same overview as JSON
 """
@@ -707,7 +708,7 @@ MANUAL_START = {
 }
 
 
-def manual_login(site: str) -> int:
+def manual_login(site: str, force: bool = False) -> int:
     """`-g SITE`: the guided login — a human login in the shared Chromium.
 
     Sites whose guided flow is just "Albert logs in by hand" (the marketplace
@@ -717,30 +718,42 @@ def manual_login(site: str) -> int:
     fallback). The claude.ai accounts and SWITCH keep their own window flows
     (`assisted_login`). You type the password yourself (paste it from
     Bitwarden) — no agent sees it; agents then use the session until the site
-    expires it.
+    expires it. `force` (-F): start even with unregistered CDP clients
+    attached (`assisted-login -f`; the window flows' transaction the same).
     """
     site = resolve_site(site)
     if site in VIEWER_SITES:
-        return viewer_login(site)
+        return viewer_login(site, force=force)
     if site in ASSISTED_SITES or site in EDUID_SSO_SITES:
-        return assisted_login(site)
+        return assisted_login(site, force=force)
     start = MANUAL_START.get(site)
     if not start:
         known = ", ".join([*MANUAL_START, *sorted(ASSISTED_SITES | EDUID_SSO_SITES)])
         print(f"❌ no guided login known for {site!r} (known: {known})")
         return 2
-    return assisted_login_cmd(site, start)
+    return assisted_login_cmd(site, start, force=force)
 
 
-def assisted_login_cmd(site: str, start: str | None = None) -> int:
-    """`browser.py assisted-login SITE [-u START]` (it asks on the terminal)."""
+def assisted_login_argv(
+    site: str, start: str | None = None, force: bool = False
+) -> list[str]:
+    """`browser.py assisted-login SITE [-u START] [-f]`."""
     argv = [sys.executable, str(BROWSER_PY), "assisted-login", site]
     if start:
         argv += ["-u", start]
-    return subprocess.run(argv, check=False).returncode
+    if force:
+        argv.append("-f")
+    return argv
 
 
-def viewer_login(site: str) -> int:
+def assisted_login_cmd(site: str, start: str | None = None, force: bool = False) -> int:
+    """`browser.py assisted-login SITE [-u START] [-f]` (it asks on the terminal)."""
+    return subprocess.run(
+        assisted_login_argv(site, start, force), check=False
+    ).returncode
+
+
+def viewer_login(site: str, force: bool = False) -> int:
     """An assisted site (email code / SSO) through `assisted-login`, with the
     pre- and post-check (and the recorded result) of `assisted_login`."""
     ok, how = assisted_check(site)
@@ -749,7 +762,7 @@ def viewer_login(site: str) -> int:
         record_check(site, True, how)
         return 0
     with site_instance(site):
-        rc = assisted_login_cmd(browser_site(site))
+        rc = assisted_login_cmd(browser_site(site), force=force)
     ok, how = assisted_check(site)
     if ok is not None:
         record_check(site, ok, how)
@@ -813,7 +826,7 @@ def _claude_check(site: str, hint: str) -> tuple[bool | None, str]:
     return True, f"logged in as {email}"
 
 
-def assisted_login(site: str) -> int:
+def assisted_login(site: str, force: bool = False) -> int:
     """`browser.py login SITE` with the shared Chromium window shown: the site's
     own assisted flow (email code / SSO click) waits until you finish it."""
     ok, how = assisted_check(site)
@@ -828,7 +841,7 @@ def assisted_login(site: str) -> int:
         return 2
     with site_instance(site):
         try:
-            with guided_window(site) as win:
+            with guided_window(site, force=force) as win:
                 if site in SITE_INSTANCE and site in CLAUDE_ACCOUNTS:
                     claude_login_by_hand(site)
                 else:
@@ -1003,6 +1016,13 @@ def build_parser() -> argparse.ArgumentParser:
         "terminal, remote view of a headless tab; the window as fallback)",
     )
     ap.add_argument(
+        "-F",
+        "--force",
+        action="store_true",
+        help="with -g: start even with UNREGISTERED CDP clients attached "
+        "(browser.py assisted-login -f; they are not paused and keep running)",
+    )
+    ap.add_argument(
         "-c",
         "--check-all",
         action="store_true",
@@ -1097,7 +1117,7 @@ def login_action(args: argparse.Namespace) -> int | None:
         )
         return 0
     if args.guided:
-        return manual_login(args.guided)
+        return manual_login(args.guided, force=args.force)
     if args.check_all:
         return check_all(mail=args.mail)
     return None
@@ -1109,6 +1129,8 @@ def main() -> int:
     args = ap.parse_args()
     if args.mail and not args.check_all:
         ap.error("-m/--mail only works together with -c/--check-all")
+    if args.force and not args.guided:
+        ap.error("-F/--force only works together with -g/--guided")
     rc = launch_action(args)
     if rc is not None:
         return rc

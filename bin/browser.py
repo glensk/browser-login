@@ -3151,7 +3151,7 @@ def _interaction_lease(
 #   * DESIRED_MODE_FILE records the mode `up` launches in. It is always
 #     "headless" (absent = headless); any other value is reported and ignored.
 #   * MAINTENANCE_FILE {owner_nonce, pid, pid_start_time, site, mode A|B, state
-#     preparing|active, owned_targets, paused, watchdog_pid, started,
+#     preparing|active|succeeded, owned_targets, paused, watchdog_pid, started,
 #     heartbeat} — ONE record, the single source of truth for "a guided login
 #     owns the browser". Phase 2's headed lease IS this record with mode A
 #     (a record without a mode is mode A). Refreshed every 10 s. It is LIVE
@@ -9613,7 +9613,9 @@ def cmd_notion_logged_in(port: int) -> int:
 #
 #   B (primary): an OWNED background tab on the login URL, shown to Albert by
 #     bin/login_viewer.py — a loopback relay that streams the headless tab into
-#     a dedicated, extension-free Brave app window and forwards his input. The
+#     a dedicated, extension-free Brave app window (without Brave: the default
+#     browser) and forwards his input. On success the record's state turns
+#     ``succeeded`` and the relay ends the view with a final "logged in" line. The
 #     browser stays headless the whole time.
 #   A (fallback, -a or offered when B cannot do the login): `switch headed`
 #     under the same transaction, the old window flow, `switch headless` in a
@@ -9638,6 +9640,9 @@ GUIDED_PROBE_EVERY_S = 5.0
 # How long a paused client has to confirm (its wrapper writes paused: true).
 PAUSE_ACK_S = 5.0
 WATCHDOG_POLL_S = 2.0
+# How long the relay gets, after a successful login, to show its final line in
+# the view and exit by itself (it polls the record every 0.5 s).
+VIEWER_FINAL_S = 3.0
 VIEWER_PY = Path(__file__).resolve().parent / "login_viewer.py"
 # The dedicated, extension-free Brave profile the viewer opens in.
 VIEWER_PROFILE_DIR = CACHE_DIR / "viewer-profile"
@@ -10049,7 +10054,8 @@ def _maint_take_gate(tx: Maintenance, stack: contextlib.ExitStack, force: bool) 
             if verdict is not None and not force:
                 raise MaintenanceRefused(
                     f"{verdict}\n   Stop them (or register them via register-exec), "
-                    "or re-run with -f/--force (they keep running, unpaused)."
+                    "or re-run with -f/--force (agent-login.py -g "
+                    f"{tx.site} -F); they keep running, unpaused."
                 )
             if verdict is not None:
                 print(f"⚠ --force: guided login anyway — {verdict}", file=sys.stderr)
@@ -10177,8 +10183,9 @@ def _open_viewer_window(url: str) -> str:
     """Show the viewer URL to Albert: a dedicated, extension-free Brave app window.
 
     Test hook (disposable browser only): write the URL to a file instead.
-    Fallback without Brave: the default browser (`open URL`) with a ⚠ — that
-    profile is NOT dedicated. Returns how it was opened.
+    Without Brave (the normal case on a Mac that does not have it): the
+    default browser (`open URL`), announced with an ℹ️ line — that profile is
+    not a dedicated one. Returns how it was opened.
     """
     test_file = os.environ.get(TEST_VIEWER_URL_ENV, "")
     if test_file and _test_mode():
@@ -10203,11 +10210,7 @@ def _open_viewer_window(url: str) -> str:
             check=False,
         )
         return "brave"
-    print(
-        "⚠ Brave Browser not found — opening the login view in your DEFAULT "
-        "browser (not a dedicated profile).",
-        file=sys.stderr,
-    )
+    print("ℹ️  opening the login view in your default browser", file=sys.stderr)
     subprocess.run(["open", url], check=False)
     return "default"
 
@@ -10321,9 +10324,26 @@ def _guided_b(tx: Maintenance, site: str, url: str, deadline: float) -> tuple[st
             f"{GUIDED_IDLE_S // 60} min without the view open)."
         )
         del url_v, first
-        return _viewer_loop(tx, site, relay, events, deadline)
+        outcome, why = _viewer_loop(tx, site, relay, events, deadline)
+        if outcome == "ok":
+            _viewer_success(tx, relay)
+        return outcome, why
     finally:
         _stop_viewer(relay)
+
+
+def _viewer_success(tx: Maintenance, relay: subprocess.Popen) -> None:
+    """Let the relay close the view with a final "logged in" line.
+
+    The record's state becomes ``succeeded``; the relay polls the record every
+    0.5 s, shows ``✅ Logged in to SITE — you can close this tab`` in the view
+    and exits by itself. It gets VIEWER_FINAL_S for that, then `_stop_viewer`
+    and the transaction's normal cleanup (owned targets → headless → lease →
+    record → resume) run as before.
+    """
+    tx.note(state="succeeded")
+    with contextlib.suppress(subprocess.TimeoutExpired):
+        relay.wait(VIEWER_FINAL_S)
 
 
 def _viewer_loop(

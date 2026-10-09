@@ -355,7 +355,7 @@ def hide_window(mod: ModuleType | None = None, nonce: str | None = None) -> bool
 
 
 @contextlib.contextmanager
-def guided_window(site: str) -> Iterator[GuidedWindow]:
+def guided_window(site: str, force: bool = False) -> Iterator[GuidedWindow]:
     """Show the shared Chromium for a guided login, then hide it again.
 
     Order (tp#836): enter the guided-login maintenance transaction in mode A
@@ -366,13 +366,17 @@ def guided_window(site: str) -> Iterator[GuidedWindow]:
     cleanup (owned tabs closed, record cleared, clients resumed). A failed
     `switch headed` raises RuntimeError after reverting whatever is left
     headed. The yielded `GuidedWindow.restored` says whether the window is gone.
+    `force` (agent-login -g SITE -F): start even with unregistered CDP clients
+    attached.
     """
     state = GuidedWindow()
     with contextlib.ExitStack() as stack:
         try:
             mod = _browser_module()
             tx = stack.enter_context(
-                mod._maintenance(site, "A")  # pylint: disable=protected-access
+                mod._maintenance(  # pylint: disable=protected-access
+                    site, "A", force=force
+                )
             )
             nonce = tx.nonce
         except RuntimeError as exc:  # MaintenanceRefused/HeadedLease*, load failure
