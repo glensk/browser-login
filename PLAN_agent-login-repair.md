@@ -169,7 +169,31 @@ manual acceptance steps under the attempt policy below.
         protection mode blocks docker), so one approved submit after the vault update is
         the test. Separate realm, so no shared attempt group. Off-LAN it must report
         `unreachable` (precheck), never submit.
-  - [ ] calibre
+  - [ ] calibre (Calibre-Web Automated v4.0.8, container `calibre-web` on nixos)
+    - [x] Root cause (read-only; Opus critique, since every Codex seat was above its cap):
+          the vault had the factory default `admin123`. On 2026-10-08 the broker's
+          pre-tp#835 Enter-submit pressed CWA's `forgot` button twice, which reset the admin
+          password twice and mailed it (Gmail msgs 52409/52410; 52410 is live). The third
+          attempt failed, which caused the hard lock. Latent: the sentinel `#logout` sits in
+          a closed dropdown (theme caliBlur), and anonymous browsing renders `/` without a
+          login.
+    - [ ] Albert: log in with the password from mail 52410, set a new one in `/me`, paste it
+          into the `calibre` item, drop the `192.168.178.72` URI, purge both mails (tp#97).
+          Decision: agents use `admin` or a dedicated non-admin user (recommended).
+    - [ ] Fields (`broker-add.py -b`): `agent_logged_in_selector=#top_admin` (non-admin:
+          `#top_tasks`), `agent_check_url=https://calibre.dom42.space/me`,
+          `agent_cookie_names=session,remember_token`, `agent_fresh_login=true`.
+    - [ ] Code (after WS1a), generic:
+      - `_submit_password`/`_submit_identifier` fail closed: no Enter fallback when the
+            buttons can't be read;
+      - a POST tripwire for secondary buttons (`forgot=`), reported as
+            `secondary-action-blocked`;
+      - `submitted` is set only after the click;
+      - "remember me" is checked before submit;
+      - a Cloudflare Access redirect reads `access-gated`, never a submit;
+      - re-login at 28 days or more of session age;
+      - the promotion gate requires the sentinel visible after a real login.
+    - [ ] Security defects in CWA itself: tp#886 (needs Albert's decision).
   - [ ] galaxus
   - [ ] galaxus-de
   - [ ] myfritz-alzenau
@@ -221,6 +245,20 @@ manual acceptance steps under the attempt policy below.
   and poll.
 - Storage-token sites need a refresh-before-export rule, or the daily check costs a
   password submit each day (NPM JWT lasts 1 day).
+- **A wrong submit can change server state.** A "stale" credential may have been destroyed
+  by the broker itself (CWA `forgot` reset). Audit pre-fix attempts on forms with secondary
+  buttons.
+- Evidence sources:
+  - the app's own mails in Gmail (`himalaya message read -p` does not mark them read);
+  - the app's activity database;
+  - NPM per-host logs `/data/logs/proxy-host-<id>_access.log*` (status codes, and the UA,
+        which dates the broker release);
+  - the full broker audit `/var/db/login-broker/audit.log`.
+- **Sentinels:**
+  - must be proven VISIBLE after a real login, not only absent before one;
+  - apps with anonymous browsing need a check URL that requires login (`/me`);
+  - apps that tie sessions to IP+UA survive bundle injection only via remember-me;
+  - apps whose session row isn't extended by use need `agent_fresh_login` to refresh.
 - Subagents never see SessionStart output, only a SubagentStart hook's `additionalContext`. A
   Codex hook without a trust row is skipped silently in `codex exec`, and each seat needs its
   own row.
