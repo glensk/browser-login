@@ -224,7 +224,7 @@ def test_switch_rechecks_the_mode_under_the_gate(cache, monkeypatch):
     modes = iter(["headed", "headless"])  # another switch got there first
     monkeypatch.setattr(browser, "_browser_mode", lambda port: next(modes))
     calls = _switch_env(monkeypatch, lambda: None)
-    assert browser.cmd_switch(PORT, "headless") == 0
+    assert browser.cmd_switch(PORT, "headless", revert=True) == 0
     assert not calls
 
 
@@ -482,11 +482,15 @@ def test_preflight_keeps_a_guided_login(cache, monkeypatch):
 
 
 def test_revert_headed_is_journaled(cache, monkeypatch, tmp_path):
-    monkeypatch.setattr(
-        browser,
-        "cmd_switch",
-        lambda port, target, force=False, gate_wait_s=None, revert=False: 0,
-    )
+    """The revert runs inside its own short maintenance record (purpose revert)."""
+    monkeypatch.setattr(browser, "_browser_mode", lambda port: "headed")
+    seen: list[dict | None] = []
+
+    def switch(port, target, force=False, gate_wait_s=None, revert=False):
+        seen.append(browser._maint_live())
+        return 0
+
+    monkeypatch.setattr(browser, "cmd_switch", switch)
     assert browser._revert_headed(PORT, "`eval`") == 0
     journal = Path(os.environ["CLAUDE_BROWSER_JOURNAL_FILE"])
     events = [
@@ -494,9 +498,18 @@ def test_revert_headed_is_journaled(cache, monkeypatch, tmp_path):
     ]
     assert [(e["event"], e["phase"]) for e in events] == [
         ("revert_headed", "start"),
+        ("revert_tx", "start"),
+        ("headed_lease", "start"),
+        ("headed_lease", "end"),
+        ("revert_tx", "end"),
         ("revert_headed", "end"),
     ]
-    assert events[1]["result"] == 0
+    assert events[2]["site"] == "revert" and events[2]["purpose"] == "revert"
+    assert events[-1]["result"] == 0
+    rec = seen[0]
+    assert rec is not None and rec["purpose"] == "revert" and rec["mode"] == "B"
+    assert rec["port"] == PORT
+    assert not browser.MAINTENANCE_FILE.exists()
 
 
 # --- login never opens a human flow --------------------------------------------

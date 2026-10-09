@@ -274,7 +274,7 @@ relay exposes only owned targets.
       | SIGKILL owner, mode A                   | ✅     | recovered in 16.1 s (switch headless ~13 s)                 |
       | SIGKILL owner + watchdog (A, B)         | ✅     | `agent-login -S` backstop recovered (1–7 s)                 |
       | failed switch back, unregistered peer   | ✅     | loud ❌ lines, record cleared, `problems=1`                 |
-      | lease-less headed + registered client   | ❌→fix | preflight revert blocked by the client gate; fix in progress (revert as a short maintenance transaction) |
+      | lease-less headed + registered client   | ✅ (fixed) | was ❌: client gate blocked the revert; now a short maintenance transaction pauses → switches → resumes (re-run on disposable 9361: ticker gap 2.2 s, doctor ✅) |
       | lease-less headed, no registered client | ✅     | preflight revert in 1.9 s, stderr only                      |
       | down/up during B                        | ✅     | `down` 75, `down -F` clean, no leaked record/tabs           |
       | cancel (SIGINT) a B login               | ✅     | 0.7 s, owned tab closed, relay gone                         |

@@ -3187,16 +3187,18 @@ def _gate_release(fd: int) -> None:
         os.close(fd)
 
 
-def _gate_busy(action: str, hint: str = "") -> str:
+def _gate_busy(action: str, hint: str = "", wait_s: float = REGISTRY_EX_WAIT_S) -> str:
     """The "clients are still attached" refusal for `action`, naming them.
 
     `hint` is appended to the closing "Let them finish, then retry" line — the
     command's override, when it has one (`down` passes its `-f/--force`).
+    `wait_s` is how long the caller really waited for the gate (a preflight
+    revert waits PREFLIGHT_GATE_WAIT_S, not REGISTRY_EX_WAIT_S).
     """
     lines = [f"   still attached: {line}" for line in _registry_client_lines()]
     return (
         f"Cannot {action}: registered CDP client(s) did not drain within "
-        f"{REGISTRY_EX_WAIT_S:.0f}s.\n"
+        f"{wait_s:.0f}s.\n"
         + (
             "\n".join(lines)
             or "   (no registration file left — see `browser.py clients`)"
@@ -3482,6 +3484,16 @@ LOGIN_TIMEOUT_RC = 124
 LOGIN_TIMEOUT_DIRTY_RC = 125
 # How long a preflight revert waits for registered clients to drain.
 PREFLIGHT_GATE_WAIT_S = 5.0
+# The maintenance record's `purpose`: a guided login (the default — records
+# without the field are guided logins), or the short lease-less headless revert
+# (`_revert_tx`; record site REVERT_SITE, mode B: it never allows headed).
+GUIDED_PURPOSE = "guided-login"
+REVERT_PURPOSE = "revert"
+REVERT_SITE = "revert"
+# The "until ~HH:MM" a caller refused during a revert sees, and how long a
+# revert waits for ANOTHER process's revert in flight before standing down.
+REVERT_UNTIL_S = 120.0
+REVERT_WAIT_S = 30.0
 # Commands that never drive the browser over CDP, plus the lifecycle commands
 # that handle the mode themselves: no preflight revert for them.
 _PREFLIGHT_SKIP_CMDS = frozenset(
@@ -3651,13 +3663,21 @@ def _headed_lease_describe() -> str:
 
 def _maint_refusal(rec: dict) -> str:
     """The refusal a registrant without the owner token gets while `rec` lives
-    (first line machine-stable: ``busy: guided login for SITE in progress``)."""
+    (first line machine-stable: ``busy: guided login for SITE in progress``, or
+    ``busy: headless revert in progress`` for a revert transaction)."""
     until = rec.get("until")
     when = (
         time.strftime("%H:%M", time.localtime(float(until)))
         if isinstance(until, (int, float)) and not isinstance(until, bool)
         else "?"
     )
+    if rec.get("purpose") == REVERT_PURPOSE:
+        return (
+            f"busy: headless revert in progress (until ~{when})\n"
+            f"   browser.py (pid {rec.get('pid')!s}) is switching a headed browser "
+            "without a guided-login lease back to headless; retry in a few "
+            f"seconds (exit {BUSY_RC} = busy, not logged out)."
+        )
     return (
         f"busy: guided login for {rec.get('site')!s} in progress (until ~{when})\n"
         f"   The guided login (agent-login.py -g {rec.get('site')!s}, mode "
@@ -3736,7 +3756,15 @@ def _headed_lease_heartbeat(nonce: str, stop: threading.Event) -> None:
 
 
 @contextlib.contextmanager
-def _maint_record(site: str, mode: str = "A", state: str = "active") -> Iterator[str]:
+def _maint_record(  # pylint: disable=too-many-arguments
+    site: str,
+    mode: str = "A",
+    state: str = "active",
+    *,
+    purpose: str = GUIDED_PURPOSE,
+    until_s: float | None = None,
+    port: int | None = None,
+) -> Iterator[str]:
     """Hold the MAINTENANCE RECORD for the block; yield the owner nonce.
 
     Refuses (`HeadedLeaseBusy`) while another live record exists. Sets
@@ -3744,12 +3772,21 @@ def _maint_record(site: str, mode: str = "A", state: str = "active") -> Iterator
     children are the owner; restores it on exit. Release is
     compare-before-release: the file is removed only while it still carries
     our nonce. The record alone — `_maintenance` is the full transaction.
+    `purpose` says what owns the browser (``guided-login``, or ``revert`` for
+    `_revert_tx`); `until_s` sets the "until ~HH:MM" a refused caller sees
+    (default GUIDED_TOTAL_S); `port` is the CDP port the transaction acts on
+    (the stale-record backstop runs its recovery against that port).
     """
     with _maint_locked(5.0) as ok:
         if not ok:
             raise HeadedLeaseBusy("another process is taking the maintenance record")
         current = _read_json_dict(MAINTENANCE_FILE)
         if _headed_lease_state(current) == "live" and current is not None:
+            if current.get("purpose") == REVERT_PURPOSE:
+                raise HeadedLeaseBusy(
+                    f"a headless revert is in progress (pid {current.get('pid')}) "
+                    "— retry in a few seconds"
+                )
             raise HeadedLeaseBusy(
                 f"a guided login already owns the browser (site "
                 f"{current.get('site')}, mode {_maint_mode(current)}, pid "
@@ -3772,10 +3809,15 @@ def _maint_record(site: str, mode: str = "A", state: str = "active") -> Iterator
             "owned_targets": [],
             "paused": [],
             "started": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
-            "until": time.time() + GUIDED_TOTAL_S,
+            "until": time.time() + (GUIDED_TOTAL_S if until_s is None else until_s),
+            "purpose": purpose,
         }
+        if port is not None:
+            base["port"] = port
         _json_write_atomic(MAINTENANCE_FILE, {**base, "heartbeat": time.time()})
-    _journal("headed_lease", phase="start", site=site, mode=base["mode"])
+    _journal(
+        "headed_lease", phase="start", site=site, mode=base["mode"], purpose=purpose
+    )
     old_env = os.environ.get(MAINTENANCE_ENV)
     os.environ[MAINTENANCE_ENV] = nonce
     stop = threading.Event()
@@ -3830,14 +3872,39 @@ def _preflight_action(cmd: str, mode: str | None, lease_live: bool) -> str | Non
     return "revert"
 
 
+def _revert_in_flight(port: int) -> bool:
+    """Wait (bounded by REVERT_WAIT_S) for ANOTHER process's revert transaction;
+    True when it ended and left nothing headed to revert.
+
+    Only a live record of purpose ``revert`` is waited for — a guided login's
+    record is its owner's business (our own transaction then gets BUSY and
+    stands down). Two commands whose preflights race therefore run ONE
+    revert: the second waits for the first instead of starting its own.
+    """
+    rec = _maint_live()
+    if rec is None or rec.get("purpose") != REVERT_PURPOSE:
+        return False
+    nonce = rec.get("owner_nonce")
+    _journal("revert_wait", owner_pid=rec.get("pid"))
+    deadline = time.monotonic() + REVERT_WAIT_S
+    while time.monotonic() < deadline:
+        cur = _maint_live()
+        if cur is None or cur.get("owner_nonce") != nonce:
+            return _browser_mode(port) != "headed"
+        time.sleep(0.2)
+    return False
+
+
 def _revert_headed(port: int, why: str) -> int:
     """Switch a headed browser that has no live lease back to headless.
 
-    Journaled as ``revert_headed`` (start + end with the exit code). Uses
-    `cmd_switch`'s own transaction (exclusive gate, unknown-client refusal,
-    re-check under the gate) with a short gate wait — never `--force`. With
-    ``revert=True`` the switch also stands down when a guided login took the
-    lease while we waited for the gate.
+    Journaled as ``revert_headed`` (start + end with the exit code). Runs the
+    revert as a short maintenance transaction (`_revert_tx`: registered
+    long-lived clients are paused so the exclusive gate is free, then
+    `cmd_switch` with a short gate wait — never `--force`). A revert another
+    process is running already is waited for (`_revert_in_flight`), not
+    repeated. BUSY_RC = another maintenance record lives: nothing was
+    touched (an ℹ️ line names who owns the browser).
     """
     print(
         f"⚠ the shared browser is HEADED without a live guided-login lease — "
@@ -3847,7 +3914,15 @@ def _revert_headed(port: int, why: str) -> int:
     _journal(
         "revert_headed", phase="start", trigger=why, lease=_headed_lease_describe()
     )
-    rc = cmd_switch(port, "headless", gate_wait_s=PREFLIGHT_GATE_WAIT_S, revert=True)
+    if _revert_in_flight(port):
+        print("✓ another process reverted it meanwhile.", file=sys.stderr)
+        rc = 0
+    else:
+        rc = _revert_tx(port, gate_wait_s=PREFLIGHT_GATE_WAIT_S)
+    if rc == BUSY_RC:
+        rec = _maint_live()
+        owner = _maint_refusal(rec).splitlines()[0] if rec else "busy"
+        print(f"ℹ️  not reverting now — {owner}", file=sys.stderr)
     _journal("revert_headed", phase="end", trigger=why, result=rc)
     return rc
 
@@ -3881,6 +3956,10 @@ def _preflight(cmd: str, port: int) -> None:
     transition (another up/switch/down in flight) skips the revert, and a
     revert that fails is one ❌ line + a ``revert_failed`` journal event, then
     the command runs anyway — the next command enforces the invariant again.
+    A revert that finds another maintenance record (a guided login, or a
+    revert it waited for in vain) is skipped (``revert_skipped``, reason
+    ``busy``) and the command proceeds; the preflight itself never exits 75
+    (the command's own registration may, while that record lives).
     """
     if cmd in _PREFLIGHT_SKIP_CMDS:
         return
@@ -3896,6 +3975,9 @@ def _preflight(cmd: str, port: int) -> None:
     _journal_parent_chain()  # before the gate is taken (no ps under the gate)
     with _stdout_to_stderr():
         rc = _revert_headed(port, f"`{cmd}`")
+    if rc == BUSY_RC:
+        _journal("revert_skipped", reason="busy", trigger=cmd)
+        return
     if rc != 0:
         reason = f"switch headless exit {rc}"
         _journal("revert_failed", trigger=cmd, reason=reason)
@@ -3975,6 +4057,16 @@ def _switch_recheck(port: int, target: str, revert: bool) -> int | None:
     return None
 
 
+def _switch_unknown_refusal(verdict: str) -> str:
+    """`switch`'s refusal while unregistered CDP clients are attached."""
+    return (
+        f"Switch aborted — {verdict}\n"
+        "   Stop the attached client(s) (or install lsof so they can be "
+        "identified), then retry — or re-run with --force to switch anyway "
+        "(any attached client WILL lose its connection)."
+    )
+
+
 HEADED_REFUSAL = (
     "❌ headed mode only inside a guided login: agent-login.py -g <site>\n"
     "   (the shared browser stays headless; `switch headed` needs the live "
@@ -4022,7 +4114,8 @@ def cmd_switch(  # pylint: disable=too-many-arguments
     # Each of the exits is a distinct, named refusal (down / already in that
     # mode / unknown CDP client / stale lock / no lease …) that callers read off
     # stdout; funnelling them through one return would hide which one refused.
-    # pylint: disable=too-many-return-statements
+    # The same holds for the branches deciding between them.
+    # pylint: disable=too-many-return-statements,too-many-branches
     if target == "headed" and not _headed_lease_held():
         print(HEADED_REFUSAL, file=sys.stderr)
         return 2
@@ -4045,22 +4138,29 @@ def cmd_switch(  # pylint: disable=too-many-arguments
             + (" (lifecycle record refreshed)" if healed else "")
         )
         return 0
+    if (
+        target == "headless"
+        and not revert
+        and not _maint_owner()
+        and _maint_live() is None
+    ):
+        # Headed without a lease: the same short transaction as the preflight
+        # revert, so a registered long-lived client cannot hold the gate.
+        rc = _revert_tx(port, force=force, gate_wait_s=gate_wait_s)
+        if rc == BUSY_RC and (rec := _maint_live()) is not None:
+            print(_maint_refusal(rec), file=sys.stderr)
+        return rc
     wait_s = REGISTRY_EX_WAIT_S if gate_wait_s is None else gate_wait_s
     gate = _gate_acquire(fcntl.LOCK_EX, wait_s)
     if gate is None:
-        return _fail(_gate_busy(f"switch to {target.upper()}"))
+        return _fail(_gate_busy(f"switch to {target.upper()}", wait_s=wait_s))
     try:
         settled = _switch_recheck(port, target, revert)
         if settled is not None:
             return settled
         verdict = _unknown_clients_verdict(port)
         if verdict is not None and not force:
-            return _fail(
-                f"Switch aborted — {verdict}\n"
-                "   Stop the attached client(s) (or install lsof so they can be "
-                "identified), then retry — or re-run with --force to switch anyway "
-                "(any attached client WILL lose its connection)."
-            )
+            return _fail(_switch_unknown_refusal(verdict))
         if verdict is not None:
             print(f"⚠ --force: switching anyway — {verdict}", file=sys.stderr)
         switching = _lifecycle_transition("switching", target, _lifecycle_read(), port)
@@ -4838,7 +4938,9 @@ def cmd_down(port: int, force: bool = False, force_maintenance: bool = False) ->
     if gate is None and not force:
         return _fail(
             _gate_busy(
-                "stop the shared browser", " — or re-run with -f/--force to stop anyway"
+                "stop the shared browser",
+                " — or re-run with -f/--force to stop anyway",
+                wait_s=REGISTRY_EX_WAIT_S,
             )
         )
     if gate is None:
@@ -11239,6 +11341,8 @@ class Maintenance:
     port: int
     owned: list[str] = dataclasses.field(default_factory=list)
     paused: list[dict] = dataclasses.field(default_factory=list)
+    # What the transaction is, in words (the pause line; `_revert_tx` sets it).
+    label: str = "the guided login"
 
     def note(self, **fields: object) -> None:
         """Merge `fields` into the record (a failed write only warns)."""
@@ -11589,6 +11693,7 @@ def _pause_clients(tx: Maintenance) -> None:
         _journal(
             "maintenance",
             phase="pause",
+            site=tx.site,
             client=rec.get("tool"),
             client_pid=rec.get("pid"),
         )
@@ -11601,7 +11706,7 @@ def _pause_clients(tx: Maintenance) -> None:
         names = ", ".join(f"{p.get('tool')} pid {p.get('pid')}" for p in pending)
         raise MaintenanceRefused(f"client(s) did not confirm the pause: {names}")
     if tx.paused:
-        print(f"⏸  paused {len(tx.paused)} registered client(s) for the guided login")
+        print(f"⏸  paused {len(tx.paused)} registered client(s) for {tx.label}")
 
 
 def _resume_clients(paused: Sequence[dict]) -> list[str]:
@@ -11707,7 +11812,7 @@ def _maintenance(
     result = "exception"
     old_held = os.environ.get("CLAUDE_BROWSER_LEASE_HELD")
     try:
-        with _maint_record(site, mode, state="preparing") as nonce:
+        with _maint_record(site, mode, state="preparing", port=port) as nonce:
             tx = Maintenance(nonce, site, "B" if mode == "B" else "A", port)
             with contextlib.ExitStack() as stack:
                 try:
@@ -11746,6 +11851,84 @@ def _maintenance(
         _journal(
             "maintenance", phase="end", site=site, result=result, problems=len(problems)
         )
+
+
+# --- the lease-less headless revert -------------------------------------------
+
+
+def _revert_tx(
+    port: int, *, force: bool = False, gate_wait_s: float | None = None
+) -> int:
+    """Switch a headed browser WITHOUT a live lease back to headless, as a short
+    maintenance transaction (record purpose ``revert``).
+
+    The preflight revert, `up` and a human/agent `switch headless` all come
+    here. Order: record (site ``revert``, mode B — never allows headed; new
+    foreign registrations exit 75 naming the revert; a second revert gets
+    `HeadedLeaseBusy`) → re-check headed → when there are registered
+    long-lived clients: unregistered peers refuse unless `force` (before
+    anything is paused), the recovery watchdog, then pause them (validated
+    SIGUSR1, exactly as `_maintenance`; a pre-protocol wrapper refuses) →
+    `cmd_switch headless` as the record's owner (gate EX, the unregistered-peer
+    check again, re-check under the gate) → record cleared → clients resumed
+    (SIGUSR2 to the validated wrapper). A paused wrapper has dropped its shared
+    gate, so the switch no longer waits for an MCP server that never drains;
+    the watchdog's recovery reverts in the same order.
+
+    Returns the switch's exit code; 0 when nothing headed was left; BUSY_RC
+    when another live maintenance record exists (nothing touched, nothing
+    printed — the caller words it); 1 when the transaction refused.
+    """
+    tx: Maintenance | None = None
+    rc = 1
+    _journal("revert_tx", phase="start", forced=force)
+    try:
+        with _maint_record(
+            REVERT_SITE,
+            "B",
+            purpose=REVERT_PURPOSE,
+            until_s=REVERT_UNTIL_S,
+            port=port,
+        ) as nonce:
+            tx = Maintenance(nonce, REVERT_SITE, "B", port, label="the headless revert")
+            if _browser_mode(port) != "headed":
+                print("✓ Shared browser already HEADLESS (reverted meanwhile).")
+                rc = 0
+            else:
+                rc = _revert_tx_switch(tx, force, gate_wait_s)
+    except HeadedLeaseBusy:
+        rc = BUSY_RC
+    except (MaintenanceRefused, HeadedLeaseError) as exc:
+        rc = _fail(f"headless revert refused: {exc}")
+    finally:
+        problems = _resume_clients(tx.paused) if tx is not None else []
+        for line in problems:
+            print(f"❌ headless-revert cleanup: {line}", file=sys.stderr)
+        _journal(
+            "revert_tx",
+            phase="end",
+            result=rc,
+            paused=len(tx.paused) if tx is not None else 0,
+            problems=len(problems),
+        )
+    return rc
+
+
+def _revert_tx_switch(tx: Maintenance, force: bool, gate_wait_s: float | None) -> int:
+    """`_revert_tx`'s body, holding the record: pause, then switch headless."""
+    if _pause_targets(tx.nonce):
+        # Refuse an unregistered peer BEFORE freezing anybody: without this a
+        # stray client would make every preflight pause and resume the MCP.
+        verdict = _unknown_clients_verdict(tx.port)
+        if verdict is not None and not force:
+            return _fail(_switch_unknown_refusal(verdict))
+        wd_pid = _spawn_watchdog(tx.port, tx.nonce)
+        tx.note(
+            watchdog_pid=wd_pid,
+            watchdog_start_time=_proc_lstart(wd_pid) if wd_pid else None,
+        )
+        _pause_clients(tx)
+    return cmd_switch(tx.port, "headless", force, gate_wait_s, revert=True)
 
 
 # --- watchdog -----------------------------------------------------------------
@@ -12506,11 +12689,16 @@ def _journal_cmd_fields(args: argparse.Namespace) -> dict[str, object]:
     """The event-specific journal fields of a journaled subcommand."""
     if args.cmd == "up":
         return {"mode": _desired_mode()}
+    # Both overrides, as given: `-f` (forced) and `-F` (force_maintenance).
+    flags: dict[str, object] = {
+        "forced": bool(getattr(args, "force", False)),
+        "force_maintenance": bool(getattr(args, "force_maintenance", False)),
+    }
     if args.cmd == "switch":
         rec = _lifecycle_read()
-        return {"from": rec.get("mode") if rec else None, "to": args.mode}
+        return {"from": rec.get("mode") if rec else None, "to": args.mode, **flags}
     if args.cmd == "down":
-        return {"forced": bool(args.force)}
+        return flags
     if args.cmd == "login-cscs-assisted":
         return {"site": "cscs", "flow": "cscs-assisted"}
     return {"site": "cscs" if args.cmd == "cscs-login" else str(args.site)}

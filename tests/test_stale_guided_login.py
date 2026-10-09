@@ -50,6 +50,7 @@ class _FakeRuns:
 def fixture_cache(tmp_path, monkeypatch):
     monkeypatch.setenv("CLAUDE_BROWSER_CACHE_DIR", str(tmp_path))
     monkeypatch.delenv("CLAUDE_BROWSER_INSTANCE", raising=False)
+    monkeypatch.delenv("CLAUDE_BROWSER_CDP_PORT", raising=False)
     return tmp_path
 
 
@@ -148,8 +149,8 @@ def test_dead_watchdog_runs_the_recovery_once_bounded(cache, monkeypatch, capsys
     out, printed = _run(monkeypatch, fake, capsys)
     assert len(fake.calls) == 1
     args, timeout_s = fake.calls[0]
-    assert args[:2] == ("maintenance-watchdog", "-n")
-    assert args[2] == NONCE[:16] and NONCE.startswith(args[2])
+    assert args[:4] == ("--cdp-port", "9222", "maintenance-watchdog", "-n")
+    assert args[4] == NONCE[:16] and NONCE.startswith(args[4])
     assert timeout_s is not None and 0 < timeout_s <= 300
     assert timeout_s == jobs.browser_timeout("maintenance-watchdog")
     assert out is not None and out.startswith("✅") and "slack" in out
@@ -196,3 +197,30 @@ def test_snapshot_prints_the_outcome_before_the_overview(cache, monkeypatch, cap
     printed = capsys.readouterr().out
     assert order == ["recover", "overview"]
     assert printed.startswith("✅") and NONCE[:8] not in printed
+
+
+@pytest.mark.parametrize(
+    "case",
+    [
+        ("private", None, None, "9223"),  # the instance whose record it read
+        ("", "9351", None, "9351"),  # $CLAUDE_BROWSER_CDP_PORT, like browser.py
+        ("private", None, 9351, "9351"),  # the record's own port wins
+        ("", None, "9351", "9222"),  # a malformed port is ignored
+    ],
+)
+def test_recovery_runs_against_the_records_instance_port(
+    cache, monkeypatch, capsys, case
+):
+    """Never an implicit 9222: the watchdog acts on the port of the record's
+    instance (or on the port the record names)."""
+    instance, env_port, rec_port, want = case
+    if instance:
+        monkeypatch.setenv("CLAUDE_BROWSER_INSTANCE", instance)
+    if env_port:
+        monkeypatch.setenv("CLAUDE_BROWSER_CDP_PORT", env_port)
+    _write(cache, **({} if rec_port is None else {"port": rec_port}))
+    fake = _FakeRuns(cache)
+    out, _ = _run(monkeypatch, fake, capsys)
+    assert out is not None and out.startswith("✅")
+    args, _timeout = fake.calls[0]
+    assert args[:3] == ("--cdp-port", want, "maintenance-watchdog")

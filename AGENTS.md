@@ -79,6 +79,14 @@ framework. It is a **provider**: other repos depend on it, not the reverse. See
   first (`_preflight` in `main`, before any gate; output to stderr only; best
   effort — a failed revert warns and the command proceeds;
   `doctor`/`close`/`close-hung` never revert). Never add a way around it.
+  The lease-less revert (preflight, `up`, a human `switch headless`) is a
+  short maintenance transaction (`_revert_tx`: record with `purpose:
+  "revert"`, mode B → pause registered exec clients → `cmd_switch` as the
+  owner → record cleared → resume); a second revert waits for or stands down
+  from the first (BUSY is a skip for the preflight, never its exit code).
+  Only callers that already coordinate clients (`_ensure_headless` as the
+  record's owner, the watchdog with `revert=True`) take `cmd_switch`'s plain
+  path.
 - **Guided login = one maintenance transaction** (`_maintenance`, Phase 3):
   ONE record file is the single source of truth (`owner_nonce`, pid + start
   time, `site`, `mode` B|A, `state`, `owned_targets`, `paused`,

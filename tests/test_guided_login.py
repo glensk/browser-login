@@ -882,6 +882,294 @@ def test_switch_and_down_parse_force_maintenance(monkeypatch):
         assert browser.parse_args().force_maintenance is True
 
 
+@pytest.mark.parametrize(
+    ("argv", "want"),
+    [
+        (["down", "-F"], {"forced": False, "force_maintenance": True}),
+        (["down", "-f"], {"forced": True, "force_maintenance": False}),
+        (
+            ["switch", "headless", "-f", "-F"],
+            {"forced": True, "force_maintenance": True},
+        ),
+    ],
+)
+def test_down_and_switch_journal_both_force_flags(cache, monkeypatch, argv, want):
+    monkeypatch.setattr(sys, "argv", ["browser.py", *argv])
+    fields = browser._journal_cmd_fields(browser.parse_args())
+    assert {k: fields[k] for k in want} == want
+
+
+# --- the lease-less headless revert (a short maintenance transaction) --------------
+
+
+def _journal_events() -> list[dict[str, Any]]:
+    path = Path(os.environ["CLAUDE_BROWSER_JOURNAL_FILE"])
+    if not path.exists():
+        return []
+    return [json.loads(ln) for ln in path.read_text(encoding="utf-8").splitlines()]
+
+
+def _revert_stubs(monkeypatch, on_switch) -> dict[str, str]:
+    """A headed fake browser: `cmd_switch` runs for real (real gate, real
+    record), only shutdown/relaunch are stubbed — `on_switch()` runs while the
+    switch holds the gate exclusively."""
+    state = {"mode": "headed"}
+    monkeypatch.setattr(browser, "_browser_mode", lambda port: state["mode"])
+    monkeypatch.setattr(browser, "_journal_parent_chain", lambda: [])
+    monkeypatch.setattr(browser, "_unknown_clients_verdict", lambda port: None)
+    monkeypatch.setattr(browser, "_spawn_watchdog", lambda port, nonce: 4242)
+    monkeypatch.setattr(browser, "_lifecycle_transition", lambda *a: {})
+
+    def shutdown(port, rec):
+        on_switch()
+        return True
+
+    def launch(port, headless):
+        state["mode"] = "headless" if headless else "headed"
+        return 0
+
+    monkeypatch.setattr(browser, "_shutdown_browser", shutdown)
+    monkeypatch.setattr(browser, "_launch_and_record", launch)
+    return state
+
+
+def test_preflight_revert_pauses_a_registered_client_then_resumes_it(
+    cache, monkeypatch, capfd
+):
+    """Matrix case 2b: a register-exec wrapper holds the gate shared for its
+    child's lifetime; the revert pauses it (validated SIGUSR1), switches
+    while it is frozen, clears the record and resumes it (SIGUSR2)."""
+    port = _free_port()
+    with _fake_client(cache, port) as fc:
+        child = int(fc["rec"]["child_pid"])
+        seen: dict[str, Any] = {}
+
+        def during() -> None:
+            rec = _record()
+            seen["purpose"], seen["site"] = rec["purpose"], rec["site"]
+            seen["paused"] = [p["tool"] for p in rec["paused"]]
+            seen["frozen"] = "T" in _stat(child)
+            seen["reg_paused"] = fc["reg"]()["paused"]
+
+        state = _revert_stubs(monkeypatch, during)
+        t0 = time.monotonic()
+        assert browser._preflight("eval", port) is None
+        assert time.monotonic() - t0 < browser.PREFLIGHT_GATE_WAIT_S
+        assert state["mode"] == "headless"
+        assert seen == {
+            "purpose": "revert",
+            "site": "revert",
+            "paused": ["fake"],
+            "frozen": True,
+            "reg_paused": True,
+        }
+        assert not browser.MAINTENANCE_FILE.exists()
+        assert _wait(lambda: "T" not in _stat(child), 5), "child not resumed"
+        assert _wait(lambda: fc["reg"]()["paused"] is False, 5)
+    out, err = capfd.readouterr()
+    assert out == ""  # a preflight never prints into the command's stdout
+    assert "paused 1 registered client(s) for the headless revert" in err
+    assert "❌" not in err
+    events = _journal_events()
+    assert not [e for e in events if e["event"] == "revert_failed"]
+    assert any(
+        e["event"] == "maintenance"
+        and e.get("phase") == "pause"
+        and e.get("site") == "revert"
+        for e in events
+    )
+    assert any(
+        e["event"] == "maintenance"
+        and e.get("phase") == "resume"
+        and e.get("how") == "wrapper"
+        for e in events
+    )
+    end = [e for e in events if e["event"] == "revert_tx" and e["phase"] == "end"]
+    assert end and end[-1]["result"] == 0 and end[-1]["paused"] == 1
+
+
+def test_switch_headless_without_lease_refuses_unregistered_peers_unless_forced(
+    cache, monkeypatch, capsys
+):
+    """A human `switch headless` takes the same path; an unregistered peer
+    still fails it closed — before any registered client is frozen."""
+    port = _free_port()
+    with _fake_client(cache, port) as fc:
+        child = int(fc["rec"]["child_pid"])
+        state = _revert_stubs(monkeypatch, lambda: None)
+        monkeypatch.setattr(
+            browser,
+            "_unknown_clients_verdict",
+            lambda port: "1 unregistered CDP client(s) attached:\n     pid 1: rogue",
+        )
+        assert browser.cmd_switch(port, "headless") == 1
+        err = capsys.readouterr().err
+        assert "Switch aborted — 1 unregistered CDP client(s)" in err
+        assert "--force" in err
+        assert state["mode"] == "headed"
+        assert "T" not in _stat(child) and fc["reg"]()["paused"] is False
+        assert not browser.MAINTENANCE_FILE.exists()
+        assert not [e for e in _journal_events() if e["event"] == "client_pause"]
+        assert browser.cmd_switch(port, "headless", force=True) == 0
+        assert state["mode"] == "headless"
+        assert "--force: switching anyway" in capsys.readouterr().err
+        assert _wait(lambda: "T" not in _stat(child), 5)
+        assert _wait(lambda: fc["reg"]()["paused"] is False, 5)
+    assert not browser.MAINTENANCE_FILE.exists()
+
+
+_RACER = r"""
+import importlib.util, pathlib, sys, time
+spec = importlib.util.spec_from_file_location("bp", sys.argv[1])
+bp = importlib.util.module_from_spec(spec); spec.loader.exec_module(bp)
+port, flag, log = int(sys.argv[2]), pathlib.Path(sys.argv[3]), sys.argv[4]
+go = float(sys.argv[5])
+bp._browser_mode = lambda p: flag.read_text(encoding="utf-8").strip()
+bp._journal_parent_chain = lambda: []
+
+def switch(p, target, force=False, gate_wait_s=None, revert=False):
+    with open(log, "a", encoding="utf-8") as fh:
+        fh.write(f"switch {target}\n")
+    time.sleep(1.0)
+    flag.write_text("headless", encoding="utf-8")
+    return 0
+
+bp.cmd_switch = switch
+while time.time() < go:
+    time.sleep(0.002)
+bp._preflight("eval", port)
+"""
+
+
+def test_two_concurrent_preflights_run_one_revert(cache, tmp_path):
+    flag, log = tmp_path / "mode", tmp_path / "switches.log"
+    flag.write_text("headed", encoding="utf-8")
+    port, go = _free_port(), time.time() + 3.0
+    procs = [
+        subprocess.Popen(
+            [
+                PY,
+                "-c",
+                _RACER,
+                str(BROWSER_PY),
+                str(port),
+                str(flag),
+                str(log),
+                str(go),
+            ],
+            env=_env(cache),
+            stdin=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        for _ in range(2)
+    ]
+    errs = [p.communicate(timeout=60)[1] for p in procs]
+    assert [p.returncode for p in procs] == [0, 0], errs
+    assert log.read_text(encoding="utf-8").splitlines() == ["switch headless"]
+    assert not browser.MAINTENANCE_FILE.exists()
+    assert "❌" not in "".join(errs)
+    events = _journal_events()
+    assert not [e for e in events if e["event"] == "revert_failed"]
+    starts = [
+        e for e in events if e["event"] == "headed_lease" and e["phase"] == "start"
+    ]
+    # The loser either waited for the winner's record, or found it and stood
+    # down (busy), or came after it and found nothing headed: never a 2nd switch.
+    assert 1 <= len(starts) <= 2
+
+
+def _revert_record(**over: Any) -> None:
+    _write_record(
+        owner_nonce="e" * 32,
+        site="revert",
+        purpose="revert",
+        until=time.time() + 60,
+        **over,
+    )
+
+
+def test_preflight_waits_for_a_revert_in_flight_instead_of_its_own(
+    cache, monkeypatch, capsys
+):
+    _revert_record()
+    state = {"mode": "headed"}
+    monkeypatch.setattr(browser, "_browser_mode", lambda port: state["mode"])
+    monkeypatch.setattr(browser, "_journal_parent_chain", lambda: [])
+    monkeypatch.setattr(
+        browser, "_revert_tx", lambda *a, **k: pytest.fail("no second revert")
+    )
+
+    def finish() -> None:
+        time.sleep(0.5)
+        state["mode"] = "headless"
+        browser.MAINTENANCE_FILE.unlink()
+
+    threading.Thread(target=finish, daemon=True).start()
+    assert browser._preflight("eval", 59990) is None
+    assert "reverted it meanwhile" in capsys.readouterr().err
+    names = [e["event"] for e in _journal_events()]
+    assert "revert_wait" in names and "revert_failed" not in names
+
+
+def test_preflight_stands_down_while_a_revert_outlives_the_wait(
+    cache, monkeypatch, capsys
+):
+    """Busy is a skip for the preflight (no ❌, no exit); the command's own
+    registration then refuses with 75, naming the revert."""
+    _revert_record()
+    monkeypatch.setattr(browser, "REVERT_WAIT_S", 0.3)
+    monkeypatch.setattr(browser, "_browser_mode", lambda port: "headed")
+    monkeypatch.setattr(browser, "_journal_parent_chain", lambda: [])
+    monkeypatch.setattr(browser, "cmd_switch", lambda *a, **k: pytest.fail("no switch"))
+    assert browser._preflight("eval", 59990) is None
+    err = capsys.readouterr().err
+    assert "❌" not in err
+    assert "ℹ️  not reverting now — busy: headless revert in progress (until ~" in err
+    last = _journal_events()[-1]
+    assert last["event"] == "revert_skipped" and last["reason"] == "busy"
+    assert _record()["owner_nonce"] == "e" * 32  # the other one is untouched
+    with pytest.raises(SystemExit) as exc:
+        browser._registry_register("agent", "eval", 59990)
+    assert exc.value.code == browser.BUSY_RC
+    assert capsys.readouterr().err.startswith("busy: headless revert in progress")
+
+
+def test_preflight_leaves_a_guided_login_record_alone(cache, monkeypatch, capsys):
+    _write_record(owner_nonce="d" * 32, mode="B")  # a guided login, not a revert
+    monkeypatch.setattr(browser, "_browser_mode", lambda port: "headed")
+    monkeypatch.setattr(browser, "_journal_parent_chain", lambda: [])
+    monkeypatch.setattr(browser, "cmd_switch", lambda *a, **k: pytest.fail("no switch"))
+    t0 = time.monotonic()
+    assert browser._preflight("eval", 59990) is None
+    assert time.monotonic() - t0 < 2  # no wait: it is not a revert
+    assert "busy: guided login for slack" in capsys.readouterr().err
+    names = [e["event"] for e in _journal_events()]
+    assert "revert_wait" not in names and names[-1] == "revert_skipped"
+
+
+def test_guided_login_refused_while_a_revert_runs_says_so(quiet_tx):
+    _revert_record()
+    with pytest.raises(browser.HeadedLeaseBusy, match="headless revert is in progress"):
+        with browser._maintenance("slack", "B", port=59990):
+            pytest.fail("must not start")
+
+
+def test_gate_refusal_names_the_real_wait(cache, monkeypatch, capsys):
+    """The preflight waits PREFLIGHT_GATE_WAIT_S, not REGISTRY_EX_WAIT_S."""
+    _write_record(owner_nonce="a" * 32, mode="B")
+    monkeypatch.setenv(browser.MAINTENANCE_ENV, "a" * 32)  # inside the tx
+    monkeypatch.setattr(browser, "_browser_mode", lambda port: "headed")
+    monkeypatch.setattr(browser, "_gate_acquire", lambda kind, wait: None)
+    rc = browser.cmd_switch(
+        59990, "headless", gate_wait_s=browser.PREFLIGHT_GATE_WAIT_S, revert=True
+    )
+    assert rc == 1
+    err = capsys.readouterr().err
+    assert "did not drain within 5s" in err and "20s" not in err
+    assert "within 20s" in browser._gate_busy("stop the shared browser")
+
+
 def test_launch_guard_refuses_without_the_marker():
     with pytest.raises(SystemExit, match="test guard"):
         browser._launch_browser("/nonexistent/chrome", [])

@@ -532,13 +532,29 @@ def _watchdog_gone(mod: ModuleType, rec: dict) -> bool:
     return lstart is not None and lstart != want
 
 
+def _record_port(mod: ModuleType, rec: dict) -> int:
+    """The CDP port a maintenance record's recovery must act on.
+
+    The record's own ``port`` (the transaction writes it); for a record
+    without one, the port of the instance whose cache dir holds it
+    (`mod.DEFAULT_CDP_PORT`, derived exactly as browser.py does:
+    $CLAUDE_BROWSER_CDP_PORT, else the instance's INSTANCE_PORTS entry).
+    Never an implicit default: a non-default instance must not act on 9222.
+    """
+    port = rec.get("port")
+    if isinstance(port, int) and not isinstance(port, bool) and 0 < port < 65536:
+        return port
+    return int(mod.DEFAULT_CDP_PORT)
+
+
 def recover_stale_guided_login() -> str | None:
     """Backstop for a guided login whose owner AND its watchdog both died.
 
     Reads browser.py's maintenance record (the current instance's cache dir);
     when it is NOT live and its detached watchdog is certainly gone
-    (`_watchdog_gone`), runs ``browser.py maintenance-watchdog -n <prefix>``
-    — the watchdog's own recovery (owned tabs closed, reap, headed reverted,
+    (`_watchdog_gone`), runs ``browser.py --cdp-port <port>
+    maintenance-watchdog -n <prefix>`` against the record's port
+    (`_record_port`) — the watchdog's own recovery (owned tabs closed, reap, headed reverted,
     record cleared, paused clients resumed) — bounded by the runner. Returns
     one ✅/❌ line, or None when there is nothing to do. A live record is
     never touched. The owner nonce is a token: it never appears in the
@@ -563,7 +579,13 @@ def recover_stale_guided_login() -> str | None:
     site = str(rec.get("site") or "?")
     budget = browser_timeout("maintenance-watchdog")
     run = run_browser(
-        "maintenance-watchdog", "-n", nonce[:prefix_len], timeout_s=budget, quiet=True
+        "--cdp-port",
+        str(_record_port(mod, rec)),
+        "maintenance-watchdog",
+        "-n",
+        nonce[:prefix_len],
+        timeout_s=budget,
+        quiet=True,
     )
     what = f"stale guided login for {site} (owner: {state}, watchdog gone)"
     problem = _recovery_problem(mod, run, nonce, budget)

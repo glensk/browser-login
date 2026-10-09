@@ -196,15 +196,26 @@ desktop**: no focus steal, no window, no z-order change, no native prompt
 - **Preflight revert (best effort).** Every command that drives the browser
   (all but `status`, `journal`, `down`, `switch`, `clients`, the recovery tools
   `doctor`, `close-hung`, `close`, and the offline ones) first checks: headed
-  and no live mode-A record → `switch headless` (journaled as `revert_headed`) BEFORE it
-  takes the client gate, with all its output on stderr (a consumer's stdout —
-  `slack-session` JSON, `token`, `open -N` — stays clean). It waits at most 5 s
-  for the gate, re-checks under it (a guided login that took the lease
-  meanwhile is left alone: `revert_skipped`), and is skipped while another
-  up/switch/down is in flight. A revert that fails (e.g. an unregistered client
-  blocks the switch) is one ❌ line on stderr plus a `revert_failed` journal
-  event — the command still runs, and the next command tries again. By hand:
-  `browser.py switch headless` (`-f` past an unregistered client).
+  and no live mode-A record → revert to headless (journaled as `revert_headed`)
+  BEFORE it takes the client gate, with all its output on stderr (a consumer's
+  stdout — `slack-session` JSON, `token`, `open -N` — stays clean). The revert
+  is a **short maintenance transaction** (`_revert_tx`, record site `revert`,
+  `purpose: "revert"`, mode B): record → pause the registered long-lived
+  clients exactly like a guided login (validated SIGUSR1; a paused
+  `register-exec` wrapper drops its shared gate, so a Playwright MCP server no
+  longer blocks the revert forever) → `switch headless` as the record's owner
+  (at most 5 s for the gate, re-check under it) → record cleared → clients
+  resumed (SIGUSR2). An unregistered CDP client refuses it before anything is
+  paused. While the record lives, a new registration exits 75 with `busy:
+  headless revert in progress (until ~HH:MM)`; a second command's preflight
+  waits up to 30 s for that revert instead of starting its own, and stands
+  down (`revert_skipped`, reason `busy`, no ❌, the command proceeds) when it
+  outlives the wait or when a guided login owns the record. The preflight is
+  skipped while another up/switch/down is in flight. A revert that fails (e.g.
+  an unregistered client blocks the switch) is one ❌ line on stderr plus a
+  `revert_failed` journal event — the command still runs, and the next command
+  tries again. By hand: `browser.py switch headless` runs the same transaction
+  (`-f` past an unregistered client); `up` on a lease-less headed browser too.
 - **`login` never opens a human flow.** Where a login needs you (claude.ai
   without a readable magic link, chatgpt.com, Slack, Notion, the SWITCH edu-ID
   fallback) it exits **4** and prints `needs Albert: agent-login.py -g <site>` —
