@@ -40,7 +40,10 @@ import pytest
 
 _REPO = Path(__file__).resolve().parent.parent
 PORT = 59334
-EPFL = {"groups.epfl.ch": "SOCKS5 127.0.0.1:1081"}
+EPFL = {
+    "groups.epfl.ch": "SOCKS5 127.0.0.1:1081",
+    "api.epfl.ch": "SOCKS5 127.0.0.1:1081",
+}
 
 
 def _load(name: str, path: Path):
@@ -141,7 +144,7 @@ def test_entries_are_validated_one_by_one():
 
 
 def test_render_one_host_exact_bytes():
-    assert browser._render_pac(EPFL) == (
+    assert browser._render_pac({"groups.epfl.ch": EPFL["groups.epfl.ch"]}) == (
         "function FindProxyForURL(url, host) {\n"
         "  host = host.toLowerCase();\n"
         '  if (host === "groups.epfl.ch") return "SOCKS5 127.0.0.1:1081; DIRECT";\n'
@@ -210,7 +213,8 @@ def test_pac_url_is_inline_base64_data():
 
 def test_summary_line():
     assert browser._pac_summary({**EPFL, "a.test": "PROXY h:1"}) == (
-        "a.test → PROXY h:1, groups.epfl.ch → SOCKS5 127.0.0.1:1081"
+        "a.test → PROXY h:1, api.epfl.ch → SOCKS5 127.0.0.1:1081, "
+        "groups.epfl.ch → SOCKS5 127.0.0.1:1081"
     )
 
 
@@ -291,7 +295,7 @@ def _running(monkeypatch, up: bool, cmd: str | None, pids=(777,)):
     monkeypatch.setattr(browser, "_proc_command", lambda pid: cmd)
 
 
-_SUMMARY = "Proxy PAC: groups.epfl.ch → SOCKS5 127.0.0.1:1081"
+_SUMMARY = "Proxy PAC: " + browser._pac_summary(EPFL)
 
 
 def test_status_line_when_down(monkeypatch):
