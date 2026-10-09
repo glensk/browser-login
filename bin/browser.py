@@ -1419,7 +1419,7 @@ def _browser_mode(port: int) -> str | None:
     return "headless" if headless else "headed"
 
 
-def _guided_login_allowed(port: int, site: str, label: str) -> bool:
+def _guided_login_allowed(port: int, site: str, label: str, hint: str = "") -> bool:
     """True when a login may hand the window to a human; else say so and False.
 
     An ASSISTED step (type an emailed code, finish SSO+2FA) needs Albert at a
@@ -1427,13 +1427,14 @@ def _guided_login_allowed(port: int, site: str, label: str) -> bool:
     holds the live headed lease (`_headed_lease_held`) and the browser runs
     headed. Everybody else gets ``needs Albert: agent-login.py -g <site>`` and
     the caller exits NEEDS_ALBERT_RC — `browser.py login` never opens a human
-    flow on its own (tp#836). No TTY or environment heuristics.
+    flow on its own (tp#836). No TTY or environment heuristics. A non-empty
+    `hint` (e.g. the broker's cooldown) follows that line in parentheses.
     """
     if _headed_lease_held() and _browser_mode(port) == "headed":
         return True
     print(
         f"❌ {label} needs a login only you can finish.\n"
-        f"needs Albert: agent-login.py -g {site}",
+        f"needs Albert: agent-login.py -g {site}" + (f" ({hint})" if hint else ""),
         file=sys.stderr,
     )
     return False
@@ -8661,6 +8662,19 @@ SWITCH_LOGIN_PATH = "/auth/login"
 SWITCH_SIGN_IN_FORM_ACTION = "/auth/openid_connect_eduid_ch"
 SWITCH_SIGN_IN_FORM_SELECTOR = f'form[action="{SWITCH_SIGN_IN_FORM_ACTION}"]'
 SWITCH_SIGN_IN_BUTTON_SELECTOR = SWITCH_SIGN_IN_FORM_SELECTOR + " button[type=submit]"
+# The edu-ID identity provider the SSO button leads to. While its session lives
+# the authorize request there only redirects back; otherwise it renders its
+# login form (email / password step), which only a human can finish. Its email
+# step renders ``input#username[name=j_username][type=email]`` about 2 s after
+# the click, at /idp/profile/oidc/authorize.
+SWITCH_IDP_HOST = "login.eduid.ch"
+SWITCH_IDP_LOGIN_INPUT_SELECTOR = (
+    "input[type=password], input[type=email], input[name=j_username], input#username"
+)
+# A broker-free background click that SETTLES this long on the edu-ID login
+# form has no live IdP session behind it: give up instead of waiting out the
+# full timeout, so the broker path that follows does not double the cost.
+SWITCH_IDP_FORM_SETTLE_S = 1.5
 
 
 def _switch_verdict(url: str, has_sign_in_form: bool) -> str:
@@ -8709,6 +8723,22 @@ def _switch_page_verdict(page) -> str:
     if has_form is None and verdict == "logged-in":
         return "unknown"
     return verdict
+
+
+def _switch_on_idp_login_form(page) -> bool:
+    """True when the tab shows the edu-ID IdP's own login form (email or
+    password step) — the click found no live IdP session. False on any other
+    page, and when the page cannot be read (the caller then keeps waiting)."""
+    try:
+        host = urllib.parse.urlsplit(page.url).hostname or ""
+    except Exception:  # pylint: disable=broad-exception-caught
+        return False
+    if host != SWITCH_IDP_HOST:
+        return False
+    try:
+        return page.query_selector(SWITCH_IDP_LOGIN_INPUT_SELECTOR) is not None
+    except Exception:  # pylint: disable=broad-exception-caught
+        return False
 
 
 def _page_by_target(browser, tid: str):
@@ -8764,20 +8794,35 @@ def _switch_probe(port: int) -> tuple[str, str]:
 
 
 def _switch_wait_for_login(
-    page, timeout_s: float, poll_s: float = 0.5, heartbeat: bool = False
+    page,
+    timeout_s: float,
+    poll_s: float = 0.5,
+    heartbeat: bool = False,
+    idp_give_up_s: float | None = None,
 ) -> bool:
     """PASSIVE poll of the login tab: True as soon as it settles logged in.
 
     Never navigates the tab — a `goto` mid-flight would abort the edu-ID
     redirect chain the human is completing. `heartbeat` prints a progress line
     to stderr every 30 s (the long assisted wait), exactly like
-    `_chatgpt_wait_for_login`.
+    `_chatgpt_wait_for_login`. With `idp_give_up_s`, the wait ends False as
+    soon as the tab has shown the edu-ID login form for that long
+    (`_switch_on_idp_login_form`) — nobody is there to fill it in. A redirect
+    that only passes through login.eduid.ch renders no form and is waited out.
     """
     start = time.monotonic()
     last_beat = 0.0
+    idp_since: float | None = None
     while time.monotonic() - start < timeout_s:
         if _switch_page_verdict(page) == "logged-in":
             return True
+        if idp_give_up_s is not None:
+            if not _switch_on_idp_login_form(page):
+                idp_since = None
+            elif idp_since is None:
+                idp_since = time.monotonic()
+            elif time.monotonic() - idp_since >= idp_give_up_s:
+                return False
         elapsed = time.monotonic() - start
         if heartbeat and elapsed - last_beat >= 30:
             print(
@@ -8828,26 +8873,59 @@ def _switch_eduid_broker_listed() -> bool:
     return entry is not None and not entry.get("refused")
 
 
-def _switch_sso_click_background(port: int) -> bool:
-    """The edu-ID SSO click in a BACKGROUND tab; True iff it ends logged in.
+def _switch_sso_click_background(port: int, *, idp_give_up: bool = False) -> str:
+    """The edu-ID SSO click in a BACKGROUND tab; its outcome.
 
-    Needs no visible window (the IdP session already lives in the profile, so
-    the click completes without typing). Proof is `_switch_page_verdict` on
-    that same tab, polled by `_switch_wait_for_login`. Held under the
+    ``logged-in`` (proof: `_switch_page_verdict` on that same tab, polled by
+    `_switch_wait_for_login`), ``eduid-login`` (the tab ended on the edu-ID
+    login form — no live IdP session) or ``not-logged-in`` (anything else,
+    the background tab failing included). Needs no visible window: while the
+    IdP session lives in the profile the click completes without typing.
+    `idp_give_up` stops the wait once the edu-ID login form has settled
+    (SWITCH_IDP_FORM_SETTLE_S) instead of after the full 20 s. Held under the
     interaction lease like the window flow, so no other tool clicks meanwhile.
     """
     from playwright.sync_api import Error as PlaywrightError
 
-    def click(page) -> bool:
+    def click(page) -> str:
         # No form = already logged in or mid-flow: the verdict decides.
         with contextlib.suppress(PlaywrightError):
             page.click(SWITCH_SIGN_IN_BUTTON_SELECTOR, timeout=10_000)
-        return _switch_wait_for_login(page, timeout_s=20)
+        if _switch_wait_for_login(
+            page,
+            timeout_s=20,
+            idp_give_up_s=SWITCH_IDP_FORM_SETTLE_S if idp_give_up else None,
+        ):
+            return "logged-in"
+        return "eduid-login" if _switch_on_idp_login_form(page) else "not-logged-in"
 
     with _interaction_lease("login switch"):
-        return bool(
-            _with_background_page(port, SWITCH_ORIGIN + SWITCH_LOGIN_PATH, click)
-        )
+        got = _with_background_page(port, SWITCH_ORIGIN + SWITCH_LOGIN_PATH, click)
+    return got if isinstance(got, str) else "not-logged-in"
+
+
+def _switch_login_via_sso_click(port: int) -> bool:
+    """The SSO click alone, on the profile's OWN edu-ID session (no broker).
+
+    Returns True when the portal ends logged in (event ``sso-background``
+    recorded); False — after a ⚠️ line saying why — otherwise. Gives up early
+    when the click lands on the edu-ID login form, so a dead IdP session costs
+    seconds, not the full wait, before the broker path runs.
+    """
+    _deadline_step("switch:sso-click")
+    print("▶ SSO click on the browser's own edu-ID session (background).")
+    outcome = _switch_sso_click_background(port, idp_give_up=True)
+    if outcome == "logged-in":
+        print("✅ Logged into Switch Cloud Portal (live edu-ID session + SSO click).")
+        _record_login_event("switch", "sso-background")
+        return True
+    why = (
+        "landed on the edu-ID login form (no live edu-ID session)"
+        if outcome == "eduid-login"
+        else "did not log in"
+    )
+    print(f"⚠️ SSO click without the broker {why}.", file=sys.stderr)
+    return False
 
 
 def _switch_login_via_eduid_broker(port: int) -> bool:
@@ -8860,6 +8938,7 @@ def _switch_login_via_eduid_broker(port: int) -> bool:
     """
     if not _switch_eduid_broker_listed():
         return False
+    _deadline_step("switch:broker")
     print("▶ edu-ID session from the login broker, then the SSO click (background).")
     rc = _broker_login(port, "eduid")
     if rc != 0:
@@ -8869,7 +8948,8 @@ def _switch_login_via_eduid_broker(port: int) -> bool:
             file=sys.stderr,
         )
         return False
-    if _switch_sso_click_background(port):
+    _deadline_step("switch:broker-sso-click")
+    if _switch_sso_click_background(port) == "logged-in":
         print("✅ Logged into Switch Cloud Portal (broker edu-ID session + SSO click).")
         _record_login_event("switch", "broker-sso")
         return True
@@ -8882,13 +8962,27 @@ def _switch_login_via_eduid_broker(port: int) -> bool:
 
 
 def _switch_warm_or_via_broker(port: int) -> bool:
-    """True when the portal is already logged in, or gets logged in through the
-    broker's edu-ID session — the two window-free ways `cmd_switch_login` tries
-    before the window flow."""
+    """True when the portal is already logged in, or gets logged in without a
+    window — the ways `cmd_switch_login` tries before the guided gate, in order:
+    the warm probe, the SSO click on the profile's own edu-ID session
+    (`_switch_login_via_sso_click`), then the broker's edu-ID session plus the
+    click (`_switch_login_via_eduid_broker`)."""
+    _deadline_step("switch:probe")
     if _switch_probe(port)[0] == "logged-in":
         print("✓ Already logged into Switch Cloud Portal (cloud.switch.ch).")
         return True
+    if _switch_login_via_sso_click(port):
+        return True
     return _switch_login_via_eduid_broker(port)
+
+
+def _switch_broker_wait_hint() -> str:
+    """``or wait: …`` when this run's broker ``eduid`` login was refused as
+    rate limited (its detail names the cooldown), else ''."""
+    detail = _broker_rate_limit_detail("eduid")
+    if detail is None:
+        return ""
+    return f"or wait: the broker rate-limits eduid — {detail or 'no detail given'}"
 
 
 def cmd_switch_login(port: int) -> int:
@@ -8897,21 +8991,28 @@ def cmd_switch_login(port: int) -> int:
 
     A cold session is one click: the /auth/login page's single edu-ID button
     completes the login with NO password while the browser's edu-ID IdP session
-    is alive. When the login broker lists ``eduid``, that IdP session is first
-    obtained from the broker and the click runs in a BACKGROUND tab — no window
-    needed, headless works (mode ``broker-sso``, `_switch_login_via_eduid_broker`).
-    Otherwise (or if that fails) the click runs in the shared window (mode
-    ``sso``), and when it lands on login.eduid.ch the run becomes ASSISTED — you
-    finish the edu-ID login once there. The interactive part is held under the
+    is alive. That click runs FIRST, alone, in a BACKGROUND tab (mode
+    ``sso-background``, `_switch_login_via_sso_click`); it gives up as soon as
+    it lands on the edu-ID login form. Then, when the login broker lists
+    ``eduid``, that IdP session is obtained from the broker and the click runs
+    again in a background tab (mode ``broker-sso``,
+    `_switch_login_via_eduid_broker`). Neither needs a window, so both work
+    headless. Only then the guided gate: inside a guided login the click runs
+    in the shared window (mode ``sso``), and when it lands on login.eduid.ch the
+    run becomes ASSISTED — you finish the edu-ID login once there; outside one
+    it exits NEEDS_ALBERT_RC, naming the broker's cooldown when that was why
+    the broker path failed. The interactive part is held under the
     INTERACTION lease, so no other tool clicks in the meantime. The window flow
     runs in a fresh tab this process owns (brought to the front only under the
     headed lease), closed again afterwards (tp#845).
     """
-    # Warm probe + guided-login gate FIRST, outside the lease (both are read-only,
-    # exactly what `logged-in` does lease-free).
+    # The window-free ways first; the guided gate only after all of them failed.
     if _switch_warm_or_via_broker(port):
         return 0
-    if not _guided_login_allowed(port, "switch", "Switch Cloud Portal"):
+    _deadline_step("switch:guided-gate")
+    if not _guided_login_allowed(
+        port, "switch", "Switch Cloud Portal", _switch_broker_wait_hint()
+    ):
         return NEEDS_ALBERT_RC
     try:
         with _owned_background_page(port) as page:
@@ -9109,10 +9210,22 @@ BROKER_ERRORS = {
     "internal": "internal broker error",
 }
 _BROKER_SITES_CACHE: list[list[dict]] = []
+# The broker's refusal of this process's latest `login` per site: (error code,
+# detail) — read by callers that need the structured reason behind the exit code
+# (`_broker_rate_limit_detail`). Cleared when a new `_broker_login` starts.
+_BROKER_REFUSALS: dict[str, tuple[str, str]] = {}
 
 
 class BrokerUnavailable(Exception):
     """No (working) login broker answers on the socket."""
+
+
+def _broker_rate_limit_detail(site: str) -> str | None:
+    """The broker's detail (e.g. ``cooldown after a failed login: retry in
+    1487s``) when this process's latest `_broker_login` of `site` was refused
+    with the error code ``rate_limited``; None for any other outcome."""
+    code, detail = _BROKER_REFUSALS.get(site, ("", ""))
+    return detail if code == "rate_limited" else None
 
 
 def _broker_socket() -> str:
@@ -10571,6 +10684,7 @@ def _broker_login(port: int, site: str) -> int:  # pylint: disable=too-many-retu
     bundle, replace the site's in-scope cookies, write its storage keys, then
     verify with `_broker_logged_in`.
     """
+    _BROKER_REFUSALS.pop(site, None)
     _deadline_step("broker:precheck")
     rc = _broker_logged_in(port, site)
     if rc == 0:
@@ -10593,6 +10707,7 @@ def _broker_login(port: int, site: str) -> int:  # pylint: disable=too-many-retu
             if not resp.get("ok"):
                 code = str(resp.get("error"))
                 detail = str(resp.get("detail") or "")
+                _BROKER_REFUSALS[site] = (code, detail)
                 msg = f"{site}: {BROKER_ERRORS.get(code, code)}"
                 _print_broker_diag(resp.get("diag"))
                 return _broker_fail(

@@ -211,24 +211,55 @@ def test_cscs_probe_gives_up_after_the_wait(monkeypatch):
 
 
 class _SwitchPage:
-    def __init__(self) -> None:
+    """A background portal tab whose SSO click ends in `outcome`:
+    ``logged-in``, ``eduid-login`` (the edu-ID login form) or ``login``."""
+
+    def __init__(self, outcome: str) -> None:
         self.url = browser.SWITCH_ORIGIN + browser.SWITCH_LOGIN_PATH
+        self.outcome = outcome
         self.clicks: list[str] = []
 
     def click(self, selector: str, **_kw) -> None:
         self.clicks.append(selector)
+        if self.outcome == "eduid-login":
+            self.url = IDP_URL
+        elif self.outcome == "logged-in":
+            self.url = browser.SWITCH_ORIGIN + "/"
+
+    def query_selector(self, selector: str):
+        if selector == browser.SWITCH_IDP_LOGIN_INPUT_SELECTOR:
+            return object() if self.outcome == "eduid-login" else None
+        raise AssertionError(f"unexpected selector {selector!r}")
+
+
+IDP_URL = "https://login.eduid.ch/idp/profile/oidc/authorize?execution=e1s1"
+LOGIN_URL = browser.SWITCH_ORIGIN + browser.SWITCH_LOGIN_PATH
+_REAL_GUIDED = browser._guided_login_allowed
+_REAL_BROKER_LOGIN = browser._broker_login
 
 
 @pytest.fixture
 def switch_env(monkeypatch):
-    """Everything around `cmd_switch_login` stubbed; returns the call log."""
-    log: dict = {"broker": [], "bg": [], "events": [], "headed": 0, "page": None}
+    """Everything around `cmd_switch_login` stubbed; returns the call log.
+
+    ``state["clicks"]`` lists the outcome of each background SSO click in turn
+    (the broker-free click first, then the one after the broker's login)."""
+    log: dict = {
+        "broker": [],
+        "bg": [],
+        "pages": [],
+        "events": [],
+        "headed": 0,
+        "hints": [],
+        "waits": [],
+    }
     entry: object = {"site": "eduid", "refused": False}
     state: dict = {
         "entry": entry,
         "broker_rc": 0,
-        "verdict": "logged-in",
+        "clicks": ["eduid-login", "logged-in"],
         "headed": False,
+        "probe": "login",
     }
 
     def broker_site(site):
@@ -243,25 +274,31 @@ def switch_env(monkeypatch):
 
     def bg(port, url, fn):
         log["bg"].append(url)
-        page = _SwitchPage()
-        log["page"] = page
+        page = _SwitchPage(state["clicks"][len(log["pages"])])
+        log["pages"].append(page)
         return fn(page)
 
-    def headed(port, site, label):
+    def headed(port, site, label, hint=""):
         assert site == "switch" and label
         log["headed"] += 1
+        log["hints"].append(hint)
         return state["headed"]
 
-    monkeypatch.setattr(browser, "_switch_probe", lambda port: ("login", ""))
+    def wait(page, timeout_s, **kw):
+        log["waits"].append(kw.get("idp_give_up_s"))
+        return browser._switch_page_verdict(page) == "logged-in"
+
+    monkeypatch.setattr(browser, "_BROKER_REFUSALS", {})
+    monkeypatch.setattr(browser, "_switch_probe", lambda port: (state["probe"], ""))
     monkeypatch.setattr(browser, "_broker_site", broker_site)
     monkeypatch.setattr(browser, "_broker_login", broker_login)
     monkeypatch.setattr(browser, "_with_background_page", bg)
-    monkeypatch.setattr(browser, "_switch_page_verdict", lambda page: state["verdict"])
     monkeypatch.setattr(
         browser,
-        "_switch_wait_for_login",
-        lambda page, timeout_s, **_k: browser._switch_page_verdict(page) == "logged-in",
+        "_switch_page_verdict",
+        lambda page: "logged-in" if page.outcome == "logged-in" else "login",
     )
+    monkeypatch.setattr(browser, "_switch_wait_for_login", wait)
     monkeypatch.setattr(
         browser, "_interaction_lease", lambda purpose: contextlib.nullcontext("n")
     )
@@ -276,20 +313,25 @@ def test_switch_login_chains_broker_eduid_and_background_click(switch_env, capsy
     log, _state = switch_env
     assert browser.cmd_switch_login(9222) == 0
     assert log["broker"] == ["eduid"]
-    assert log["bg"] == [browser.SWITCH_ORIGIN + browser.SWITCH_LOGIN_PATH]
-    assert log["page"].clicks == [browser.SWITCH_SIGN_IN_BUTTON_SELECTOR]
+    assert log["bg"] == [LOGIN_URL, LOGIN_URL]
+    assert [p.clicks for p in log["pages"]] == [
+        [browser.SWITCH_SIGN_IN_BUTTON_SELECTOR]
+    ] * 2
     assert log["events"] == [("switch", "broker-sso")]
     assert log["headed"] == 0  # no window needed: works headless
-    assert "✅ Logged into Switch Cloud Portal" in capsys.readouterr().out
+    out, err = capsys.readouterr()
+    assert "✅ Logged into Switch Cloud Portal (broker" in out
+    assert "landed on the edu-ID login form" in err
 
 
 def test_switch_login_falls_back_when_the_click_does_not_log_in(switch_env, capsys):
     log, state = switch_env
-    state["verdict"] = "login"  # the edu-ID session did not carry the SSO
+    state["clicks"] = ["eduid-login", "login"]  # broker's session did not carry it
     # no guided login: the window flow is refused with "needs Albert"
     assert browser.cmd_switch_login(9222) == browser.NEEDS_ALBERT_RC
-    assert log["broker"] == ["eduid"] and len(log["bg"]) == 1
+    assert log["broker"] == ["eduid"] and len(log["bg"]) == 2
     assert log["headed"] == 1 and not log["events"]
+    assert log["hints"] == [""]
     assert "falling back to the window flow" in capsys.readouterr().err
 
 
@@ -297,7 +339,7 @@ def test_switch_login_falls_back_when_the_broker_login_fails(switch_env, capsys)
     log, state = switch_env
     state["broker_rc"] = 4
     assert browser.cmd_switch_login(9222) == browser.NEEDS_ALBERT_RC
-    assert log["broker"] == ["eduid"] and not log["bg"]
+    assert log["broker"] == ["eduid"] and len(log["bg"]) == 1
     assert log["headed"] == 1
     assert "broker login eduid failed (exit 4)" in capsys.readouterr().err
 
@@ -315,8 +357,167 @@ def test_switch_login_without_broker_eduid_is_the_window_flow(switch_env, entry)
     log, state = switch_env
     state["entry"] = entry
     assert browser.cmd_switch_login(9222) == browser.NEEDS_ALBERT_RC
-    assert not log["broker"] and not log["bg"]
+    assert not log["broker"] and len(log["bg"]) == 1  # only the broker-free click
     assert log["headed"] == 1
+
+
+# --- tp#866: the broker-free click first, then the broker, then the gate ---------
+
+
+@pytest.mark.parametrize("broker", ["failing", "down"])
+def test_switch_background_click_alone_logs_in_without_the_broker(
+    switch_env, capsys, broker
+):
+    """(1) A live edu-ID session in the profile: the click alone logs in —
+    exit 0, the broker is never asked, no guided gate."""
+    log, state = switch_env
+    state["clicks"] = ["logged-in"]
+    state["broker_rc"] = 2
+    if broker == "down":
+        state["entry"] = "down"
+    assert browser.cmd_switch_login(9222) == 0
+    assert not log["broker"] and log["bg"] == [LOGIN_URL]
+    assert log["events"] == [("switch", "sso-background")]
+    assert log["headed"] == 0
+    # the broker-free click gives up early on the edu-ID login form
+    assert log["waits"] == [browser.SWITCH_IDP_FORM_SETTLE_S]
+    assert "live edu-ID session + SSO click" in capsys.readouterr().out
+
+
+def test_switch_click_on_the_eduid_form_tries_the_broker_next(switch_env, capsys):
+    """(2) The broker-free click lands on edu-ID's login form → the broker path
+    runs next (its click waits the full time: no early give-up there)."""
+    log, _state = switch_env
+    assert browser.cmd_switch_login(9222) == 0
+    assert log["broker"] == ["eduid"]
+    assert log["pages"][0].url == IDP_URL
+    assert log["waits"] == [browser.SWITCH_IDP_FORM_SETTLE_S, None]
+    assert log["events"] == [("switch", "broker-sso")]
+    err = capsys.readouterr().err
+    assert "SSO click without the broker landed on the edu-ID login form" in err
+
+
+def test_switch_warm_session_clicks_nothing(switch_env, capsys):
+    """(4) Warm portal session: no click, no broker, no gate, no login event."""
+    log, state = switch_env
+    state["probe"] = "logged-in"
+    assert browser.cmd_switch_login(9222) == 0
+    assert not log["bg"] and not log["broker"] and not log["events"]
+    assert log["headed"] == 0
+    assert "Already logged into Switch Cloud Portal" in capsys.readouterr().out
+
+
+class _FakeBrowser:
+    def close(self) -> None:
+        return None
+
+
+class _FakePw:
+    def stop(self) -> None:
+        return None
+
+
+def _refusing_broker(monkeypatch, error: str, detail: str) -> list[str]:
+    """The REAL `_broker_login` and guided gate against a broker that refuses
+    every login with `error`; returns the requests it saw."""
+    requests: list[str] = []
+
+    def request(op, **kw):
+        requests.append(f"{op}:{kw.get('site')}")
+        return {"ok": False, "error": error, "detail": detail}
+
+    monkeypatch.setattr(browser, "_broker_login", _REAL_BROKER_LOGIN)
+    monkeypatch.setattr(browser, "_broker_logged_in", lambda port, site: 2)
+    monkeypatch.setattr(browser, "_connect", lambda port: (_FakePw(), _FakeBrowser()))
+    monkeypatch.setattr(browser, "_broker_request", request)
+    monkeypatch.setattr(browser, "_guided_login_allowed", _REAL_GUIDED)
+    monkeypatch.setattr(browser, "_headed_lease_held", lambda: False)
+    return requests
+
+
+def test_switch_both_fail_names_the_broker_cooldown(switch_env, monkeypatch, capsys):
+    """(3) Click on the edu-ID form AND the broker rate-limited → exit 4, and
+    the needs-Albert line names the broker's cooldown (its structured
+    ``rate_limited`` code; the detail verbatim)."""
+    log, state = switch_env
+    state["clicks"] = ["eduid-login"]
+    detail = "cooldown after a failed login: retry in 1487s"
+    requests = _refusing_broker(monkeypatch, "rate_limited", detail)
+    assert browser.cmd_switch_login(9222) == browser.NEEDS_ALBERT_RC
+    assert requests == ["login:eduid"] and len(log["bg"]) == 1
+    assert not log["events"]
+    err = capsys.readouterr().err
+    assert "rate limited by the broker" in err
+    assert (
+        "needs Albert: agent-login.py -g switch (or wait: the broker rate-limits "
+        f"eduid — {detail})"
+    ) in err
+
+
+def test_switch_both_fail_without_rate_limit_has_no_wait_hint(
+    switch_env, monkeypatch, capsys
+):
+    _log, state = switch_env
+    state["clicks"] = ["eduid-login"]
+    _refusing_broker(monkeypatch, "login_failed", "")
+    assert browser.cmd_switch_login(9222) == browser.NEEDS_ALBERT_RC
+    err = capsys.readouterr().err
+    assert "needs Albert: agent-login.py -g switch\n" in err
+    assert "or wait" not in err
+
+
+# --- the early give-up of the wait itself ----------------------------------------
+
+
+class _IdpWaitPage:
+    """A tab that shows `urls` in turn (one per poll), with the edu-ID login
+    form only where `forms` says so."""
+
+    def __init__(self, urls: list[str], forms: list[bool]) -> None:
+        self._urls, self._forms, self.polls = urls, forms, 0
+
+    @property
+    def url(self) -> str:
+        return self._urls[min(self.polls, len(self._urls) - 1)]
+
+    def query_selector(self, selector: str):
+        if selector == browser.SWITCH_SIGN_IN_FORM_SELECTOR:
+            return None
+        return object() if self._forms[min(self.polls, len(self._forms) - 1)] else None
+
+    def wait_for_timeout(self, _ms: float) -> None:
+        self.polls += 1
+        time.sleep(0.01)
+
+
+def test_wait_gives_up_once_the_eduid_form_settles():
+    page = _IdpWaitPage([IDP_URL], [True])
+    t0 = time.monotonic()
+    assert not browser._switch_wait_for_login(
+        page, timeout_s=10, poll_s=0.01, idp_give_up_s=0.05
+    )
+    assert time.monotonic() - t0 < 2
+    assert browser._switch_on_idp_login_form(page)
+
+
+def test_wait_rides_out_a_pass_through_the_idp():
+    """A live IdP session redirects THROUGH login.eduid.ch, rendering no form."""
+    page = _IdpWaitPage([IDP_URL] * 3 + [browser.SWITCH_ORIGIN + "/projects"], [False])
+    assert browser._switch_wait_for_login(
+        page, timeout_s=10, poll_s=0.01, idp_give_up_s=0.0
+    )
+
+
+def test_wait_without_give_up_ignores_the_eduid_form():
+    page = _IdpWaitPage([IDP_URL], [True])
+    t0 = time.monotonic()
+    assert not browser._switch_wait_for_login(page, timeout_s=0.3, poll_s=0.01)
+    assert time.monotonic() - t0 >= 0.3
+
+
+def test_the_eduid_form_check_needs_the_idp_host():
+    page = _IdpWaitPage([LOGIN_URL], [True])
+    assert not browser._switch_on_idp_login_form(page)
 
 
 # ---------------------------------------------------------------------------

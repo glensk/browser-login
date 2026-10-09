@@ -10,11 +10,11 @@ into nothing unless you pass -t, -g or -c.
 The marketplace sites (anibis, tutti, Ricardo, Kleinanzeigen) run on YOUR Safari
 session: you log in in Safari, `browser.py login SITE` copies that site's session
 cookies into the shared Chromium (Kleinanzeigen falls back to the broker). CSCS and
-Smartsheet log in through the broker. SWITCH Cloud logs in with the broker's edu-ID
-session plus the portal's SSO click (no window; your own login only when the broker has
-no usable `eduid` item). Anthropic, OpenAI and Slack need you once (email code / SSO):
-`-g SITE` asks you on the terminal, then shows a remote view of a headless tab (the
-window only as a fallback) and waits; -t and -c only check them.
+Smartsheet log in through the broker. SWITCH Cloud logs in with the portal's SSO click,
+on the browser's own edu-ID session first, then on the broker's (no window; your own
+login only when neither works). Anthropic, OpenAI and Slack need you once (email code /
+SSO): `-g SITE` asks you on the terminal, then shows a remote view of a headless tab
+(the window only as a fallback) and waits; -t and -c only check them.
 
 Examples:
   ./agent-login.py              # overview
@@ -199,7 +199,8 @@ TARGETS = (
         "SWITCH Cloud",
         "https://cloud.switch.ch",
         EDUID_SSO_FLOW,
-        "Switch Cloud Portal: broker edu-ID session + SSO click (no window); "
+        "Switch Cloud Portal: SSO click on the browser's own edu-ID session, else "
+        "the broker's (no window); "
         "your own login: ./agent-login.py -g switch",
         broker_site="eduid",
     ),
