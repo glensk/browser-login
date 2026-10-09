@@ -834,6 +834,22 @@ def test_clients_stops_an_orphaned_child_group(cache):
         assert _wait(lambda: not _stat(child), 10), "orphan still running"
 
 
+def test_clients_marks_a_paused_client(cache, monkeypatch, capsys):
+    monkeypatch.setattr(browser, "_unknown_cdp_clients", lambda port: [])
+    paused = browser._registry_register(
+        "playwright-mcp", "npx @playwright/mcp", 59990, extra={"paused": True}
+    )
+    running = browser._registry_register("browser.py", "eval", 59990)
+    try:
+        assert browser.cmd_clients(59990) == 0
+    finally:
+        paused()
+        running()
+    lines = [ln for ln in capsys.readouterr().out.splitlines() if ln.startswith("  - ")]
+    assert sum("PAUSED (guided login)" in ln for ln in lines) == 1
+    assert any("playwright-mcp" in ln and "PAUSED" in ln for ln in lines)
+
+
 def test_legacy_wrapper_is_named_instead_of_a_gate_timeout(quiet_tx):
     old = browser._registry_register("playwright-mcp", "npx @playwright/mcp", 59990)
     try:

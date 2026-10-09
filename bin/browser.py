@@ -4478,7 +4478,9 @@ def cmd_clients(port: int) -> int:
     if live:
         print(f"{len(live)} registered CDP client(s):")
         for rec in live:
-            print(f"  - {_describe_client(rec)}")
+            # A register-exec client a guided login has SIGSTOPped says so.
+            paused = " — PAUSED (guided login)" if rec.get("paused") is True else ""
+            print(f"  - {_describe_client(rec)}{paused}")
     else:
         print("No registered CDP clients.")
     unknown = _unknown_cdp_clients(port)

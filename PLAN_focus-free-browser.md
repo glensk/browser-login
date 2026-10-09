@@ -211,8 +211,13 @@ relay exposes only owned targets.
       maintenance record (owner nonce, 10 s heartbeat) while holding the gate; new
       registrations without the owner token refuse; interaction lease held throughout;
       clear, then SIGCONT.
-- [ ] Test SIGSTOP/SIGCONT on `@playwright/mcp@0.0.76` mid-session (pending calls, socket
+- [x] Test SIGSTOP/SIGCONT on `@playwright/mcp@0.0.76` mid-session (pending calls, socket
       survival). If it breaks MCP: documented manual `browser_close`/reconnect instead.
+      2026-10-09 PASS (real `_maintenance`, disposable browser, pauses 10 s/60 s/5 min,
+      idle and in-flight): stdio session and CDP socket survive, all later calls work; an
+      in-flight call whose Playwright timeout ran out during the pause returns
+      `TimeoutError` (work done; retry) — documented in README. No reconnect fallback needed.
+      `clients` now shows `PAUSED`. Scripts: scratchpad `mcp-pause/`.
 - [x] Watchdog: detached process spawned by the transaction (plus a check in the
       LaunchAgent watcher) reverts headed → headless and closes owned targets within 30 s of
       a stale heartbeat. Residual, stated: an already-running MCP reconnecting inside that

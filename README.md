@@ -338,7 +338,12 @@ the button is the way out.
    wrapper — only after validating its pid AND start time from its live registry
    entry; the entry goes into the record first. The wrapper SIGSTOPs its child's
    process group, releases its shared hold on the client gate and confirms
-   (`paused: true`) within 5 s, or the start is refused. A long-lived
+   (`paused: true`) within 5 s, or the start is refused. Measured with
+   `@playwright/mcp@0.0.76` (pauses up to 5 min): the MCP's stdio session and
+   CDP socket survive and every later call works; only a call that was in
+   flight with a Playwright timeout (navigate 60 s, actions 5 s) can come back
+   as `TimeoutError` when the pause outlasts it — the work itself is done;
+   retry the call. A long-lived
    registration from before this protocol (no `kind`) refuses the start at
    once, naming its pids: restart the Claude sessions that run the Playwright
    MCP.
