@@ -203,6 +203,16 @@ manual acceptance steps under the attempt policy below.
 - [ ] WS1b — durability per flow, after WS2's root causes: broker re-export before expiry,
       credential-change handling, Safari-cookie expiry, monitoring of assisted sessions with
       an alert to Albert. Plan → codex-debate → implement.
+- [ ] WS4 — no more unsynced rotations (Albert, 2026-10-10: layers 1 and 2). Plan →
+      codex-debate → implementation:
+  - Layer 1: Vaultwarden is the single master copy. SOPS and Keychain copies are derived
+    by a sync tool, and duplicates are merged (`npm-password` → `npm-admin-password`).
+  - Layer 2: one rotation command (server → Vaultwarden with Touch ID → every copy →
+    fingerprint verify), and a hook blocks agents from rotating any other way.
+  - Plan file: `mydotfiles/PLAN_credential-single-source.md` (planner subagent).
+- [ ] calibre account (Albert, 2026-10-10): dedicated non-admin CWA user `agent` without an
+      e-mail address; tp#886 lockdown to read-only guests + no mailed reset (builder on
+      nixos).
 - [ ] WS3 — onboarding guard (plan → codex-debate → implement): static validation of a new
       item (sentinel present, fill origins, cookie scope, attempt group), a budgeted
       promotion test (`pending` → `usable`), and a removal path (`broker-add.py` remove or
