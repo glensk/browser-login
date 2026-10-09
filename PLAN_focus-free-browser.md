@@ -187,9 +187,24 @@ accepted and folded in below.
 
 ### Phase 3 — guided login (B primary, A fallback)
 
+Status 2026-10-09 — first live B run (Notion, cookies deleted first,
+`browser.py assisted-login notion -f` because another session's bare-npx MCP was attached):
+✅ result 0 in 5 min 40 s; record, heartbeat, watchdog, owned target (closed=1 owned=1),
+`maintenance/end result=ok problems=0`, record file gone, `logged-in notion` ✅, `doctor`
+all ✅. focus_watch over the session: zero Chrome activations; 3 Chrome `window_new`, all
+`on_screen: false`, never shown. Typing, email-code paste and clicks through the viewer
+worked. Notion dropped the fresh login on `/onboarding` ("Join teammates…"); "‹" →
+"Back to previous workspace" reached the sidebar. Defects found → fixed in the follow-up
+commit: no `-F` pass-through on `agent-login.py -g`; the relay's `opener=unknown` note
+(our own `logged-in` probe tabs) overwrote the viewer banner; the viewer said "reload to
+reconnect" after success instead of ✅; a ⚠ for the normal no-Brave path. Deviation: Brave
+is not installed, so the viewer opens in the DEFAULT browser (Safari, Albert's daily
+profile) — accepted for now: loopback-only, one-shot token bound to an HttpOnly cookie,
+relay exposes only owned targets.
+
 - [ ] Single entry: `agent-login.py -g <site>` → `browser.py assisted-login <site>`,
       confirmation typed on `/dev/tty`.
-- [ ] Maintenance transaction (B and A): take the client gate exclusively; pause registered
+- [x] Maintenance transaction (B and A): take the client gate exclusively; pause registered
       long-lived clients (the `register-exec` wrapper SIGSTOPs its child's process group,
       SIGCONTs on clear); refuse if unregistered CDP peers exist (`-f` overrides); write the
       maintenance record (owner nonce, 10 s heartbeat) while holding the gate; new
@@ -210,7 +225,7 @@ accepted and folded in below.
       exposes only that CDP subset for owned targets, with exactly its origin allowed.
 - [ ] Viewer opens in a dedicated extension-free Brave profile (or a CfT app-mode window
       with its own throwaway profile) — never Albert's daily profile.
-- [ ] Owned targets: B always creates a dedicated login target (never reuses a site tab);
+- [x] Owned targets: B always creates a dedicated login target (never reuses a site tab);
       a target supervisor follows new targets whose `openerId` is owned (OAuth popups),
       switches the viewer to them, handles popup close + opener redirect, never selects a
       non-owned tab. Owned ids live in the maintenance record and are closed on success,
