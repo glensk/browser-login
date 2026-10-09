@@ -57,6 +57,9 @@ USERNAME_SELECTOR = (
 )
 OTP_SELECTOR = "input[autocomplete=one-time-code], input[name*=otp i], #otp"
 STEP_TIMEOUT_S = 20.0
+# Post-login prompts answered per login (page_state.POST_LOGIN_PROMPTS): Zoho
+# can ask "Trust this browser?" and then "Review your account details".
+MAX_POST_LOGIN_PROMPTS = 2
 # Identifier-first logins that offer a passkey (SWITCH edu-ID, verified
 # 2026-10-07) show "Use password" / "Use a passkey" buttons instead of the
 # password field after the e-mail step. The password choice is clicked once,
@@ -727,7 +730,8 @@ def generic_login(
     pw_field = _fill_password(page, pw_field, secret, allowed, dev=dev)
     _submit_password(page, pw_field, allowed, dev=dev)
 
-    otp_done = trusted = False
+    otp_done = False
+    prompts_answered = 0
     deadline = time.monotonic() + settle_s
     while time.monotonic() < deadline:
         page.wait_for_timeout(500)
@@ -743,12 +747,13 @@ def generic_login(
             return
         trust = (
             None
-            if trusted or off_fill_origins(page.url, allowed, dev=dev)
-            else (trust_prompt_button(page))
+            if prompts_answered >= MAX_POST_LOGIN_PROMPTS
+            or off_fill_origins(page.url, allowed, dev=dev)
+            else trust_prompt_button(page)
         )
         if trust is not None:
             trust.click(timeout=5000)
-            trusted = True
+            prompts_answered += 1
     # Still on the login after the password: wrong password, an e-mail code, a
     # captcha... Fail HERE so the failure report shows this page.
     raise LoginFailed(

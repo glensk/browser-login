@@ -70,6 +70,32 @@ def test_prompt_without_a_confirming_button_or_hidden_one() -> None:
     )
 
 
+ZOHO_REVIEW = (
+    "Review your account details\nAs a measure to keep your Zoho account up to "
+    "date, please review your account details before proceeding.\nConfirm\n"
+    "Remind me later"
+)
+
+
+def test_zoho_review_prefers_remind_me_later_over_confirm() -> None:
+    later = FakeButton("Remind me later")
+    page = FakePage(ZOHO_REVIEW, [FakeButton("Confirm"), FakeButton("Manage"), later])
+    assert trust_prompt_button(page) is later
+
+
+def test_zoho_review_falls_back_to_confirm() -> None:
+    confirm = FakeButton("Confirm")
+    hidden_later = FakeButton("Remind me later", visible=False)
+    assert (
+        trust_prompt_button(FakePage(ZOHO_REVIEW, [hidden_later, confirm])) is confirm
+    )
+
+
+def test_confirm_alone_is_never_clicked_without_the_review_prompt() -> None:
+    page = FakePage("Delete your account?\nConfirm", [FakeButton("Confirm")])
+    assert trust_prompt_button(page) is None
+
+
 def test_stay_signed_in_input_button() -> None:
     yes = FakeButton("", value="Yes")
     page = FakePage("Stay signed in?\nDo this to reduce sign-in prompts.", [yes])

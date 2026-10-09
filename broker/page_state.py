@@ -175,33 +175,55 @@ def diagnose(page: Any, secret: Secret) -> dict[str, Any]:
     }
 
 
-# "Trust this browser?" / "Stay signed in?" asked AFTER the password and second
-# factor were accepted (Zoho accounts, 2026-10-08: "Trust" | "Not now"). The
-# login is done; the page only waits for this answer. Answering "trust" keeps
-# the broker's own profile out of the second factor next time.
+# Pages a site shows AFTER the password and second factor were accepted, each
+# with the control the broker answers it with, in order of preference. The login
+# is done; the page only waits for this answer.
+# - "Trust this browser?" / "Stay signed in?" (Zoho accounts: "Trust" | "Not
+#   now"): answering "trust" keeps the broker's own profile out of the second
+#   factor next time.
+# - Zoho's periodic "Review your account details" ("Confirm" | "Remind me
+#   later"): postponed, so the broker never vouches for the account's contact
+#   details; "Confirm" only when no postpone control is shown.
 TRUST_PROMPT_RE = re.compile(
     r"trust this (?:browser|device)\?|stay signed in\?|remember this (?:browser|device)\?",
     re.IGNORECASE,
 )
-TRUST_BUTTON_LABELS = frozenset({"trust", "trust browser", "trust this browser", "yes"})
+TRUST_BUTTON_LABELS = ("trust", "trust browser", "trust this browser", "yes")
+REVIEW_PROMPT_RE = re.compile(r"review your account details", re.IGNORECASE)
+REVIEW_BUTTON_LABELS = ("remind me later", "confirm")
+POST_LOGIN_PROMPTS = (
+    (TRUST_PROMPT_RE, TRUST_BUTTON_LABELS),
+    (REVIEW_PROMPT_RE, REVIEW_BUTTON_LABELS),
+)
+# "Remind me later" is a styled link or span on Zoho, not a button.
+_PROMPT_CONTROLS = (
+    "button, input[type=submit], input[type=button], [role=button], a, span"
+)
 
 
 def trust_prompt_button(page: Any) -> Any:
-    """The visible confirming button of a post-login "trust this browser" prompt,
-    or None (no such prompt, or no unambiguous button). Inspection only."""
+    """The visible control that answers a known post-login prompt (see
+    ``POST_LOGIN_PROMPTS``), or None (no such prompt, or no matching control).
+    Inspection only."""
     try:
-        text = page.inner_text("body", timeout=1000)
+        text = page.inner_text("body", timeout=1000) or ""
     except Exception:  # pylint: disable=broad-exception-caught
         return None
-    if not TRUST_PROMPT_RE.search(text or ""):
-        return None
-    try:
-        for button in page.query_selector_all(
-            "button, input[type=submit], input[type=button], [role=button]"
-        ):
-            label = (button.inner_text() or button.get_attribute("value") or "").strip()
-            if label.lower() in TRUST_BUTTON_LABELS and button.is_visible():
-                return button
-    except Exception:  # pylint: disable=broad-exception-caught
-        return None
+    for prompt_re, labels in POST_LOGIN_PROMPTS:
+        if prompt_re.search(text):
+            return _first_control(page, labels)
     return None
+
+
+def _first_control(page: Any, labels: tuple[str, ...]) -> Any:
+    """The visible control whose label is the earliest entry of ``labels``."""
+    found: dict[str, Any] = {}
+    try:
+        for control in page.query_selector_all(_PROMPT_CONTROLS):
+            label = control.inner_text() or control.get_attribute("value") or ""
+            label = label.strip().lower()
+            if label in labels and label not in found and control.is_visible():
+                found[label] = control
+    except Exception:  # pylint: disable=broad-exception-caught
+        return None
+    return next((found[label] for label in labels if label in found), None)
