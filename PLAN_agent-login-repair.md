@@ -152,7 +152,23 @@ manual acceptance steps under the attempt policy below.
 
       One live submit is needed.
   - [ ] npm-nixos
-  - [ ] npm-raspi
+    - [x] Root cause (read-only, Codex diagnose debate converged in round 1): the vault
+          password is stale (len 19 `36d8`). The live one is SOPS `NPM_ADMIN_PASSWORD`
+          (len 28 `e426`), verified against the NPM hash on nixos. All 3 `POST /api/tokens`
+          answered 400 with the 96-byte "Invalid email or password" body. The July rotation
+          never updated the agent-login items. `npm-password` (agent secret) is stale too.
+    - [ ] Albert pastes the SOPS value into the `npm-nixos`, `npm-raspi` and `npm-password`
+          items (web vault; `broker-add.py` cannot set a login password).
+    - [ ] Code (after WS1a):
+      - poll `sentinel_shown()` instead of `wait_for_selector`, since the first
+            `a[href='/nginx/proxy']` is a hidden navbar item;
+      - refresh the NPM JWT before export when less than 12 h remain (`GET /api/tokens`);
+      - bundle completeness check;
+      - sentinel `a.card-link[href='/nginx/proxy']` on both NPM items.
+  - [ ] npm-raspi: same failure, same fix. The password is unconfirmed (Home Assistant
+        protection mode blocks docker), so one approved submit after the vault update is
+        the test. Separate realm, so no shared attempt group. Off-LAN it must report
+        `unreachable` (precheck), never submit.
   - [ ] calibre
   - [ ] galaxus
   - [ ] galaxus-de
@@ -193,6 +209,18 @@ manual acceptance steps under the attempt policy below.
   needs no password. WS1a moves admission into `get_secret` (CSCS debate rule).
 - Broker run times must stay inside the client timeouts. Required order: broker deadline <
   browser.py socket < `LOGIN_TIMEOUT_S` < runner / consumer subprocess timeouts.
+- **Stale credentials are a top suspect.** Rotations updated Keychain/SOPS but not the
+  `agent-logins` items. Compare fingerprints (`agent-login.py -f SITE`: length + 4 hex)
+  against the authoritative copy, and prove it in-host where possible (hash compare,
+  nothing printed). WS1b/WS3 need a drift check plus a rotation path that updates every
+  copy.
+- A server's error-body size or text can tell "unknown user" from "wrong password" without
+  another submit (NPM: 60 vs 96 bytes).
+- A sentinel whose FIRST match is hidden makes `wait_for_selector(visible)` time out, and
+  then the one-shot scan decides. Use a selector whose first match is the visible element,
+  and poll.
+- Storage-token sites need a refresh-before-export rule, or the daily check costs a
+  password submit each day (NPM JWT lasts 1 day).
 - Subagents never see SessionStart output, only a SubagentStart hook's `additionalContext`. A
   Codex hook without a trust row is skipped silently in `codex exec`, and each seat needs its
   own row.
