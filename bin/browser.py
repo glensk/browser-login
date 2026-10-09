@@ -48,9 +48,10 @@ Generic lifecycle:
             and refuses while one stays attached (-f/--force stops anyway —
             they lose their connection); a stale lifecycle record with no
             browser behind it is cleared without waiting.
-  open URL  Open/navigate a tab to URL in the shared browser.
-            [-N|--new] always a NEW background tab over raw CDP; prints
-            `target=<id>` — the id this caller owns (tp#786).
+  open URL  Open URL in a NEW background tab over raw CDP; prints
+            `target=<id>` — the id this caller owns (tp#786). Never navigates
+            a tab it did not create (tp#863). [-N|--new] the same, explicitly;
+            [-r|--reuse] (manual use) navigates a tab already on URL instead.
   eval JS   Run a JS expression in the active (or --url-matched) tab; print JSON.
             [-t|--timeout SECONDS] hard deadline (default 60), attach included.
             [-T|--target TID] evaluates in exactly that target over raw CDP
@@ -380,7 +381,18 @@ def _positive_seconds(raw: str) -> float:
 
 def _add_open_eval_parsers(sub: Any) -> None:
     """The `open` and `eval` subparsers (kept out of `parse_args` for size)."""
-    po = sub.add_parser("open", help="Open/navigate a tab to URL.")
+    po = sub.add_parser(
+        "open",
+        help="Open URL in a NEW background tab; prints target=<id>.",
+        description=(
+            "Open URL in a NEW background tab (raw CDP Target.createTarget, no "
+            "Playwright attach) and print `target=<id>` on its own line after "
+            "the ✓ line. That id is the caller's tab: pass it to `eval -T` and "
+            "`close -i`. Never navigates a tab it did not create — not even a "
+            "blank one, which may be another client's fresh `open -N` tab "
+            "(tp#863)."
+        ),
+    )
     po.add_argument("url", help="URL to open.")
     pog = po.add_mutually_exclusive_group()
     pog.add_argument(
@@ -389,9 +401,10 @@ def _add_open_eval_parsers(sub: Any) -> None:
         action="store_true",
         help=(
             "Navigate an existing tab already on this URL (compared without "
-            "query/fragment) instead of opening a new tab. Picks the oldest "
-            "match. For manual use only — tools open their own tab with -N "
-            "(tp#786/tp#845). Mutually exclusive with -N."
+            "query/fragment) instead of opening a new tab; picks the oldest "
+            "match, opens a new tab when there is none. For manual use only — "
+            "tools open their own tab (tp#786/tp#845). Mutually exclusive "
+            "with -N."
         ),
     )
     pog.add_argument(
@@ -399,10 +412,8 @@ def _add_open_eval_parsers(sub: Any) -> None:
         "--new",
         action="store_true",
         help=(
-            "Always create a NEW background tab (raw CDP Target.createTarget, "
-            "no Playwright attach; never reuses a tab) and print `target=<id>` "
-            "on its own line after the ✓ line. That id is the caller's tab: "
-            "pass it to `eval -T` and `close -i`. Mutually exclusive with -r."
+            "Always create a NEW background tab — the default; kept as an "
+            "explicit flag for callers that pass it. Mutually exclusive with -r."
         ),
     )
     pe = sub.add_parser("eval", help="Eval a JS expression in a tab; print JSON.")
@@ -5113,11 +5124,12 @@ def _tab_line(target: dict[str, object], full_urls: bool = False) -> str:
 
 
 def _open_new_raw(port: int, url: str) -> int:
-    """`open -N`: a NEW background tab over raw CDP; prints ``target=<id>``.
+    """`open` (and `open -N`): a NEW background tab over raw CDP; prints
+    ``target=<id>``.
 
     No Playwright attach (it waits for every page target, so one heavy or
-    wedged foreign tab would slow this down — tp#786). Registers like `open`;
-    takes no lease. Exit 1 when the tab cannot be created.
+    wedged foreign tab would slow this down — tp#786). Registers; takes no
+    lease. Exit 1 when the tab cannot be created.
     """
     if not _is_up(port):
         sys.exit("Shared browser is down. Run: browser.py up")
@@ -5136,33 +5148,38 @@ def _open_new_raw(port: int, url: str) -> int:
         release()
 
 
-def cmd_open(port: int, url: str, reuse: bool = False, new: bool = False) -> int:
-    """Open/navigate a tab to URL (`new`: always a new tab, see `_open_new_raw`)."""
-    if new:
-        return _open_new_raw(port, url)
+def _reuse_same_url_tab(port: int, url: str) -> bool:
+    """`open -r`: navigate the oldest tab already on `url` (compared without
+    query/fragment); False when there is none. Manual use only (tp#786)."""
     pw, browser = _connect(port)
     try:
-        ctx = browser.contexts[0] if browser.contexts else browser.new_context()
-        if reuse:
-            base = _strip_query(url)
-            same = [pg for pg in ctx.pages if _strip_query(pg.url) == base]
-            if same:  # oldest match = the tab `eval --url` would pick
-                page = same[0]
-                page.goto(url, wait_until="domcontentloaded")
-                print(f"✓ Reused tab: {page.url}  (title: {page.title()!r})")
-                return 0
-        blank = [pg for pg in ctx.pages if _is_blank(pg.url)]
-        if blank:  # reuse a blank tab in place — navigation does not focus it
-            page = blank[0]
-            page.goto(url, wait_until="domcontentloaded")
-            print(f"✓ Opened: {page.url}  (title: {page.title()!r})")
-        else:  # new tab, created in the background so Chrome stays unfocused
-            info = _open_background_tab(port, browser, url)
-            print(f"✓ Opened: {info['url']}  (title: {info['title']!r})")
-        return 0
+        ctx = browser.contexts[0] if browser.contexts else None
+        base = _strip_query(url)
+        pages = ctx.pages if ctx is not None else []
+        same = [pg for pg in pages if _strip_query(pg.url) == base]
+        if not same:
+            return False
+        page = same[0]  # oldest match = the tab `eval --url` would pick
+        page.goto(url, wait_until="domcontentloaded")
+        print(f"✓ Reused tab: {page.url}  (title: {page.title()!r})")
+        return True
     finally:
         browser.close()  # detaches CDP; the real browser keeps running
         pw.stop()
+
+
+def cmd_open(port: int, url: str, reuse: bool = False, new: bool = False) -> int:
+    """Open URL in a NEW background tab; prints ``target=<id>`` (tp#863).
+
+    Never navigates a tab it did not create: a blank tab may be another
+    client's fresh `open -N` handoff (``about:blank`` until its URL commits),
+    so there is no blank-tab reuse. `reuse` (-r, manual use only) first
+    navigates an existing tab already on this URL and opens a new tab only
+    when there is none. `new` (-N) is the default, kept as an explicit flag.
+    """
+    if reuse and not new and _reuse_same_url_tab(port, url):
+        return 0
+    return _open_new_raw(port, url)
 
 
 def _eval_watchdog_fire(timeout_s: float) -> None:
@@ -8723,72 +8740,25 @@ def _page_by_target(browser, tid: str):
 _switch_page_by_target = _page_by_target
 
 
-def _switch_close_target(browser, tid: str) -> None:
-    """Close the probe target over CDP — the path for a tab Playwright never
-    adopted, which `page.close()` cannot reach (it would else stay open)."""
-    session = browser.new_browser_cdp_session()
-    session.send("Target.closeTarget", {"targetId": tid})
-
-
 def _switch_probe(port: int) -> tuple[str, str]:
     """READ-ONLY portal probe; returns (verdict, observed url). Never focuses.
 
-    Takes NO interaction lease and touches no tab of the user's: the probe page
-    is created in the BACKGROUND over CDP (``background: true`` cannot raise the
-    window), read, and closed again in the ``finally``. Playwright never adopts
-    a target created mid-session, so the connection is dropped and re-made —
-    the same dance as `_doctor_probe`, except that the page is identified by its
-    TARGET ID (see `_switch_page_by_target`).
+    Takes NO interaction lease and touches no tab of the user's: the probe runs
+    in a fresh owned BACKGROUND tab (`_background_page_run`, tp#864) — ledgered,
+    created and closed by target id over raw CDP, under the step deadline —
+    navigated to the portal root and read once a Turbo redirect could land.
 
     Anything that goes wrong is ``unknown``, never ``logged-in``.
     """
-    from playwright.sync_api import Error as PlaywrightError
+    seen = {"url": ""}
 
-    pw, browser = _connect(port)
-    tid = ""
-    try:
-        session = browser.new_browser_cdp_session()
-        created = session.send(
-            "Target.createTarget",
-            {"url": SWITCH_ORIGIN + "/", "background": True},
-        )
-        tid = str(created.get("targetId") or "")
-    except PlaywrightError:  # TimeoutError subclasses this
-        return ("unknown", "")
-    finally:
-        browser.close()
-        pw.stop()
-    if not tid:
-        return ("unknown", "")
-
-    pw, browser = _connect(port)
-    page = None
-    url = ""
-    try:
-        page = _page_by_target(browser, tid)
-        if page is None:
-            return ("unknown", "")
-        page.wait_for_load_state("domcontentloaded", timeout=10_000)
-        deadline = time.monotonic() + 10.0
-        while time.monotonic() < deadline:
-            url = page.url
-            if not _is_blank(url):
-                break
-            time.sleep(0.25)
+    def probe(page) -> tuple[str, str]:
         page.wait_for_timeout(500)  # let a Turbo redirect land
-        url = page.url
-        return (_switch_page_verdict(page), url)
-    except PlaywrightError:  # TimeoutError subclasses this
-        return ("unknown", url)
-    finally:
-        if page is not None:
-            with contextlib.suppress(PlaywrightError):
-                page.close()
-        else:
-            with contextlib.suppress(PlaywrightError):
-                _switch_close_target(browser, tid)
-        browser.close()
-        pw.stop()
+        seen["url"] = page.url
+        return (_switch_page_verdict(page), seen["url"])
+
+    got = _background_page_run(port, SWITCH_ORIGIN + "/", _broker_probe_viewport, probe)
+    return got if got is not None else ("unknown", seen["url"])
 
 
 def _switch_wait_for_login(

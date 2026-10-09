@@ -72,11 +72,12 @@ browser.py switch headless    # revert a headed browser (stop + relaunch, logins
 browser.py clients            # who is attached over CDP (registered + unknown clients)
 browser.py journal [-n N] [-e EVENT] [-j]  # who launched/switched/stopped it, logins, window raises
 browser.py doctor             # full health check on a disposable tab (never touches real tabs)
-browser.py open https://…     # navigate a tab (opens in the BACKGROUND — no focus steal)
-browser.py open -r https://…  # --reuse: navigate an existing same-URL tab (manual use only —
-                              #   tools open their own tab with -N; matches sans query/fragment)
-browser.py open -N https://…  # --new: ALWAYS a new background tab (raw CDP, no Playwright
-                              #   attach); prints `target=<id>` — the tab you own (tp#786)
+browser.py open https://…     # a NEW background tab (raw CDP, no Playwright attach, no focus
+                              #   steal); prints `target=<id>` — the tab you own (tp#786). Never
+                              #   navigates a tab it did not create, not even a blank one (tp#863)
+browser.py open -r https://…  # --reuse: navigate an existing same-URL tab instead (manual use
+                              #   only; matches sans query/fragment; none → a new tab)
+browser.py open -N https://…  # --new: the default, explicitly (tools pass it)
 browser.py eval -T <id> 'location.host'  # --target: eval in exactly that tab over raw CDP;
                               #   exit 1 if it is gone; JSON-serialisable results only
                               #   (returnByValue — undefined prints null)
@@ -110,8 +111,9 @@ browser.py down [-f]          # quit the shared browser (graceful CDP close → 
 at all — and on a cold start it **wipes stale session-restore state** so it opens
 ONE clean tab instead of resurrecting every tab from last time (your logins
 persist — they live in Cookies/Local Storage, not the session files). `open`
-likewise reuses a blank tab or creates new tabs via CDP `Target.createTarget`
-with `background: true`. The only time a window exists is the FALLBACK of a
+always creates a new tab via CDP `Target.createTarget` with `background: true`
+— it never reuses a blank tab, which may be another client's fresh `open -N`
+tab still on `about:blank` (tp#863). The only time a window exists is the FALLBACK of a
 guided login you start yourself (`agent-login.py -g SITE`; see "Guided login").
 
 **Every check and login runs in a fresh tab it owns** (tp#845): `logged-in SITE`,

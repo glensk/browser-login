@@ -18,7 +18,11 @@ test launches a DISPOSABLE headless browser on a free port and stops it):
 * popups are closed leaves-first, unrelated tabs and iframe/worker targets are
   untouched, `page.close()` is never called;
 * `login anthropic -e EMAIL` and `eval-fresh` keep their exit-code contracts;
-* AST: `_match_page` only for `eval --url`; the URL pickers are gone.
+* AST: `_match_page` only for `eval --url`; the URL pickers are gone;
+  ``page.close()`` only in doctor's disposable probe;
+* tp#863: `open` (also `-r` without a same-URL tab) never navigates a blank
+  tab another client owns — it creates a new target and prints its id;
+* tp#864: `logged-in switch`'s probe runs in a ledgered owned tab closed by id.
 
 Run: uv run pytest -q tests/test_owned_tabs_tp845.py     (from the repo root)
 """
@@ -254,6 +258,7 @@ def _stub_checks(monkeypatch) -> None:
         browser, "_slack_session_from_page", lambda ctx, page: {"token": "x"}
     )
     monkeypatch.setattr(browser, "_capture_and_cache_token", lambda ctx, page: 0)
+    monkeypatch.setattr(browser, "_switch_page_verdict", lambda page: "logged-in")
 
 
 CHECKS = {
@@ -263,6 +268,7 @@ CHECKS = {
     "biopolwifi": browser.cmd_biopolwifi_logged_in,
     "token": browser.cmd_token,
     "slack-session": browser.cmd_slack_session,
+    "switch": browser.cmd_switch_logged_in,  # tp#864
 }
 
 
@@ -652,6 +658,92 @@ def test_eval_fresh_is_bounded_even_inside_a_guided_login(cache, monkeypatch):
     assert isinstance(seen[0], browser.LoginDeadline) and seen[0].timeout_s == 5
 
 
+# --- tp#863: `open` never navigates a tab it did not create ------------------------------
+
+FOREIGN = "FOREIGN1"  # another client's fresh `open -N` tab, not committed yet
+
+
+class _ForeignBlankPage:
+    """A blank tab some other client owns: navigating it is the bug."""
+
+    url = "about:blank"
+
+    def goto(self, *_a, **_k):
+        raise AssertionError("open navigated a blank tab it does not own")
+
+
+class _SameUrlPage:
+    def __init__(self, url: str) -> None:
+        self.url = url
+        self.gotos: list[str] = []
+
+    def goto(self, url, **_k):
+        self.gotos.append(url)
+        self.url = url
+
+    def title(self) -> str:
+        return "same"
+
+
+class _Ctx:
+    def __init__(self, pages: list[Any]) -> None:
+        self.pages = pages
+
+
+class _OpenBrowser:
+    def __init__(self, pages: list[Any]) -> None:
+        self.contexts = [_Ctx(pages)]
+
+    def close(self) -> None:
+        return None
+
+
+def _assert_new_tab_only(fake: FakeCdp, url: str, out: str) -> None:
+    creates = [m for m in fake.browser_log if m.get("method") == "Target.createTarget"]
+    assert [m["params"] for m in creates] == [{"url": url, "background": True}]
+    ids = [ln[7:] for ln in out.splitlines() if ln.startswith("target=")]
+    assert ids == fake.created and FOREIGN not in ids
+    assert fake.targets[FOREIGN].url == "about:blank"
+    assert not fake.targets[FOREIGN].received  # no Page.navigate, nothing at all
+    assert FOREIGN not in fake.closed
+
+
+@pytest.mark.parametrize("new", [False, True], ids=["default", "-N"])
+def test_open_never_navigates_a_foreign_blank_tab(
+    fake, cache, monkeypatch, capsys, new
+):
+    fake.add(FOREIGN, "about:blank", "")
+    monkeypatch.setattr(browser, "_connect", lambda *a, **k: pytest.fail("attached"))
+    url = "https://app.example.com/x"
+    assert browser.cmd_open(fake.port, url, new=new) == 0
+    _assert_new_tab_only(fake, url, capsys.readouterr().out)
+
+
+def test_open_reuse_without_a_match_opens_a_new_tab(fake, cache, monkeypatch, capsys):
+    fake.add(FOREIGN, "about:blank", "")
+    monkeypatch.setattr(
+        browser,
+        "_connect",
+        lambda *a, **k: (FakePw(), _OpenBrowser([_ForeignBlankPage()])),
+    )
+    url = "https://app.example.com/x"
+    assert browser.cmd_open(fake.port, url, reuse=True) == 0
+    _assert_new_tab_only(fake, url, capsys.readouterr().out)
+
+
+def test_open_reuse_navigates_the_same_url_tab(fake, cache, monkeypatch, capsys):
+    same = _SameUrlPage("https://app.example.com/x?old=1")
+    monkeypatch.setattr(
+        browser,
+        "_connect",
+        lambda *a, **k: (FakePw(), _OpenBrowser([_ForeignBlankPage(), same])),
+    )
+    assert browser.cmd_open(fake.port, "https://app.example.com/x", reuse=True) == 0
+    assert same.gotos == ["https://app.example.com/x"]
+    assert not fake.created
+    assert "✓ Reused tab:" in capsys.readouterr().out
+
+
 # --- AST guards ---------------------------------------------------------------------------
 
 
@@ -682,6 +774,73 @@ def test_the_url_pickers_are_gone_and_no_context_is_forged():
         and c.func.attr == "new_page"
     ]
     assert not new_pages  # every tab is a background one, created by id
+
+
+# --- tp#864: `logged-in switch`'s probe tab is owned, ledgered, closed by id ------------
+
+
+@pytest.mark.parametrize("verdict", ["logged-in", "login"])
+def test_switch_probe_runs_in_a_ledgered_owned_tab(
+    fake, cache, attach, monkeypatch, verdict
+):
+    ledgered: list[list[Path]] = []
+
+    def judge(page) -> str:
+        ledgered.append(_ledgers(cache))  # the tab is on the ledger meanwhile
+        return str(verdict)
+
+    monkeypatch.setattr(browser, "_switch_page_verdict", judge)
+    got = browser._switch_probe(fake.port)
+    tid = fake.created[0]
+    assert got == (verdict, browser.SWITCH_ORIGIN + "/")
+    assert attach["page"].gotos == [(browser.SWITCH_ORIGIN + "/", False)]
+    assert attach["adopted"] == [tid] and len(ledgered[0]) == 1
+    assert fake.closed == [tid] and not _ledgers(cache)  # by id; never page.close()
+    assert fake.create_params[0]["url"].startswith(browser.OWNED_MARKER_PREFIX)
+
+
+def test_switch_probe_failure_is_unknown_and_still_closes(fake, cache, attach):
+    attach["page"].goto_error = PlaywrightError("net::ERR_TIMED_OUT (fake)")
+    assert browser._switch_probe(fake.port) == ("unknown", "")
+    assert fake.closed == fake.created and not _ledgers(cache)
+
+
+def _close_calls_on_pages() -> set[str]:
+    """Functions that call ``.close()`` on a Playwright page (``page``/``pg``)."""
+    found = set()
+    for fn in (n for n in ast.walk(_tree()) if isinstance(n, ast.FunctionDef)):
+        for c in (c for c in ast.walk(fn) if isinstance(c, ast.Call)):
+            f = c.func
+            if (
+                isinstance(f, ast.Attribute)
+                and f.attr == "close"
+                and isinstance(f.value, ast.Name)
+                and f.value.id in {"page", "pg"}
+            ):
+                found.add(fn.name)
+    return found
+
+
+def test_page_close_only_in_doctors_disposable_probe():
+    # tp#843/tp#864: owned tabs close by target id over raw CDP. The doctor's
+    # disposable probe tab (not an owned check tab) is the one exception.
+    assert _close_calls_on_pages() == {"_doctor_probe_cleanup"}
+
+
+def test_switch_probe_uses_the_owned_helper():
+    fn = next(
+        n
+        for n in ast.walk(_tree())
+        if isinstance(n, ast.FunctionDef) and n.name == "_switch_probe"
+    )
+    called = {
+        c.func.id
+        for c in ast.walk(fn)
+        if isinstance(c, ast.Call) and isinstance(c.func, ast.Name)
+    }
+    assert "_background_page_run" in called
+    assert not {"_connect", "_page_by_target"} & called
+    assert not hasattr(browser, "_switch_close_target")
 
 
 # --- opt-in: a real disposable headless browser ----------------------------------------------

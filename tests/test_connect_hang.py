@@ -113,10 +113,11 @@ def _run_cli(fake: FakeCdp, tmp_path: Path, *argv: str, env: dict, deadline: flo
 def test_real_connect_times_out_and_names_the_hung_tab_origin_only(fake, tmp_path):
     fake.add("AAAA0001", "https://example.com/", "Example", mode="ok")
     fake.add("EEE09E93FFFF", HUNG_URL, HUNG_TITLE, mode="silent")
-    proc, took = _run_cli(
+    proc, took = _run_cli(  # `open -r`: the one `open` mode that still attaches
         fake,
         tmp_path,
         "open",
+        "-r",
         "https://example.com",
         env={"CLAUDE_BROWSER_CONNECT_TIMEOUT_S": "2"},
         deadline=60,
