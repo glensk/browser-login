@@ -15,9 +15,19 @@ Process model: the child runs in its own session; stdin is a pipe fed from
 secret-run's stdin (``-s``: the value + newline, then EOF); stdout/stderr are
 pipes drained concurrently, one masker each. ``-t`` uses a pseudo-terminal
 instead (window size and SIGWINCH passed through). SIGINT/SIGTERM/SIGHUP/
-SIGQUIT are forwarded to the child's process group. When the child exits,
-output still held open by a background grandchild is waited for <= 2 s, then
-the group gets SIGTERM, 2 s later SIGKILL.
+SIGQUIT are forwarded to the child's process group. A forwarded SIGINT/
+SIGTERM/SIGHUP also arms a 3 s deadline: whatever of the group is still alive
+then gets SIGKILL, and secret-run exits with the child's status (128+N when it
+died of signal N) — so a runner's own TERM-then-KILL grace (5 s or more) never
+leaves a child that ignores SIGTERM behind. When the child exits, output still
+held open by a background grandchild is waited for <= 2 s, then the group gets
+SIGTERM, 2 s later SIGKILL.
+
+Residual risk: a direct SIGKILL of secret-run itself cannot be caught, so
+nothing cleans up — the child's session keeps running (its stdout/stderr pipes
+are gone, so it dies of SIGPIPE on its next write, or runs on if it is silent).
+Callers stop secret-run with SIGTERM/SIGINT/SIGHUP and SIGKILL it only after
+more than 3 s.
 
 Exit codes: the child's; 128+N when it died of signal N; 124 timeout (-T);
 125 secret-run's own failure (broker down, refused, rate limited, leak check
@@ -27,6 +37,10 @@ secret-run's output went away (EPIPE).
 Status lines go to stderr (✅ ❌ ⚠️); stdout belongs to the child. The broker
 socket is /var/db/login-broker-run/broker.sock ($SECRET_RUN_SOCKET overrides).
 """
+
+# too-many-lines: the broker client is deliberately ONE self-contained file (it
+# is installed on its own as `secret-run`), like browser.py.
+# pylint: disable=too-many-lines
 
 from __future__ import annotations
 
@@ -74,6 +88,7 @@ EOF_GRACE_S = 2.0
 TERM_GRACE_S = 2.0
 TIMEOUT_TERM_GRACE_S = 5.0
 KILL_GIVE_UP_S = 2.0
+SIGNAL_KILL_DEADLINE_S = 3.0
 TICK_S = 0.05
 READ_CHUNK = 65536
 MAX_PENDING_INPUT = 1024 * 1024
@@ -86,6 +101,8 @@ DENIED_NAMES = frozenset(
 DENIED_PREFIXES = ("LD_", "DYLD_", "PYTHON")
 SHELLS = frozenset({"sh", "bash", "zsh", "dash", "ksh", "fish"})
 FORWARDED_SIGNALS = (signal.SIGINT, signal.SIGTERM, signal.SIGHUP, signal.SIGQUIT)
+# A forwarded one of these arms the SIGKILL deadline (SIGQUIT only forwards).
+DEADLINE_SIGNALS = (signal.SIGINT, signal.SIGTERM, signal.SIGHUP)
 
 
 class SecretRunError(Exception):
@@ -286,6 +303,7 @@ class _Group:  # pylint: disable=too-many-instance-attributes  # kill-phase cloc
         self.killed_at: float | None = None
         self.timed_out = False
         self.epipe = False
+        self.signal_deadline: float | None = None
 
     def signal(self, sig: int) -> None:
         """Send `sig` to the whole group (gone = nothing to do)."""
@@ -297,6 +315,37 @@ class _Group:  # pylint: disable=too-many-instance-attributes  # kill-phase cloc
         if self.kill_at is None:
             self.signal(signal.SIGTERM)
             self.kill_at = time.monotonic() + grace
+
+    def arm_signal_deadline(self, grace: float = SIGNAL_KILL_DEADLINE_S) -> None:
+        """A termination signal was forwarded: SIGKILL the group after `grace`
+        (sooner if a kill is already due earlier; never re-armed later)."""
+        if self.signal_deadline is not None:
+            return
+        self.signal_deadline = time.monotonic() + grace
+        if self.killed_at is None and (
+            self.kill_at is None or self.signal_deadline < self.kill_at
+        ):
+            self.kill_at = self.signal_deadline
+
+    def group_alive(self) -> bool:
+        """True while any member of the child's process group exists."""
+        try:
+            os.killpg(self.pgid, 0)
+        except ProcessLookupError:
+            return False
+        except PermissionError:
+            return True
+        return True
+
+    def _kill_rest_after_signal(self) -> None:
+        """After a forwarded termination signal, members that outlived the
+        child (detached grandchildren in the group) get SIGKILL at the deadline."""
+        if self.signal_deadline is None:
+            return
+        while self.group_alive() and time.monotonic() < self.signal_deadline:
+            time.sleep(TICK_S)
+        if self.group_alive():
+            self.signal(signal.SIGKILL)
 
     def child_exited(self) -> bool:
         """True once the direct child has exited (reaps it)."""
@@ -334,6 +383,7 @@ class _Group:  # pylint: disable=too-many-instance-attributes  # kill-phase cloc
         if self.proc.poll() is None:
             self.signal(signal.SIGKILL)
         rc = self.proc.wait()
+        self._kill_rest_after_signal()
         if self.epipe:
             return EXIT_EPIPE
         if self.timed_out:
@@ -346,13 +396,16 @@ def _forwarding(
     group: _Group, enabled: bool, on_winch: Callable[[], None] | None = None
 ) -> Iterator[None]:
     """Forward SIGINT/SIGTERM/SIGHUP/SIGQUIT to the group (and SIGWINCH to
-    `on_winch`) while the child runs; previous handlers restored after."""
+    `on_winch`) while the child runs; previous handlers restored after.
+    SIGINT/SIGTERM/SIGHUP also arm the group's SIGKILL deadline."""
     if not enabled:
         yield
         return
 
     def forward(sig: int, _frame: FrameType | None) -> None:
         group.signal(sig)
+        if sig in DEADLINE_SIGNALS:
+            group.arm_signal_deadline()
 
     saved: dict[int, Any] = {}
     for sig in FORWARDED_SIGNALS:

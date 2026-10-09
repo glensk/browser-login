@@ -11,6 +11,7 @@ from __future__ import annotations
 
 # pylint: disable=missing-function-docstring,redefined-outer-name,import-error
 # pylint: disable=protected-access,wrong-import-position,consider-using-with
+import contextlib
 import fcntl
 import importlib.util
 import json
@@ -530,3 +531,61 @@ def test_e2e_signals_reach_the_child(world, sig, code):
             proc.kill()
     assert proc.returncode == code
     assert out == b"got\n"
+
+
+def _gone_within(pid, seconds):
+    deadline = time.monotonic() + seconds
+    while time.monotonic() < deadline:
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return True
+        time.sleep(0.05)
+    return False
+
+
+@pytest.mark.parametrize(
+    "script,code",
+    [
+        (  # the child itself ignores SIGTERM and holds the pipes
+            'trap "" TERM; sleep 60 & echo $$ $!; echo ready; '
+            "while :; do sleep 0.1; done",
+            128 + signal.SIGKILL,
+        ),
+        (  # the child obeys; a detached grandchild ignores SIGTERM, pipes closed
+            'trap "exit 5" TERM; '
+            "sh -c 'trap \"\" TERM; exec sleep 60' </dev/null >/dev/null 2>&1 & "
+            "echo $$ $!; echo ready; while :; do sleep 0.1; done",
+            5,
+        ),
+    ],
+    ids=["child-ignores-term", "grandchild-ignores-term"],
+)
+def test_e2e_sigterm_kills_a_term_ignoring_group_within_the_deadline(
+    world, script, code
+):
+    proc = subprocess.Popen(
+        [sys.executable, str(CLIENT), "-e", "X=item", "--", "sh", "-c", script],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        stdin=subprocess.DEVNULL,
+        env={**os.environ, **world.env()},
+    )
+    pids: list[int] = []
+    try:
+        assert proc.stdout is not None
+        pids = [int(p) for p in proc.stdout.readline().split()]
+        assert proc.stdout.readline() == b"ready\n"
+        start = time.monotonic()
+        proc.send_signal(signal.SIGTERM)
+        proc.communicate(timeout=15)
+        assert time.monotonic() - start < sr.SIGNAL_KILL_DEADLINE_S + 1.0
+        for pid in pids:
+            assert _gone_within(pid, 4.0 - (time.monotonic() - start)), pid
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+        for pid in pids:
+            with contextlib.suppress(ProcessLookupError):
+                os.kill(pid, signal.SIGKILL)
+    assert proc.returncode == code
