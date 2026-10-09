@@ -130,7 +130,27 @@ manual acceptance steps under the attempt policy below.
       base. Acceptance per site: logged-in probe ✅ in the shared Chromium, plus its consumer
       where one exists:
   - [ ] cscs: token discovery proven, exported storage keys > 0, injection read back before
-        the SPA redirect, stable portal probe, `cscs-api.py` (Waldur) call succeeds
+        the SPA redirect, stable portal probe, `cscs-api.py` (Waldur) call succeeds.
+    - [x] Root cause found (read-only, Codex diagnose debate converged in 3 rounds):
+          `cscs_portal_ready` (recipes.py:791) passes on ANY 40-hex localStorage value, even
+          an expired Waldur token (about 1 h lifetime). The broker therefore reuses a dead
+          profile and skips the login. Discovery on `/` then loses the race against the
+          portal's new `boot-redirect.js`, and `_with_portal_token_keys` (daemon.py:234)
+          silently returns 0 keys. The audit still says `ok`.
+          Second issue: a fresh login (188 s) exceeds the client's `BROKER_TIMEOUT_S` 180 s.
+          `cscs-api.py:773` also kills the login after 180 s.
+    - [ ] Fix (after WS1a deploys):
+      - the check asks the server: `/api/users/me/` 200 + identity, returning
+            valid/invalid/indeterminate;
+      - export allowlist `waldur/auth/token` (+ expires_at, method), read on `/profile/`;
+      - `BundleExportError` instead of the silent fallback;
+      - client-side bundle check before touching cookies;
+      - inject + read-back on `/profile/`;
+      - `cmd_token` validates its token;
+      - timeout ordering, incl. the sdsc `cscs-api.py` subprocess timeout;
+      - hermetic portal fixture tests (stale/valid/503/export-fail).
+
+      One live submit is needed.
   - [ ] npm-nixos
   - [ ] npm-raspi
   - [ ] calibre
@@ -166,6 +186,13 @@ manual acceptance steps under the attempt policy below.
   of a commit on `origin/main`). `bin/browser.py` is live for every consumer immediately.
 - The positive proof "ended off the fill origin, no password field" also passes on an "Access
   Denied" page (zendesk). Only a DOM sentinel proves a login.
+- An audit `ok` does not prove a usable session. A check on a value's *shape* (a token-like
+  string in storage) passes on expired tokens. Only a server-validated proof counts (CSCS:
+  `/api/users/me/` 200). Look for the same pattern in every other site's check.
+- Today the limiter is consulted before profile reuse, so a cooldown also blocks a reuse that
+  needs no password. WS1a moves admission into `get_secret` (CSCS debate rule).
+- Broker run times must stay inside the client timeouts. Required order: broker deadline <
+  browser.py socket < `LOGIN_TIMEOUT_S` < runner / consumer subprocess timeouts.
 - Subagents never see SessionStart output, only a SubagentStart hook's `additionalContext`. A
   Codex hook without a trust row is skipped silently in `codex exec`, and each seat needs its
   own row.
