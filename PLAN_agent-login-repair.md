@@ -157,8 +157,9 @@ manual acceptance steps under the attempt policy below.
           (len 28 `e426`), verified against the NPM hash on nixos. All 3 `POST /api/tokens`
           answered 400 with the 96-byte "Invalid email or password" body. The July rotation
           never updated the agent-login items. `npm-password` (agent secret) is stale too.
-    - [ ] Albert pastes the SOPS value into the `npm-nixos`, `npm-raspi` and `npm-password`
-          items (web vault; `broker-add.py` cannot set a login password).
+    - [x] Vault updated by Albert 2026-10-10: both NPM login items and `npm-password` show
+          len 28 `e426`. The duplicate `npm-admin-password` (no consumer) was deleted.
+          Albert's own login on both NPM instances works with this value.
     - [ ] Code (after WS1a):
       - poll `sentinel_shown()` instead of `wait_for_selector`, since the first
             `a[href='/nginx/proxy']` is a hidden navbar item;
@@ -210,9 +211,15 @@ manual acceptance steps under the attempt policy below.
   - Layer 2: one rotation command (server → Vaultwarden with Touch ID → every copy →
     fingerprint verify), and a hook blocks agents from rotating any other way.
   - Plan file: `mydotfiles/PLAN_credential-single-source.md` (planner subagent).
-- [ ] calibre account (Albert, 2026-10-10): dedicated non-admin CWA user `agent` without an
-      e-mail address; tp#886 lockdown to read-only guests + no mailed reset (builder on
-      nixos).
+- [ ] calibre account (Albert, 2026-10-10):
+  - [x] Non-admin CWA user `agent` created (role 258, no e-mail). Password (len 32 `47b0`)
+        in Keychain `CALIBRE_AGENT_PASSWORD`. Verified: `#top_tasks` visible after login,
+        `/me` 200. Backups `app.db.bak-20261010-000354-pre-agent-user`.
+  - [x] tp#886 part 1: Guest role 430 → 290 (browse + download). Docs committed.
+  - [ ] tp#886 part 2: CWA v4.0.8 has no switch for the mailed reset (upstream #1585).
+        Albert decides: start-up patch (recommended), upstream issue, or accept.
+  - [ ] Albert sets the `calibre` item to user `agent` + Keychain password, and drops the
+        `192.168.178.72` URI.
 - [ ] WS3 — onboarding guard (plan → codex-debate → implement): static validation of a new
       item (sentinel present, fill origins, cookie scope, attempt group), a budgeted
       promotion test (`pending` → `usable`), and a removal path (`broker-add.py` remove or
