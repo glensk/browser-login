@@ -72,8 +72,9 @@ manual acceptance steps under the attempt policy below.
       `config.toml`, with a trust row per seat; OpenCode through `instructions` in
       `opencode.json`.
 - [x] WS-Z — Zendesk: not needed (Albert, 2026-10-09). Remove it instead of fixing it.
-- [ ] Zendesk removal: Albert deletes the Vaultwarden item (web vault). Then `agent-login.py`
-      must drop the site's stale state (last-check, sites snapshot); covered by WS1a pruning.
+- [x] Zendesk removal: Albert deleted the Vaultwarden item (2026-10-09). Verified: gone from
+      the broker snapshot, the overview and agents.md. A stale `last-check.json` entry is left;
+      WS1a pruning removes it.
 - [ ] WS1a — diagnostics and scheduler safety. Hard gate: merged + deployed before any
       secret-submitting site retry. Plan → codex-debate → implement → review → release:
   - [ ] acceptance matrix generator (`agent-login.py -j` based): one row per item, static
