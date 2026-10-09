@@ -521,7 +521,8 @@ available through Touch ID; it needs `-P` in a terminal.
 ## Campus-only hosts (proxy PAC)
 
 Some sites answer only from inside a campus network: `groups.epfl.ch` (needed to
-read RCP group administrators) times out from home. `vpn.sh epflproxy` runs an
+read RCP group administrators) and `api.epfl.ch`, the API its pages read their
+data from, time out from home. `vpn.sh epflproxy` runs an
 EPFL SOCKS5 proxy on `127.0.0.1:1081` (`vpn.sh ethproxy`: ETH on `1080`). The
 shared browser launches with a proxy auto-config (PAC) that sends ONLY the hosts
 in `bin/pac_hosts.json` through their proxy and every other host DIRECT — no
@@ -529,7 +530,8 @@ global proxy, and never `$ALL_PROXY`:
 
 ```json
 {
-  "groups.epfl.ch": "SOCKS5 127.0.0.1:1081"
+  "groups.epfl.ch": "SOCKS5 127.0.0.1:1081",
+  "api.epfl.ch": "SOCKS5 127.0.0.1:1081"
 }
 ```
 

@@ -1,3 +1,4 @@
 {
-  "groups.epfl.ch": "SOCKS5 127.0.0.1:1081"
+  "groups.epfl.ch": "SOCKS5 127.0.0.1:1081",
+  "api.epfl.ch": "SOCKS5 127.0.0.1:1081"
 }
