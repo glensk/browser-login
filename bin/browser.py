@@ -3424,7 +3424,8 @@ def _interaction_lease(
 #   * DESIRED_MODE_FILE records the mode `up` launches in. It is always
 #     "headless" (absent = headless); any other value is reported and ignored.
 #   * MAINTENANCE_FILE {owner_nonce, pid, pid_start_time, site, mode A|B, state
-#     preparing|active|succeeded, owned_targets, paused, watchdog_pid, started,
+#     preparing|active|succeeded, owned_targets, paused, watchdog_pid,
+#     watchdog_start_time, started,
 #     heartbeat} — ONE record, the single source of truth for "a guided login
 #     owns the browser". Phase 2's headed lease IS this record with mode A
 #     (a record without a mode is mode A). Refreshed every 10 s. It is LIVE
@@ -11623,7 +11624,13 @@ def _maintenance(
             tx = Maintenance(nonce, site, "B" if mode == "B" else "A", port)
             with contextlib.ExitStack() as stack:
                 try:
-                    tx.note(watchdog_pid=_spawn_watchdog(port, nonce))
+                    wd_pid = _spawn_watchdog(port, nonce)
+                    # Its start time lets agent-login -S's backstop tell a
+                    # dead watchdog from a reused pid.
+                    tx.note(
+                        watchdog_pid=wd_pid,
+                        watchdog_start_time=_proc_lstart(wd_pid) if wd_pid else None,
+                    )
                     _pause_clients(tx)
                     _maint_take_gate(tx, stack, force)
                     # Lease held, foreign registrations refused: reap what dead

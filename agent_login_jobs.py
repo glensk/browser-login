@@ -282,6 +282,9 @@ BROWSER_TIMEOUTS = {
     "eval": 60.0,
     "eval-fresh": 60.0,
     "reap-owned": 60.0,
+    # Stale-record recovery (`recover_stale_guided_login`): close the owned
+    # tabs (15 s), reap (gate wait + raw CDP), revert headed, resume clients.
+    "maintenance-watchdog": 120.0,
 }
 
 
@@ -493,3 +496,94 @@ def guided_window(site: str, force: bool = False) -> Iterator[GuidedWindow]:
             yield state
         finally:
             state.restored = hide_window(mod, nonce)
+
+
+# How long a not-live record without a known watchdog pid must sit before the
+# backstop treats it as abandoned: a watchdog the owner spawned but never got
+# to record polls every 2 s, so it would have cleared the record long before.
+STALE_NO_WATCHDOG_S = 120.0
+
+
+def _watchdog_gone(mod: ModuleType, rec: dict) -> bool:
+    """True only when the record's watchdog is certainly not running.
+
+    A recorded pid that is gone (or, when the record carries a
+    ``watchdog_start_time``, reused by a later process) is dead. No pid at all
+    (the spawn failed, or the owner died before noting it) counts as dead only
+    once the heartbeat is older than STALE_NO_WATCHDOG_S. Anything else —
+    a live pid, a malformed value, an unreadable start time — is "maybe
+    alive": the backstop does nothing.
+    """
+    # pylint: disable=protected-access
+    pid = rec.get("watchdog_pid")
+    if pid is None:
+        beat = rec.get("heartbeat")
+        if not isinstance(beat, (int, float)) or isinstance(beat, bool):
+            return False
+        return time.time() - float(beat) > STALE_NO_WATCHDOG_S
+    if not isinstance(pid, int) or isinstance(pid, bool) or pid <= 0:
+        return False
+    if not mod._pid_alive(pid):
+        return True
+    want = rec.get("watchdog_start_time")
+    if not want:
+        return False
+    lstart = mod._proc_lstart(pid)
+    return lstart is not None and lstart != want
+
+
+def recover_stale_guided_login() -> str | None:
+    """Backstop for a guided login whose owner AND its watchdog both died.
+
+    Reads browser.py's maintenance record (the current instance's cache dir);
+    when it is NOT live and its detached watchdog is certainly gone
+    (`_watchdog_gone`), runs ``browser.py maintenance-watchdog -n <prefix>``
+    — the watchdog's own recovery (owned tabs closed, reap, headed reverted,
+    record cleared, paused clients resumed) — bounded by the runner. Returns
+    one ✅/❌ line, or None when there is nothing to do. A live record is
+    never touched. The owner nonce is a token: it never appears in the
+    output (the subprocess gets the same prefix the watchdog itself is
+    started with, `WATCHDOG_NONCE_LEN`).
+    """
+    # pylint: disable=protected-access
+    try:
+        mod = _browser_module()
+        rec = mod._read_json_dict(mod.MAINTENANCE_FILE)
+        if rec is None:
+            return None
+        state = str(mod._headed_lease_state(rec))
+        if state == "live" or not _watchdog_gone(mod, rec):
+            return None
+        prefix_len = int(mod.WATCHDOG_NONCE_LEN)
+    except (RuntimeError, OSError):
+        return None
+    nonce = rec.get("owner_nonce")
+    if not isinstance(nonce, str) or len(nonce) < 8:
+        return None  # maintenance-watchdog refuses a short prefix anyway
+    site = str(rec.get("site") or "?")
+    budget = browser_timeout("maintenance-watchdog")
+    run = run_browser(
+        "maintenance-watchdog", "-n", nonce[:prefix_len], timeout_s=budget, quiet=True
+    )
+    what = f"stale guided login for {site} (owner: {state}, watchdog gone)"
+    problem = _recovery_problem(mod, run, nonce, budget)
+    return (
+        f"❌ {what}: {problem}" if problem else f"✅ recovered {what}: record cleared"
+    )
+
+
+def _recovery_problem(
+    mod: ModuleType, run: BrowserRun, nonce: str, budget: float
+) -> str | None:
+    """Why the `maintenance-watchdog` run did not clear the record, or None."""
+    if run.killed:
+        return f"browser.py maintenance-watchdog killed after {budget:.0f} s"
+    if run.rc != 0:
+        return f"browser.py maintenance-watchdog exit {run.rc}"
+    try:
+        cur = mod._read_json_dict(mod.MAINTENANCE_FILE)  # pylint: disable=protected-access
+    except OSError:
+        cur = None
+    if cur is not None and cur.get("owner_nonce") == nonce:
+        return "the maintenance record is still in place"
+    return None

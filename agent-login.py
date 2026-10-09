@@ -76,6 +76,7 @@ from agent_login_jobs import (  # noqa: E402
     install_daily,
     launchagent_plist,
     login_timeout_s,
+    recover_stale_guided_login,
     run_browser,
     safari_sessions,
     send_mail,
@@ -1118,8 +1119,9 @@ def build_parser() -> argparse.ArgumentParser:
         "-S",
         "--snapshot",
         action="store_true",
-        help="refresh the site-list and secret-run snapshots and the agents file "
-        "(which also lists the secrets agents can inject), print nothing "
+        help="recover a stale guided login whose watchdog died (one line), "
+        "refresh the site-list and secret-run snapshots and the agents file "
+        "(which also lists the secrets agents can inject), print nothing else "
         "(LaunchAgent, every 10 min)",
     )
     ap.add_argument(
@@ -1207,6 +1209,11 @@ def main() -> int:
     if rc is not None:
         return rc
     if args.snapshot:
+        # First, before anything else touches the browser: a guided login
+        # whose owner and watchdog both died leaves its record behind.
+        outcome = recover_stale_guided_login()
+        if outcome is not None:
+            print(outcome)
         data = overview(fresh=True)
         _note, data["secrets"] = agent_login_secrets.secrets_state(
             broker_request, _state_path(AGENTS_FILE_NAME).parent, fresh=True

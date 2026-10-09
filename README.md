@@ -366,7 +366,14 @@ cleared normally. Belt and braces: a PAUSED wrapper also resumes itself within
 2 s once the record FILE that paused it is gone or names another owner — not
 when the owner merely died (the watchdog needs the gate first), except after
 60 s of a dead record (watchdog presumed dead) — and the relay ends itself
-(`-M`) when the record or its owner disappears. `logged-in` checks never pick
+(`-M`) when the record or its owner disappears. Backstop for a watchdog that
+died too: `agent-login.py -S` (LaunchAgent, every 10 min) first reads the
+record and, when it is not live AND its `watchdog_pid` is certainly gone (pid
+not running, or no pid recorded and a heartbeat older than 120 s; a live pid
+or a malformed value = do nothing), runs the same recovery once
+(`browser.py maintenance-watchdog -n <nonce prefix>`, killed after 120 s) and
+logs one ✅/❌ line without the nonce. A live record is never touched.
+`logged-in` checks never pick
 an existing tab (it could be the owned login tab): they always run in a fresh
 background tab of their own (tp#845), during a guided login and outside one.
 
@@ -796,7 +803,7 @@ Examples:
 | `-c`, `--check-all` | every usable site: logged in? if not, `browser.py login`; one line per site, exit 1 if any stays logged out |
 | `-m`, `-M`, `--mail` | with -c: mail `albert.glensk@gmail.com` (gog) when a site stays logged out |
 | `-r`, `--refresh` | ask the broker now (re-reads Bitwarden, ~40 s) instead of the snapshot |
-| `-S`, `--snapshot` | refresh the site-list and secret-run snapshots and the agents file (which also lists the secrets agents can inject), print nothing (LaunchAgent, every 10 min) |
+| `-S`, `--snapshot` | recover a stale guided login whose watchdog died (one line), refresh the site-list and secret-run snapshots and the agents file (which also lists the secrets agents can inject), print nothing else (LaunchAgent, every 10 min) |
 | `-K`, `--keychain` | rescan the login keychain (~15 s) and list every item (names only) with whether agents can read it |
 | `-A`, `--agents` | print the summary agent sessions get at start (the agents file) |
 | `-I`, `--install-daily` | install + load the LaunchAgents com.albert.agent-login-check (`-c -m` daily 09:15) and com.albert.agent-login-snapshot (`-S` every 10 min) |

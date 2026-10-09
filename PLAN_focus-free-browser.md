@@ -213,10 +213,13 @@ relay exposes only owned targets.
       clear, then SIGCONT.
 - [ ] Test SIGSTOP/SIGCONT on `@playwright/mcp@0.0.76` mid-session (pending calls, socket
       survival). If it breaks MCP: documented manual `browser_close`/reconnect instead.
-- [ ] Watchdog: detached process spawned by the transaction (plus a check in the
+- [x] Watchdog: detached process spawned by the transaction (plus a check in the
       LaunchAgent watcher) reverts headed → headless and closes owned targets within 30 s of
       a stale heartbeat. Residual, stated: an already-running MCP reconnecting inside that
       window after a SIGKILL could reach a headed browser — covered by the SIGKILL fault test.
+      2026-10-09: detached watchdog (df04a95) + backstop in `agent-login.py -S` (every 10 min):
+      a not-live record whose watchdog is gone (pid dead or reused — start time now
+      recorded) is recovered via `browser.py maintenance-watchdog`.
 - [x] B spike on the pinned CfT 153, pass criteria: typing, Tab/Enter/modifiers/dead keys,
       clipboard paste of a password, non-ASCII + IME composition, scrolling, scaled-coordinate
       clicks. Stock DevTools screencast first (same-origin from `127.0.0.1:9222`); expected
