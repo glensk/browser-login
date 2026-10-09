@@ -262,11 +262,16 @@ browser, never a real Chrome). mypy/pylint are this repo's documented gates (AGE
   - Status handling: `TimeoutExpired` → `killed`, no retry, "killed by the runner"
     wording; 124 + failing check → exactly one retry; 124 + passing check → logged in, no
     retry; 125 → no retry; `browser_mode()` returns None when killed.
-- [ ] **15. Deploy.** Merge the worktree; `browser.py -h`; one real `./agent-login.py -t
+- [x] **15. Deploy.** Merge the worktree; `browser.py -h`; one real `./agent-login.py -t
       cscs`; read `browser.py journal` for the `step` breadcrumbs.
-- [ ] **16. Out of scope (separate tp items):** `cmd_token`'s URL-based tab pick
-      (`_pick_page` — tp#845); the intermittent Keycloak bounce after injecting the bundle
-      is still unexplained.
+      2026-10-09: merged as 6c5ac1e (docs) + 3cd1dc2 (code). Live `-t cscs` returned in
+      71 s; breadcrumbs bg:create → adopt → prepare → goto → load → fn → teardown →
+      close; the owned tab was closed and confirmed. The login itself still fails
+      (`login broker did not answer within 180s`, now bounded): see step 16.
+- [x] **16. Out of scope (separate tp items):** `cmd_token`'s URL-based tab pick
+      (`_pick_page` — tp#845, still leaves a Keycloak tab until then); the intermittent
+      Keycloak bounce / slow broker answer for CSCS is not pursued — the CSCS portal
+      login only serves the CSCS cluster, which is not in use (Albert, 2026-09-05).
 
 ## Implementation notes (steps 0–14, deviations from the text above)
 
