@@ -287,7 +287,8 @@ relay exposes only owned targets.
 
       Still open: sleep/wake, Cisco VPN / off-LAN (observed on the next days with focus_watch
       and `logged-in`), OAuth popup and passkey in B (on the next real login that needs them);
-      headed background-tab freeze → tp#871.
+      headed background-tab freeze → tp#871, closed: not reproduced in a 15-min idle
+      gate (attributed to load ~150), no code shipped.
 - [x] Soak: one working day with `focus_watch.py`. Pass = ZERO Chrome-for-Testing
       activations or window creations outside a live guided-login lease, fault tests
       included. On the first unexplained event: put a logging CDP proxy in front of MCP;
