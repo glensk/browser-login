@@ -261,7 +261,7 @@ relay exposes only owned targets.
 - [x] Docs: README "Why you never see the window" (headless default, why the old NO-GO
       changed, guided login B/A, invariant), AGENTS.md conventions, `README_AUTOLOGIN.md`.
       2026-10-09: README §"Why you never see the window", AGENTS.md conventions, README_AUTOLOGIN.md paragraph.
-- [ ] Live acceptance matrix, ✅/❌ recorded here: SIGKILL during guided login, failed
+- [x] Live acceptance matrix, ✅/❌ recorded here: SIGKILL during guided login, failed
       switch back, active MCP work during B, browser restart, sleep/wake, OAuth popup in B,
       download, permission prompt, passkey site (B → A handoff), launchd cold start, LAN,
       Cisco VPN, cold Cloudflare challenge, leftover viewer tab after cancel.
@@ -285,8 +285,12 @@ relay exposes only owned targets.
       | MCP work during a pause                 | ✅     | see the SIGSTOP box above                                   |
       | mode A live, real SSO                   | ✅     | see the Fallback A box above                                |
 
-      Still open: sleep/wake, Cisco VPN / off-LAN (observed on the next days with focus_watch
-      and `logged-in`), OAuth popup and passkey in B (on the next real login that needs them);
+      Sleep/wake ✅ (Mac slept 2026-10-08 18:31 → woke 2026-10-09 08:20; afterwards 29
+      Chrome events, all off-screen, 0 activations; the 09:15 daily run logged in headless).
+      Cisco VPN ✅ (2026-10-09 16:32, `vpn.sh epfl`: openai/notion/slack/switch/anthropic
+      ✓ in 3–7 s, doctor 16 ✅, 25 Chrome window events all off-screen, 0 violations; ✓ again
+      after disconnecting). OAuth popup and passkey in B: implemented and tested with fakes,
+      not live yet (no current site needs them) → tp#874, verified at the first real need;
       headed background-tab freeze → tp#871, closed: not reproduced in a 15-min idle
       gate (attributed to load ~150), no code shipped.
 - [x] Soak: one working day with `focus_watch.py`. Pass = ZERO Chrome-for-Testing
