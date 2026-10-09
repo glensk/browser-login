@@ -39,7 +39,6 @@ import argparse
 import json
 import os
 import socket
-import subprocess
 import sys
 import time
 from dataclasses import asdict, dataclass
@@ -62,16 +61,22 @@ from agent_login_jobs import (  # noqa: E402
     LAUNCH_HOUR,
     LAUNCH_LABEL,
     LAUNCH_MINUTE,
+    LOGIN_TIMEOUT_DIRTY_RC,
+    LOGIN_TIMEOUT_RC,
     MAIL_TO,
     NETWORK_HOST,
     SNAPSHOT_INTERVAL_S,
     SNAPSHOT_LABEL,
+    BrowserRun,
     _browser,
     browser_mode,
+    browser_timeout,
     guided_busy,
     guided_window,
     install_daily,
     launchagent_plist,
+    login_timeout_s,
+    run_browser,
     safari_sessions,
     send_mail,
     snapshot_plist,
@@ -674,20 +679,24 @@ def run_test(site: str) -> int:
         f"▶ browser.py login {site}  (Safari session or login broker; "
         "you see no password)"
     )
-    login_rc = subprocess.run(
-        [sys.executable, str(BROWSER_PY), "login", site], check=False
-    ).returncode
+    login = run_browser("login", site, timeout_s=browser_timeout("login"))
+    failed = login_run_failure(login)
+    if failed is not None:  # 125 or an outer kill: never retried, no check
+        print(f"❌ {site}: {failed}")
+        record_check(site, False, failed)
+        return 1 if login.rc is None else login.rc
+    login_rc = int(login.rc or 0)
     if login_rc != 0:
         print(f"❌ login {site} failed (exit {login_rc})")
     print(f"▶ browser.py logged-in {site}  (positive check on the check URL)")
-    rc = subprocess.run(
-        [sys.executable, str(BROWSER_PY), "logged-in", site], check=False
-    ).returncode
+    rc = _browser("logged-in", site, timeout_s=browser_timeout("logged-in"))
     if BUSY_RC in (rc, login_rc):
         print(f"⏸  {site}: {BUSY_HOW}")
         return BUSY_RC
     if rc == 0:
-        how = "logged in"
+        how = INNER_TIMEOUT_OK if login_rc == LOGIN_TIMEOUT_RC else "logged in"
+    elif login_rc == LOGIN_TIMEOUT_RC:  # -t never retries; -c does, once
+        how = f"NOT logged in ({_inner_timeout_text()}; check exit {rc})"
     else:
         how = f"NOT logged in (browser.py login exit {login_rc}, check exit {rc})"
     record_check(site, rc == 0, how)
@@ -737,8 +746,8 @@ def manual_login(site: str, force: bool = False) -> int:
 def assisted_login_argv(
     site: str, start: str | None = None, force: bool = False
 ) -> list[str]:
-    """`browser.py assisted-login SITE [-u START] [-f]`."""
-    argv = [sys.executable, str(BROWSER_PY), "assisted-login", site]
+    """The browser.py arguments `assisted-login SITE [-u START] [-f]`."""
+    argv = ["assisted-login", site]
     if start:
         argv += ["-u", start]
     if force:
@@ -747,10 +756,10 @@ def assisted_login_argv(
 
 
 def assisted_login_cmd(site: str, start: str | None = None, force: bool = False) -> int:
-    """`browser.py assisted-login SITE [-u START] [-f]` (it asks on the terminal)."""
-    return subprocess.run(
-        assisted_login_argv(site, start, force), check=False
-    ).returncode
+    """`browser.py assisted-login SITE [-u START] [-f]` (it asks on the terminal).
+
+    No time limit: a guided login waits for Albert (it bounds itself)."""
+    return _browser(*assisted_login_argv(site, start, force), timeout_s=None)
 
 
 def viewer_login(site: str, force: bool = False) -> int:
@@ -795,7 +804,9 @@ def _assisted_check(site: str) -> tuple[bool | None, str]:
         return None, f"{busy} — re-check later"
     hint = f"log in once: ./agent-login.py -g {site}"
     if site not in CLAUDE_ACCOUNTS:
-        rc = _browser("logged-in", site, quiet=True)
+        rc = _browser(
+            "logged-in", site, quiet=True, timeout_s=browser_timeout("logged-in")
+        )
         if rc == BUSY_RC:
             return None, BUSY_RECHECK
         return (True, "logged in") if rc == 0 else (False, f"NOT logged in — {hint}")
@@ -818,7 +829,13 @@ def _claude_check(site: str, hint: str) -> tuple[bool | None, str]:
             f"the {where} browser instance holds {email} — one claude.ai session "
             "per browser profile"
         )
-    rc = _browser("logged-in", "anthropic", quiet=True) if site == "anthropic" else 0
+    rc = (
+        _browser(
+            "logged-in", "anthropic", quiet=True, timeout_s=browser_timeout("logged-in")
+        )
+        if site == "anthropic"
+        else 0
+    )
     if rc == BUSY_RC:
         return None, BUSY_RECHECK
     if rc != 0:
@@ -845,7 +862,8 @@ def assisted_login(site: str, force: bool = False) -> int:
                 if site in SITE_INSTANCE and site in CLAUDE_ACCOUNTS:
                     claude_login_by_hand(site)
                 else:
-                    _browser("login", browser_site(site))
+                    # Guided: the site's window flow waits for Albert — no limit.
+                    _browser("login", browser_site(site), timeout_s=None)
         except RuntimeError:
             return 1
     ok, how = assisted_check(site)
@@ -864,29 +882,81 @@ def ensure_logged_in(site: str) -> tuple[bool | None, str]:
     """(logged in?, how) — positive check, else `browser.py login`, then re-check.
 
     None = busy (exit 75: a guided login owns the browser): never a login
-    attempt, never "logged out"."""
-    rc = _browser("logged-in", site, quiet=True)
+    attempt, never "logged out". A login whose inner deadline fired with its
+    tabs closed (124) is retried ONCE, and only when the check then fails; 125
+    (tab cleanup unconfirmed) and an outer kill are never retried."""
+    rc = _browser("logged-in", site, quiet=True, timeout_s=browser_timeout("logged-in"))
     if rc == BUSY_RC:
         return None, BUSY_HOW
     if rc == 0:
         return True, "logged in"
-    res = subprocess.run(
-        [sys.executable, str(BROWSER_PY), "login", site],
-        check=False,
-        capture_output=True,
-        text=True,
-    )
+    for attempt in (1, 2):
+        run = run_browser(
+            "login", site, timeout_s=browser_timeout("login"), capture=True
+        )
+        outcome = _after_login(site, run, retry_left=attempt == 1)
+        if outcome is not None:
+            return outcome
+        print(f"↻ {site}: {_inner_timeout_text()} and the check fails — retrying once")
+    return False, f"NOT logged in ({_inner_timeout_text()}, twice)"  # not reached
+
+
+INNER_TIMEOUT_OK = "logged in (after an inner timeout)"
+
+
+def _inner_timeout_text() -> str:
+    """How a login whose inner deadline fired is described."""
+    return f"browser.py login timed out after {login_timeout_s():g}s"
+
+
+def _after_inner_timeout(
+    check_rc: int, *, retry_left: bool
+) -> tuple[bool | None, str] | None:
+    """Exit 124 (tabs closed): the check decides; a failed check → retry once."""
+    if check_rc == 0:
+        return True, INNER_TIMEOUT_OK
+    if retry_left:
+        return None
+    return False, f"NOT logged in ({_inner_timeout_text()}, twice)"
+
+
+def login_run_failure(run: BrowserRun) -> str | None:
+    """The NOT-logged-in wording of a login that must not be retried — its
+    tab cleanup is unconfirmed (125) or the runner had to kill it — else None.
+    Both reach the failure mail."""
+    if run.killed:
+        return (
+            f"NOT logged in (browser.py login killed by the runner after "
+            f"{browser_timeout('login'):g}s (inner watchdog failed))"
+        )
+    if run.rc == LOGIN_TIMEOUT_DIRTY_RC:
+        return (
+            f"NOT logged in ({_inner_timeout_text()}; owned tabs may remain — see "
+            "browser.py journal, event owned_target)"
+        )
+    return None
+
+
+def _after_login(
+    site: str, run: BrowserRun, *, retry_left: bool
+) -> tuple[bool | None, str] | None:
+    """`ensure_logged_in`'s verdict after one `browser.py login`; None = retry."""
+    failed = login_run_failure(run)
+    if failed is not None:
+        return False, failed
     routes = [
         line.split("route:", 1)[1].strip()
-        for line in res.stdout.splitlines()
+        for line in run.stdout.splitlines()
         if "route:" in line
     ]
-    rc = _browser("logged-in", site, quiet=True)
-    if BUSY_RC in (rc, res.returncode):
+    rc = _browser("logged-in", site, quiet=True, timeout_s=browser_timeout("logged-in"))
+    if BUSY_RC in (rc, run.rc):
         return None, BUSY_HOW
+    if run.rc == LOGIN_TIMEOUT_RC:
+        return _after_inner_timeout(rc, retry_left=retry_left)
     if rc == 0:
         return True, f"logged in again ({routes[-1] if routes else 'browser.py login'})"
-    return False, f"NOT logged in (browser.py login exit {res.returncode})"
+    return False, f"NOT logged in (browser.py login exit {run.rc})"
 
 
 def failure_mail(failed: list[tuple[str, str]]) -> tuple[str, str]:
@@ -928,7 +998,7 @@ def ensure_browser_up() -> bool:
     if browser_mode() is not None:
         return True
     print("▶ shared Chromium is down — starting it (browser.py up, headless)")
-    _browser("up", quiet=True)
+    _browser("up", quiet=True, timeout_s=browser_timeout("up"))
     return browser_mode() is not None
 
 

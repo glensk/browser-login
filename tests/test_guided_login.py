@@ -117,9 +117,9 @@ def quiet_tx(cache, monkeypatch):
     monkeypatch.setattr(browser, "_is_up", lambda port: False)
     monkeypatch.setattr(browser, "_browser_mode", lambda port: None)
 
-    def close(port, ids):
+    def close(port, ids, **_kw):
         closed.append(list(ids))
-        return list(ids)
+        return list(ids), True
 
     monkeypatch.setattr(browser, "_close_owned_targets", close)
     return closed
@@ -870,13 +870,13 @@ def test_agent_login_treats_busy_as_skip_not_logout(monkeypatch, tmp_path):
     al = _load("agent_login_busy_test", _REPO / "agent-login.py")
     calls: list[tuple] = []
 
-    def fake_browser(*args, quiet=False):
+    def fake_browser(*args, quiet=False, **_kw):
         calls.append(args)
         return 75
 
     monkeypatch.setattr(al, "_browser", fake_browser)
     monkeypatch.setattr(
-        al.subprocess, "run", lambda *a, **k: pytest.fail("tried `browser.py login`")
+        subprocess, "run", lambda *a, **k: pytest.fail("tried `browser.py login`")
     )
     assert al.ensure_logged_in("cscs") == (None, al.BUSY_HOW)
     assert calls == [("logged-in", "cscs")]

@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import ast
 import importlib.util
 import os
+import subprocess
 import sys
 from pathlib import Path
 
@@ -15,6 +17,7 @@ assert _SPEC and _SPEC.loader
 al = importlib.util.module_from_spec(_SPEC)
 sys.modules["agent_login"] = al  # dataclasses resolve their module by name
 _SPEC.loader.exec_module(al)
+jobs = sys.modules["agent_login_jobs"]
 
 KA = next(t for t in al.TARGETS if t.site == "kleinanzeigen")
 ANIBIS = next(t for t in al.TARGETS if t.site == "anibis")
@@ -379,7 +382,7 @@ def test_run_test_switch_logs_in_when_the_broker_has_eduid(
     sites = [{"site": "eduid", "refused": False}]
     monkeypatch.setattr(al, "broker_state", lambda **_k: (_READABLE, sites))
     calls: list = []
-    monkeypatch.setattr(al.subprocess, "run", _fake_run(calls))
+    monkeypatch.setattr(subprocess, "run", _fake_run(calls))
     monkeypatch.setattr(al, "assisted_check", _no_assisted_check)
     assert al.run_test("switch") == 0
     assert calls == [["login", "switch"], ["logged-in", "switch"]]
@@ -390,7 +393,7 @@ def test_run_test_switch_only_checks_without_eduid(monkeypatch, tmp_path) -> Non
     monkeypatch.setenv("AGENT_LOGIN_STATE_FILE", str(tmp_path / "last.json"))
     monkeypatch.setattr(al, "broker_state", lambda **_k: (_READABLE, []))
     calls: list = []
-    monkeypatch.setattr(al.subprocess, "run", _fake_run(calls))
+    monkeypatch.setattr(subprocess, "run", _fake_run(calls))
     monkeypatch.setattr(al, "assisted_check", lambda s: (False, "NOT logged in"))
     assert al.run_test("switch") == 2
     assert not calls  # no `browser.py login`: it would wait for a human
@@ -414,7 +417,7 @@ def test_check_all_starts_a_down_browser(monkeypatch) -> None:
     state: dict[str, str | None] = {"mode": None}
     calls: list[tuple[str, ...]] = []
 
-    def fake_browser(*args: str, quiet: bool = False) -> int:
+    def fake_browser(*args: str, quiet: bool = False, **_kw) -> int:
         del quiet
         calls.append(args)
         state["mode"] = "headless"
@@ -432,7 +435,7 @@ def test_check_all_starts_a_down_browser(monkeypatch) -> None:
 def test_check_all_browser_wont_start(monkeypatch) -> None:
     """Browser stays down: ONE failure (and one mail), no per-site verdicts."""
     monkeypatch.setattr(al, "wait_for_network", lambda: True)
-    monkeypatch.setattr(al, "_browser", lambda *a, quiet=False: 1)
+    monkeypatch.setattr(al, "_browser", lambda *a, **_kw: 1)
     monkeypatch.setattr(al, "browser_mode", lambda: None)
     monkeypatch.setattr(al, "overview", pytest.fail)
     monkeypatch.setattr(al, "record_check", pytest.fail)
@@ -462,3 +465,149 @@ def test_check_all_browser_dies_mid_run(monkeypatch) -> None:
     monkeypatch.setattr(al, "record_check", lambda *a, **k: None)
     assert al.check_all() == 1
     assert seen == ["a"]
+
+
+# --- every browser.py call has an explicit time budget (tp#843) --------------------
+
+_REPO = Path(__file__).resolve().parent.parent
+_RUNNER_FILES = ("agent-login.py", "agent_login_jobs.py", "agent_login_claude.py")
+# The only calls without a time limit: guided logins, which wait for Albert.
+_GUIDED_UNBOUNDED = {
+    ("agent-login.py", "assisted_login"),
+    ("agent-login.py", "assisted_login_cmd"),
+}
+
+
+def _functions(path: Path) -> list[ast.FunctionDef]:
+    tree = ast.parse(path.read_text(encoding="utf-8"))
+    return [n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef)]
+
+
+def _call_name(call: ast.Call) -> str:
+    func = call.func
+    if isinstance(func, ast.Name):
+        return func.id
+    if isinstance(func, ast.Attribute) and isinstance(func.value, ast.Name):
+        return f"{func.value.id}.{func.attr}"
+    return ""
+
+
+def test_only_run_browser_spawns_browser_py():
+    """A subprocess call in a function that names BROWSER_PY lives in run_browser."""
+    offenders = []
+    for name in _RUNNER_FILES:
+        for fn in _functions(_REPO / name):
+            names = {n.id for n in ast.walk(fn) if isinstance(n, ast.Name)}
+            spawns = any(
+                _call_name(c) in ("subprocess.run", "subprocess.Popen")
+                for c in ast.walk(fn)
+                if isinstance(c, ast.Call)
+            )
+            if spawns and "BROWSER_PY" in names and fn.name != "run_browser":
+                offenders.append(f"{name}:{fn.name}")
+    assert not offenders
+
+
+def test_every_browser_call_passes_timeout_s_and_only_guided_ones_none():
+    unbounded, missing = set(), []
+    for name in _RUNNER_FILES:
+        for fn in _functions(_REPO / name):
+            for call in (c for c in ast.walk(fn) if isinstance(c, ast.Call)):
+                if _call_name(call) not in ("_browser", "run_browser"):
+                    continue
+                kw = {k.arg: k.value for k in call.keywords}
+                if "timeout_s" not in kw:
+                    missing.append(f"{name}:{fn.name}:{call.lineno}")
+                    continue
+                value = kw["timeout_s"]
+                if isinstance(value, ast.Constant) and value.value is None:
+                    unbounded.add((name, fn.name))
+    assert not missing
+    assert unbounded == _GUIDED_UNBOUNDED
+
+
+def test_runner_budgets(monkeypatch):
+    monkeypatch.setenv("CLAUDE_BROWSER_LOGIN_TIMEOUT_S", "600")
+    assert jobs.browser_timeout("login") == 690
+    monkeypatch.delenv("CLAUDE_BROWSER_LOGIN_TIMEOUT_S")
+    assert jobs.browser_timeout("login") == 390
+    monkeypatch.setenv("CLAUDE_BROWSER_LOGIN_TIMEOUT_S", "nan")
+    assert jobs.browser_timeout("login") == 390
+    assert jobs.browser_timeout("logged-in") == 210
+    assert jobs.browser_timeout("status") == 30
+
+
+def _timeout_run(*_a, **kw):
+    raise subprocess.TimeoutExpired(
+        ["browser.py"], float(kw.get("timeout") or 0), output=b"part"
+    )
+
+
+def test_an_outer_kill_is_reported_as_killed(monkeypatch):
+    monkeypatch.setattr(subprocess, "run", _timeout_run)
+    run = jobs.run_browser("login", "x", timeout_s=1.0, capture=True)
+    assert run.killed and run.rc is None and run.stdout == "part"
+    assert jobs._browser("logged-in", "x", timeout_s=1.0) == jobs.KILLED_RC
+    assert jobs.KILLED_RC != jobs.BUSY_RC
+    assert jobs.browser_mode() is None  # `status` killed: unknown
+
+
+class _Runs:
+    """`run_browser` for `login` (codes in order) + `_browser` for the checks."""
+
+    def __init__(self, logins: list[int | None], checks: list[int]) -> None:
+        self.logins, self.checks = list(logins), list(checks)
+        self.login_calls = 0
+
+    def run_browser(self, *args, timeout_s, capture=False, quiet=False):
+        del capture, quiet
+        assert args[0] == "login" and timeout_s == jobs.browser_timeout("login")
+        self.login_calls += 1
+        rc = self.logins.pop(0)
+        return jobs.BrowserRun(rc, rc is None, "", 0.1)
+
+    def browser(self, *args, quiet=False, timeout_s):
+        del quiet
+        assert args[0] == "logged-in" and timeout_s == 210
+        return self.checks.pop(0)
+
+
+def _ensure(monkeypatch, logins, checks):
+    runs = _Runs(logins, checks)
+    monkeypatch.setattr(al, "run_browser", runs.run_browser)
+    monkeypatch.setattr(al, "_browser", runs.browser)
+    return al.ensure_logged_in("cscs"), runs
+
+
+def test_ensure_killed_login_is_not_retried(monkeypatch):
+    (ok, how), runs = _ensure(monkeypatch, [None], [2])
+    assert ok is False and "killed by the runner" in how and runs.login_calls == 1
+
+
+def test_ensure_124_and_failing_check_retries_exactly_once(monkeypatch):
+    (ok, how), runs = _ensure(monkeypatch, [124, 2], [2, 2, 2])
+    assert ok is False and runs.login_calls == 2 and "exit 2" in how
+    (ok, how), runs = _ensure(monkeypatch, [124, 124], [2, 2, 2])
+    assert ok is False and runs.login_calls == 2 and "twice" in how
+
+
+def test_ensure_124_and_passing_check_is_logged_in(monkeypatch):
+    (ok, how), runs = _ensure(monkeypatch, [124], [2, 0])
+    assert ok is True and how == al.INNER_TIMEOUT_OK and runs.login_calls == 1
+
+
+def test_ensure_125_is_not_retried(monkeypatch):
+    (ok, how), runs = _ensure(monkeypatch, [125], [2])
+    assert ok is False and runs.login_calls == 1
+    assert "owned tabs may remain" in how and "owned_target" in how
+
+
+def test_run_test_never_retries_a_124(monkeypatch, tmp_path):
+    monkeypatch.setenv("AGENT_LOGIN_STATE_FILE", str(tmp_path / "last.json"))
+    monkeypatch.setattr(al, "_eduid_sso_assisted", lambda site: False)
+    runs = _Runs([124], [2])
+    monkeypatch.setattr(al, "run_browser", runs.run_browser)
+    monkeypatch.setattr(al, "_browser", runs.browser)
+    assert al.run_test("cscs") == 2
+    assert runs.login_calls == 1
+    assert "timed out" in al.last_checks(tmp_path / "last.json")["cscs"]["how"]

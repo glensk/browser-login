@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import contextlib
 import importlib.util
+import math
 import os
 import shutil
 import socket
@@ -255,24 +256,111 @@ def safari_sessions(sites: list[str]) -> dict[str, dict]:
     return out
 
 
-def _browser(*args: str, quiet: bool = False) -> int:
-    """Run bin/browser.py with `args`; its exit code."""
-    out = subprocess.DEVNULL if quiet else None
-    return subprocess.run(
-        [sys.executable, str(BROWSER_PY), *args], check=False, stdout=out, stderr=out
-    ).returncode
+# --- running bin/browser.py: every call has an explicit time budget (tp#843) ---
+# browser.py bounds an unattended `login`/`logged-in` itself (its LoginDeadline
+# exits 124/125); the runner's subprocess timeout is the last resort for when
+# that inner layer fails too. It derives from the SAME env var + a margin for
+# interpreter start, venv bootstrap and the inner 15 s tab cleanup.
+
+LOGIN_TIMEOUT_ENV = "CLAUDE_BROWSER_LOGIN_TIMEOUT_S"
+LOGIN_TIMEOUT_DEFAULT_S = 300.0
+RUNNER_MARGIN_S = 90.0
+# browser.py's exit codes of a fired LoginDeadline: tabs closed / unconfirmed.
+LOGIN_TIMEOUT_RC = 124
+LOGIN_TIMEOUT_DIRTY_RC = 125
+# `_browser`'s exit code after the RUNNER killed browser.py (never BUSY_RC).
+KILLED_RC = -9
+# Fixed budgets of the other subcommands (seconds; `logged-in` = 120 + margin;
+# `eval` is always called with `-t 30`).
+BROWSER_TIMEOUTS = {
+    "logged-in": 120.0 + RUNNER_MARGIN_S,
+    "status": 30.0,
+    "up": 120.0,
+    "switch": 120.0,
+    "down": 60.0,
+    "open": 60.0,
+    "eval": 60.0,
+}
+
+
+def env_seconds(raw: str | None, default: float) -> float:
+    """browser.py's `_env_seconds`: a finite number > 0, else `default` (pinned
+    to the same answers by tests/test_login_timeout.py)."""
+    if raw is None:
+        return default
+    try:
+        value = float(raw)
+    except ValueError:
+        return default
+    return value if math.isfinite(value) and value > 0 else default
+
+
+def login_timeout_s() -> float:
+    """browser.py's inner `login` deadline ($CLAUDE_BROWSER_LOGIN_TIMEOUT_S)."""
+    return env_seconds(os.environ.get(LOGIN_TIMEOUT_ENV), LOGIN_TIMEOUT_DEFAULT_S)
+
+
+def browser_timeout(cmd: str) -> float:
+    """The runner's budget for `browser.py CMD` (KeyError for an unknown CMD)."""
+    if cmd == "login":
+        return login_timeout_s() + RUNNER_MARGIN_S
+    return BROWSER_TIMEOUTS[cmd]
+
+
+@dataclass
+class BrowserRun:
+    """One `browser.py` run: its exit code (None when the runner killed it)."""
+
+    rc: int | None
+    killed: bool
+    stdout: str
+    elapsed_s: float
+
+
+def run_browser(
+    *args: str, timeout_s: float | None, capture: bool = False, quiet: bool = False
+) -> BrowserRun:
+    """Run bin/browser.py with `args`, killed after `timeout_s` (None = never:
+    only for a guided login, which waits for Albert).
+
+    `capture` collects stdout (stderr too, not returned); `quiet` discards
+    both; neither = they go to our terminal. On a timeout ``subprocess.run``
+    SIGKILLs browser.py only — its `security` children run in their own
+    session and are left alone (tp#504).
+    """
+    argv = [sys.executable, str(BROWSER_PY), *args]
+    t0 = time.monotonic()
+    try:
+        if capture:
+            res = subprocess.run(
+                argv, check=False, capture_output=True, text=True, timeout=timeout_s
+            )
+        else:
+            out = subprocess.DEVNULL if quiet else None
+            res = subprocess.run(
+                argv, check=False, stdout=out, stderr=out, timeout=timeout_s
+            )
+    except subprocess.TimeoutExpired as exc:
+        partial = exc.stdout or ""
+        if isinstance(partial, bytes):
+            partial = partial.decode(errors="replace")
+        return BrowserRun(None, True, partial, time.monotonic() - t0)
+    stdout = res.stdout if capture and isinstance(res.stdout, str) else ""
+    return BrowserRun(res.returncode, False, stdout, time.monotonic() - t0)
+
+
+def _browser(*args: str, quiet: bool = False, timeout_s: float | None) -> int:
+    """`run_browser` → its exit code, KILLED_RC after an outer kill."""
+    run = run_browser(*args, timeout_s=timeout_s, quiet=quiet)
+    return KILLED_RC if run.rc is None else run.rc
 
 
 def browser_mode() -> str | None:
-    """ "headless" / "headed" for the running shared Chromium, None when down."""
-    res = subprocess.run(
-        [sys.executable, str(BROWSER_PY), "status"],
-        check=False,
-        capture_output=True,
-        text=True,
-    )
-    first = (res.stdout.splitlines() or [""])[0]
-    if not first.startswith("✓ Up"):
+    """ "headless" / "headed" for the running shared Chromium, None when down
+    (or when `status` itself had to be killed: unknown)."""
+    run = run_browser("status", timeout_s=browser_timeout("status"), capture=True)
+    first = (run.stdout.splitlines() or [""])[0]
+    if run.killed or not first.startswith("✓ Up"):
         return None
     return "headless" if "(headless)" in first else "headed"
 
@@ -341,7 +429,7 @@ def hide_window(mod: ModuleType | None = None, nonce: str | None = None) -> bool
             return True
     print("▶ hiding the Chromium window again (switch headless) …")
     for attempt in (1, 2):
-        if _browser("switch", "headless") == 0:
+        if _browser("switch", "headless", timeout_s=browser_timeout("switch")) == 0:
             return True
         print(f"❌ browser.py switch headless failed (attempt {attempt}/2)")
         if attempt == 1:
@@ -383,7 +471,7 @@ def guided_window(site: str, force: bool = False) -> Iterator[GuidedWindow]:
             print(f"❌ guided login refused: {exc}")
             raise
         print("▶ showing the shared Chromium window (guided login) …")
-        if _browser("switch", "headed") != 0:
+        if _browser("switch", "headed", timeout_s=browser_timeout("switch")) != 0:
             if browser_mode() == "headed":
                 hide_window(mod, nonce)
             raise RuntimeError("browser.py switch headed failed")

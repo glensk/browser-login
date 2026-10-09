@@ -83,8 +83,12 @@ currently ``cscs``, ``anthropic``/``claude``, ``openai``/``chatgpt``, ``slack``,
                     login event. An ASSISTED step runs ONLY inside a guided
                     login (agent-login.py -g SITE, which holds the headed
                     lease); anywhere else `login` exits 4 and prints
-                    `needs Albert: agent-login.py -g SITE`.
-  logged-in SITE    Exit 0 if SITE is logged in, 2 if not (no login attempted).
+                    `needs Albert: agent-login.py -g SITE`. Outside a guided
+                    login it is bounded by $CLAUDE_BROWSER_LOGIN_TIMEOUT_S
+                    (default 300): exit 124 when it timed out and its tabs are
+                    closed, 125 when that cleanup is unconfirmed.
+  logged-in SITE    Exit 0 if SITE is logged in, 2 if not (no login attempted;
+                    bounded to 120 s, exit 124/125 like `login`).
   login-log SITE    Show how often a *real* login was actually needed for SITE
                     (count, first/last, average interval) — read from the log.
   store-creds SITE  Store SITE credentials in the macOS keychain (password+TOTP
@@ -195,8 +199,12 @@ DEFAULT_CDP_PORT = int(
 )
 
 
-def _connect_timeout_s(raw: str | None, default: float = 30.0) -> float:
-    """Parse ``CLAUDE_BROWSER_CONNECT_TIMEOUT_S``; invalid or <= 0 → `default`."""
+def _env_seconds(raw: str | None, default: float = 30.0) -> float:
+    """Parse a seconds env var: a finite number > 0, else `default` (also unset).
+
+    agent_login_jobs.py keeps a copy (`env_seconds`) for the runner's budget;
+    tests/test_login_timeout.py pins the two to the same answers.
+    """
     try:
         value = float(raw) if raw is not None else default
     except ValueError:
@@ -204,12 +212,36 @@ def _connect_timeout_s(raw: str | None, default: float = 30.0) -> float:
     return value if 0 < value < float("inf") else default  # NaN fails both
 
 
+# The old name of `_env_seconds` (CLAUDE_BROWSER_CONNECT_TIMEOUT_S, default 30).
+_connect_timeout_s = _env_seconds
+
+
 # How long a Playwright attach (`connect_over_cdp`) may take before browser.py
 # gives up and names the tab that blocks it (tp#693). Playwright's own default
 # is its 180 s launch timeout — long enough to look like a hang to every caller.
-CONNECT_TIMEOUT_S = _connect_timeout_s(
-    os.environ.get("CLAUDE_BROWSER_CONNECT_TIMEOUT_S")
+CONNECT_TIMEOUT_S = _env_seconds(os.environ.get("CLAUDE_BROWSER_CONNECT_TIMEOUT_S"))
+# Hard deadline of one unattended `login` (tp#843), enforced by `LoginDeadline`:
+# sync Playwright calls take no timeout, so one page that never settles would
+# hang the login — and the interaction lease and gate it holds — without limit.
+# The longest legitimate single wait is the broker's BROKER_TIMEOUT_S (180 s);
+# a slow but healthy CSCS login takes ~65 s. agent-login's runner kills
+# browser.py at this value + 90 s (agent_login_jobs.browser_timeout). Never
+# applied to a guided login.
+LOGIN_TIMEOUT_ENV = "CLAUDE_BROWSER_LOGIN_TIMEOUT_S"
+LOGIN_TIMEOUT_DEFAULT_S = 300.0
+LOGIN_TIMEOUT_S = _env_seconds(
+    os.environ.get(LOGIN_TIMEOUT_ENV), LOGIN_TIMEOUT_DEFAULT_S
 )
+# `logged-in SITE`: two attaches and one background page at most.
+LOGGED_IN_TIMEOUT_S = 120.0
+# One background page (`_background_page_run`): raw create 5 + attach
+# (CONNECT_TIMEOUT_S) + goto 15 + load 10 + its check ≈ 10 + raw close 5.
+BG_PAGE_STEP_S = CONNECT_TIMEOUT_S + 60.0
+# What a fired deadline (and a login's final cleanup) may spend closing the
+# tabs the command owns, all of them together.
+DEADLINE_CLEANUP_S = 15.0
+# How often the deadline's watcher thread looks at the clock.
+DEADLINE_POLL_S = 0.25
 # Test-only override: the tests point every coordination file (registry, lease,
 # lifecycle) at a temp dir so they never touch the live browser's state.
 CACHE_DIR = (
@@ -423,9 +455,10 @@ def _add_journal_parser(sub: Any) -> None:
         "-e",
         "--event",
         default=None,
-        help="only this event: up, switch, down, login, bring_to_front, register, "
-        "unregister, register_refused, revert_headed, headed_lease, guided_login, "
-        "maintenance, client_pause, client_resume, watchdog_recover",
+        help="only this event: up, switch, down, login, login_step, owned_target, "
+        "watchdog, bring_to_front, register, unregister, register_refused, "
+        "revert_headed, headed_lease, guided_login, maintenance, client_pause, "
+        "client_resume, watchdog_recover",
     )
     pjn.add_argument(
         "-j", "--json", action="store_true", help="print the raw JSON lines"
@@ -3359,6 +3392,13 @@ PROBE_BACKGROUND_ENV = "CLAUDE_BROWSER_PROBE_BACKGROUND"
 # Exit code while a guided login owns the browser (EX_TEMPFAIL): "busy, retry
 # later" — never "not logged in" (2), so checks skip instead of logging in.
 BUSY_RC = 75
+# Exit codes of a `login`/`logged-in` whose LoginDeadline fired (tp#843): 124 =
+# timed out, every tab it owned confirmed closed (agent-login retries a login
+# once, after a failed check); 125 = timed out, tab cleanup NOT confirmed (no
+# retry — see the journal, event owned_target). Never 75 (callers would skip
+# it silently), 4 (would send Albert to -g) or 2 (reads as "not logged in").
+LOGIN_TIMEOUT_RC = 124
+LOGIN_TIMEOUT_DIRTY_RC = 125
 # How long a preflight revert waits for registered clients to drain.
 PREFLIGHT_GATE_WAIT_S = 5.0
 # Commands that never drive the browser over CDP, plus the lifecycle commands
@@ -6103,10 +6143,12 @@ def _close_stale_cscs_tabs(ctx, keep=None) -> int:
 
 def cmd_token(port: int) -> int:
     """Read the 40-hex Waldur token from the portal tab and cache it."""
+    _deadline_step("token:pick")
     pw, browser = _connect(port)
     try:
         ctx, page = _pick_portal_page(browser)
         if not _on_portal(page):
+            _deadline_step("token:goto")
             page.goto(PORTAL_PROFILE_URL, wait_until="domcontentloaded")
             page.wait_for_timeout(1500)
         if "auth.cscs.ch" in page.url:  # portal bounced us to Keycloak → not logged in
@@ -6115,6 +6157,7 @@ def cmd_token(port: int) -> int:
                 "Run: browser.py login cscs   (then re-run: browser.py token)"
             )
             return 2  # distinct code: caller maps this to a 'needs login' hint
+        _deadline_step("token:scan")
         rc = _capture_and_cache_token(ctx, page)
         _close_stale_cscs_tabs(ctx, keep=page)  # clear dead OAuth/login stubs
         return rc
@@ -8880,7 +8923,8 @@ def cmd_login_log(site_name: str | None) -> int:
 # (allowlisted cookies + named localStorage keys) — never a password or TOTP seed.
 # We inject the bundle into the shared browser. Exit codes of the broker paths:
 # 0 logged in · 2 not logged in / not whitelisted · 3 broker unavailable ·
-# 4 the site needs a human (captcha / second factor).
+# 4 the site needs a human (captcha / second factor) · 124/125 the command's
+# LoginDeadline fired (tabs closed / cleanup unconfirmed — LOGIN_TIMEOUT_RC).
 
 BROKER_SOCKET_DEFAULT = "/var/db/login-broker-run/broker.sock"
 BROKER_TIMEOUT_S = 180.0
@@ -8944,8 +8988,19 @@ def _broker_request(op: str, *, timeout: float = BROKER_TIMEOUT_S, **kw: Any) ->
     payload = json.dumps({"op": op, **kw}).encode() + b"\n"
     path = _broker_socket()
     buf = bytearray()
+    # ONE deadline for connect + send + the whole reply: a per-recv timeout
+    # would let a broker that dribbles bytes stretch the call without limit.
+    deadline = time.monotonic() + timeout
+    late = f"login broker did not answer within {timeout:g}s"
+
+    def left() -> float:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise BrokerUnavailable(late)
+        return max(0.01, remaining)
+
     with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:
-        sock.settimeout(timeout)
+        sock.settimeout(left())
         try:
             sock.connect(path)
         except OSError as exc:
@@ -8953,15 +9008,19 @@ def _broker_request(op: str, *, timeout: float = BROKER_TIMEOUT_S, **kw: Any) ->
                 f"no login broker at {path} ({exc.strerror or exc})"
             ) from None
         try:
+            sock.settimeout(left())
             sock.sendall(payload)
             while not buf.endswith(b"\n"):
+                sock.settimeout(left())
                 chunk = sock.recv(65536)
                 if not chunk:
                     break
                 buf += chunk
                 if len(buf) > BROKER_MAX_RESPONSE:
                     raise BrokerUnavailable("login broker reply too large")
-        except OSError as exc:  # socket.timeout is an OSError
+        except TimeoutError:  # socket.timeout
+            raise BrokerUnavailable(late) from None
+        except OSError as exc:
             raise BrokerUnavailable(f"login broker did not answer ({exc})") from None
     try:
         resp = json.loads(bytes(buf))
@@ -9025,6 +9084,277 @@ def _url_origin(url: str) -> str:
     return f"{parts.scheme}://{host.lower()}{suffix}"
 
 
+# ---------------------------------------------------------------------------
+# Login deadline (tp#843) — an unattended login/logged-in can never hang
+# ---------------------------------------------------------------------------
+# Sync Playwright calls (`evaluate`, `page.close`, `CDPSession.send`,
+# `browser.close`, `pw.stop`) take no timeout and cannot be cancelled from
+# another thread: a SPA that never settles would hold the login — with its
+# interaction lease and gate — forever. `LoginDeadline` bounds the whole
+# command instead: one daemon watcher thread compares the clock with the
+# overall deadline and every nested step deadline; when one passes, it closes
+# the tabs the command owns over raw CDP (bounded, confirmed by a re-list),
+# journals where the command was stuck, and hard-exits 124 (tabs closed) or
+# 125 (cleanup unconfirmed). Every flock (gate, registration, lease) dies with
+# the process; `_registry_live_clients` reaps the leftover registration file.
+#
+# Armed by `cmd_login`/`cmd_logged_in` unless THIS process owns the live
+# guided-login maintenance record (`_maint_owner`): a guided login waits for a
+# human and is never bounded. Helpers deep in the call stack reach the active
+# instance through `_active_deadline()` (no instance = their calls are no-ops).
+
+
+class LoginDeadline:  # pylint: disable=too-many-instance-attributes
+    """The command-scoped deadline of one `login`/`logged-in` (see above)."""
+
+    def __init__(  # pylint: disable=too-many-arguments
+        self,
+        port: int,
+        cmd: str,
+        site: str,
+        timeout_s: float,
+        *,
+        end_event: str | None = None,
+    ) -> None:
+        self.lock = threading.Lock()
+        self.armed = False
+        self.generation = 0
+        self.firing = False
+        self.port = port
+        self.cmd = cmd
+        self.site = site
+        self.timeout_s = timeout_s
+        self.end_event = end_event
+        self.t0 = time.monotonic()
+        self.owned: set[str] = set()
+        self.step = "start"
+        # (absolute monotonic deadline, scope, seconds) — the overall one first.
+        self.deadlines: list[tuple[float, str, float]] = []
+        self._done = threading.Event()
+
+    # -- lifecycle --
+    def arm(self) -> None:
+        """Start the clock (overall deadline = now + timeout_s) and the watcher."""
+        with self.lock:
+            self.armed = True
+            self.generation += 1
+            gen = self.generation
+            self.t0 = time.monotonic()
+            self.deadlines = [(self.t0 + self.timeout_s, "overall", self.timeout_s)]
+        threading.Thread(
+            target=self._watch, args=(gen,), name="login-deadline", daemon=True
+        ).start()
+
+    def disarm(self) -> bool:
+        """Stop the clock; True when the deadline had already fired.
+
+        Once this returns, no hard exit can follow. A fire that decided first
+        (``firing`` set under the lock) is waited for: it exits the process,
+        so this call only returns when the exit was stubbed out (tests).
+        """
+        with self.lock:
+            fired = self.firing
+            self.armed = False
+            self.generation += 1
+        if fired:
+            self._done.wait()
+        return fired
+
+    # -- bookkeeping, callable from any depth of the command --
+    def step_to(self, label: str) -> None:
+        """Record the step the command enters (journaled as a breadcrumb)."""
+        with self.lock:
+            self.step = label
+            elapsed_ms = int((time.monotonic() - self.t0) * 1000)
+        _journal(
+            "login_step",
+            command=self.cmd,
+            site=self.site,
+            step=label,
+            elapsed_ms=elapsed_ms,
+        )
+
+    def add_owned(self, tid: str) -> None:
+        """A target this command created and must close (journaled first)."""
+        if not tid:
+            return
+        with self.lock:
+            self.owned.add(tid)
+        _journal("owned_target", op="add", tid=tid, command=self.cmd, site=self.site)
+
+    def drop_owned(self, tid: str) -> None:
+        """A target confirmed gone."""
+        with self.lock:
+            if tid not in self.owned:
+                return
+            self.owned.discard(tid)
+        _journal("owned_target", op="close", tid=tid, command=self.cmd, site=self.site)
+
+    def owned_ids(self) -> list[str]:
+        """A snapshot of the owned target ids."""
+        with self.lock:
+            return sorted(self.owned)
+
+    @contextlib.contextmanager
+    def push(self, seconds: float, scope: str) -> Iterator[None]:
+        """A nested step deadline (now + `seconds`) for the duration of the block."""
+        entry = (time.monotonic() + seconds, scope, seconds)
+        with self.lock:
+            self.deadlines.append(entry)
+        try:
+            yield
+        finally:
+            with self.lock, contextlib.suppress(ValueError):
+                self.deadlines.remove(entry)
+
+    # -- the watcher --
+    def _watch(self, gen: int) -> None:
+        while True:
+            time.sleep(DEADLINE_POLL_S)
+            with self.lock:
+                if not self.armed or self.generation != gen:
+                    return
+                if not self.deadlines:
+                    continue
+                due = min(self.deadlines)
+                if time.monotonic() < due[0]:
+                    continue
+                self.firing = True
+                snapshot = sorted(self.owned)
+                step = self.step
+            self._fire(due, snapshot, step)
+            return
+
+    def _fire(
+        self, due: tuple[float, str, float], snapshot: list[str], step: str
+    ) -> None:
+        """Clean up, journal and hard-exit (runs on the watcher; never raises)."""
+        _deadline_at, scope, seconds = due
+        rc = LOGIN_TIMEOUT_DIRTY_RC
+        try:
+            sys.stderr.write(
+                f"❌ {self.cmd} {self.site}: no progress after {seconds:g}s in step "
+                f"{step} (a Playwright call never returned)\n"
+            )
+            sys.stderr.flush()
+            gone, confirmed = _close_owned_targets(
+                self.port,
+                snapshot,
+                budget_s=DEADLINE_CLEANUP_S,
+                journal_event="watchdog",
+            )
+            for tid in gone:
+                self.drop_owned(tid)
+            rc = LOGIN_TIMEOUT_RC if confirmed else LOGIN_TIMEOUT_DIRTY_RC
+            duration_ms = int((time.monotonic() - self.t0) * 1000)
+            _journal(
+                "watchdog",
+                command=self.cmd,
+                site=self.site,
+                scope=scope,
+                step=step,
+                timeout_s=seconds,
+                elapsed_ms=duration_ms,
+                owned=",".join(snapshot),
+                closed=",".join(gone),
+                confirmed=confirmed,
+            )
+            if self.end_event is not None:
+                # `_journaled_dispatch`'s finally never runs after os._exit.
+                _journal(
+                    self.end_event,
+                    phase="end",
+                    **{
+                        "site": self.site,
+                        **_JOURNAL_NOTES,
+                        "result": rc,
+                        "reason": "timeout",
+                        "duration_ms": duration_ms,
+                    },
+                )
+            if not confirmed:
+                sys.stderr.write(
+                    f"❌ {self.cmd} {self.site}: could not confirm that its tab(s) "
+                    "closed — see `browser.py journal -e owned_target`\n"
+                )
+        except Exception:  # pylint: disable=broad-exception-caught
+            rc = LOGIN_TIMEOUT_DIRTY_RC
+        finally:
+            with contextlib.suppress(Exception):
+                sys.stdout.flush()
+                sys.stderr.flush()
+            _hard_exit(rc)
+            self._done.set()  # reached only when the exit is stubbed (tests)
+
+
+# The active deadline of this process (at most one; set by `_login_deadline`).
+_ACTIVE_DEADLINE: list[LoginDeadline] = []
+
+
+def _hard_exit(rc: int) -> None:
+    """``os._exit`` — the main thread is stuck inside Playwright (tests patch it)."""
+    os._exit(rc)  # pylint: disable=protected-access
+
+
+def _active_deadline() -> LoginDeadline | None:
+    """The armed `LoginDeadline` of this command, or None."""
+    return _ACTIVE_DEADLINE[0] if _ACTIVE_DEADLINE else None
+
+
+def _deadline_step(label: str) -> None:
+    """Breadcrumb for the active deadline (no-op without one)."""
+    dl = _active_deadline()
+    if dl is not None:
+        dl.step_to(label)
+
+
+def _deadline_push(
+    seconds: float, scope: str
+) -> contextlib.AbstractContextManager[None]:
+    """A nested step deadline on the active deadline (no-op without one)."""
+    dl = _active_deadline()
+    return dl.push(seconds, scope) if dl is not None else contextlib.nullcontext()
+
+
+@contextlib.contextmanager
+def _login_deadline(  # pylint: disable=too-many-arguments
+    port: int,
+    cmd: str,
+    site: str,
+    timeout_s: float,
+    *,
+    end_event: str | None = None,
+) -> Iterator[LoginDeadline | None]:
+    """Arm a `LoginDeadline` for the block — unless this process owns the live
+    guided-login record (a human-waiting flow is never bounded) or one is
+    already active. On every exit: disarm, then close whatever the command
+    still owns (bounded by DEADLINE_CLEANUP_S; ⚠ when unconfirmed)."""
+    if _active_deadline() is not None or _maint_owner():
+        yield _active_deadline()
+        return
+    dl = LoginDeadline(port, cmd, site, timeout_s, end_event=end_event)
+    _ACTIVE_DEADLINE[:] = [dl]
+    dl.arm()
+    try:
+        yield dl
+    finally:
+        dl.disarm()
+        _ACTIVE_DEADLINE.clear()
+        leftover = dl.owned_ids()
+        if leftover:
+            gone, confirmed = _close_owned_targets(
+                port, leftover, budget_s=DEADLINE_CLEANUP_S, journal_event="login"
+            )
+            for tid in gone:
+                dl.drop_owned(tid)
+            if not confirmed:
+                print(
+                    f"⚠ {cmd} {site}: {len(leftover) - len(gone)} tab(s) it opened "
+                    "may still be open — see `browser.py journal -e owned_target`",
+                    file=sys.stderr,
+                )
+
+
 def _with_background_page(port: int, url: str, fn: Callable[[Any], Any]) -> Any:
     """Open `url` in a BACKGROUND tab (never focused), run ``fn(page)``, close it.
 
@@ -9057,48 +9387,81 @@ def _background_page_run(
     prepare: Callable[[Any], None] | None,
     fn: Callable[[Any], Any],
 ) -> Any:
-    """Shared body of the two background-page helpers (None on any failure)."""
+    """Shared body of the two background-page helpers (None on any failure).
+
+    The tab is created and closed over raw CDP by its target id (bounded, no
+    Playwright attach involved) and is owned by the active `LoginDeadline`
+    from the moment it exists; the whole helper runs under one step deadline
+    (BG_PAGE_STEP_S) whose breadcrumbs ``bg:*`` name the call that hung.
+    """
+    with _deadline_push(BG_PAGE_STEP_S, "background_page"):
+        _deadline_step("bg:create")
+        if not _is_up(port):
+            sys.exit("Shared browser is down. Run: browser.py up")
+        _ensure_page_target(port)  # zero tabs: createTarget may open a window
+        # Registered BEFORE the tab exists, like `open -N`: a guided login's
+        # record refuses us here, before we touch its browser.
+        release = _registry_register("browser.py", _purpose(), port)
+        try:
+            ws_url = _browser_ws_url(port)
+            start = "about:blank" if prepare is not None else url
+            tid = _cdp_create_background_target(ws_url, start, 5.0) if ws_url else None
+            if not tid:
+                return None
+            dl = _active_deadline()
+            if dl is not None:
+                dl.add_owned(tid)
+            try:
+                return _background_page_attached(port, tid, url, prepare, fn)
+            finally:
+                _deadline_step("bg:close")
+                _, confirmed = _close_owned_targets(
+                    port, [tid], budget_s=5.0, journal_event=None
+                )
+                if confirmed and dl is not None:
+                    dl.drop_owned(tid)  # else the command's final cleanup retries
+        finally:
+            release()
+
+
+def _background_page_attached(
+    port: int,
+    tid: str,
+    url: str,
+    prepare: Callable[[Any], None] | None,
+    fn: Callable[[Any], Any],
+) -> Any:
+    """Attach, adopt target `tid`, (prepare +) load `url`, run `fn` — detach.
+
+    Closing the tab is the caller's job (raw CDP by id), never ``page.close()``.
+    """
     from playwright.sync_api import Error as PlaywrightError
 
+    _deadline_step("bg:adopt")
     pw, browser = _connect(port)
-    tid = ""
-    start = "about:blank" if prepare is not None else url
-    try:
-        created = browser.new_browser_cdp_session().send(
-            "Target.createTarget", {"url": start, "background": True}
-        )
-        tid = str(created.get("targetId") or "")
-    except PlaywrightError:
-        return None
-    finally:
-        browser.close()
-        pw.stop()
-    if not tid:
-        return None
-    pw, browser = _connect(port)
-    page = None
     try:
         page = _switch_page_by_target(browser, tid)
         if page is None:
             return None
         if prepare is not None:
+            _deadline_step("bg:prepare")
             prepare(page)
+            _deadline_step("bg:goto")
             page.goto(url, wait_until="domcontentloaded", timeout=15_000)
         else:
+            _deadline_step("bg:load")
             page.wait_for_load_state("domcontentloaded", timeout=15_000)
+        _deadline_step("bg:load")
         with contextlib.suppress(PlaywrightError):
             page.wait_for_load_state("load", timeout=10_000)
+        _deadline_step("bg:fn")
         return fn(page)
     except PlaywrightError:
         return None
     finally:
-        if page is not None:
-            with contextlib.suppress(PlaywrightError):
-                page.close()
-        else:
-            with contextlib.suppress(PlaywrightError):
-                _switch_close_target(browser, tid)
-        browser.close()
+        _deadline_step("bg:teardown")
+        with contextlib.suppress(PlaywrightError):
+            browser.close()  # detaches CDP; the real browser keeps running
         pw.stop()
 
 
@@ -9310,8 +9673,10 @@ def _broker_login(port: int, site: str) -> int:  # pylint: disable=too-many-retu
     bundle, replace the site's in-scope cookies, write its storage keys, then
     verify with `_broker_logged_in`.
     """
+    _deadline_step("broker:precheck")
     rc = _broker_logged_in(port, site)
     if rc == 0:
+        _deadline_step("broker:after")
         return _broker_after_login(port, site)
     if rc != 2:
         return rc
@@ -9322,6 +9687,7 @@ def _broker_login(port: int, site: str) -> int:  # pylint: disable=too-many-retu
     connected = True
     try:
         with _interaction_lease(f"login {site}"):
+            _deadline_step("broker:request")
             try:
                 resp = _broker_request("login", site=site)
             except BrokerUnavailable as exc:
@@ -9336,10 +9702,12 @@ def _broker_login(port: int, site: str) -> int:  # pylint: disable=too-many-retu
                     msg + (f" ({detail})" if detail else ""),
                 )
             bundle = resp.get("bundle") if isinstance(resp.get("bundle"), dict) else {}
+            _deadline_step("broker:cookies")
             n_cookies = _broker_replace_cookies(browser, bundle or {})
             browser.close()
             pw.stop()
             connected = False
+            _deadline_step("broker:storage")
             n_keys = _broker_write_storage(port, bundle or {})
             print(
                 f"Injected {n_cookies} cookie(s) and {n_keys} storage key(s) for {site}."
@@ -9348,12 +9716,14 @@ def _broker_login(port: int, site: str) -> int:  # pylint: disable=too-many-retu
         if connected:
             browser.close()
             pw.stop()
+    _deadline_step("broker:verify")
     rc = _broker_logged_in(port, site)
     if rc != 0:
         return _broker_fail(
             2, f"{site}: session injected but the site is not logged in."
         )
     _record_login_event(site, "broker")
+    _deadline_step("broker:after")
     return _broker_after_login(port, site)
 
 
@@ -9633,7 +10003,11 @@ def _safari_login(port: int, site: str) -> int:
 
 
 def cmd_login_cscs_assisted(port: int) -> int:
-    """The pre-broker CSCS login (keychain / 1Password) — human-only."""
+    """The pre-broker CSCS login (keychain / 1Password) — human-only.
+
+    No `LoginDeadline` on purpose: it needs a terminal and may wait for Albert
+    (Touch ID, a TOTP prompt); only unattended `login`s are bounded (tp#843).
+    """
     if not sys.stdin.isatty():
         return _fail(
             "login-cscs-assisted is human-only (needs a terminal). Agents use "
@@ -10030,26 +10404,95 @@ def _guided_open_owned(tx: Maintenance, url: str) -> str | None:
     return tid
 
 
-def _close_owned_targets(port: int, ids: Sequence[str]) -> list[str]:
-    """Close every still-open owned target (raw CDP); the ids that are gone now.
+# `_close_owned_targets`: how long the closing re-list may poll, and the budget
+# the guided-login transaction (and its watchdog) give it.
+CLOSE_OWNED_CONFIRM_S = 2.0
+MAINT_CLOSE_BUDGET_S = 30.0
 
-    Never closes the last page target: a blank keep-alive goes first (tp#317).
+
+def _port_refuses(port: int, timeout: float) -> bool:
+    """True when nothing listens on the CDP port (the browser is down)."""
+    try:
+        with socket.create_connection(("127.0.0.1", port), timeout=timeout):
+            return False
+    except ConnectionRefusedError:
+        return True
+    except OSError:
+        return False
+
+
+def _close_owned_targets(
+    port: int,
+    ids: Sequence[str],
+    *,
+    budget_s: float = 30.0,
+    journal_event: str | None = "maintenance",
+) -> tuple[list[str], bool]:
+    """Close every still-open owned target (raw CDP) → ``(gone, confirmed)``.
+
+    One monotonic deadline (`budget_s`) covers it all; each HTTP/websocket
+    call gets at most 3 s of what is left. Never closes the last page target:
+    a blank keep-alive goes first (tp#317). Afterwards ``/json/list`` is read
+    again (polled up to CLOSE_OWNED_CONFIRM_S): ``confirmed`` = none of `ids`
+    is listed any more. A browser that refuses connections is down — every
+    id is gone. `journal_event` None = no journal line.
     """
-    gone: list[str] = []
-    ws_url = _browser_ws_url(port)
+    ids = list(ids)
+    if not ids:
+        return [], True
+    deadline = time.monotonic() + budget_s
+
+    def cap() -> float:
+        return max(0.05, min(3.0, deadline - time.monotonic()))
+
+    ws_url = _browser_ws_url(port, timeout=cap())
     if ws_url is None:
-        return list(ids)  # browser down: nothing left to close
+        down = _port_refuses(port, cap())
+        if journal_event is not None:
+            _journal(journal_event, phase="close_owned", owned=len(ids), down=down)
+        return (list(ids), True) if down else ([], False)
     for tid in ids:
-        pages = _page_targets(port)
+        if time.monotonic() >= deadline:
+            break
+        listing = _cdp_get(port, "/json/list", timeout=cap())
+        if not isinstance(listing, list):
+            continue  # cannot apply the keep-alive rule blind: leave it
+        pages = [t for t in listing if isinstance(t, dict) and t.get("type") == "page"]
         if not any(t.get("id") == tid for t in pages):
-            gone.append(tid)
             continue
         if len(pages) <= 1:
-            _cdp_create_background_target(ws_url, "about:blank", 3.0)
-        if _cdp_close_target(port, tid, 3.0, ws_url=ws_url):
-            gone.append(tid)
-    _journal("maintenance", phase="close_owned", closed=len(gone), owned=len(ids))
-    return gone
+            _cdp_create_background_target(ws_url, "about:blank", cap())
+        _cdp_close_target(port, tid, cap(), ws_url=ws_url)
+    gone, confirmed = _confirm_targets_gone(port, ids, deadline)
+    if journal_event is not None:
+        _journal(
+            journal_event,
+            phase="close_owned",
+            closed=len(gone),
+            owned=len(ids),
+            confirmed=confirmed,
+        )
+    return gone, confirmed
+
+
+def _confirm_targets_gone(
+    port: int, ids: Sequence[str], deadline: float
+) -> tuple[list[str], bool]:
+    """Re-read ``/json/list`` until none of `ids` is listed (bounded)."""
+    stop = min(deadline, time.monotonic() + CLOSE_OWNED_CONFIRM_S)
+    while True:
+        left = max(0.25, min(3.0, deadline - time.monotonic()))
+        listing = _cdp_get(port, "/json/list", timeout=left)
+        if isinstance(listing, list):
+            listed = {t.get("id") for t in listing if isinstance(t, dict)}
+            gone = [tid for tid in ids if tid not in listed]
+            if len(gone) == len(ids):
+                return gone, True
+        else:
+            gone = []
+        if time.monotonic() >= stop:
+            return gone, False
+        time.sleep(0.1)
 
 
 def _ensure_headless(port: int) -> bool:
@@ -10279,7 +10722,9 @@ def _maintenance(
                         os.environ.pop("CLAUDE_BROWSER_LEASE_HELD", None)
                     else:
                         os.environ["CLAUDE_BROWSER_LEASE_HELD"] = old_held
-                    _close_owned_targets(port, list(tx.owned))
+                    _close_owned_targets(
+                        port, list(tx.owned), budget_s=MAINT_CLOSE_BUDGET_S
+                    )
                     tx.owned.clear()
                     if not _ensure_headless(port):
                         problems.append("still headed")
@@ -10324,7 +10769,11 @@ def _watchdog_recover(port: int, rec: dict, state: str) -> int:
     """The watchdog's recovery (see `cmd_maintenance_watchdog`)."""
     _journal("watchdog_recover", phase="start", reason=state, site=rec.get("site"))
     owned = [str(t) for t in rec.get("owned_targets") or [] if isinstance(t, str)]
-    closed = _close_owned_targets(port, owned) if owned else []
+    closed, _confirmed = (
+        _close_owned_targets(port, owned, budget_s=MAINT_CLOSE_BUDGET_S)
+        if owned
+        else ([], True)
+    )
     reverted: object = "headless"
     if _browser_mode(port) == "headed":
         with _stdout_to_stderr():
@@ -10591,7 +11040,7 @@ def _guided_a(
             return "fail", f"browser.py login {site} exit {rc}"
         return _guided_a_tab(tx, site, url, deadline)
     finally:
-        _close_owned_targets(tx.port, list(tx.owned))
+        _close_owned_targets(tx.port, list(tx.owned), budget_s=MAINT_CLOSE_BUDGET_S)
         tx.owned.clear()
         tx.note(owned_targets=[])
         _ensure_headless(tx.port)
@@ -10686,6 +11135,10 @@ def cmd_assisted_login(port: int, req: GuidedRequest) -> int:
     Exit 0 logged in (or already was), 1 an error (incl. a failed cleanup),
     2 refused (no terminal, not confirmed, busy) or still not logged in,
     130 cancelled with Ctrl-C.
+
+    No `LoginDeadline` on purpose: a guided login waits for Albert (bounded by
+    GUIDED_TOTAL_S/GUIDED_IDLE_S instead), and its `login`/`logged-in`
+    children inherit the owner token, so they stay unarmed too (tp#843).
     """
     tty = _open_tty()
     if tty is None:
@@ -10755,7 +11208,7 @@ def _offer_window(
 ) -> tuple[str, str]:
     """B could not finish: close its tabs, ask for the window (A) on the terminal."""
     print(f"⚠ the login view cannot finish this login: {why}")
-    _close_owned_targets(tx.port, list(tx.owned))
+    _close_owned_targets(tx.port, list(tx.owned), budget_s=MAINT_CLOSE_BUDGET_S)
     for tid in list(tx.owned):
         tx.drop_owned(tid)
     answer = _tty_ask(tty, "switch to a visible window for this login? [y/N] ")
@@ -10876,6 +11329,7 @@ def _resolve_site(name: str, *, for_login: bool = False) -> Site:
     human-only ``login-cscs-assisted``). An unknown name that the broker lists
     (not refused) becomes a dynamic broker Site; anything else exits 2.
     """
+    _deadline_step("resolve")
     key = name.strip().lower()
     test = _test_sites().get(key)
     if test is not None:
@@ -10913,7 +11367,20 @@ def _resolve_site(name: str, *, for_login: bool = False) -> Site:
 
 
 def cmd_login(port: int, site_name: str) -> int:
-    """Ensure SITE is logged in (automated or assisted, per the site)."""
+    """Ensure SITE is logged in (automated or assisted, per the site).
+
+    Bounded by a `LoginDeadline` (LOGIN_TIMEOUT_S → exit 124/125), armed before
+    anything else — `_resolve_site` already talks to the broker — unless this
+    process owns the live guided-login record (a guided login waits for a
+    human; its children carry $CLAUDE_BROWSER_MAINTENANCE).
+    """
+    key = site_name.strip().lower()
+    with _login_deadline(port, "login", key, LOGIN_TIMEOUT_S, end_event="login"):
+        return _cmd_login(port, site_name)
+
+
+def _cmd_login(port: int, site_name: str) -> int:
+    """`cmd_login`'s body, under its deadline."""
     key = site_name.strip().lower()
     if key in _safari.SAFARI_SITES:
         _journal_note(flow="safari")
@@ -10927,11 +11394,16 @@ def cmd_login(port: int, site_name: str) -> int:
 
 
 def cmd_logged_in(port: int, site_name: str) -> int:
-    """Exit 0 if SITE is logged in, 2 if not."""
+    """Exit 0 if SITE is logged in, 2 if not (124/125: its deadline fired).
+
+    Bounded like `cmd_login`, by LOGGED_IN_TIMEOUT_S — e.g. `logged-in cscs`
+    scans the portal tab with an unbounded ``evaluate``.
+    """
     key = site_name.strip().lower()
-    if key in _safari.SAFARI_SITES:
-        return _safari_logged_in(port, key)
-    return _resolve_site(site_name).logged_in(port)
+    with _login_deadline(port, "logged-in", key, LOGGED_IN_TIMEOUT_S):
+        if key in _safari.SAFARI_SITES:
+            return _safari_logged_in(port, key)
+        return _resolve_site(site_name).logged_in(port)
 
 
 def cmd_store_creds(site_name: str) -> int:

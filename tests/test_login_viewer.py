@@ -553,7 +553,11 @@ def _relay(**over) -> Any:
 def _record(path: Path, **over) -> None:
     rec = {"owner_nonce": "abc", "pid": os.getpid(), "site": "notion"}
     rec.update(over)
-    path.write_text(json.dumps(rec), encoding="utf-8")
+    # Atomic, like the real record: the relay polls it from a worker thread,
+    # and a read between write_text's truncate and write sees no record.
+    tmp = path.with_name(path.name + ".tmp")
+    tmp.write_text(json.dumps(rec), encoding="utf-8")
+    os.replace(tmp, path)
 
 
 def test_maintenance_poll(tmp_path):

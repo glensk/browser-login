@@ -698,7 +698,7 @@ def guided_env(monkeypatch):
             finally:
                 log.append(("release", site))
 
-    def fake_browser(*args, quiet=False):
+    def fake_browser(*args, quiet=False, **_kw):
         log.append(args)
         codes = rc.get(args)
         return codes.pop(0) if codes else 0
