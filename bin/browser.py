@@ -11265,7 +11265,7 @@ def cmd_notion_logged_in(port: int) -> int:
 
 
 # ---------------------------------------------------------------------------
-# Guided login (`assisted-login`, PLAN_focus-free-browser.md Phase 3)
+# Guided login (`assisted-login`, plans-done/PLAN_focus-free-browser_DONE.md Phase 3)
 # ---------------------------------------------------------------------------
 # ONE human entry: `browser.py assisted-login SITE` (agent-login.py -g SITE calls
 # it), confirmed by typing the site name on /dev/tty — no terminal, no start.

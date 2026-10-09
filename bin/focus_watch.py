@@ -2,7 +2,7 @@
 """focus_watch.py — log who takes focus on this Mac, and every Chrome-for-Testing window.
 
 The acceptance instrument for "the shared Chrome for Testing never takes focus
-or opens a window" (PLAN_focus-free-browser.md, Phase 0). It watches on one
+or opens a window" (plans-done/PLAN_focus-free-browser_DONE.md, Phase 0). It watches on one
 Cocoa run loop and appends one JSON line per event:
 
   * activate      — an app became frontmost (NSWorkspace activation

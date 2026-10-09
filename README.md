@@ -152,7 +152,7 @@ Separately, the Claude Code wrapper only auto-starts the browser when
 
 The design goal is that **driving the browser never interferes with your
 desktop**: no focus steal, no window, no z-order change, no native prompt
-(PLAN_focus-free-browser.md, tp#836). It is enforced by one invariant:
+(plans-done/PLAN_focus-free-browser_DONE.md, tp#836). It is enforced by one invariant:
 
 > **The shared browser is HEADLESS unless a live guided-login maintenance
 > record of mode A exists** — written by a guided login you start yourself

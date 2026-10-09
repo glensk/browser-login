@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Remote view of ONE owned headless tab: screencast frames out, input in.
 
-Guided login, design "B" (PLAN_focus-free-browser.md, Phase 3). The shared
+Guided login, design "B" (plans-done/PLAN_focus-free-browser_DONE.md, Phase 3). The shared
 browser runs headless; when a human must log in, this relay attaches to exactly
 one target of the CDP endpoint, streams ``Page.startScreencast`` frames to a
 single loopback web page and forwards the human's input back:
