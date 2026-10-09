@@ -265,6 +265,29 @@ relay exposes only owned targets.
       switch back, active MCP work during B, browser restart, sleep/wake, OAuth popup in B,
       download, permission prompt, passkey site (B → A handoff), launchd cold start, LAN,
       Cisco VPN, cold Cloudflare challenge, leftover viewer tab after cancel.
+      Results 2026-10-09 (disposable instance 9351, real `_maintenance`/`_guided_b`/
+      `_guided_a` in-process; scratchpad `matrix/`):
+
+      | Case                                    | Result | Evidence                                                    |
+      | :-------------------------------------- | :----- | :---------------------------------------------------------- |
+      | SIGKILL owner, mode B                   | ✅     | watchdog recovered in 2.7 s, owned tab closed, client resumed |
+      | SIGKILL owner, mode A                   | ✅     | recovered in 16.1 s (switch headless ~13 s)                 |
+      | SIGKILL owner + watchdog (A, B)         | ✅     | `agent-login -S` backstop recovered (1–7 s)                 |
+      | failed switch back, unregistered peer   | ✅     | loud ❌ lines, record cleared, `problems=1`                 |
+      | lease-less headed + registered client   | ❌→fix | preflight revert blocked by the client gate; fix in progress (revert as a short maintenance transaction) |
+      | lease-less headed, no registered client | ✅     | preflight revert in 1.9 s, stderr only                      |
+      | down/up during B                        | ✅     | `down` 75, `down -F` clean, no leaked record/tabs           |
+      | cancel (SIGINT) a B login               | ✅     | 0.7 s, owned tab closed, relay gone                         |
+      | download in headless owned tab          | ✅     | lands in `<cache>/downloads` (Chrome's temp file passes through `~/Downloads`) |
+      | launchd-like cold start                 | ✅     | headless in 4.7 s, 0 activations, 0 windows                 |
+      | cold Cloudflare (empty profile)         | ✅     | chatgpt.com + claude.ai load, no challenge                  |
+      | focus over all cases                    | ⚠ accepted | 0 activations in B/headless; a mode-A headed launch activates Chrome when another app is frontmost (3×) — accepted: A is only a human-started login whose window must be typed into |
+      | MCP work during a pause                 | ✅     | see the SIGSTOP box above                                   |
+      | mode A live, real SSO                   | ✅     | see the Fallback A box above                                |
+
+      Still open: sleep/wake, Cisco VPN / off-LAN (observed on the next days with focus_watch
+      and `logged-in`), OAuth popup and passkey in B (on the next real login that needs them);
+      headed background-tab freeze → tp#871.
 - [x] Soak: one working day with `focus_watch.py`. Pass = ZERO Chrome-for-Testing
       activations or window creations outside a live guided-login lease, fault tests
       included. On the first unexplained event: put a logging CDP proxy in front of MCP;
