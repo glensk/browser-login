@@ -126,13 +126,15 @@ def _private_mode_state(tmp_path, monkeypatch):
     """The headless-invariant state files of every loaded browser.py live in tmp.
 
     ``desired-mode.json``, ``maintenance.json`` (the guided-login record, + its
-    lock) and the download dir are module constants computed from the live
+    lock), the download dir and the proxy PAC copy are module constants computed from the live
     cache dir at import time;
     a test reaching `cmd_up`/`cmd_switch`/`_headed_lease` must never write the
     real ones. A guided login running on this Mac must not leak into a test
     either, hence the lease env var is cleared.
     """
     monkeypatch.delenv("CLAUDE_BROWSER_MAINTENANCE", raising=False)
+    # A developer's host-map override must not change what a launch test sees.
+    monkeypatch.delenv("CLAUDE_BROWSER_PAC_HOSTS", raising=False)
     state = tmp_path / "mode-state"
     for mod in list(sys.modules.values()):
         if getattr(mod, "MAINTENANCE_FILE", None) is None:
@@ -141,6 +143,8 @@ def _private_mode_state(tmp_path, monkeypatch):
         monkeypatch.setattr(mod, "MAINTENANCE_FILE", state / "maintenance.json")
         monkeypatch.setattr(mod, "MAINTENANCE_LOCK", state / ".maintenance.lock")
         monkeypatch.setattr(mod, "DOWNLOAD_DIR", state / "downloads")
+        if getattr(mod, "PAC_FILE", None) is not None:
+            monkeypatch.setattr(mod, "PAC_FILE", state / "proxy.pac")
     yield
 
 

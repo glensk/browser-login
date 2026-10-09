@@ -116,6 +116,13 @@ framework. It is a **provider**: other repos depend on it, not the reverse. See
   long-lived CDP clients register via `register-exec`; `switch` fails closed
   on unregistered clients. Full contract: README "Why you never see the
   window" and "Consumer contract".
+- **Proxy = per-host PAC only**: the launch passes one inline
+  `--proxy-pac-url=data:…` built from `bin/pac_hosts.json` (or
+  `$CLAUDE_BROWSER_PAC_HOSTS`): listed hosts via their SOCKS proxy with a
+  `; DIRECT` fallback, everything else DIRECT. Never a global `--proxy-server`,
+  never `$ALL_PROXY`; no host → no proxy flag at all. A `file://` PAC URL is
+  ignored by Chrome for Testing 153 — keep the `data:` URL. README "Campus-only
+  hosts (proxy PAC)".
 - **No `--remote-allow-origins`**: CDP WebSocket clients send NO `Origin`
   header (Chrome then answers 403); new `websockets` clients pass
   `origin=None` explicitly.

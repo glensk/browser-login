@@ -511,6 +511,56 @@ master password never reaches the agent. Without the enrolment it asks for the
 typed master password in a terminal. `-N` (new items from the Keychain) is not
 available through Touch ID; it needs `-P` in a terminal.
 
+## Campus-only hosts (proxy PAC)
+
+Some sites answer only from inside a campus network: `groups.epfl.ch` (needed to
+read RCP group administrators) times out from home. `vpn.sh epflproxy` runs an
+EPFL SOCKS5 proxy on `127.0.0.1:1081` (`vpn.sh ethproxy`: ETH on `1080`). The
+shared browser launches with a proxy auto-config (PAC) that sends ONLY the hosts
+in `bin/pac_hosts.json` through their proxy and every other host DIRECT — no
+global proxy, and never `$ALL_PROXY`:
+
+```json
+{
+  "groups.epfl.ch": "SOCKS5 127.0.0.1:1081"
+}
+```
+
+- A key is an exact host; a leading dot (`.epfl.ch`) also matches every
+  subdomain. A value is one `SOCKS5|SOCKS4|SOCKS|PROXY|HTTPS HOST:PORT`. An entry
+  that is not exactly that is skipped (that host goes DIRECT) and named on
+  `up`'s stderr and in `status`.
+- Every proxied rule ends in `; DIRECT`: with the proxy stopped, Chrome falls
+  back to a direct connection for that host (which times out off campus, as
+  before) and nothing else is affected.
+- `CLAUDE_BROWSER_PAC_HOSTS=<file>` replaces the committed map (same JSON
+  shape; `{}` turns the PAC off). Without any host there is no proxy flag at
+  all and the launch is the pre-PAC one.
+- The PAC travels inline as a `data:` URL (`--proxy-pac-url=data:…`): Chrome for
+  Testing 153 ignores a `file://` PAC URL (measured 2026-10-09). `up` writes a
+  0600 copy of exactly what it passed to `~/.cache/claude-browser/proxy.pac`
+  for reading; Chrome never reads that file.
+- CDP is unaffected: clients connect to Chrome on `127.0.0.1`; the PAC only
+  steers Chrome's own outgoing requests.
+
+`browser.py status` shows the map in one line and whether the running browser
+carries it:
+
+```text
+Proxy PAC: groups.epfl.ch → SOCKS5 127.0.0.1:1081 (active; DIRECT when the proxy is down)
+```
+
+The PAC is a launch flag: a change to the map (or the first deployment of this
+feature) does nothing to a browser that is already running — `status` then says
+`NOT in the running browser`. Apply it with a restart, when no guided login or
+long-lived client is in the middle of something:
+
+```commands
+browser.py down
+browser.py up
+browser.py status
+```
+
 ## Troubleshooting
 
 **`open` / `eval` / `doctor` / `login` fail with "could not attach … within

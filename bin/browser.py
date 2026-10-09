@@ -137,6 +137,7 @@ disk). No system browser is touched, so this never collides with your daily Brav
 
 import argparse
 import atexit
+import base64
 import contextlib
 import dataclasses
 import fcntl
@@ -2481,6 +2482,176 @@ def _apply_profile_prefs() -> str | None:
     return None
 
 
+# Proxy auto-config (PAC): a few hosts are reachable only from inside a campus
+# network (groups.epfl.ch times out from home). The shared browser routes ONLY
+# the hosts listed in `bin/pac_hosts.json` through their SOCKS5 proxy (run by
+# `vpn.sh epflproxy` / `ethproxy`) and every other host DIRECT — no global
+# proxy, never $ALL_PROXY. CDP is unaffected: clients connect TO Chrome on
+# 127.0.0.1, the PAC only steers Chrome's own outgoing requests. Each rule ends
+# in `; DIRECT`, so a stopped proxy degrades to the old direct attempt instead
+# of an error page for that host — and nothing else changes at all.
+#
+# Chrome for Testing 153 IGNORES a `file://` --proxy-pac-url (measured
+# 2026-10-09: groups.epfl.ch still timed out direct) and honours an inline
+# `data:` URL, so the PAC travels inline. PAC_FILE is the 0600 copy of exactly
+# what was passed, for a human to read; Chrome never reads it.
+PAC_HOSTS_FILE = Path(__file__).resolve().parent / "pac_hosts.json"
+PAC_HOSTS_ENV = "CLAUDE_BROWSER_PAC_HOSTS"
+PAC_FILE = CACHE_DIR / "proxy.pac"
+PAC_URL_PREFIX = "data:application/x-ns-proxy-autoconfig;base64,"
+# A host label, optionally with a leading dot for "this domain and every
+# subdomain" (`.epfl.ch`). Lowercase only; the loader lowercases first.
+_PAC_HOST_RE = re.compile(
+    r"\.?[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)*"
+)
+# One proxy directive as Chrome's PAC result grammar spells it. Strict on
+# purpose: the value is pasted into JavaScript, and DIRECT is implicit.
+_PAC_PROXY_RE = re.compile(
+    r"(SOCKS5|SOCKS4|SOCKS|PROXY|HTTPS) ([A-Za-z0-9.-]+):(\d{1,5})"
+)
+
+
+def _pac_hosts_path() -> Path:
+    """The host → proxy map in force: $CLAUDE_BROWSER_PAC_HOSTS, else the repo's."""
+    override = os.environ.get(PAC_HOSTS_ENV, "").strip()
+    return Path(override).expanduser() if override else PAC_HOSTS_FILE
+
+
+def _parse_pac_hosts(data: object) -> tuple[dict[str, str], list[str]]:
+    """Validate a decoded host map; (the valid entries, one problem per bad one)."""
+    if not isinstance(data, dict):
+        return {}, ["not a JSON object of host → proxy"]
+    hosts: dict[str, str] = {}
+    problems: list[str] = []
+    for raw_host, raw_proxy in data.items():
+        host = str(raw_host).strip().lower()
+        proxy = raw_proxy.strip() if isinstance(raw_proxy, str) else ""
+        m = _PAC_PROXY_RE.fullmatch(proxy)
+        if not _PAC_HOST_RE.fullmatch(host):
+            problems.append(f"{raw_host!r}: not a host name")
+        elif m is None or not 0 < int(m.group(3)) < 65536:
+            problems.append(
+                f"{raw_host!r}: proxy {raw_proxy!r} is not 'SOCKS5 HOST:PORT'"
+            )
+        else:
+            hosts[host] = proxy
+    return hosts, problems
+
+
+def _load_pac_hosts() -> tuple[dict[str, str], list[str]]:
+    """The valid host → proxy entries and every problem (never raises).
+
+    A missing or unreadable file means no PAC at all — the browser then
+    launches exactly as before this feature; an invalid entry is skipped
+    (that host goes DIRECT) and named. Only the repo's own file may be absent
+    silently; a missing $CLAUDE_BROWSER_PAC_HOSTS file is a problem.
+    """
+    path = _pac_hosts_path()
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return {}, ([] if path == PAC_HOSTS_FILE else [f"{path}: missing"])
+    except (OSError, ValueError) as exc:
+        return {}, [f"{path}: {exc}"]
+    hosts, problems = _parse_pac_hosts(data)
+    return hosts, [f"{path}: {p}" for p in problems]
+
+
+def _render_pac(hosts: Mapping[str, str]) -> str:
+    """The PAC script: each listed host via its proxy (then DIRECT), the rest DIRECT.
+
+    Exact hosts are tested before `.domain` suffix rules, each group sorted, so
+    the same map always renders the same bytes (the launch flag and `status`
+    compare them). Values are JSON-quoted on top of the loader's validation.
+    """
+    exact = sorted(h for h in hosts if not h.startswith("."))
+    suffix = sorted(h for h in hosts if h.startswith("."))
+    lines = [
+        "function FindProxyForURL(url, host) {",
+        "  host = host.toLowerCase();",
+    ]
+    for h in exact:
+        route = json.dumps(f"{hosts[h]}; DIRECT")
+        lines.append(f"  if (host === {json.dumps(h)}) return {route};")
+    for h in suffix:
+        route = json.dumps(f"{hosts[h]}; DIRECT")
+        lines.append(
+            f"  if (host === {json.dumps(h[1:])} || host.endsWith({json.dumps(h)})) "
+            f"return {route};"
+        )
+    lines += ['  return "DIRECT";', "}", ""]
+    return "\n".join(lines)
+
+
+def _pac_url(pac: str) -> str:
+    """The inline ``data:`` URL Chrome accepts for --proxy-pac-url."""
+    return PAC_URL_PREFIX + base64.b64encode(pac.encode("utf-8")).decode("ascii")
+
+
+def _pac_summary(hosts: Mapping[str, str]) -> str:
+    """``groups.epfl.ch → SOCKS5 127.0.0.1:1081, …`` (sorted, one line)."""
+    return ", ".join(f"{h} → {hosts[h]}" for h in sorted(hosts))
+
+
+def _proxy_flags() -> list[str]:
+    """The launch flag for the PAC (``[]`` without hosts); writes PAC_FILE.
+
+    No host → no flag, so the launch is byte-identical to the pre-PAC one.
+    Problems only warn (stderr): a bad entry or an unwritable PAC_FILE must
+    never stop the shared browser from coming up.
+    """
+    hosts, problems = _load_pac_hosts()
+    for problem in problems:
+        print(f"⚠ proxy PAC: {problem}", file=sys.stderr)
+    if not hosts:
+        return []
+    pac = _render_pac(hosts)
+    try:
+        PAC_FILE.parent.mkdir(parents=True, exist_ok=True)
+        tmp = _unique_tmp(PAC_FILE)
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write(pac)
+        os.replace(tmp, PAC_FILE)
+    except OSError as exc:
+        print(f"⚠ proxy PAC: copy not written to {PAC_FILE}: {exc}", file=sys.stderr)
+    return [f"--proxy-pac-url={_pac_url(pac)}"]
+
+
+def _running_pac_url(port: int) -> str | None:
+    """The --proxy-pac-url of the running root browser; "" = none, None = unknown."""
+    pids = _find_root_pids(port)
+    if len(pids) != 1:
+        return None
+    cmd = _proc_command(pids[0])
+    if cmd is None:
+        return None
+    m = re.search(r"--proxy-pac-url=(\S+)", cmd)
+    return m.group(1) if m else ""
+
+
+def _pac_status_line(port: int) -> str:
+    """One ``Proxy PAC:`` line for `status`: the hosts and whether they are live."""
+    hosts, problems = _load_pac_hosts()
+    warn = f" ⚠ ignored: {'; '.join(problems)}" if problems else ""
+    if not hosts:
+        return f"Proxy PAC: none configured{warn}"
+    if not _is_up(port):
+        state = "applied at the next `browser.py up`"
+    else:
+        running = _running_pac_url(port)
+        if running is None:
+            state = "running browser unknown"
+        elif running == _pac_url(_render_pac(hosts)):
+            state = "active; DIRECT when the proxy is down"
+        else:
+            state = (
+                "NOT in the running browser — "
+                "`browser.py down` then `browser.py up` applies it"
+            )
+    return f"Proxy PAC: {_pac_summary(hosts)} ({state}){warn}"
+
+
 def _launch_and_record(port: int, headless: bool) -> int:
     """Cold-launch the shared browser and record it. Shared by ``up``/``switch``.
 
@@ -2536,6 +2707,8 @@ def _launch_and_record(port: int, headless: bool) -> int:
         user_agent = _headless_user_agent(binary)
         if user_agent:
             flags.append(f"--user-agent={user_agent}")
+    # Only the hosts in bin/pac_hosts.json via their SOCKS proxy, all else DIRECT.
+    flags.extend(_proxy_flags())
     pref_problem = _apply_profile_prefs()
     if pref_problem is not None:
         print(f"⚠ profile prefs not applied: {pref_problem}", file=sys.stderr)
@@ -3801,6 +3974,7 @@ def _print_lifecycle(port: int) -> None:
         print(f"  ⚠ {problem}")
     print(f"Desired mode: {_desired_mode_state()}")
     print(f"Headed lease: {_headed_lease_describe()}")
+    print(_pac_status_line(port))
 
 
 PROBE_MARKS = {"unresponsive": "  ⚠ unresponsive", "indeterminate": "  ? indeterminate"}
@@ -7367,7 +7541,6 @@ def _magic_link_email(link: str) -> str | None:
     lower-cased. Standard or URL-safe base64, padding optional. None when the
     link is not a full `_MAGIC_LINK_RE` match or the part does not decode to
     exactly one address."""
-    import base64
     import binascii
 
     if not link or not _MAGIC_LINK_RE.fullmatch(link):
