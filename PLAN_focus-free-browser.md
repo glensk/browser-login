@@ -202,8 +202,9 @@ is not installed, so the viewer opens in the DEFAULT browser (Safari, Albert's d
 profile) — accepted for now: loopback-only, one-shot token bound to an HttpOnly cookie,
 relay exposes only owned targets.
 
-- [ ] Single entry: `agent-login.py -g <site>` → `browser.py assisted-login <site>`,
+- [x] Single entry: `agent-login.py -g <site>` → `browser.py assisted-login <site>`,
       confirmation typed on `/dev/tty`.
+      2026-10-09: done; `agent-login.py -g SITE -F` passes `-f` through (13ae308).
 - [x] Maintenance transaction (B and A): take the client gate exclusively; pause registered
       long-lived clients (the `register-exec` wrapper SIGSTOPs its child's process group,
       SIGCONTs on clear); refuse if unregistered CDP peers exist (`-f` overrides); write the
@@ -216,51 +217,59 @@ relay exposes only owned targets.
       LaunchAgent watcher) reverts headed → headless and closes owned targets within 30 s of
       a stale heartbeat. Residual, stated: an already-running MCP reconnecting inside that
       window after a SIGKILL could reach a headed browser — covered by the SIGKILL fault test.
-- [ ] B spike on the pinned CfT 153, pass criteria: typing, Tab/Enter/modifiers/dead keys,
+- [x] B spike on the pinned CfT 153, pass criteria: typing, Tab/Enter/modifiers/dead keys,
       clipboard paste of a password, non-ASCII + IME composition, scrolling, scaled-coordinate
       clicks. Stock DevTools screencast first (same-origin from `127.0.0.1:9222`); expected
       result: own minimal viewer — screencast frames + hidden textarea,
       `beforeinput`/paste/composition → `Input.insertText` / `Input.imeSetComposition`,
       mouse/wheel → `Input.dispatchMouseEvent` — served by a tokenized loopback relay that
       exposes only that CDP subset for owned targets, with exactly its origin allowed.
-- [ ] Viewer opens in a dedicated extension-free Brave profile (or a CfT app-mode window
+      2026-10-08: all criteria ✅ (results: stock screencast rejected, own viewer `bin/login_viewer.py`); 2026-10-09 live Notion login through it.
+- [x] Viewer opens in a dedicated extension-free Brave profile (or a CfT app-mode window
       with its own throwaway profile) — never Albert's daily profile.
+      Deviation accepted 2026-10-09: no Brave on this Mac → default browser (Safari); loopback only, one-shot cookie-bound token, owned targets only.
 - [x] Owned targets: B always creates a dedicated login target (never reuses a site tab);
       a target supervisor follows new targets whose `openerId` is owned (OAuth popups),
       switches the viewer to them, handles popup close + opener redirect, never selects a
       non-owned tab. Owned ids live in the maintenance record and are closed on success,
       timeout, cancel and stale-heartbeat recovery.
-- [ ] Unsupported surfaces end B within seconds with a named reason: JS dialogs handled in
+- [x] Unsupported surfaces end B within seconds with a named reason: JS dialogs handled in
       the viewer; WebAuthn/passkey, permission requests, client-cert and external-protocol
       prompts → close owned targets, offer fallback A in the same transaction. B idle
       timeout 5 min.
+      Implemented and unit-tested (df04a95); live passkey/permission cases stay in the acceptance matrix below.
 - [ ] Fallback A: transactional `switch headed` → login with the window shown →
       `switch headless`, inside the same maintenance lease; the only path allowed to show or
       raise a window.
 
 ### Phase 4 — docs and acceptance
 
-- [ ] Docs: README "Why you never see the window" (headless default, why the old NO-GO
+- [x] Docs: README "Why you never see the window" (headless default, why the old NO-GO
       changed, guided login B/A, invariant), AGENTS.md conventions, `README_AUTOLOGIN.md`.
+      2026-10-09: README §"Why you never see the window", AGENTS.md conventions, README_AUTOLOGIN.md paragraph.
 - [ ] Live acceptance matrix, ✅/❌ recorded here: SIGKILL during guided login, failed
       switch back, active MCP work during B, browser restart, sleep/wake, OAuth popup in B,
       download, permission prompt, passkey site (B → A handoff), launchd cold start, LAN,
       Cisco VPN, cold Cloudflare challenge, leftover viewer tab after cancel.
-- [ ] Soak: one working day with `focus_watch.py`. Pass = ZERO Chrome-for-Testing
+- [x] Soak: one working day with `focus_watch.py`. Pass = ZERO Chrome-for-Testing
       activations or window creations outside a live guided-login lease, fault tests
       included. On the first unexplained event: put a logging CDP proxy in front of MCP;
       if still unexplained, make the proxy the only 9222 endpoint (Chrome on an internal
       port).
+      2026-10-09 PASS: focus log 2026-10-08 15:53 → 2026-10-09 14:02 (22 h incl. a working day, a guided login, 2 browser restarts by another session): 0 Chrome activations, 730 `window_new` all off-screen, 0 shown.
 
 ### Fallback phase — only if Phase 1's gate fails
 
-- [ ] Spike a second macOS GUI user first: off-session rAF/input/screenshots, cross-user
+- [x] Spike a second macOS GUI user first: off-session rAF/input/screenshots, cross-user
       loopback CDP, fast user switching, reboot + FileVault recovery, Local Network TCC,
       Cisco VPN.
-- [ ] Then a Linux VM (OrbStack/Lima, headed on Xvfb): decide where lifecycle/login code
+      Not needed: Phase 1's gate passed (headless works for every site).
+- [x] Then a Linux VM (OrbStack/Lima, headed on Xvfb): decide where lifecycle/login code
       runs and how control crosses the boundary; expect full re-login; test Cisco
       split-tunnel routing and internal DNS from inside the VM.
-- [ ] Pick by that matrix; nixos stays rejected.
+      Not needed: Phase 1's gate passed (headless works for every site).
+- [x] Pick by that matrix; nixos stays rejected.
+      Not needed: Phase 1's gate passed (headless works for every site).
 
 ## Verification
 
