@@ -237,9 +237,13 @@ deadline.
     lives; new bullet "Owned-tab ledger (tp#845)" — three ownership kinds, two-phase
     marker, tri-state liveness, reaping only via `reap-owned`/the maintenance
     transaction/the watchdog, never `_preflight`/`status`.
-- [ ] **15. Deploy.** `browser.py doctor` on a disposable instance; on live: `logged-in
+- [x] **15. Deploy.** `browser.py doctor` on a disposable instance; on live: `logged-in
       openai`, then `reap-owned -n` and `status` show no leftover chatgpt tab (tp#845
       acceptance). File the follow-up tp for `open` blank-tab reuse.
+      2026-10-09: merged as 07cf209; disposable doctor 16 ✅ (owned-tab ledgers:
+      none); live openai/notion/anthropic/slack ✓ in 7–9 s (33–44 s before),
+      `reap-owned -n` 0 dead owners, no leftover tab. Follow-ups: tp#863 (`open`
+      blank-tab reuse), tp#864 (`_switch_probe` unledgered tab).
 
 ## Implementation notes (steps 0–14, worktree build)
 
