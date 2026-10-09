@@ -246,9 +246,15 @@ relay exposes only owned targets.
       prompts → close owned targets, offer fallback A in the same transaction. B idle
       timeout 5 min.
       Implemented and unit-tested (df04a95); live passkey/permission cases stay in the acceptance matrix below.
-- [ ] Fallback A: transactional `switch headed` → login with the window shown →
+- [x] Fallback A: transactional `switch headed` → login with the window shown →
       `switch headless`, inside the same maintenance lease; the only path allowed to show or
       raise a window.
+      2026-10-09 live (`agent-login.py -g switch`, mode A): headed 14:36:59 → headless
+      14:37:18 (19 s), login 14 s with no input (edu-ID session alive), playwright-mcp
+      paused + resumed, record cleared, `logged-in switch` ✅. focus_watch: Chrome windows
+      on-screen only inside the lease, zero Chrome activations (iTerm2 stayed frontmost).
+      Albert was needed only because the unattended path skips the background SSO click
+      when the broker refuses (tp#866).
 
 ### Phase 4 — docs and acceptance
 
