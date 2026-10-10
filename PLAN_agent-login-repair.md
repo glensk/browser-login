@@ -251,8 +251,9 @@ manual acceptance steps under the attempt policy below.
         fails closed by holding the app down if upstream code drifts. Verified live: reset
         refused, hashes unchanged, login via the button and via Enter both work. Upstream
         comment posted on CWA #1585.
-  - [ ] Albert sets the `calibre` item to user `agent` + Keychain password, and drops the
-        `192.168.178.72` URI.
+  - [x] Albert set the `calibre` item (2026-10-10). Broker snapshot verified: user `agent`,
+        password len 32 `47b0`, check `/me`, sentinel `#top_tasks`, cookie names
+        `session,remember_token`, `fresh_login` true, LAN URI removed.
 - [ ] WS1a release order (re-review 2026-10-10: B1–B5, C1–C3, N1/N2 fixed; tp#893):
   1. [x] Client committed and pushed 2026-10-10 (`5e55b33`). Sentinel-less sites keep the old proof.
   2. [x] 2026-10-10: a check-only `-c` over all 54 sites, with every site pending. The
