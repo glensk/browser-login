@@ -292,7 +292,13 @@ manual acceptance steps under the attempt policy below.
       is deleted). The `Cloudflare` login item was taken out of agent-secrets and lost
       agent_secret_id/agent_secret_fields/api_key, done in Albert's Safari via AppleScript.
       Verified: `secret-run -l` lists only cloudflare-api-key, and the Cloudflare broker
-      login still works. Phase 2 of the leaked DNS token's rotation is running (tp#97).
+      login still works.
+- [x] Leaked Cloudflare DNS token rotated (2026-10-10, tp#97/tp#660):
+  - Three new tokens (`npm-dns01-nixos`, `npm-dns01-raspi`, `network-apis-dns-read`)
+    replaced it. The old `68b86542…` is deleted and now gets 401 code 1000.
+  - Real renewals on nixos and the raspi; nixos nginx reloaded. The raspi add-on was
+    restarted with Albert's go, and serves the cert until 2027-01-08; all 7 hosts answer.
+  - Records committed in macbook2014-nixos, credplane and tp.
 - [ ] WS3 — onboarding guard (plan → codex-debate → implement): static validation of a new
       item (sentinel present, fill origins, cookie scope, attempt group), a budgeted
       promotion test (`pending` → `usable`), and a removal path (`broker-add.py` remove or
