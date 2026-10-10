@@ -236,7 +236,26 @@ manual acceptance steps under the attempt policy below.
       - Both stay `pending` forever, so the scheduled check probes and never submits.
   - [ ] galaxus-de: same analysis. No Safari cookies and no TOTP, so it gets an assisted
         login (Albert once, in the window) plus monitoring.
-  - [ ] myfritz-alzenau
+  - [ ] myfritz-alzenau / myfritz-prilly
+    - [x] Root cause (read-only, Codex diagnose converged in round 1): phase `submit`, a
+          false `needs_human`. sso.myfritz.net (Keycloak) shows an INVISIBLE, self-submitting
+          reCAPTCHA page between password and OTP. `challenge_reason` flags any visible
+          recaptcha iframe within 500 ms. prilly once won the race (2026-10-09).
+          alzenau (volker99934@proton.me) also hits "Dein E-Mail-Konto existiert nicht mehr".
+          The two items are DIFFERENT accounts on one Keycloak scope, so they overwrite each
+          other. prilly's logout = Keycloak's 10 h max session.
+    - [ ] Code (after CSCS):
+      - classify challenges (invisible anchor ≠ challenge; checkbox/popup = challenge;
+            a grace period that resets on navigation; never click);
+      - snapshot the challenge page at detection time;
+      - no `fresh_login` for myfritz (it would drop CLOUD_SSO_DEVICE).
+    - [ ] Albert: merge the Alzenau box into the gmail MyFRITZ account? (asked 2026-10-10)
+- [ ] WS5 — account identity (tp#833, hit 2026-10-10): 8 same-scope groups report ✅ for
+      the wrong account; gitlab-sdsc-test passed while the browser was `albertadmin`.
+      Plan → codex-debate → implement:
+  - identity proof per item (in-page compare against the vault username, never printed);
+  - same-scope group invalidation;
+  - per-account browser instances, or merged accounts, where two accounts are needed.
   - [ ] notion: instrument why the session expires (vendor policy or lost profile state). No
         subagent runs a guided login. Albert does exactly one `-g notion`, observed over the
         interval. "Monitored + alert to Albert" is an acceptable durable outcome.
@@ -367,6 +386,10 @@ manual acceptance steps under the attempt policy below.
   blank page. Check the server's access log before believing a submit failed.
 - Debate outcome files: every subagent must write its own path. The shared
   `$TMPDIR/ccc-codex-debate/<session>.outcome.json` was overwritten between two debates.
+- An invisible, self-submitting reCAPTCHA is not a human challenge. The failure screenshot
+  can show the page AFTER the culprit; read the broker profile's visit history instead.
+- Same cookie scope + different accounts = silent overwrite, with every sibling still ✅.
+  A logged-in proof must prove WHICH account (WS5).
 - Subagents never see SessionStart output, only a SubagentStart hook's `additionalContext`. A
   Codex hook without a trust row is skipped silently in `codex exec`, and each seat needs its
   own row.
