@@ -160,6 +160,14 @@ manual acceptance steps under the attempt policy below.
     - [x] Vault updated by Albert 2026-10-10: both NPM login items and `npm-password` show
           len 28 `e426`. The duplicate `npm-admin-password` (no consumer) was deleted.
           Albert's own login on both NPM instances works with this value.
+    - [x] Canary root cause (WS2-npm builder, Codex converged in round 3): the broker
+          profile's HTTP cache held the pre-upgrade NPM `index.html` (no Cache-Control). Its
+          hashed assets were gone after the 2026-10-09 container recreate, and NPM serves HTML
+          for them, so the SPA rendered blank. It was not a reload.
+          Fix built: clear the cache at every broker launch; script-MIME diagnostics; polled
+          sentinel; blank page = indeterminate; NPM JWT refresher; `refresh_only`; bundle
+          completeness + rollback. Server side: tp#898. Deferred to WS1b: a 6-hourly
+          `login --refresh-only` keeps the 1-day token alive.
     - [ ] Code (after WS1a):
       - poll `sentinel_shown()` instead of `wait_for_selector`, since the first
             `a[href='/nginx/proxy']` is a hidden navbar item;
@@ -196,7 +204,27 @@ manual acceptance steps under the attempt policy below.
       - the promotion gate requires the sentinel visible after a real login.
     - [ ] Security defects in CWA itself: tp#886 (needs Albert's decision).
   - [ ] galaxus
-  - [ ] galaxus-de
+    - [x] Root cause (read-only, Codex diagnose converged in round 1): phase `submit`. The
+          identity server accepts the e-mail, then shows "Deine Anmeldedaten sind nicht
+          korrekt" for the password. Galaxus' frontend shows that text for `InvalidCredentials`
+          AND for `Unknown`, and Galaxus answers a failed reCAPTCHA/bot check with it on
+          purpose. Most likely bot rejection of the headless broker (Akamai Bot Manager +
+          reCAPTCHA, about 70 %); a stale password is the alternative. Albert is unsure which
+          vault item filled his 2026-09-19 Safari login, so we take the branch that works
+          either way: **no more broker submits**. galaxus.ch and galaxus.de are SEPARATE
+          accounts (separate groups).
+    - [ ] Build (after the npm release, same files):
+      - `SAFARI_SITES["galaxus"]`: import Albert's Safari session; per-site flag that drops
+            Chromium's own bot cookies.
+      - `BOT_COOKIE_DENY` += `bm_*`.
+      - `MANUAL_START` += galaxus, galaxus-de, using the headed window flow.
+      - Allowlisted reason codes from `submit-password` (`idp_invalid_credentials` /
+            `idp_unknown` / `captcha_required`).
+      - Vault: sentinel `[data-testid="customer-account-button"]`, check `/de/orders`; Albert
+            sets the groups `digitecgalaxus-ch` / `galaxus-eu` by hand.
+      - Both stay `pending` forever, so the scheduled check probes and never submits.
+  - [ ] galaxus-de: same analysis. No Safari cookies and no TOTP, so it gets an assisted
+        login (Albert once, in the window) plus monitoring.
   - [ ] myfritz-alzenau
   - [ ] notion: instrument why the session expires (vendor policy or lost profile state). No
         subagent runs a guided login. Albert does exactly one `-g notion`, observed over the
