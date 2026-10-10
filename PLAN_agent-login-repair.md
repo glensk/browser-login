@@ -227,13 +227,24 @@ manual acceptance steps under the attempt policy below.
         `192.168.178.72` URI.
 - [ ] WS1a release order (re-review 2026-10-10: B1–B5, C1–C3, N1/N2 fixed; tp#893):
   1. [x] Client committed and pushed 2026-10-10 (`5e55b33`). Sentinel-less sites keep the old proof.
-  2. Run the free `browser.py logged-in` for every sentinel site, then `agent-login.py -x`.
+  2. [x] 2026-10-10: a check-only `-c` over all 54 sites, with every site pending. The
+     limiter.json hash was identical before and after (`8f39f83c…`), so the daily check no
+     longer burns the limiter. 33 ✅. The 8 origin mismatches are all logged-out sites
+     redirected to their IdP, which is expected; no logged-in site mismatched. `-V`: all 48
+     selectors pass. Original text of this step:
+     Run the free `browser.py logged-in` for every sentinel site, then `agent-login.py -x`.
      Every site whose page ends on another origin gets `agent_proof_origins`
      (broker-add has no column for it yet → extend or edit by hand) BEFORE step 3.
      Otherwise the stricter origin rule would quarantine working sites (risk R-a).
   3. Selector check: done 2026-10-10, 0 of 48 current selectors fail the plain-CSS rule
      (R-b). Re-run the new read-only helper right before the install.
-  4. `sudo install/install.sh` + selfcheck, then one canary, then the candidate logins.
+  4. [x] Broker installed 2026-10-10 (release `fd9f8a063d90`), selfcheck all ✅.
+     Canary npm-nixos (1 submit): the server accepted it (`POST /api/tokens 200`,
+     `/api/users/me 200`), but the post-submit proof judged during NPM's page reload and
+     recorded "still on login page" [phase submit] → cooldown + quarantine. This is a proof
+     timing bug for SPAs that reload after login. Fix with the WS2-npm builder (poll the
+     sentinel, wait for reload, indeterminate on a blank page, profile reuse for storage
+     tokens, JWT refresh). Re-test after that release, then the candidate logins.
 - [x] Sentinel batch 1 (broker-add, Albert's Touch ID, 2026-10-10): anibis, docker,
       docker-hub (check URL → app.docker.com), infomaniak, ricardo, tutti, zoho-desk, both
       NPMs (`a.card-link[href='/nginx/proxy']`), calibre (`#top_tasks`, check `/me`).
@@ -298,6 +309,11 @@ manual acceptance steps under the attempt policy below.
   - apps with anonymous browsing need a check URL that requires login (`/me`);
   - apps that tie sessions to IP+UA survive bundle injection only via remember-me;
   - apps whose session row isn't extended by use need `agent_fresh_login` to refresh.
+- A post-submit proof must wait out SPA reloads: NPM stores the JWT and calls
+  `location.reload()`, and a proof taken mid-reload reads "still on the login page" or a
+  blank page. Check the server's access log before believing a submit failed.
+- Debate outcome files: every subagent must write its own path. The shared
+  `$TMPDIR/ccc-codex-debate/<session>.outcome.json` was overwritten between two debates.
 - Subagents never see SessionStart output, only a SubagentStart hook's `additionalContext`. A
   Codex hook without a trust row is skipped silently in `codex exec`, and each seat needs its
   own row.
