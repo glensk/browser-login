@@ -31,7 +31,6 @@ import os
 import pty
 import select
 import signal
-import socket
 import subprocess
 import sys
 import threading
@@ -43,6 +42,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+from ports import unused_port
 
 _REPO = Path(__file__).resolve().parent.parent
 BROWSER_PY = _REPO / "bin" / "browser.py"
@@ -59,12 +59,12 @@ def _load(name: str, path: Path):
 
 
 browser = _load("browser_guided_test", BROWSER_PY)
+PORT = unused_port()  # the nominal CDP port of the in-process tests
 
 
 def _free_port() -> int:
-    with socket.socket() as s:
-        s.bind(("127.0.0.1", 0))
-        return int(s.getsockname()[1])
+    """A port nothing uses, below the ephemeral range (tp#905)."""
+    return unused_port()
 
 
 def _wait(pred, timeout: float, step: float = 0.1):
@@ -202,7 +202,7 @@ def test_assisted_login_help_has_short_flags():
 
 
 def test_maintenance_record_lifecycle(quiet_tx, monkeypatch):
-    with browser._maintenance("slack", "B", port=59990) as tx:
+    with browser._maintenance("slack", "B", port=PORT) as tx:
         rec = _record()
         assert rec["owner_nonce"] == tx.nonce and rec["mode"] == "B"
         assert rec["state"] == "active" and rec["watchdog_pid"] == 4242
@@ -223,7 +223,7 @@ def test_maintenance_record_lifecycle(quiet_tx, monkeypatch):
 
 def test_maintenance_cleans_up_on_an_exception(quiet_tx):
     with pytest.raises(KeyboardInterrupt):
-        with browser._maintenance("slack", "B", port=59990) as tx:
+        with browser._maintenance("slack", "B", port=PORT) as tx:
             tx.add_owned("T9")
             raise KeyboardInterrupt
     assert not browser.MAINTENANCE_FILE.exists()
@@ -233,7 +233,7 @@ def test_maintenance_cleans_up_on_an_exception(quiet_tx):
 def test_maintenance_refuses_while_another_guided_login_lives(quiet_tx):
     _write_record()
     with pytest.raises(browser.HeadedLeaseBusy, match="already owns the browser"):
-        with browser._maintenance("notion", "B", port=59990):
+        with browser._maintenance("notion", "B", port=PORT):
             pytest.fail("must not start")
     assert _record()["owner_nonce"] == "f" * 32  # the other one is untouched
 
@@ -244,13 +244,13 @@ def test_maintenance_refuses_unregistered_peers_unless_forced(quiet_tx, monkeypa
         browser, "_unknown_clients_verdict", lambda port: "1 unregistered CDP client"
     )
     with pytest.raises(browser.MaintenanceRefused, match="unregistered") as exc:
-        with browser._maintenance("slack", "B", port=59990):
+        with browser._maintenance("slack", "B", port=PORT):
             pytest.fail("must not start")
     # The refusal names both ways to force it: browser.py's and agent-login's.
     assert "-f/--force" in str(exc.value)
     assert "agent-login.py -g slack -F" in str(exc.value)
     assert not browser.MAINTENANCE_FILE.exists()
-    with browser._maintenance("slack", "B", port=59990, force=True) as tx:
+    with browser._maintenance("slack", "B", port=PORT, force=True) as tx:
         assert _record()["owner_nonce"] == tx.nonce
 
 
@@ -275,7 +275,7 @@ def test_preflight_treats_a_mode_a_record_as_the_lease(cmd, mode, live, want):
 def test_registration_without_the_token_refuses(cache, capsys):
     _write_record(owner_nonce="a" * 32)
     with pytest.raises(SystemExit) as exc:
-        browser._registry_register("agent", "eval", 59990)
+        browser._registry_register("agent", "eval", PORT)
     assert exc.value.code == browser.BUSY_RC == 75  # busy, NOT "logged out" (2)
     err = capsys.readouterr().err
     assert err.startswith("busy: guided login for slack in progress (until ~")
@@ -286,7 +286,7 @@ def test_registration_without_the_token_refuses(cache, capsys):
 def test_registration_with_the_token_is_marked_as_ours(cache, monkeypatch):
     _write_record(owner_nonce="a" * 32)
     monkeypatch.setenv(browser.MAINTENANCE_ENV, "a" * 32)
-    reg = browser._registry_register("viewer", "relay", 59990)
+    reg = browser._registry_register("viewer", "relay", PORT)
     try:
         rec = json.loads(reg.path.read_text(encoding="utf-8"))
         assert rec["maintenance"] == "a" * 32
@@ -299,7 +299,7 @@ def test_registration_with_the_token_is_marked_as_ours(cache, monkeypatch):
 
 def test_registration_after_the_record_ended_is_normal(cache):
     _write_record(heartbeat=time.time() - 500)  # hung owner = not live
-    reg = browser._registry_register("agent", "eval", 59990)
+    reg = browser._registry_register("agent", "eval", PORT)
     reg()
 
 
@@ -517,7 +517,7 @@ def flow(quiet_tx, monkeypatch):
 def test_b_fallback_asks_and_switches_to_a_on_yes(flow, capsys):
     tty = _FakeTty("testsite", "y")
     assert (
-        browser._assisted_login_tty(tty, 59990, browser.GuidedRequest("testsite")) == 0
+        browser._assisted_login_tty(tty, PORT, browser.GuidedRequest("testsite")) == 0
     )
     assert flow == ["B http://x/login", "A B"]  # A runs inside the SAME transaction
     assert "switch to a visible window" in tty.prompts[-1]
@@ -528,7 +528,7 @@ def test_b_fallback_asks_and_switches_to_a_on_yes(flow, capsys):
 def test_b_fallback_declined_is_exit_2(flow):
     tty = _FakeTty("testsite", "")
     assert (
-        browser._assisted_login_tty(tty, 59990, browser.GuidedRequest("testsite")) == 2
+        browser._assisted_login_tty(tty, PORT, browser.GuidedRequest("testsite")) == 2
     )
     assert flow == ["B http://x/login"]
 
@@ -537,7 +537,7 @@ def test_fallback_window_flag_goes_straight_to_a(flow):
     tty = _FakeTty("testsite")
     assert (
         browser._assisted_login_tty(
-            tty, 59990, browser.GuidedRequest("testsite", window=True)
+            tty, PORT, browser.GuidedRequest("testsite", window=True)
         )
         == 0
     )
@@ -548,7 +548,7 @@ def test_fallback_window_flag_goes_straight_to_a(flow):
 def test_wrong_confirmation_starts_nothing(flow, capsys):
     tty = _FakeTty("slack")
     assert (
-        browser._assisted_login_tty(tty, 59990, browser.GuidedRequest("testsite")) == 2
+        browser._assisted_login_tty(tty, PORT, browser.GuidedRequest("testsite")) == 2
     )
     assert flow == [] and "not confirmed" in capsys.readouterr().err
     assert not browser.MAINTENANCE_FILE.exists()
@@ -558,7 +558,7 @@ def test_already_logged_in_needs_no_confirmation(flow, monkeypatch):
     monkeypatch.setattr(browser, "_guided_probe", lambda port, site: True)
     tty = _FakeTty()
     assert (
-        browser._assisted_login_tty(tty, 59990, browser.GuidedRequest("testsite")) == 0
+        browser._assisted_login_tty(tty, PORT, browser.GuidedRequest("testsite")) == 0
     )
     assert not tty.prompts and not flow
 
@@ -580,7 +580,7 @@ def test_path_a_order_headed_then_headless(quiet_tx, monkeypatch):
     monkeypatch.setattr(browser, "_self_run", self_run)
     monkeypatch.setattr(browser, "_guided_probe", lambda port, site: True)
     monkeypatch.setattr(browser, "_ensure_headless", headless)
-    with browser._maintenance("slack", "B", port=59990) as tx:
+    with browser._maintenance("slack", "B", port=PORT) as tx:
         outcome = browser._guided_a(tx, "slack", None, time.monotonic() + 60)
     assert outcome == ("ok", "")
     assert calls[:3] == [("switch", "headed"), ("login", "slack"), ("headless",)]
@@ -636,7 +636,7 @@ def test_b_success_lets_the_relay_close_the_view_itself(b_stubs, monkeypatch):
     its own within VIEWER_FINAL_S, before the transaction's cleanup."""
     seen, stopped = b_stubs
     monkeypatch.setattr(browser, "_viewer_loop", lambda *a: ("ok", ""))
-    with browser._maintenance("notion", "B", port=59990) as tx:
+    with browser._maintenance("notion", "B", port=PORT) as tx:
         out = browser._guided_b(tx, "notion", "http://x/login", time.monotonic() + 60)
         assert out == ("ok", "")
         assert _record()["state"] == "succeeded"
@@ -648,7 +648,7 @@ def test_b_success_lets_the_relay_close_the_view_itself(b_stubs, monkeypatch):
 def test_b_without_success_leaves_the_state_and_stops_the_relay(b_stubs, monkeypatch):
     seen, stopped = b_stubs
     monkeypatch.setattr(browser, "_viewer_loop", lambda *a: ("timeout", "no login"))
-    with browser._maintenance("notion", "B", port=59990) as tx:
+    with browser._maintenance("notion", "B", port=PORT) as tx:
         out = browser._guided_b(tx, "notion", "http://x/login", time.monotonic() + 60)
         assert out == ("timeout", "no login")
         assert _record()["state"] == "active"
@@ -660,7 +660,7 @@ def test_relay_reads_the_success_the_transaction_writes(quiet_tx):
     """The contract between browser.py's record and login_viewer.py's poll."""
     lv = _load("login_viewer_contract_test", _REPO / "bin" / "login_viewer.py")
     path = browser.MAINTENANCE_FILE
-    with browser._maintenance("notion", "B", port=59990) as tx:
+    with browser._maintenance("notion", "B", port=PORT) as tx:
         assert lv.maintenance_poll(path, tx.nonce) == ("live", "")
         tx.note(state="succeeded")
         assert lv.maintenance_poll(path, tx.nonce) == ("succeeded", "notion")
@@ -710,7 +710,7 @@ def test_probe_uses_a_fresh_background_tab_during_a_guided_login(
         browser.cmd_openai_logged_in,
         browser.cmd_anthropic_logged_in,
     ):
-        assert cmd(59990) == 0
+        assert cmd(PORT) == 0
     assert used == [("about:blank", browser._broker_probe_viewport)] * 3
 
 
@@ -837,11 +837,11 @@ def test_clients_stops_an_orphaned_child_group(cache):
 def test_clients_marks_a_paused_client(cache, monkeypatch, capsys):
     monkeypatch.setattr(browser, "_unknown_cdp_clients", lambda port: [])
     paused = browser._registry_register(
-        "playwright-mcp", "npx @playwright/mcp", 59990, extra={"paused": True}
+        "playwright-mcp", "npx @playwright/mcp", PORT, extra={"paused": True}
     )
-    running = browser._registry_register("browser.py", "eval", 59990)
+    running = browser._registry_register("browser.py", "eval", PORT)
     try:
-        assert browser.cmd_clients(59990) == 0
+        assert browser.cmd_clients(PORT) == 0
     finally:
         paused()
         running()
@@ -851,11 +851,11 @@ def test_clients_marks_a_paused_client(cache, monkeypatch, capsys):
 
 
 def test_legacy_wrapper_is_named_instead_of_a_gate_timeout(quiet_tx):
-    old = browser._registry_register("playwright-mcp", "npx @playwright/mcp", 59990)
+    old = browser._registry_register("playwright-mcp", "npx @playwright/mcp", PORT)
     try:
         t0 = time.monotonic()
         with pytest.raises(browser.MaintenanceRefused, match="Restart the Claude"):
-            with browser._maintenance("slack", "B", port=59990):
+            with browser._maintenance("slack", "B", port=PORT):
                 pytest.fail("must not start")
         assert time.monotonic() - t0 < 5  # no 20 s gate wait
     finally:
@@ -865,15 +865,15 @@ def test_legacy_wrapper_is_named_instead_of_a_gate_timeout(quiet_tx):
 
 def test_down_and_switch_refuse_during_a_guided_login(cache, monkeypatch, capsys):
     _write_record(owner_nonce="d" * 32)
-    assert browser.cmd_switch(59990, "headless", force=True) == 75
-    assert browser.cmd_down(59990, force=True) == 75
+    assert browser.cmd_switch(PORT, "headless", force=True) == 75
+    assert browser.cmd_down(PORT, force=True) == 75
     err = capsys.readouterr().err
     assert "busy: guided login for slack" in err and "-F/--force-maintenance" in err
     monkeypatch.setattr(browser, "_browser_mode", lambda port: None)
     # -F gets past the guard (then: nothing to switch on this port).
-    assert browser.cmd_switch(59990, "headless", force_maintenance=True) == 1
+    assert browser.cmd_switch(PORT, "headless", force_maintenance=True) == 1
     monkeypatch.setenv(browser.MAINTENANCE_ENV, "d" * 32)  # the owner itself
-    assert browser.cmd_switch(59990, "headless") == 1
+    assert browser.cmd_switch(PORT, "headless") == 1
 
 
 def test_switch_and_down_parse_force_maintenance(monkeypatch):
@@ -1106,7 +1106,7 @@ def test_preflight_waits_for_a_revert_in_flight_instead_of_its_own(
         browser.MAINTENANCE_FILE.unlink()
 
     threading.Thread(target=finish, daemon=True).start()
-    assert browser._preflight("eval", 59990) is None
+    assert browser._preflight("eval", PORT) is None
     assert "reverted it meanwhile" in capsys.readouterr().err
     names = [e["event"] for e in _journal_events()]
     assert "revert_wait" in names and "revert_failed" not in names
@@ -1122,7 +1122,7 @@ def test_preflight_stands_down_while_a_revert_outlives_the_wait(
     monkeypatch.setattr(browser, "_browser_mode", lambda port: "headed")
     monkeypatch.setattr(browser, "_journal_parent_chain", lambda: [])
     monkeypatch.setattr(browser, "cmd_switch", lambda *a, **k: pytest.fail("no switch"))
-    assert browser._preflight("eval", 59990) is None
+    assert browser._preflight("eval", PORT) is None
     err = capsys.readouterr().err
     assert "❌" not in err
     assert "ℹ️  not reverting now — busy: headless revert in progress (until ~" in err
@@ -1130,7 +1130,7 @@ def test_preflight_stands_down_while_a_revert_outlives_the_wait(
     assert last["event"] == "revert_skipped" and last["reason"] == "busy"
     assert _record()["owner_nonce"] == "e" * 32  # the other one is untouched
     with pytest.raises(SystemExit) as exc:
-        browser._registry_register("agent", "eval", 59990)
+        browser._registry_register("agent", "eval", PORT)
     assert exc.value.code == browser.BUSY_RC
     assert capsys.readouterr().err.startswith("busy: headless revert in progress")
 
@@ -1141,7 +1141,7 @@ def test_preflight_leaves_a_guided_login_record_alone(cache, monkeypatch, capsys
     monkeypatch.setattr(browser, "_journal_parent_chain", lambda: [])
     monkeypatch.setattr(browser, "cmd_switch", lambda *a, **k: pytest.fail("no switch"))
     t0 = time.monotonic()
-    assert browser._preflight("eval", 59990) is None
+    assert browser._preflight("eval", PORT) is None
     assert time.monotonic() - t0 < 2  # no wait: it is not a revert
     assert "busy: guided login for slack" in capsys.readouterr().err
     names = [e["event"] for e in _journal_events()]
@@ -1151,7 +1151,7 @@ def test_preflight_leaves_a_guided_login_record_alone(cache, monkeypatch, capsys
 def test_guided_login_refused_while_a_revert_runs_says_so(quiet_tx):
     _revert_record()
     with pytest.raises(browser.HeadedLeaseBusy, match="headless revert is in progress"):
-        with browser._maintenance("slack", "B", port=59990):
+        with browser._maintenance("slack", "B", port=PORT):
             pytest.fail("must not start")
 
 
@@ -1162,7 +1162,7 @@ def test_gate_refusal_names_the_real_wait(cache, monkeypatch, capsys):
     monkeypatch.setattr(browser, "_browser_mode", lambda port: "headed")
     monkeypatch.setattr(browser, "_gate_acquire", lambda kind, wait: None)
     rc = browser.cmd_switch(
-        59990, "headless", gate_wait_s=browser.PREFLIGHT_GATE_WAIT_S, revert=True
+        PORT, "headless", gate_wait_s=browser.PREFLIGHT_GATE_WAIT_S, revert=True
     )
     assert rc == 1
     err = capsys.readouterr().err

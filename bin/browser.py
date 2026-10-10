@@ -3266,20 +3266,39 @@ def _registry_client_lines() -> list[str]:
     return [_describe_client(r) for r in _registry_live_clients()]
 
 
+def _remote_port(name: str) -> int | None:
+    """The REMOTE port of an lsof TCP name (``l:p->r:p``); None if it has none.
+
+    lsof prints ``127.0.0.1:52345->127.0.0.1:9222`` (IPv6 as
+    ``[::1]:52345->[::1]:9222``); the port after the LAST colon of the part
+    after ``->`` is the peer's. A listening socket (no ``->``) has no peer.
+    """
+    _, sep, remote = name.partition("->")
+    port = remote.rpartition(":")[2] if sep else ""
+    return int(port) if port.isdigit() else None
+
+
 def _established_cdp_clients(port: int) -> list[tuple[int, str]]:
-    """(pid, command) for every process with an ESTABLISHED connection to `port`.
+    """(pid, command) for every process with an ESTABLISHED connection TO `port`.
 
     ``lsof -F`` prints one field per line, letter-prefixed (``p<pid>``,
-    ``c<command>``), grouped per process — which is why the parse is a tiny
-    state machine. Both ends of each loopback pair show up, so the browser side
-    is filtered out by its ``--user-data-dir=<our profile>`` command line, as is
-    this process. Returns [] when lsof is missing or fails; callers MUST treat
+    ``c<command>``, ``f<fd>``, ``n<local->remote>``), grouped per process —
+    which is why the parse is a tiny state machine. ``-iTCP:<port>`` matches
+    the port on EITHER end, so only a connection whose REMOTE port is `port`
+    counts, and only while something LISTENS on `port` (a listener-less name
+    in the same lsof run): an unrelated outgoing connection that merely got
+    `port` as its local (ephemeral) port is not a CDP client (tp#905) — and
+    neither is its loopback peer, whose remote port is then `port` but whose
+    port nobody listens on — nor the browser's own accepting side (local port
+    = `port`). The browser is also filtered out by its
+    ``--user-data-dir=<our profile>`` command line, as is this process.
+    Returns [] when lsof is missing or fails; callers MUST treat
     "no lsof" as CANNOT VERIFY (see `_unknown_cdp_clients`) rather than as
     "nobody is attached".
     """
     try:
         res = subprocess.run(
-            ["lsof", "-nP", f"-iTCP:{port}", "-sTCP:ESTABLISHED", "-Fpc"],
+            ["lsof", "-nP", f"-iTCP:{port}", "-sTCP:ESTABLISHED,LISTEN", "-Fpcn"],
             capture_output=True,
             text=True,
             timeout=10,
@@ -3287,19 +3306,27 @@ def _established_cdp_clients(port: int) -> list[tuple[int, str]]:
         )
     except (OSError, subprocess.SubprocessError):
         return []
-    found: list[tuple[int, str]] = []
-    seen: set[int] = set()
+    commands: dict[int, str] = {}
+    clients: set[int] = set()
+    listening = False
     pid: int | None = None
     for line in res.stdout.splitlines():
-        if line[:1] == "p" and line[1:].strip().isdigit():
-            pid = int(line[1:])
-        elif line[:1] == "c" and pid is not None:
-            if pid in seen or pid == os.getpid():
-                continue
-            seen.add(pid)
-            cmd = _proc_command(pid) or line[1:].strip()
-            if f"--user-data-dir={PROFILE_DIR}" not in cmd:
-                found.append((pid, cmd))
+        tag, value = line[:1], line[1:].strip()
+        if tag == "p":
+            pid = int(value) if value.isdigit() else None
+        elif pid is None:
+            continue
+        elif tag == "c":
+            commands[pid] = value
+        elif tag == "n" and "->" not in value:
+            listening = listening or value.rpartition(":")[2] == str(port)
+        elif tag == "n" and _remote_port(value) == port:
+            clients.add(pid)
+    found: list[tuple[int, str]] = []
+    for client in (clients - {os.getpid()}) if listening else set():
+        cmd = _proc_command(client) or commands.get(client, "")
+        if f"--user-data-dir={PROFILE_DIR}" not in cmd:
+            found.append((client, cmd))
     return sorted(found)
 
 

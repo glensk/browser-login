@@ -26,9 +26,10 @@ import time
 from pathlib import Path
 
 import pytest
+from ports import unused_port
 
 _BROWSER_PY = Path(__file__).resolve().parent.parent / "bin" / "browser.py"
-PORT = 59222
+PORT = unused_port()  # below the ephemeral range: tp#905
 
 
 def _load_browser_module():

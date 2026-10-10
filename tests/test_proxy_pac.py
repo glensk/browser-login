@@ -37,9 +37,10 @@ import sys
 from pathlib import Path
 
 import pytest
+from ports import unused_port
 
 _REPO = Path(__file__).resolve().parent.parent
-PORT = 59334
+PORT = unused_port()  # below the ephemeral range: tp#905
 EPFL = {
     "groups.epfl.ch": "SOCKS5 127.0.0.1:1081",
     "api.epfl.ch": "SOCKS5 127.0.0.1:1081",
