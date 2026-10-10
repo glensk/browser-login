@@ -41,10 +41,14 @@ Examples:
   daemon.py -C -H /var/db/login-broker        # list visible collections (IDs)
   sudo daemon.py -r ricardo                   # reset the limiter for one site
   sudo daemon.py -r secret:github             # reset a secret item's limiter
+  sudo daemon.py -r group:galaxus             # reset an attempt group
+  sudo daemon.py -r galaxus -G                # reset a site and its groups
 """
 
 from __future__ import annotations
 
+# runner, protocol and CLI of one daemon.
+# pylint: disable=too-many-lines
 import argparse
 import contextlib
 import dataclasses
@@ -57,6 +61,7 @@ import signal
 import socketserver
 import stat
 import sys
+import tempfile
 import threading
 import time
 import traceback
@@ -81,15 +86,27 @@ from broker.leakcheck import (  # noqa: E402
     Registrar,
     UnconfiguredLeakCheck,
 )
-from broker.limiter import Limiter  # noqa: E402
+from broker.limiter import (  # noqa: E402
+    AttemptGrant,
+    Denied,
+    Limiter,
+    LimiterBusy,
+    LimiterStateError,
+    group_key,
+)
 from broker.origins import origin_allowed  # noqa: E402
-from broker.page_state import diagnose  # noqa: E402
+from broker.page_state import diagnose, sentinel_shown  # noqa: E402
 from broker.peercred import peer_uid  # noqa: E402
+from broker.phases import PHASE_V  # noqa: E402
 from broker.recipes import (  # noqa: E402
+    INDETERMINATE,
     NO_PASSKEY_JS,
+    VALID,
+    AttemptController,
+    ExportFailed,
     LoginFailed,
     RecipeError,
-    check_logged_in,
+    check_proof,
     cscs_portal_ready,
     recipe_for,
 )
@@ -113,6 +130,7 @@ from broker.vault import (  # noqa: E402
     Vault,
     VaultCache,
     VaultError,
+    selector_ok,
 )
 
 # pylint: enable=wrong-import-position
@@ -207,12 +225,13 @@ class PlaywrightRunner:
         ctx.add_init_script(NO_PASSKEY_JS)
         return ctx
 
-    def _profile_logged_in(self, page: Any, item: SiteItem) -> bool:
-        """The positive check (check URL / sentinel) on the broker's own profile."""
+    def _profile_proof(self, page: Any, item: SiteItem) -> str:
+        """The tri-state proof (``recipes.check_proof``) on the broker's own
+        profile; an exception is ``indeterminate``."""
         try:
-            return check_logged_in(page, item, dev=self.dev, wait_s=5.0)
+            return check_proof(page, item, dev=self.dev, wait_s=5.0)
         except Exception:  # pylint: disable=broad-exception-caught
-            return False
+            return INDETERMINATE
 
     def _record_failure(self, page: Any, item: SiteItem, secret: Secret) -> None:
         """Secret-free failure report + screenshot (password fields emptied first)."""
@@ -307,28 +326,54 @@ class PlaywrightRunner:
     def run_in_context(
         self, ctx: Any, item: SiteItem, get_secret: Callable[[], Secret]
     ) -> dict[str, Any]:
-        """Profile check (or, with ``fresh_login``, a cookie wipe), recipe,
-        positive proof and export on an already launched context."""
+        """Profile proof (or, with ``fresh_login``, reservation + cookie wipe),
+        recipe, positive proof and export on an already launched context.
+
+        The limiter is only touched through `get_secret` (it reserves the
+        attempt): a validated profile reuse never calls it, so it works during
+        a cooldown and leaves the limiter untouched. `get_secret.attempt` (when
+        present) is the ``AttemptController`` handed to the recipe.
+        """
         page = ctx.pages[0] if ctx.pages else ctx.new_page()
+        if getattr(get_secret, "candidate", False) and not getattr(
+            get_secret, "candidate_checked", False
+        ):
+            # Two-sided: the candidate must be ABSENT on the check page of a
+            # fresh, logged-OUT throwaway profile — before anything is reserved
+            # or a cookie is cleared (`fresh_login` included). `__call__` does
+            # it with its own Playwright before the site context opens.
+            self._candidate_absent(self._throwaway_answer(item))
         if item.fresh_login:
             # Never "via profile": the login must pass through the IdP in this
             # run so its session-only SSO cookie exists when the bundle is cut.
+            # Reserve FIRST: a denied reservation leaves the profile untouched.
+            secret = get_secret()
             self.clear_site_cookies(ctx, item)
-            reuse = False
         else:
-            reuse = self._profile_logged_in(page, item)
-        if reuse:
-            return self.export_bundle(ctx, item, "profile")
-        secret = get_secret()
+            proof = self._profile_proof(page, item)
+            if proof == VALID:
+                # (a candidate: present here + absent logged out = verified)
+                return self._export(ctx, item, "profile", proven=False)
+            if proof == INDETERMINATE:
+                raise LoginFailed(
+                    "could not tell whether the broker profile is logged in "
+                    "(check page did not load or answered 5xx)",
+                    phase="profile-proof",
+                )
+            secret = get_secret()
+        attempt: AttemptController = getattr(get_secret, "attempt", None) or (
+            AttemptController()
+        )
         try:
-            recipe_for(item.site)(page, item, secret, dev=self.dev)
-        except RecipeError:
+            recipe_for(item.site)(page, item, secret, dev=self.dev, attempt=attempt)
+        except RecipeError as exc:
             self._record_failure(page, item, secret)
+            exc.submitted = exc.submitted or attempt.submitted
             raise
         except Exception as exc:  # pylint: disable=broad-exception-caught
             # A Playwright timeout or a detached element: report it like a
             # recipe failure (screenshot, page picture) and say where it
-            # happened. Whether the secret was already submitted is unknown.
+            # happened. The submit marker decides the limiter outcome.
             self._record_failure(page, item, secret)
             raise LoginFailed(
                 f"unexpected error in the login recipe: {exception_site(exc)}",
@@ -340,14 +385,116 @@ class PlaywrightRunner:
         except Exception:  # pylint: disable=broad-exception-caught
             before = {}
         # Positive proof after EVERY login, whatever the recipe saw.
-        if not self._profile_logged_in(page, item):
+        proof = self._profile_proof(page, item)
+        if proof != VALID:
             self._record_failure(page, item, secret)
             self.last_diag[item.site]["before_check"] = before
             raise LoginFailed(
-                "login did not reach a logged-in state (check URL / sentinel)",
-                submitted=True,
+                "login did not reach a logged-in state (status / origin / sentinel)"
+                if proof != INDETERMINATE
+                else "the logged-in proof could not decide (check page did not "
+                "load or answered 5xx)",
+                submitted=attempt.submitted,
+                phase="broker-proof",
             )
-        return self.export_bundle(ctx, item, "login")
+        return self._export(ctx, item, "login", proven=True)
+
+    def _throwaway_answer(self, item: SiteItem, *, pw: Any = None) -> str:
+        """The candidate sentinel on the check page of a fresh, logged-out
+        throwaway profile: ``invalid`` = loaded (status < 400) and ABSENT,
+        ``valid`` = it shows logged out, ``indeterminate`` = could not tell.
+        `pw`: the caller's running Playwright (one per thread: a nested
+        ``sync_playwright()`` raises inside the outer one's event loop)."""
+        got = self.sentinel_absent(item, str(item.logged_in_selector), pw=pw)
+        status = got.get("status")
+        if not got.get("loaded") or not isinstance(status, int) or status <= 0:
+            return INDETERMINATE
+        if status >= 400:
+            return INDETERMINATE
+        return VALID if got.get("present") else "invalid"
+
+    @staticmethod
+    def _candidate_absent(proof: str) -> None:
+        """A candidate sentinel must be ABSENT when logged out (two-sided
+        proof); present or undecidable -> ``candidate_unverifiable``."""
+        if proof == "invalid":
+            return
+        err = LoginFailed(
+            "the candidate sentinel shows on a logged-OUT page too: it proves nothing"
+            if proof == VALID
+            else "the logged-out check page did not load: the candidate "
+            "sentinel cannot be verified",
+            phase="profile-proof",
+        )
+        err.code = "candidate_unverifiable"
+        raise err
+
+    def sentinel_absent(
+        self, item: SiteItem, sentinel: str, *, pw: Any = None
+    ) -> dict[str, Any]:
+        """Load the item's check page in a FRESH throwaway profile (no cookies,
+        no secret, never the site's profile) and report whether `sentinel`
+        shows there: a sentinel that shows logged out proves nothing. `pw`: a
+        running Playwright to reuse (else one of its own)."""
+        if pw is None:
+            from playwright.sync_api import (  # pylint: disable=import-outside-toplevel
+                sync_playwright,
+            )
+
+            with sync_playwright() as own:
+                return self.sentinel_absent(item, sentinel, pw=own)
+        url = item.check_url or item.login_url
+        tmp_root = self.home / "tmp"
+        tmp_root.mkdir(mode=0o700, parents=True, exist_ok=True)
+        tmp = Path(tempfile.mkdtemp(prefix="sentinel-", dir=str(tmp_root)))
+        try:
+            ctx = self._launch(pw, tmp)
+            try:
+                page = ctx.pages[0] if ctx.pages else ctx.new_page()
+                try:
+                    resp = page.goto(url, wait_until="domcontentloaded")
+                    with contextlib.suppress(Exception):
+                        page.wait_for_load_state("load", timeout=10_000)
+                    page.wait_for_timeout(1500)
+                except Exception:  # pylint: disable=broad-exception-caught
+                    return {"loaded": False, "status": None, "present": None}
+                status = getattr(resp, "status", None) if resp else None
+                present = bool(sentinel_shown(page, sentinel))
+                return {"loaded": True, "status": status, "present": present}
+            finally:
+                with contextlib.suppress(Exception):
+                    ctx.close()
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def _export(
+        self, ctx: Any, item: SiteItem, via: str, *, proven: bool
+    ) -> dict[str, Any]:
+        """`export_bundle`, raising ``ExportFailed`` when it fails or the
+        bundle holds no cookie and no storage key. `proven`: a fresh login was
+        proven just before (the limiter counts it as ``ok`` anyway)."""
+        try:
+            bundle = self.export_bundle(ctx, item, via)
+        except Exception as exc:  # pylint: disable=broad-exception-caught
+            raise ExportFailed(
+                f"export failed: {exception_site(exc)}",
+                phase="bundle-export",
+                auth_proven=proven,
+                submitted=proven,
+            ) from exc
+        if not bundle.get("cookies") and not any(
+            (bundle.get("storage") or {}).values()
+        ):
+            err = ExportFailed(
+                "the exported session holds no cookie and no storage key "
+                "(check agent_cookie_hosts / agent_storage_keys)",
+                phase="bundle-export",
+                auth_proven=proven,
+                submitted=proven,
+            )
+            err.code = "empty_bundle"
+            raise err
+        return bundle
 
     def __call__(
         self, item: SiteItem, get_secret: Callable[[], Secret]
@@ -359,6 +506,12 @@ class PlaywrightRunner:
         profile = self.profile_dir(item.site)
         profile.mkdir(mode=0o700, parents=True, exist_ok=True)
         with sync_playwright() as pw:
+            if getattr(get_secret, "candidate", False):
+                # The logged-out half of a candidate's proof, with THIS
+                # Playwright and before the site's own context opens.
+                self._candidate_absent(self._throwaway_answer(item, pw=pw))
+                with contextlib.suppress(AttributeError, TypeError):
+                    setattr(get_secret, "candidate_checked", True)
             ctx = self._launch(pw, profile)
             try:
                 return self.run_in_context(ctx, item, get_secret)
@@ -518,6 +671,7 @@ class Broker(SecretOps):  # pylint: disable=too-many-instance-attributes  # deps
         self._audit_lock = threading.Lock()
         self._items_lock = threading.Lock()
         self._items_cache: tuple[float, list[SiteItem]] | None = None
+        self._probe_slot = threading.Lock()  # `sentinel_absent`: one at a time
 
     def _items(self, *, fresh: bool = False) -> list[SiteItem]:
         """The vault's site items, cached SITES_TTL_S (raises VaultError)."""
@@ -590,11 +744,19 @@ class Broker(SecretOps):  # pylint: disable=too-many-instance-attributes  # deps
                 resp = {"ok": True, "pong": True}
             elif op == "sites":
                 resp = self._sites(fresh=req.get("fresh") in (True, "1", "true"))
-            elif op in ("login", "logout", "fingerprint"):
+            elif op in ("login", "logout", "fingerprint", "sentinel_absent"):
                 if not site or not SITE_ID_RE.match(site):
                     resp = _err("bad_request", "missing or invalid site id")
                 elif op == "login":
-                    resp = self._login(site)
+                    resp = self._login_request(site, req)
+                    extra.update(
+                        scheduled=req.get("scheduled") in (True, "1", "true"),
+                        candidate=req.get("candidate_sentinel") is not None,
+                        phase=resp.get("phase"),
+                        fresh_auth=resp.get("fresh_auth"),
+                    )
+                elif op == "sentinel_absent":
+                    resp = self._sentinel_absent(site, req.get("sentinel"))
                 elif op == "fingerprint":
                     resp = self._fingerprint(site)
                 else:
@@ -612,7 +774,15 @@ class Broker(SecretOps):  # pylint: disable=too-many-instance-attributes  # deps
             items = self._items(fresh=fresh)
         except VaultError as exc:
             return _err("vault_error", str(exc))
-        return {"ok": True, "sites": [it.public() for it in items]}
+        now = self.clock()
+        out = []
+        for it in items:
+            entry = it.public()
+            if not it.refused:
+                denied = self.limiter.peek_site(it.site, now, group=it.attempt_group)
+                entry["limit"] = denied.limit() if denied else {"state": "ok"}
+            out.append(entry)
+        return {"ok": True, "sites": out}
 
     def _fingerprint(self, site: str) -> dict[str, Any]:
         """Length + 4 hex of the SHA-256 of the password the vault holds for `site`
@@ -631,7 +801,68 @@ class Broker(SecretOps):  # pylint: disable=too-many-instance-attributes  # deps
                 shutil.rmtree(profile)
         return {"ok": True, "removed": existed}
 
-    def _login(self, site: str) -> dict[str, Any]:
+    def _login_request(self, site: str, req: dict[str, Any]) -> dict[str, Any]:
+        """``login`` with its options: ``scheduled`` (the daily check) and a
+        one-shot ``candidate_sentinel`` (never for a scheduled run)."""
+        scheduled = req.get("scheduled") in (True, "1", "true")
+        candidate = req.get("candidate_sentinel")
+        if candidate is None:
+            return self._login(site, scheduled=scheduled)
+        if not isinstance(candidate, str) or not selector_ok(candidate.strip()):
+            return _phase_err(
+                "bad_request",
+                "candidate_sentinel: one CSS selector, one line, <=512 chars",
+                "precheck",
+            )
+        if not candidate.strip():
+            return _phase_err("bad_request", "candidate_sentinel is empty", "precheck")
+        if scheduled:
+            return _phase_err(
+                "refused",
+                "a scheduled login never tries a candidate sentinel",
+                "precheck",
+            )
+        with self._site_lock(site):
+            return self._do_login(site, candidate=candidate.strip())
+
+    # One early return per refusal, in the order they are checked.
+    def _sentinel_absent(  # pylint: disable=too-many-return-statements
+        self, site: str, sentinel: object
+    ) -> dict[str, Any]:
+        """``sentinel_absent``: does `sentinel` show on the check page in a
+        fresh, logged-out throwaway profile? (no secret, no limiter)"""
+        if not isinstance(sentinel, str) or not sentinel.strip():
+            return _err("bad_request", "sentinel: one CSS selector")
+        if not selector_ok(sentinel.strip()):
+            return _err("bad_request", "sentinel: one CSS selector, <=512 chars")
+        try:
+            item = next((it for it in self._items() if it.site == site), None)
+        except VaultError as exc:
+            return _err("vault_error", str(exc))
+        if item is None:
+            return _err("unknown_site", f"{site!r} is not in agent-logins")
+        if item.refused:
+            return _err("refused", item.refused)
+        probe = getattr(self.runner, "sentinel_absent", None)
+        if probe is None:
+            return _err("internal", "this broker runner cannot load pages")
+        # One throwaway browser at a time, broker-wide, and never while a login
+        # of the same site runs: it is free, so it must stay cheap.
+        if not self._probe_slot.acquire(blocking=False):  # pylint: disable=consider-using-with  # released in the finally below
+            return _err("busy", "another sentinel check is running — retry")
+        try:
+            lock = self._site_lock(site)
+            if not lock.acquire(blocking=False):
+                return _err("busy", f"a login of {site} is running — retry")
+            try:
+                got = probe(item, sentinel.strip())
+            finally:
+                lock.release()
+        finally:
+            self._probe_slot.release()
+        return {"ok": True, **got}
+
+    def _login(self, site: str, *, scheduled: bool = False) -> dict[str, Any]:
         with self._guard:
             flight = self._flights.get(site)
             leader = flight is None
@@ -646,7 +877,7 @@ class Broker(SecretOps):  # pylint: disable=too-many-instance-attributes  # deps
         result = _err("internal", "unexpected broker error")
         try:
             with self._site_lock(site):
-                result = self._do_login(site)
+                result = self._do_login(site, scheduled=scheduled)
         finally:
             flight.result = result
             with self._guard:
@@ -655,7 +886,12 @@ class Broker(SecretOps):  # pylint: disable=too-many-instance-attributes  # deps
         return result
 
     # One return per protocol error code, in the order they are checked.
-    def _do_login(self, site: str) -> dict[str, Any]:  # pylint: disable=too-many-return-statements
+    def _do_login(  # pylint: disable=too-many-return-statements,too-many-branches
+        self, site: str, *, scheduled: bool = False, candidate: str | None = None
+    ) -> dict[str, Any]:
+        """One login: item checks, then the runner. The limiter is consulted
+        only when the runner asks for the secret (`_SecretGate`), so a validated
+        profile reuse works in a cooldown and leaves the limiter untouched."""
         try:
             items = self._items()
             item = next((it for it in items if it.site == site), None)
@@ -663,39 +899,197 @@ class Broker(SecretOps):  # pylint: disable=too-many-instance-attributes  # deps
                 items = self._items(fresh=True)
                 item = next((it for it in items if it.site == site), None)
         except VaultError as exc:
-            return _err("vault_error", str(exc))
+            return _phase_err("vault_error", str(exc), "vault")
         if item is None:
-            return _err("unknown_site", f"{site!r} is not in agent-logins")
+            return _phase_err(
+                "unknown_site", f"{site!r} is not in agent-logins", "vault"
+            )
         if item.refused:
-            return _err("refused", item.refused)
-        ok, reason = self.limiter.check(site, self.clock())
-        if not ok:
-            return _err("rate_limited", reason)
-
-        fetched: list[bool] = []
-
-        def get_secret() -> Secret:
-            self.limiter.begin_attempt(site, self.clock())
-            fetched.append(True)
-            return self.vault.secret(site)
-
-        outcome = "ok"
+            return _phase_err("refused", item.refused, "vault")
+        if candidate is not None:
+            if item.logged_in_selector:
+                return _phase_err(
+                    "bad_request",
+                    "the item already has agent_logged_in_selector; a candidate "
+                    "sentinel is only for items without one",
+                    "precheck",
+                )
+            denied = self.limiter.peek(
+                self.limiter.site_keys(site, item.attempt_group),
+                self.clock(),
+                scheduled=True,  # any unresolved failure refuses a candidate
+            )
+            if denied is not None:
+                return {
+                    **_phase_err("rate_limited", denied.reason, "limiter"),
+                    "limit": denied.limit(),
+                }
+            item = dataclasses.replace(item, logged_in_selector=candidate)
+        if scheduled and not item.has_proof:
+            return _phase_err(
+                "needs_sentinel",
+                "the item has no agent_logged_in_selector: a scheduled login "
+                "needs the strict proof, so none is attempted",
+                "vault",
+            )
+        gate = _SecretGate(self, item, scheduled=scheduled)
+        gate.candidate = candidate is not None
+        outcome = "not_submitted"
         try:
-            bundle = self.runner(item, get_secret)
+            bundle = self.runner(item, gate)
+            # The runner returns only after a VALID proof: once the password
+            # was typed that is a proven fresh authentication (a candidate's
+            # never clears a streak: "candidate").
+            typed = gate.attempt.submitted or gate.attempt.was_entered
+            outcome = ("candidate" if candidate else "ok") if typed else "not_submitted"
+        except _RateLimited as exc:
+            return {
+                **_phase_err("rate_limited", exc.denied.reason, "limiter"),
+                "limit": exc.denied.limit(),
+            }
         except RecipeError as exc:
-            outcome = "unknown" if exc.submitted else "failed"
+            outcome = _error_outcome(gate.attempt, exc)
+            if candidate is not None and outcome == "ok":
+                outcome = "candidate"
+            sent = outcome != "not_submitted"
+            phase = exc.phase or ("submit" if sent else "recipe")
             diag = getattr(self.runner, "last_diag", {}).pop(site, None)
-            return {**_err(exc.code, exc.detail), **({"diag": diag} if diag else {})}
+            return {
+                **_phase_err(exc.code, exc.detail, phase, submitted=sent),
+                **({"diag": diag} if diag else {}),
+            }
         except VaultError as exc:
-            outcome = "failed"
-            return _err("vault_error", str(exc))
+            return _phase_err("vault_error", str(exc), "vault")
         except Exception:  # pylint: disable=broad-exception-caught
-            outcome = "unknown"
-            return _err("login_failed", "unexpected error during login")
+            typed = gate.attempt.submitted or gate.attempt.was_entered
+            outcome = "unknown" if typed else "not_submitted"
+            return _phase_err(
+                "login_failed",
+                "unexpected error during login",
+                "unknown" if typed else "recipe",
+                submitted=typed,
+            )
         finally:
-            if fetched:
-                self.limiter.record_attempt(site, self.clock(), outcome)
-        return {"ok": True, "bundle": bundle}
+            gate.finish(outcome)
+        reply = {
+            "ok": True,
+            "bundle": bundle,
+            "phase": "ok",
+            "phase_v": PHASE_V,
+            "fresh_auth": outcome in ("ok", "candidate"),
+            "proof": "strict" if item.has_proof else "legacy",
+        }
+        if candidate is not None:
+            # absent logged out (checked first) + present here or after the login
+            reply["candidate_verified"] = True
+        return reply
+
+
+def _error_outcome(attempt: AttemptController, exc: RecipeError) -> str:
+    """The limiter outcome of a failed login (PLAN_ws1a "outcome mapping"):
+    nothing typed -> not_submitted; proven auth after typing -> ok; the submit
+    marker -> unknown; typed without the marker -> unknown unless the recipe
+    proved the password still sat unsent in its field."""
+    if not (attempt.submitted or attempt.was_entered):
+        return "not_submitted"
+    if exc.auth_proven:
+        return "ok"
+    if attempt.submitted:
+        return "unknown"
+    return "not_submitted" if exc.unsent else "unknown"
+
+
+def _phase_err(
+    code: str, detail: str, phase: str, *, submitted: bool = False
+) -> dict[str, Any]:
+    """An error reply with its phase (broker/phases.py) and the submit marker."""
+    return {
+        **_err(code, detail),
+        "phase": phase,
+        "phase_v": PHASE_V,
+        "submitted": submitted,
+    }
+
+
+class _RateLimited(RecipeError):
+    """The reservation inside `get_secret` was denied (nothing submitted)."""
+
+    code = "rate_limited"
+
+    def __init__(self, denied: Denied) -> None:
+        super().__init__(denied.reason, phase="limiter")
+        self.denied = denied
+
+
+class _LimiterAttempt(AttemptController):
+    """The recipe's `AttemptController`, bound to the gate's reservation:
+    every mark is persisted before the step it announces (a write failure
+    raises and the step does not happen)."""
+
+    def __init__(self, gate: _SecretGate) -> None:
+        self.gate = gate
+
+    def entered(self) -> None:
+        if self.gate.grant is not None:
+            self.gate.broker.limiter.mark_entered(self.gate.grant)
+        self.was_entered = True
+
+    def mark_submitted(self) -> None:
+        if self.gate.grant is not None:
+            self.gate.broker.limiter.mark_submitted(self.gate.grant)
+        self.submitted = True
+
+
+class _SecretGate:  # pylint: disable=too-many-instance-attributes  # deps + attempt state
+    """The runner's `get_secret`: reserves the attempt (every key of the site,
+    group bindings included), then reads the secret. ``attempt`` is the
+    controller the runner hands to the recipe; ``finish`` closes the
+    reservation once (no-op without one)."""
+
+    def __init__(self, broker: Broker, item: SiteItem, *, scheduled: bool) -> None:
+        self.broker = broker
+        self.item = item
+        self.scheduled = scheduled
+        self.finish_failed = False
+        self.grant: AttemptGrant | None = None
+        self.finished = False
+        self.candidate = False
+        self.candidate_checked = False  # the runner did the logged-out half
+        self.attempt = _LimiterAttempt(self)
+
+    def __call__(self) -> Secret:
+        if self.grant is None:
+            got = self.broker.limiter.reserve_site(
+                self.item.site,
+                self.broker.clock(),
+                group=self.item.attempt_group,
+                scheduled=self.scheduled,
+                candidate=self.candidate,
+            )
+            if isinstance(got, Denied):
+                raise _RateLimited(got)
+            self.grant = got
+        return self.broker.vault.secret(self.item.site)
+
+    def finish(self, outcome: str) -> None:
+        """Close the reservation with `outcome` (first call wins). A failed
+        write never discards the login's result: the limiter keeps the outcome
+        in memory and recovers its own mark with it (not "busy" until restart)."""
+        if self.grant is None or self.finished:
+            return
+        self.finished = True
+        try:
+            self.broker.limiter.finish(self.grant, outcome, self.broker.clock())
+        except Exception:  # pylint: disable=broad-exception-caught
+            self.finish_failed = True
+            with contextlib.suppress(Exception):
+                self.broker.audit(
+                    "limiter_finish",
+                    self.item.site,
+                    "failed",
+                    None,
+                    {"outcome": outcome},
+                )
 
 
 # ---------------------------------------------------------------------------
@@ -788,6 +1182,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
             "  daemon.py -C                       # visible collections, as _loginbroker\n"
             "  sudo daemon.py -r ricardo          # reset the limiter for one site\n"
             "  sudo daemon.py -r totp:github      # reset a TOTP item's limiter\n"
+            "  sudo daemon.py -r group:galaxus    # reset an attempt group\n"
+            "  sudo daemon.py -r galaxus -G       # reset a site and its groups\n"
         ),
     )
     p.add_argument("-s", "--socket", default=DEFAULT_SOCKET, help="socket path")
@@ -803,8 +1199,15 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "-r",
         "--reset",
         metavar="KEY",
-        help="reset the limiter for a site, or for secret:ITEM / totp:ITEM / "
-        "secret:* (the secret limiter), and exit",
+        help="reset the limiter for a site or group:<id>, or for secret:ITEM / "
+        "totp:ITEM / secret:* (the secret limiter), and exit (exit 3 while a "
+        "login is in flight on the key)",
+    )
+    p.add_argument(
+        "-G",
+        "--with-group",
+        action="store_true",
+        help="with -r SITE: also reset every attempt group the site is bound to",
     )
     p.add_argument(
         "-C",
@@ -858,24 +1261,82 @@ def print_collections(vault: FixtureVault | BwVault) -> int:
     return 0
 
 
-def _reset(args: argparse.Namespace, home: Path) -> int:
+LOGIN_KEY_RE = re.compile(r"^(group:)?[a-z0-9][a-z0-9._-]{0,63}$")
+
+
+def _home_owner(home: Path) -> tuple[int, int] | None:
+    """(uid, gid) of the broker home when running as root (the reset hands
+    the files back to the broker), else None."""
+    if os.geteuid() != 0:
+        return None
+    st = home.stat()
+    return st.st_uid, st.st_gid
+
+
+# One early exit per refusal; the login path warns about blocking groups.
+def _reset(args: argparse.Namespace, home: Path) -> int:  # pylint: disable=too-many-return-statements
+    """``-r KEY [-G]``: a site, ``group:<id>`` or a secret key; see `parse_args`."""
     if os.geteuid() != 0 and not args.dev:
         print("❌ --reset needs root (or --dev)", file=sys.stderr)
         return 2
     key = args.reset.strip().lower()
-    if ":" in key:
-        if not LIMITER_KEY_RE.match(key):
+    owner = _home_owner(home)
+    if key.startswith(("secret:", "totp:")):
+        if args.with_group or not LIMITER_KEY_RE.match(key):
             print(f"❌ not a secret limiter key: {key!r}", file=sys.stderr)
             return 2
-        limiter = build_secret_limiter(home)
-    else:
-        limiter = build_limiter(home)
-    limiter.reset(key)
-    if os.geteuid() == 0:  # root rewrote the file: hand it back to the broker
-        owner = home.stat()
-        os.chown(limiter.state_path, owner.st_uid, owner.st_gid)
-    print(f"✅ limiter reset for {key}")
-    return 0
+        return _reset_keys(build_secret_limiter(home), [key], owner)
+    if not LOGIN_KEY_RE.match(key):
+        print(f"❌ not a site id or group:<id>: {key!r}", file=sys.stderr)
+        return 2
+    limiter = build_limiter(home)
+    if key.startswith("group:"):
+        if args.with_group:
+            print("❌ -G/--with-group goes with a SITE, not a group", file=sys.stderr)
+            return 2
+        return _reset_keys(limiter, [key], owner)
+    groups = [group_key(g) for g in limiter.groups_of(key)]  # pure read
+    if args.with_group:
+        if not groups:
+            print(f"ℹ️ no group bound to {key} yet — resetting the site only")
+        return _reset_keys(limiter, [key, *groups], owner, keep_bindings=False)
+    rc = _reset_keys(limiter, [key], owner)
+    now = time.time()
+    for gkey in groups:
+        # A PURE read: no crash recovery, nothing written (a write as root
+        # would leave limiter.json root-owned).
+        denied = limiter.blocking([gkey], now)
+        if denied is not None and denied.state in ("locked", "cooldown"):
+            print(
+                f"⚠️ {gkey} still blocks {key} ({denied.state}): "
+                f"sudo install/install.sh -r {gkey}   (or -r {key} -G)"
+            )
+    return rc
+
+
+def _reset_keys(
+    limiter: Limiter,
+    keys: list[str],
+    owner: tuple[int, int] | None,
+    *,
+    keep_bindings: bool = True,
+) -> int:
+    """Reset every key: a live in-flight attempt refuses that key (exit 3), an
+    unusable state or lock file (a symlink, a corrupt lock) every key (exit 1).
+    `keep_bindings` False (``-G``): the site's group bindings go too."""
+    rc = 0
+    for key in keys:
+        try:
+            limiter.reset(key, owner=owner, keep_bindings=keep_bindings)
+        except LimiterBusy as exc:
+            print(f"❌ {exc}", file=sys.stderr)
+            rc = 3
+            continue
+        except (LimiterStateError, OSError) as exc:
+            print(f"❌ {key}: limiter state not usable ({exc})", file=sys.stderr)
+            return 1
+        print(f"✅ limiter reset for {key}")
+    return rc
 
 
 def _leakcheck_loop(broker: Broker, stop: threading.Event) -> None:
@@ -904,6 +1365,9 @@ def main(argv: list[str] | None = None) -> int:  # pylint: disable=too-many-retu
             print(f"❌ {exc}", file=sys.stderr)
             return 1
         return print_collections(BwVault(boot, home / "bw"))
+    if args.with_group and not args.reset:
+        print("❌ -G/--with-group only works with -r SITE", file=sys.stderr)
+        return 2
     limiter = build_limiter(home)
     if not args.dev and os.geteuid() == args.allow_uid:
         print(
@@ -918,6 +1382,7 @@ def main(argv: list[str] | None = None) -> int:  # pylint: disable=too-many-retu
     else:
         vault = _LazyBwVault(home)
     home.mkdir(mode=0o700, parents=True, exist_ok=True)
+    limiter.ensure_lock_file()  # created by the broker itself: it owns it
     leakcheck: Registrar
     if args.no_leakcheck:
         print(

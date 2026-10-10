@@ -1184,13 +1184,18 @@ def test_agent_login_treats_busy_as_skip_not_logout(monkeypatch, tmp_path):
         calls.append(args)
         return 75
 
+    def fake_run(*args, **_kw):
+        calls.append(args)
+        return sys.modules["agent_login_jobs"].BrowserRun(75, False, "", 0.0)
+
     monkeypatch.setattr(al, "_browser", fake_browser)
+    monkeypatch.setattr(al, "run_browser", fake_run)
     monkeypatch.setattr(
         subprocess, "run", lambda *a, **k: pytest.fail("tried `browser.py login`")
     )
-    assert al.ensure_logged_in("cscs") == (None, al.BUSY_HOW)
+    assert al.ensure_logged_in("cscs")[:2] == (None, al.BUSY_HOW)
     assert calls == [("logged-in", "cscs")]
-    # -c -m: a busy site is skipped — no failure, no mail.
+    # -c -m (manual mail): a busy site is skipped — no failure, no mail.
     monkeypatch.setattr(al, "wait_for_network", lambda: True)
     monkeypatch.setattr(al, "ensure_browser_up", lambda: True)
     monkeypatch.setattr(
@@ -1203,8 +1208,11 @@ def test_agent_login_treats_busy_as_skip_not_logout(monkeypatch, tmp_path):
         },
     )
     monkeypatch.setattr(al, "send_mail", lambda *a: pytest.fail("mailed a failure"))
-    monkeypatch.setattr(al, "record_check", lambda *a: pytest.fail("recorded busy"))
+    recorded: list[tuple] = []
+    monkeypatch.setattr(al, "record_check", lambda *a: recorded.append(a))
     assert al.check_all(mail=True) == 0
+    # WS1a: busy is recorded as UNKNOWN (never as logged out, never success)
+    assert [(r[0], r[1], r[3]["code"]) for r in recorded] == [("cscs", None, "busy")]
 
 
 # --- agent-login routing ---------------------------------------------------------

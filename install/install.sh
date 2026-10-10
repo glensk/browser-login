@@ -57,12 +57,13 @@ DRY=0
 PURGE=0
 MODE="install"
 RESET_SITE=""
+RESET_GROUPS=0
 LOGIN_PAIR=""
 SECRETS_PAIR=""
 
 usage() {
 	/bin/cat <<'EOF'
-Usage: sudo install/install.sh [-n] [-U [-P]] [-e] [-r KEY] [-c]
+Usage: sudo install/install.sh [-n] [-U [-P]] [-e] [-r KEY [-G]] [-c]
                                [-C ORG_ID:COLL_ID] [-X ORG_ID:COLL_ID] [-B] [-h]
 
 Install (default), update, uninstall or enrol the login broker LaunchDaemon.
@@ -82,8 +83,13 @@ Options:
                           master password and collection id; write
                           /var/db/login-broker/bootstrap.json (0600 _loginbroker)
   -r, --reset KEY         clear a login limiter: a SITE (cooldown / hard block after
-                          failed logins) or secret:ITEM / totp:ITEM / secret:* (the
-                          secret-run limiter); runs the installed daemon's reset as root
+                          failed logins), an attempt group group:ID, or
+                          secret:ITEM / totp:ITEM / secret:* (the secret-run
+                          limiter); runs the installed daemon's reset as root.
+                          Refused (exit 3) while a login is in flight on the key;
+                          -r SITE warns when a group of the site still blocks it
+  -G, --with-group        with -r SITE: also reset every attempt group the site
+                          is bound to
   -c, --collections       list the collections the broker account sees
                           (org_id, org_name, collection_id, collection_name)
   -C, --login-collection ORG_ID:COLL_ID
@@ -104,6 +110,8 @@ Examples:
   sudo install/install.sh -e     # one-time Bitwarden enrolment
   sudo install/install.sh -r kleinanzeigen  # clear a site's login cooldown
   sudo install/install.sh -r secret:github  # clear a secret item's limiter
+  sudo install/install.sh -r group:galaxus  # clear an attempt group
+  sudo install/install.sh -r galaxus -G     # clear a site and its groups
   sudo install/install.sh -c     # which collections (IDs) the broker sees
   sudo install/install.sh -C ORG:COLL -X ORG:COLL  # switch collections by ID
   sudo install/install.sh -B     # roll the last switch back
@@ -151,10 +159,11 @@ while (($#)); do
 	-r | --reset)
 		MODE="reset"
 		RESET_SITE="${2:-}"
-		[[ "$RESET_SITE" =~ ^[a-z0-9][a-z0-9_-]*$ || "$RESET_SITE" =~ ^(secret|totp):([a-z0-9][a-z0-9._-]*|\*)$ ]] ||
-			die "-r needs a site id or secret:ITEM / totp:ITEM / secret:* (e.g. -r kleinanzeigen)"
+		[[ "$RESET_SITE" =~ ^[a-z0-9][a-z0-9_-]*$ || "$RESET_SITE" =~ ^group:[a-z0-9][a-z0-9._-]*$ || "$RESET_SITE" =~ ^(secret|totp):([a-z0-9][a-z0-9._-]*|\*)$ ]] ||
+			die "-r needs a site id, group:ID or secret:ITEM / totp:ITEM / secret:* (e.g. -r kleinanzeigen)"
 		shift
 		;;
+	-G | --with-group) RESET_GROUPS=1 ;;
 	-c | --collections) MODE="collections" ;;
 	-C | --login-collection)
 		MODE="switch"
@@ -176,6 +185,10 @@ while (($#)); do
 	esac
 	shift
 done
+
+if ((RESET_GROUPS)) && [[ "$MODE" != reset || ! "$RESET_SITE" =~ ^[a-z0-9][a-z0-9_-]*$ ]]; then
+	die "-G/--with-group only works with -r SITE"
+fi
 
 if ((!DRY)) && ((EUID != 0)); then
 	die "must run as root (sudo $0), or preview with -n"
@@ -629,8 +642,13 @@ with open(sys.argv[1], "w", encoding="utf-8") as fh:
 do_reset() {
 	local py="${LIBEXEC}/current/venv/bin/python"
 	[[ -x "$py" ]] || die "install the broker first (no ${py})"
-	run "$py" "${LIBEXEC}/current/broker/daemon.py" -H "$HOME_DIR" -r "$RESET_SITE"
-	audit "limiter reset for ${RESET_SITE}"
+	if ((RESET_GROUPS)); then
+		run "$py" "${LIBEXEC}/current/broker/daemon.py" -H "$HOME_DIR" -r "$RESET_SITE" -G
+		audit "limiter reset for ${RESET_SITE} (with its groups)"
+	else
+		run "$py" "${LIBEXEC}/current/broker/daemon.py" -H "$HOME_DIR" -r "$RESET_SITE"
+		audit "limiter reset for ${RESET_SITE}"
+	fi
 }
 
 # collections_tsv — `daemon.py -C` as the role account (it owns the bw state).

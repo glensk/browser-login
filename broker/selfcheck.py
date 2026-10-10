@@ -14,7 +14,7 @@
 ``nobody``): g) a ``secret`` request is answered ``forbidden``.
 
 -P/--state-perms, run as root or the role account (the home is closed to the
-agent uid): h) secret-limiter.json / secret-runs.json / leakcheck-labels.json
+agent uid): h) the limiter / secret-run state and lock files
 are 0600 and owned by the home's owner (absent = not used yet).
 
 Not installed (neither home nor code dir exists): prints ``⚠️ SKIP not
@@ -44,7 +44,14 @@ DEFAULT_HOME = "/var/db/login-broker"
 DEFAULT_CODE = "/usr/local/libexec/login-broker/current"
 DEFAULT_SOCKET = "/var/db/login-broker-run/broker.sock"
 DEFAULT_LINK = "/usr/local/bin/secret-run"
-PRIVATE_STATE = ("secret-limiter.json", "secret-runs.json", "leakcheck-labels.json")
+PRIVATE_STATE = (
+    "secret-limiter.json",
+    "secret-limiter.json.lock",
+    "secret-runs.json",
+    "leakcheck-labels.json",
+    "limiter.json",
+    "limiter.json.lock",
+)
 
 
 def _me() -> tuple[int, str]:
@@ -149,7 +156,7 @@ def probe_forbidden(sock: Path, timeout: float = 10.0) -> tuple[bool, str]:
 
 
 def check_state_perms(home: Path) -> list[tuple[bool, str]]:
-    """(h) the secret-op state files: 0600, owned by the home's owner."""
+    """(h) the limiter and secret-op state files: 0600, owned by the home's owner."""
     try:
         owner = home.stat().st_uid
     except OSError as exc:

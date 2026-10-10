@@ -21,13 +21,25 @@ Examples:
   ./agent-login.py -t anibis    # real test: `browser.py login` (Safari session first,
                                 # then the broker), then the positive logged-in check
   ./agent-login.py -c           # every usable site: logged in? if not, log in
-  ./agent-login.py -c -m        # the same, and mail Albert when a site stays logged out
+  ./agent-login.py -c -m        # the same + mail Albert (manual; the daily job does not mail)
   ./agent-login.py -t https://auth.cscs.ch   # SITE may also be a name or login address
   ./agent-login.py -g anibis    # guided login: confirm, then log in via the remote view
   ./agent-login.py -g anthropic # your login (email code) in the shown shared Chromium
   ./agent-login.py -g notion -F # the same, even with unregistered CDP clients attached
   ./agent-login.py -P           # print the daily LaunchAgent (-I installs, -U removes)
   ./agent-login.py -j           # the same overview as JSON
+  ./agent-login.py -x           # acceptance matrix (-x -j: as JSON)
+  ./agent-login.py -p github    # promote: the daily check may log it in
+  ./agent-login.py -Q galaxus   # release a quarantine (main session, audited)
+  ./agent-login.py -V           # selectors the new broker would refuse (pre-install)
+
+Where a login broke: every check records its PHASE (precheck, limiter, vault,
+recipe, submit, profile-proof, broker-proof, bundle-export, cookie-inject,
+storage-inject, client-proof, consumer-followup, safari-source, unknown) and a
+code, a redacted detail and the broker's screenshot; the overview shows them.
+A ✅ is a fresh (≤ 36 h), proven check; older reads ❓. The daily check (-c)
+never logs in a site that is pending, quarantined, locked, in cooldown or
+without a sentinel, and never retries after the password may have been sent.
 """
 
 from __future__ import annotations
@@ -36,6 +48,7 @@ from __future__ import annotations
 # helpers already live in the agent_login_* modules.
 # pylint: disable=too-many-lines
 import argparse
+import contextlib
 import json
 import os
 import socket
@@ -48,6 +61,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))  # the repo's `broker` 
 # pylint: disable=wrong-import-position
 import agent_login_keychain  # noqa: E402
 import agent_login_secrets  # noqa: E402
+import agent_login_state as als  # noqa: E402
 from agent_login_claude import (  # noqa: E402
     CLAUDE_ACCOUNTS,
     SITE_INSTANCE,
@@ -58,6 +72,7 @@ from agent_login_claude import (  # noqa: E402
 )
 from agent_login_jobs import (  # noqa: E402
     BUSY_RC,
+    KILLED_RC,
     LAUNCH_HOUR,
     LAUNCH_LABEL,
     LAUNCH_MINUTE,
@@ -84,8 +99,9 @@ from agent_login_jobs import (  # noqa: E402
     uninstall_daily,
     wait_for_network,
 )
-from broker import safari_cookies  # noqa: E402
+from broker import phases, safari_cookies  # noqa: E402
 from broker.recipes import DEFAULT_CHECK_URLS  # noqa: E402
+from broker.vault import SITE_ID_RE, selector_ok  # noqa: E402
 
 # pylint: enable=wrong-import-position
 
@@ -323,6 +339,22 @@ def classify(
     return _classify_listed(target, entry)
 
 
+def has_sentinel(entry: dict) -> bool:
+    """The broker item has an authenticated sentinel (`sentinel` from a WS1a
+    broker, else derived from its `logged_in_selector`)."""
+    flag = entry.get("sentinel")
+    if isinstance(flag, bool):
+        return flag
+    return bool(entry.get("logged_in_selector"))
+
+
+SENTINEL_HINT = (
+    "no agent_logged_in_selector — a login cannot be proven; find one: "
+    "browser.py logged-in {site} -x 'CSS' (logged out everywhere: one approved "
+    "browser.py login {site} -x 'CSS'), then broker-add.py -L"
+)
+
+
 def _classify_eduid_sso(
     target: Target, listed: dict[str, dict], *, readable: bool
 ) -> tuple[str, str]:
@@ -343,7 +375,8 @@ def _classify_listed(target: Target, entry: dict) -> tuple[str, str]:
     reason = str(entry.get("reason") or refused)
     if target.flow == SAFARI_FLOW:
         # Listed at all = Albert's consent for the Safari import; a refused item
-        # only rules out the broker fallback.
+        # only rules out the broker fallback. (No sentinel: the row's
+        # `sentinel` flag says so — the old proof still decides.)
         if refused:
             return "safari", f"{target.note}; broker item refused: {reason}"
         return "safari", target.note
@@ -378,11 +411,43 @@ def safari_state(sites: list[str]) -> dict[str, dict]:
     }
 
 
+def _broker_fields(entry: dict) -> dict:
+    """The broker columns of a row (limiter state, group, scope, sentinel)."""
+    limit = entry.get("limit") if isinstance(entry.get("limit"), dict) else None
+    return {
+        "limit": limit,
+        "attempt_group": entry.get("attempt_group"),
+        "sentinel": has_sentinel(entry) if entry else None,
+        "cookie_hosts": list(entry.get("cookie_hosts") or []),
+        "storage_origins": list(entry.get("storage_origins") or []),
+        "proof_origins": list(entry.get("proof_origins") or []),
+    }
+
+
+def _known_extras(planned: set[str]) -> list[str]:
+    """Broker sites known from earlier runs (site-state.json, the last
+    sites.json snapshot whatever its age): shown while the broker is down."""
+    known = set(als.site_states())
+    try:
+        snap = json.loads(_state_path("sites.json").read_text(encoding="utf-8"))
+        known |= {str(s.get("site")) for s in snap.get("sites") or [] if s.get("site")}
+    except (OSError, ValueError, AttributeError, TypeError):
+        pass
+    return sorted(s for s in known - planned if SITE_ID_RE.match(s))
+
+
 def overview(*, fresh: bool = False) -> dict:
     """Everything the report shows, as data."""
     health, sites = broker_state(fresh=fresh)
     readable = health.startswith("running, Bitwarden")
     listed = {str(s.get("site")): s for s in sites}
+    if readable and listed:
+        with contextlib.suppress(als.StateError, OSError):
+            als.ensure_known([s for s in listed if SITE_ID_RE.match(s)])
+    try:
+        stages = als.site_states()
+    except als.StateError:
+        stages = {}
     safari = safari_state([t.site for t in TARGETS if t.flow == SAFARI_FLOW])
     rows = []
     for t in TARGETS:
@@ -398,6 +463,8 @@ def overview(*, fresh: bool = False) -> dict:
                 "status": status,
                 "detail": detail,
                 "in_bitwarden": bool(entry.get("fill_origins")),
+                **_broker_fields(entry),
+                **_stage_fields(stages.get(t.broker_site or t.site)),
                 **safari.get(t.site, {}),
             }
         )
@@ -406,6 +473,9 @@ def overview(*, fresh: bool = False) -> dict:
         if site in planned:
             continue
         refused = entry.get("refused")
+        status, detail = "extra", ""
+        if refused:
+            status, detail = "refused", str(entry.get("reason") or "")
         rows.append(
             {
                 "site": site,
@@ -414,16 +484,42 @@ def overview(*, fresh: bool = False) -> dict:
                 "flow": "one-page",
                 "note": "",
                 "check_url": str(entry.get("check_url") or ""),
-                "status": "refused" if refused else "extra",
-                "detail": str(entry.get("reason") or "") if refused else "",
+                "status": status,
+                "detail": detail,
                 "in_bitwarden": bool(entry.get("fill_origins")),
+                **_broker_fields(entry),
+                **_stage_fields(stages.get(site)),
             }
         )
+    if not readable:
+        for site in _known_extras(planned):
+            rows.append(
+                {
+                    "site": site,
+                    "name": site,
+                    "fill_origin": "",
+                    "flow": "one-page",
+                    "note": "",
+                    "check_url": "",
+                    "status": "unchecked",
+                    "detail": "broker unreadable — known from earlier runs",
+                    "in_bitwarden": None,
+                    **_broker_fields({}),
+                    **_stage_fields(stages.get(site)),
+                }
+            )
     return {
         "broker": health,
         "broker_ok": readable,
         "rows": rows,
     }
+
+
+def _stage_fields(entry: dict | None) -> dict:
+    """The site-state columns of a row: stage and quarantine."""
+    entry = entry or {}
+    q = entry.get("quarantine") if isinstance(entry.get("quarantine"), dict) else None
+    return {"stage": entry.get("stage"), "quarantine": q}
 
 
 def safari_cell(row: dict) -> str:
@@ -437,15 +533,6 @@ def safari_cell(row: dict) -> str:
     return f"Safari: until {row.get('safari_expires')}"
 
 
-LAST_CHECK_FILE = Path.home() / ".local/state/agent-login/last-check.json"
-
-
-def _state_file() -> Path:
-    """LAST_CHECK_FILE, or $AGENT_LOGIN_STATE_FILE (tests point it at a temp dir)."""
-    env = os.environ.get("AGENT_LOGIN_STATE_FILE")
-    return Path(env) if env else LAST_CHECK_FILE
-
-
 AGENTS_FILE_NAME = "agents.md"
 # How each kind of login is used by an agent (the summary's ✅ lines).
 _HOW_TO_USE = {
@@ -456,28 +543,77 @@ _HOW_TO_USE = {
 }
 
 
+TARGET_SITES = {t.site for t in TARGETS}
+_CHECK_FIRST = {
+    "stale": "its last success is older than the status age",
+    "unknown": "its last check could not tell",
+    "unchecked": "not checked yet",
+}
+
+
+def _summary_name(row: dict) -> str | None:
+    """A row's display name for agents.md: a static TARGETS name, else the
+    validated site id — never a name read from Bitwarden or a page."""
+    site = str(row.get("site") or "")
+    if not SITE_ID_RE.match(site):
+        return None
+    if site in TARGET_SITES:
+        return next(t.name for t in TARGETS if t.site == site)
+    return site
+
+
+def _summary_reason(row: dict, state: str, checks: dict[str, dict]) -> str:
+    """The ❌ text of agents.md: fixed vocabulary only (phase/code texts, the
+    fixed setup reasons, fixed hints) — never a detail or a page's words."""
+    site = row["site"]
+    if state == "setup":
+        if row["status"] in _SETUP_REASON:
+            return _SETUP_REASON[row["status"]]
+        return (
+            "Safari session missing, expired or unreadable — Albert logs in in Safari"
+        )
+    rec = checks.get(site) or {}
+    text = phases.text(str(rec.get("phase") or ""), str(rec.get("code") or ""))
+    if row.get("flow") == ASSISTED_FLOW or row["status"] == "assisted":
+        return f"not logged in — needs Albert: ./agent-login.py -g {site}"
+    return f"not logged in — {text}"
+
+
 def agent_summary(data: dict, checks: dict[str, dict]) -> str:
-    """The short Markdown every agent session gets at start (SessionStart hook)."""
-    ok_lines, bad_lines = [], []
-    for row in sorted(data["rows"], key=lambda r: r["name"].lower()):
-        works, why = verdict(row, checks)
-        if works:
-            how = _HOW_TO_USE.get(row["status"], row["status"])
-            detail = str((checks.get(row["site"]) or {}).get("how") or "")
-            if detail.startswith("logged in as"):
-                how += f", {detail[len('logged in as ') :]}"
-            inst = SITE_INSTANCE.get(row["site"])
+    """The short Markdown every agent session gets at start (SessionStart hook).
+
+    Prompt-injection surface: it renders ONLY fixed vocabulary (phase/code
+    texts, fixed reasons and hints) and validated identifiers (static names,
+    site ids, the expected claude.ai account) — never a detail, a broker
+    reason, a screenshot path or anything a page said."""
+    ok_lines, check_lines, bad_lines = [], [], []
+    for row in sorted(data["rows"], key=lambda r: str(r["name"]).lower()):
+        name = _summary_name(row)
+        if name is None:
+            continue
+        site = row["site"]
+        state, _why = row_state(row, checks)
+        if state == "ok":
+            how = _HOW_TO_USE.get(row["status"], "login broker")
+            if site in CLAUDE_ACCOUNTS:
+                how += f", {CLAUDE_ACCOUNTS[site]}"
+            inst = SITE_INSTANCE.get(site)
             if inst:
                 how += (
                     f" — its own browser (CDP 127.0.0.1:9223), stopped when idle: "
                     f"`CLAUDE_BROWSER_INSTANCE={inst} browser.py up` first, "
                     "`… down` when done; every browser.py call needs that prefix"
                 )
-            ok_lines.append(
-                f"- ✅ {row['name']} (`{browser_site(row['site'])}`): {how}"
+            if needs_sentinel(row):
+                how += " — weak proof (no sentinel yet)"
+            ok_lines.append(f"- ✅ {name} (`{browser_site(site)}`): {how}")
+        elif state in _CHECK_FIRST:
+            check_lines.append(
+                f"- ❓ {name} (`{browser_site(site)}`): {_CHECK_FIRST[state]} — "
+                f"check first: `browser.py logged-in {browser_site(site)}`"
             )
         else:
-            bad_lines.append(f"- ❌ {row['name']}: {why}")
+            bad_lines.append(f"- ❌ {name}: {_summary_reason(row, state, checks)}")
     here = Path(__file__).resolve().parent
     out = [
         f"## Web logins agents can use (agent-login.py, {time.strftime('%Y-%m-%d %H:%M')})",
@@ -487,16 +623,18 @@ def agent_summary(data: dict, checks: dict[str, dict]) -> str:
         "site: `browser.py logged-in <site>`. If it fails: for broker/Safari sites "
         "run `browser.py login <site>` (never asks for a password); for sites on "
         "Albert's session do NOT start a login — ask Albert to run "
-        "`agent-login.py -g <site>`. Never ask Albert for passwords.",
+        "`agent-login.py -g <site>`. Never ask Albert for passwords. A site that "
+        "fails after its password was submitted is quarantined: do not retry it.",
         "",
         *ok_lines,
+        *check_lines,
         *bad_lines,
         *agent_login_secrets.summary_lines(data.get("secrets") or []),
         "",
         f"Full status: `{here}/agent-login.py` (❌ items need Albert unless noted).",
     ]
     if not data.get("broker_ok"):
-        out.insert(2, f"⚠️ login broker: {data.get('broker')}\n")
+        out.insert(2, "⚠️ login broker unavailable — broker sites cannot log in now\n")
     return "\n".join(out) + "\n"
 
 
@@ -513,35 +651,36 @@ def write_agent_summary(data: dict | None = None) -> Path:
     return path
 
 
-def record_check(site: str, ok: bool, how: str, path: Path | None = None) -> None:
-    """Remember a site's latest REAL check (what the overview shows)."""
-    path = path or _state_file()
-    try:
-        data = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, ValueError):
-        data = {}
-    data[site] = {"ok": ok, "how": how, "at": time.strftime("%Y-%m-%d %H:%M")}
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(".tmp")
-    tmp.write_text(json.dumps(data, indent=1), encoding="utf-8")
-    tmp.replace(path)
+def record_check(
+    site: str, ok: bool | None, how: str, result: dict | None = None
+) -> None:
+    """Remember a site's latest REAL check (`agent_login_state.record_check`):
+    ok True / False / None (= could not tell), plus where it stopped —
+    browser.py's result record (`-R`) when there is one."""
+    r = result or {}
+    state = "ok" if ok else ("unknown" if ok is None else "failed")
+    proof_v = r.get("proof_v")
+    with contextlib.suppress(als.StateError, OSError):
+        als.record_check(
+            site,
+            state,
+            how,
+            phase=str(r.get("phase") or ""),
+            code=str(r.get("code") or ""),
+            detail=str(r.get("detail") or ""),
+            screenshot=r.get("screenshot"),
+            stop_origin=str(r.get("stop_origin") or ""),
+            submitted=r.get("submitted"),
+            route=str(r.get("route") or ""),
+            proof_v=proof_v if isinstance(proof_v, int) else 0,
+            final_origin=str(r.get("final_origin") or ""),
+            origin_ok=r.get("origin_ok"),
+        )
 
 
-def last_checks(path: Path | None = None) -> dict[str, dict]:
-    """``{site: {"ok", "how", "at"}}`` from the last check runs (empty if none)."""
-    try:
-        data = json.loads((path or _state_file()).read_text(encoding="utf-8"))
-    except (OSError, ValueError):
-        return {}
-    return data if isinstance(data, dict) else {}
-
-
-def check_cell(site: str, checks: dict[str, dict]) -> str:
-    """'✅ 2026-10-04 21:15' / '❌ …' / 'not checked yet'."""
-    c = checks.get(site)
-    if not c:
-        return "not checked yet"
-    return f"{'✅' if c.get('ok') else '❌'} {c.get('at', '?')}"
+def last_checks() -> dict[str, dict]:
+    """``{site: record}`` of the latest checks (checks.json v2)."""
+    return als.checks()
 
 
 # Setup problems: the site cannot work for agents whatever the last check said.
@@ -573,29 +712,84 @@ def _setup_problem(row: dict) -> str | None:
     return problem
 
 
-def verdict(row: dict, checks: dict[str, dict]) -> tuple[bool, str]:
-    """(works for agents?, reason/detail) — one answer per login.
-
-    ✅ only when the setup is complete AND the latest REAL check (``-c``/``-t``)
-    passed; everything else is ❌ with the first thing that is wrong.
-    """
+def row_state(row: dict, checks: dict[str, dict]) -> tuple[str, str]:
+    """(state, why) of one login: ``ok`` (setup complete AND the latest real
+    check passed, fresh), ``stale`` (that ✅ is older than the max status
+    age), ``unknown`` (the latest check could not tell), ``unchecked``,
+    ``failed``, or ``setup`` (cannot work whatever a check says)."""
     problem = _setup_problem(row)
-    c = checks.get(row["site"])
-    if problem or not c or not c.get("ok"):
-        if problem:
-            return False, problem
-        if not c:
-            return False, f"not checked yet — ./agent-login.py -t {row['site']}"
-        return False, f"last check {c.get('at', '?')}: {c.get('how', 'failed')}"
-    how = f"checked {c.get('at', '?')}"
+    if problem:
+        return "setup", problem
+    site = row["site"]
+    rec = checks.get(site)
+    fresh = als.freshness(rec)
+    if not rec or fresh == "unchecked":
+        return "unchecked", f"not checked yet — ./agent-login.py -t {site}"
+    when = rec.get("at_text", "?")
+    reason = phases.text(str(rec.get("phase") or ""), str(rec.get("code") or ""))
+    if fresh == "stale":
+        hours = als.max_status_age_s() / 3600
+        return "stale", (
+            f"last success {when} is older than {hours:g} h — verify: "
+            f"browser.py logged-in {browser_site(site)}"
+        )
+    if fresh == "unknown":
+        return "unknown", f"last check {when} could not tell — {reason}"
+    if fresh != "ok":
+        return "failed", f"last check {when}: {reason}"
+    how = f"checked {when}"
     if row["status"] == "safari" and row.get("safari"):
         how += f", Safari session until {row.get('safari_expires')}"
+    elif site in CLAUDE_ACCOUNTS:
+        how += f", logged in as {CLAUDE_ACCOUNTS[site]}"
     elif row.get("flow") == ASSISTED_FLOW or row["status"] == "assisted":
-        detail = str(c.get("how") or "")
-        how += f", {detail}" if detail.startswith("logged in as") else ", your session"
+        how += ", your session"
     else:
         how += ", login broker"
-    return True, how
+    return "ok", how
+
+
+def verdict(row: dict, checks: dict[str, dict]) -> tuple[bool, str]:
+    """(works for agents?, reason/detail) — one answer per login (✅ only for
+    a fresh, proven check of a complete setup)."""
+    state, why = row_state(row, checks)
+    return state == "ok", why
+
+
+def needs_sentinel(row: dict) -> bool:
+    """A broker-backed row whose item has no authenticated sentinel yet: its
+    checks use the old proof, it is never logged in by a scheduled run and
+    cannot be promoted (C2) — a warning for agents, not a ❌."""
+    return row.get("sentinel") is False and row["status"] in (
+        "ready",
+        "extra",
+        "safari",
+    )
+
+
+def _row_flags(row: dict) -> str:
+    """Stage, quarantine and limiter state of a broker row, with the command
+    that lifts each (empty for rows without them)."""
+    site = row["site"]
+    item = row.get("broker_site") or site  # switch -> its broker item eduid
+    flags = []
+    if needs_sentinel(row):
+        flags.append(
+            "needs sentinel (old proof) — "
+            + SENTINEL_HINT.format(site=item).split(";", 1)[1].strip()
+        )
+    q = row.get("quarantine")
+    if isinstance(q, dict):
+        flags.append(
+            f"quarantined after {q.get('phase')} {q.get('at_text', '')} "
+            f"(release: ./agent-login.py -Q {item})"
+        )
+    limit = row.get("limit") or {}
+    if limit.get("state") in ("locked", "cooldown", "quarantined", "busy"):
+        flags.append(f"{limit['state']}: {limit.get('reset') or limit.get('key')}")
+    if row.get("stage") == "pending" and row["status"] in ("ready", "extra"):
+        flags.append(f"pending — no scheduled login until ./agent-login.py -p {site}")
+    return "; ".join(flags)
 
 
 def print_overview(data: dict) -> None:
@@ -610,15 +804,27 @@ def print_overview(data: dict) -> None:
     )
     print(f"  broker: {'🟢' if ok else '🔴'} {data['broker']}\n")
     checks = last_checks()
-    judged = [(r, *verdict(r, checks)) for r in rows]
-    judged.sort(key=lambda x: (not x[1], x[0]["name"].lower()))
+    judged = [(r, *row_state(r, checks)) for r in rows]
+    order = {"ok": 0, "stale": 1, "unknown": 1, "unchecked": 1}
+    judged.sort(key=lambda x: (order.get(x[1], 2), x[0]["name"].lower()))
     width = max(len(r["name"]) for r in rows)
     col = "agent_fill_origins"
+    icons = {"ok": "✅", "stale": "❓", "unknown": "❓", "unchecked": "❓"}
     print(_c("2", f"     {'login'.ljust(width)}  {col}  status"))
-    for r, works, why in judged:
+    for r, state, why in judged:
         bw = str(bool(r.get("in_bitwarden"))).ljust(len(col))
-        line = f"  {'✅' if works else '❌'} {_c('1', r['name'].ljust(width))}  {bw}  "
-        print(line + (_c("2", why) if works else why))
+        icon = icons.get(state, "❌")
+        line = f"  {icon} {_c('1', r['name'].ljust(width))}  {bw}  "
+        rec = checks.get(r["site"]) or {}
+        if state == "failed":
+            if rec.get("detail"):
+                why += f" — {rec['detail']}"
+            if rec.get("screenshot"):
+                why += f"  📷 {rec['screenshot']}"
+        flags = _row_flags(r)
+        if flags:
+            why += f"  [{flags}]"
+        print(line + (_c("2", why) if state == "ok" else why))
     print()
     print(
         _c(
@@ -657,14 +863,57 @@ def _eduid_sso_assisted(site: str) -> bool:
     return classify(target, listed, readable=readable)[0] == "assisted"
 
 
+# One return per exit-code meaning.
+def derived_result(run: BrowserRun) -> dict:  # pylint: disable=too-many-return-statements
+    """The phase record of a `browser.py login` that wrote none (killed,
+    an older browser.py): what its exit code tells."""
+    if run.result:
+        return run.result
+    if run.killed:
+        return {"phase": "unknown", "code": "killed", "submitted": None}
+    rc = run.rc
+    if rc in (LOGIN_TIMEOUT_RC, LOGIN_TIMEOUT_DIRTY_RC):
+        return {"phase": "unknown", "code": "timeout", "submitted": None}
+    if rc == 3:
+        return {"phase": "precheck", "code": "broker_unavailable"}
+    if rc == BUSY_RC:
+        return {"phase": "precheck", "code": "busy"}
+    if rc == 0:
+        return {"phase": "ok", "code": "ok"}
+    return {"phase": "unknown", "code": "internal"}
+
+
+def _quarantine_after_kill(site: str, run: BrowserRun) -> None:
+    """A login the RUNNER killed may have been inside the broker request:
+    quarantine the broker item (browser.py could not write it)."""
+    if not run.killed:
+        return
+    target = next((t for t in TARGETS if t.site == site), None)
+    key = (target.broker_site if target and target.broker_site else "") or site
+    with contextlib.suppress(als.StateError, OSError):
+        als.quarantine(key, "unknown", "killed")
+
+
+def failure_how(res: dict, login_rc: int | None, check_rc: int | None = None) -> str:
+    """`NOT logged in — <phase text>: <code text>[ — detail]` for the overview."""
+    text = phases.text(str(res.get("phase") or ""), str(res.get("code") or ""))
+    how = f"NOT logged in — {text}"
+    if res.get("detail"):
+        how += f" — {res['detail']}"
+    exits = f"browser.py login exit {login_rc}"
+    if check_rc is not None:
+        exits += f", check exit {check_rc}"
+    return f"{how} ({exits})"
+
+
 def run_test(site: str) -> int:
     """Real end-to-end test: `browser.py login` (Safari session first for the
     SAFARI_SITES, else the login broker) → session in the shared Chromium → the
     client's POSITIVE check (check URL / sentinel, in a background tab).
 
     The verdict is the positive check, never the login command's exit code
-    alone: a login that "succeeded" while the check page still redirects to the
-    login page is reported as NOT logged in. The result is recorded for the overview.
+    alone. The result is recorded for the overview with WHERE it stopped
+    (browser.py's phase record). A test never promotes a site.
     """
     site = resolve_site(site)
     if site in ASSISTED_SITES or _eduid_sso_assisted(site):
@@ -681,31 +930,37 @@ def run_test(site: str) -> int:
         f"▶ browser.py login {site}  (Safari session or login broker; "
         "you see no password)"
     )
-    login = run_browser("login", site, timeout_s=browser_timeout("login"))
+    login = run_browser("login", site, timeout_s=browser_timeout("login"), result=True)
+    res = derived_result(login)
     failed = login_run_failure(login)
     if failed is not None:  # 125 or an outer kill: never retried, no check
+        _quarantine_after_kill(site, login)
         print(f"❌ {site}: {failed}")
-        record_check(site, False, failed)
+        record_check(site, False, failed, res)
         return 1 if login.rc is None else login.rc
     login_rc = int(login.rc or 0)
     if login_rc != 0:
-        print(f"❌ login {site} failed (exit {login_rc})")
+        print(f"❌ login {site} failed (exit {login_rc}) at {res.get('phase')}")
     print(f"▶ browser.py logged-in {site}  (positive check on the check URL)")
-    rc = _browser("logged-in", site, timeout_s=browser_timeout("logged-in"))
+    rc, check = probe(site, quiet=False)
     if BUSY_RC in (rc, login_rc):
         print(f"⏸  {site}: {BUSY_HOW}")
+        record_check(site, None, BUSY_HOW, {"phase": "precheck", "code": "busy"})
         return BUSY_RC
     if rc == 0:
         how = INNER_TIMEOUT_OK if login_rc == LOGIN_TIMEOUT_RC else "logged in"
-    elif login_rc == LOGIN_TIMEOUT_RC:  # -t never retries; -c does, once
-        how = f"NOT logged in ({_inner_timeout_text()}; check exit {rc})"
+        record_check(
+            site, True, how, {**res, **(check or {}), "phase": "ok", "code": "ok"}
+        )
     else:
-        how = f"NOT logged in (browser.py login exit {login_rc}, check exit {rc})"
-    record_check(site, rc == 0, how)
+        if login_rc == 0:  # the login said yes, the check says no
+            res = {**res, "phase": "client-proof", "code": "logged_out"}
+        how = failure_how(res, login_rc, rc)
+        record_check(site, False, how, res)
     print(
         ("✅ " if rc == 0 else "❌ ")
         + f"{site}: shared Chromium is "
-        + ("logged in" if rc == 0 else "NOT logged in")
+        + ("logged in" if rc == 0 else f"NOT logged in — stopped at {res.get('phase')}")
         + " (positive check)"
     )
     return rc or login_rc
@@ -880,27 +1135,63 @@ def assisted_login(site: str, force: bool = False) -> int:
 BUSY_HOW = "busy: guided login in progress — skipped, re-check later"
 
 
-def ensure_logged_in(site: str) -> tuple[bool | None, str]:
-    """(logged in?, how) — positive check, else `browser.py login`, then re-check.
+Outcome = tuple[bool | None, str, dict | None]
+
+
+def probe(site: str, *, quiet: bool = True) -> tuple[int, dict | None]:
+    """The free `browser.py logged-in SITE` check: (exit code, its phase
+    record — strict or old proof, final origin)."""
+    run = run_browser(
+        "logged-in",
+        site,
+        timeout_s=browser_timeout("logged-in"),
+        quiet=quiet,
+        result=True,
+    )
+    return (KILLED_RC if run.rc is None else run.rc), run.result
+
+
+def ensure_logged_in(site: str, gate: tuple[str, str] | None = None) -> Outcome:
+    """(logged in?, how, phase record) — positive check, else ONE scheduled
+    `browser.py login -s`, then re-check.
 
     None = busy (exit 75: a guided login owns the browser): never a login
-    attempt, never "logged out". A login whose inner deadline fired with its
-    tabs closed (124) is retried ONCE, and only when the check then fails; 125
-    (tab cleanup unconfirmed) and an outer kill are never retried."""
-    rc = _browser("logged-in", site, quiet=True, timeout_s=browser_timeout("logged-in"))
+    attempt, never "logged out". `gate` (code, why): the site may not be
+    logged in by a scheduled run (pending, quarantined, locked, …) — the free
+    check still runs, the login does not. A login whose deadline fired is
+    retried ONCE, and only when its record proves it stopped BEFORE the broker
+    request (phase precheck); 125, an outer kill and any later phase are
+    never retried — the broker may have typed the password."""
+    rc, check = probe(site)
     if rc == BUSY_RC:
-        return None, BUSY_HOW
+        return None, BUSY_HOW, {"phase": "precheck", "code": "busy"}
     if rc == 0:
-        return True, "logged in"
+        weak = gate is not None and gate[0] == "needs_sentinel"
+        how = "needs sentinel (old proof)" if weak else "logged in"
+        return True, how, {**(check or {}), "phase": "ok", "code": "ok"}
+    if gate is not None:
+        code, why = gate
+        return (
+            False,
+            f"NOT logged in — {why}",
+            {**(check or {}), "phase": "precheck", "code": code},
+        )
     for attempt in (1, 2):
         run = run_browser(
-            "login", site, timeout_s=browser_timeout("login"), capture=True
+            "login",
+            site,
+            "-s",
+            timeout_s=browser_timeout("login"),
+            capture=True,
+            result=True,
         )
         outcome = _after_login(site, run, retry_left=attempt == 1)
         if outcome is not None:
             return outcome
-        print(f"↻ {site}: {_inner_timeout_text()} and the check fails — retrying once")
-    return False, f"NOT logged in ({_inner_timeout_text()}, twice)"  # not reached
+        print(
+            f"↻ {site}: {_inner_timeout_text()} before the broker request — retrying once"
+        )
+    return False, f"NOT logged in ({_inner_timeout_text()}, twice)", None  # not reached
 
 
 INNER_TIMEOUT_OK = "logged in (after an inner timeout)"
@@ -912,14 +1203,16 @@ def _inner_timeout_text() -> str:
 
 
 def _after_inner_timeout(
-    check_rc: int, *, retry_left: bool
-) -> tuple[bool | None, str] | None:
-    """Exit 124 (tabs closed): the check decides; a failed check → retry once."""
+    check_rc: int, res: dict, *, retry_left: bool
+) -> Outcome | None:
+    """Exit 124 (tabs closed): the check decides; a failed check → retry once,
+    but only when the record proves the deadline fired before the broker
+    request (phase precheck)."""
     if check_rc == 0:
-        return True, INNER_TIMEOUT_OK
-    if retry_left:
+        return True, INNER_TIMEOUT_OK, {"phase": "ok", "code": "ok"}
+    if retry_left and res.get("phase") == "precheck":
         return None
-    return False, f"NOT logged in ({_inner_timeout_text()}, twice)"
+    return False, failure_how(res, LOGIN_TIMEOUT_RC, check_rc), res
 
 
 def login_run_failure(run: BrowserRun) -> str | None:
@@ -939,26 +1232,29 @@ def login_run_failure(run: BrowserRun) -> str | None:
     return None
 
 
-def _after_login(
-    site: str, run: BrowserRun, *, retry_left: bool
-) -> tuple[bool | None, str] | None:
+def _after_login(site: str, run: BrowserRun, *, retry_left: bool) -> Outcome | None:
     """`ensure_logged_in`'s verdict after one `browser.py login`; None = retry."""
+    res = derived_result(run)
     failed = login_run_failure(run)
     if failed is not None:
-        return False, failed
+        _quarantine_after_kill(site, run)
+        return False, failed, res
     routes = [
         line.split("route:", 1)[1].strip()
         for line in run.stdout.splitlines()
         if "route:" in line
     ]
-    rc = _browser("logged-in", site, quiet=True, timeout_s=browser_timeout("logged-in"))
+    rc, check = probe(site)
     if BUSY_RC in (rc, run.rc):
-        return None, BUSY_HOW
+        return None, BUSY_HOW, {"phase": "precheck", "code": "busy"}
     if run.rc == LOGIN_TIMEOUT_RC:
-        return _after_inner_timeout(rc, retry_left=retry_left)
+        return _after_inner_timeout(rc, res, retry_left=retry_left)
     if rc == 0:
-        return True, f"logged in again ({routes[-1] if routes else 'browser.py login'})"
-    return False, f"NOT logged in (browser.py login exit {run.rc})"
+        how = f"logged in again ({routes[-1] if routes else 'browser.py login'})"
+        return True, how, {**res, **(check or {}), "phase": "ok", "code": "ok"}
+    if run.rc == 0:
+        res = {**res, "phase": "client-proof", "code": "logged_out"}
+    return False, failure_how(res, run.rc), res
 
 
 def failure_mail(failed: list[tuple[str, str]]) -> tuple[str, str]:
@@ -1005,27 +1301,74 @@ def ensure_browser_up() -> bool:
 
 
 def _check_assisted_row(site: str, failed: list[tuple[str, str]]) -> None:
-    """`-c` for a site you log into yourself: check only; busy = skip."""
+    """`-c` for a site you log into yourself: check only; busy = unknown."""
     ok, how = assisted_check(site)
     if ok is None:
         print(f"⏸  {site}: {how}")
+        record_check(site, None, how, {"phase": "precheck", "code": "busy"})
         return
     print(f"{'✅' if ok else '❌'} {site}: {how}")
-    record_check(site, ok, how)
+    record_check(
+        site, ok, how, None if ok else {"phase": "client-proof", "code": "logged_out"}
+    )
     if not ok:
         failed.append((site, how))
 
 
-def check_all(*, mail: bool = False) -> int:
-    """Every usable site (Safari or broker): logged in? If not, log in. One line
-    per site; exit 1 if any stays logged out (and, with `mail`, ONE mail).
-    Waits for the network first; still offline after 5 min = skip quietly."""
+def schedule_gate(row: dict) -> tuple[str, str] | None:
+    """Why a SCHEDULED run must not log `row` in (code, text with the exact
+    command that lifts it), or None. Pure broker rows only: a Safari import
+    and the edu-ID SSO click are free — `browser.py login -s` gates their
+    broker fallback itself."""
+    site = row["site"]
+    if row["status"] not in ("ready", "extra") or row.get("flow") in (
+        SAFARI_FLOW,
+        EDUID_SSO_FLOW,
+    ):
+        return None
+    q = row.get("quarantine")
+    if isinstance(q, dict):
+        return "quarantined", (
+            f"quarantined after {q.get('phase')} {q.get('at_text', '')} — release: "
+            f"./agent-login.py -Q {site}"
+        )
+    if needs_sentinel(row):
+        return "needs_sentinel", (
+            f"needs sentinel — no scheduled login with the old proof; find one: "
+            f"browser.py logged-in {site} -x 'CSS'"
+        )
+    limit = row.get("limit") or {}
+    if limit.get("state") in ("locked", "cooldown", "quarantined"):
+        return str(limit["state"]), (
+            f"{limit['state']} — {limit.get('reset') or 'sudo install/install.sh -r ' + site}"
+        )
+    if row.get("stage") != "usable":
+        return "pending", f"pending — promote: ./agent-login.py -p {site}"
+    return None
+
+
+def _record_unchecked(data: dict | None, code: str, why: str) -> None:
+    """A run that could not check anything records `unknown` for every
+    checkable row (never success, never "logged out")."""
+    for row in (data or {}).get("rows") or []:
+        if row["status"] in ("ready", "extra", "safari", "assisted"):
+            record_check(row["site"], None, why, {"phase": "precheck", "code": code})
+
+
+def check_all(*, mail: bool = False) -> int:  # pylint: disable=too-many-branches
+    """Every usable site (Safari or broker): logged in? If not — and a
+    scheduled login is allowed (`schedule_gate`) — ONE `browser.py login -s`.
+    One line per site; exit 1 if any stays logged out (and, with `mail`, ONE
+    mail). Waits for the network first; still offline after 5 min = every
+    row `unknown`, no mail."""
     if not wait_for_network():
         print(f"⏸  no network ({NETWORK_HOST} does not resolve) — skipped, no mail")
+        _record_unchecked(overview(), "offline", "no network — not checked")
         return 0
     if not ensure_browser_up():
         how = "down, and `browser.py up` did not start it"
         print(f"❌ shared Chromium: {how} — no site checked")
+        _record_unchecked(overview(), "browser_down", f"shared Chromium {how}")
         if mail:
             send_mail(
                 "agent-login: shared Chromium does not start",
@@ -1042,32 +1385,257 @@ def check_all(*, mail: bool = False) -> int:
         print(f"❌ login broker: {data['broker']}")
         failed.append(("login broker", data["broker"]))
     for row in data["rows"]:
+        site = row["site"]
         if row["status"] == "assisted":
-            _check_assisted_row(row["site"], failed)
+            _check_assisted_row(site, failed)
+            continue
+        if row["status"] == "unchecked":  # the broker cannot read Bitwarden
+            record_check(
+                site,
+                None,
+                "broker unreadable — not checked",
+                {"phase": "precheck", "code": "broker_unavailable"},
+            )
             continue
         if row["status"] not in ("ready", "extra", "safari"):
             continue
-        rule = safari_cookies.SAFARI_SITES.get(row["site"])
+        rule = safari_cookies.SAFARI_SITES.get(site)
         if rule is not None and not rule.auto:
-            print(f"⏭  {row['site']}: not imported unattended (see SAFARI_SITES)")
+            print(f"⏭  {site}: not imported unattended (see SAFARI_SITES)")
             continue
         if not ensure_browser_up():
             # The browser went away mid-run: stop instead of failing every site.
             how = "shared Chromium went down mid-run and did not restart"
-            print(f"❌ {row['site']}: {how} — remaining sites not checked")
+            print(f"❌ {site}: {how} — remaining sites not checked")
             failed.append(("shared Chromium", how))
             break
-        ok, how = ensure_logged_in(row["site"])
+        ok, how, res = ensure_logged_in(site, gate=schedule_gate(row))
         if ok is None:
-            print(f"⏸  {row['site']}: {how}")
+            print(f"⏸  {site}: {how}")
+            record_check(site, None, how, res)
             continue
-        print(f"{'✅' if ok else '❌'} {row['site']}: {how}")
-        record_check(row["site"], ok, how)
+        print(f"{'✅' if ok else '❌'} {site}: {how}")
+        record_check(site, ok, how, res)
         if not ok:
-            failed.append((row["site"], how))
+            failed.append((site, how))
     if failed and mail:
         send_mail(*failure_mail(failed))
     return 1 if failed else 0
+
+
+def prune_removed(data: dict) -> list[str]:
+    """After a FRESH live broker listing (`-S`, `-r`): drop the state of
+    sites that are neither planned nor listed any more (e.g. zendesk)."""
+    rows = data.get("rows") or []
+    if not data.get("broker_ok") or not rows:
+        return []
+    keep = {r["site"] for r in rows} | {t.broker_site for t in TARGETS if t.broker_site}
+    with contextlib.suppress(als.StateError, OSError):
+        return als.prune(keep)
+    return []
+
+
+SELECTOR_FIELDS = (
+    ("logged_in_selector", "agent_logged_in_selector"),
+    ("pre_click", "agent_pre_click"),
+)
+
+
+def selector_audit() -> int:
+    """`-V`: every live broker item whose sentinel or pre-click selector the
+    new broker would refuse (not plain CSS: Playwright `text=`/`xpath=`/`>>`,
+    `:has-text(` …). Read-only, from the site-list snapshot, no secrets.
+    Exit 0 none, 1 some (fix them before installing the broker), 3 no list."""
+    health, sites = broker_state()
+    if not sites:
+        print(f"❌ no broker site list to check ({health})")
+        return 3
+    bad = [
+        (str(s.get("site")), field, str(s.get(key)))
+        for s in sites
+        for key, field in SELECTOR_FIELDS
+        if s.get(key) and not selector_ok(str(s.get(key)))
+    ]
+    for site, field, value in bad:
+        print(f"❌ {site}: {field} is not plain CSS: {value}")
+    if bad:
+        print(
+            f"{len(bad)} selector(s) the new broker refuses — fix them "
+            "(broker-add.py) before `sudo install/install.sh`."
+        )
+        return 1
+    print(f"✅ all {len(sites)} broker items use plain-CSS selectors")
+    return 0
+
+
+def release_action(site: str) -> int:
+    """`-Q SITE`: lift a quarantine (the main session's call; audited)."""
+    site = resolve_site(site)
+    if not SITE_ID_RE.match(site):
+        print(f"❌ not a site id: {site!r}")
+        return 2
+    try:
+        had = als.release(site, why="agent-login.py -Q")
+    except als.StateError as exc:
+        print(f"❌ {site}: site state not usable ({exc})")
+        return 1
+    print(
+        f"✅ {site}: quarantine released (audited)"
+        if had
+        else f"ℹ️ {site} was not quarantined (audit entry written)"
+    )
+    return 0
+
+
+# One early return per promotion precondition, in the order they are checked.
+def promote_refusal(site: str) -> str | None:  # pylint: disable=too-many-return-statements
+    """Why `site` may not be promoted to scheduled logins, or None. Mechanical:
+    a FRESH broker listing shows it usable with a sentinel, its latest check is
+    a fresh ok from the strict proof, and it is not quarantined."""
+    health, sites = broker_state(fresh=True)
+    if not health.startswith("running, Bitwarden"):
+        return f"no fresh broker listing ({health})"
+    entry = next((s for s in sites if s.get("site") == site), None)
+    if entry is None:
+        return "not listed by the broker"
+    if entry.get("refused"):
+        return f"the broker refuses the item ({entry.get('reason') or '?'})"
+    if not has_sentinel(entry):
+        return "the item has no agent_logged_in_selector"
+    if als.quarantined(site):
+        return f"quarantined — release first: ./agent-login.py -Q {site}"
+    rec = als.checks().get(site)
+    if als.freshness(rec) != "ok" or not rec:
+        return f"no fresh successful check — run ./agent-login.py -t {site} first"
+    if int(rec.get("proof_v") or 0) < 1:
+        return "the last check predates the strict proof — re-run ./agent-login.py -t"
+    return None
+
+
+def promote_action(site: str) -> int:
+    """`-p SITE`: allow scheduled logins for a proven site (audited)."""
+    site = resolve_site(site)
+    if not SITE_ID_RE.match(site):
+        print(f"❌ not a site id: {site!r}")
+        return 2
+    why = promote_refusal(site)
+    if why is not None:
+        print(f"❌ {site}: not promoted — {why}")
+        return 2
+    try:
+        als.promote(site, why="agent-login.py -p")
+    except als.StateError as exc:
+        print(f"❌ {site}: site state not usable ({exc})")
+        return 1
+    print(f"✅ {site}: promoted — the daily check may log it in from now on")
+    return 0
+
+
+# consumer, privilege — only what the code knows; anything else is "?".
+MATRIX_META = {
+    "cscs": ("cscs-api.py (Waldur)", "user"),
+    "smartsheet": ("sdsc/smartsheet-api", "user"),
+    "slack": ("slack_api.py (users.admin.*)", "admin"),
+    "anthropic": ("anthropic-api.py (Team admin)", "admin"),
+    "openai": ("ChatGPT Business admin", "admin"),
+    "switch": ("Switch Cloud Portal", "user"),
+}
+
+
+def refresh_policy(row: dict) -> str:
+    """How the row's session is renewed."""
+    if row["status"] == "safari":
+        return "Albert's Safari session"
+    if row["status"] == "assisted" or row.get("flow") == ASSISTED_FLOW:
+        return "Albert: ./agent-login.py -g"
+    if needs_sentinel(row):
+        return "none (needs a sentinel)"
+    if row.get("quarantine"):
+        return "none (quarantined)"
+    if row["status"] in ("ready", "extra"):
+        return "daily -c" if row.get("stage") == "usable" else "none (pending)"
+    return "none"
+
+
+def matrix_rows(data: dict, checks: dict[str, dict]) -> list[dict]:
+    """The acceptance matrix: one row per inventory item."""
+    out = []
+    for row in data["rows"]:
+        site = row["site"]
+        consumer, privilege = MATRIX_META.get(site, ("?", "?"))
+        rec = checks.get(site) or {}
+        limit = row.get("limit") or {}
+        sentinel = row.get("sentinel")
+        out.append(
+            {
+                "site": site,
+                "flow": row.get("flow"),
+                "consumer": consumer,
+                "privilege": privilege,
+                "check_url": row.get("check_url") or "",
+                "sentinel": "unknown"
+                if sentinel is None
+                else ("yes" if sentinel else "none"),
+                "proof_origins": row.get("proof_origins") or [],
+                "bundle_scope": {
+                    "cookie_hosts": row.get("cookie_hosts") or [],
+                    "storage_origins": row.get("storage_origins") or [],
+                },
+                "attempt_group": row.get("attempt_group") or "",
+                "refresh": refresh_policy(row),
+                "stage": row.get("stage")
+                or ("n/a" if row["status"] in ("assisted", "safari") else "unknown"),
+                "quarantine": bool(row.get("quarantine")),
+                "limit": limit.get("state")
+                or ("unknown" if not data["broker_ok"] else "n/a"),
+                "last_phase": rec.get("phase") or "",
+                "final_origin": rec.get("final_origin") or "",
+                "origin_ok": rec.get("origin_ok"),
+                "state": row_state(row, checks)[0],
+            }
+        )
+    return out
+
+
+def print_matrix(data: dict, *, as_json: bool) -> int:
+    """`-x`: the acceptance matrix (table or JSON)."""
+    rows = matrix_rows(data, last_checks())
+    if as_json:
+        print(json.dumps(rows, indent=1))
+        return 0
+    cols = (
+        "site",
+        "flow",
+        "consumer",
+        "privilege",
+        "sentinel",
+        "attempt_group",
+        "refresh",
+        "stage",
+        "limit",
+        "last_phase",
+        "state",
+    )
+    table = [list(cols)] + [[str(r[c]) for c in cols] for r in rows]
+    widths = [max(len(line[i]) for line in table) for i in range(len(cols))]
+    for line in table:
+        print("  ".join(cell.ljust(w) for cell, w in zip(line, widths)).rstrip())
+    mismatches = origin_mismatches(rows)
+    if mismatches:
+        print(
+            "\nLast check ended on ANOTHER origin than the check URL's (set "
+            "agent_proof_origins before release, or fix agent_check_url):"
+        )
+        for r in mismatches:
+            print(
+                f"  {r['site']}: ended on {r['final_origin']} (check URL {r['check_url']})"
+            )
+    return 0
+
+
+def origin_mismatches(rows: list[dict]) -> list[dict]:
+    """Matrix rows whose latest check ended off the proof origins."""
+    return [r for r in rows if r.get("origin_ok") is False and r.get("final_origin")]
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -1143,7 +1711,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--install-daily",
         action="store_true",
         help=f"install + load the LaunchAgents {LAUNCH_LABEL} "
-        f"(`-c -m` daily {LAUNCH_HOUR:02d}:{LAUNCH_MINUTE:02d}) and {SNAPSHOT_LABEL} "
+        f"(`-c` daily {LAUNCH_HOUR:02d}:{LAUNCH_MINUTE:02d}) and {SNAPSHOT_LABEL} "
         f"(`-S` every {SNAPSHOT_INTERVAL_S // 60} min)",
     )
     ap.add_argument(
@@ -1159,7 +1727,39 @@ def build_parser() -> argparse.ArgumentParser:
         help="print both LaunchAgent plists (writes nothing)",
     )
     ap.add_argument(
-        "-j", "--json", action="store_true", help="print the overview as JSON"
+        "-j",
+        "--json",
+        action="store_true",
+        help="print the overview (with -x: the matrix) as JSON",
+    )
+    ap.add_argument(
+        "-x",
+        "--matrix",
+        action="store_true",
+        help="the acceptance matrix: one row per login (consumer, privilege, "
+        "sentinel, scope, attempt group, refresh, stage, limit, last phase)",
+    )
+    ap.add_argument(
+        "-p",
+        "--promote",
+        metavar="SITE",
+        help="allow scheduled logins (-c) for SITE — refused unless a fresh broker "
+        "listing shows its sentinel and its latest check is a fresh, strict ok",
+    )
+    ap.add_argument(
+        "-V",
+        "--validate-selectors",
+        action="store_true",
+        help="list live broker items whose agent_logged_in_selector / "
+        "agent_pre_click the new broker would refuse (not plain CSS); read-only, "
+        "from the snapshot; run it before installing the broker",
+    )
+    ap.add_argument(
+        "-Q",
+        "--release",
+        metavar="SITE",
+        help="release SITE's quarantine (after a failed login that may have "
+        "submitted the password) — the main session's decision, audited",
     )
     return ap
 
@@ -1177,7 +1777,8 @@ def launch_action(args: argparse.Namespace) -> int | None:
     return None
 
 
-def login_action(args: argparse.Namespace) -> int | None:
+# One return per action flag.
+def login_action(args: argparse.Namespace) -> int | None:  # pylint: disable=too-many-return-statements
     """-t / -g / -c, or None when none was asked for."""
     if args.test:
         return run_test(args.test)
@@ -1195,10 +1796,15 @@ def login_action(args: argparse.Namespace) -> int | None:
         return manual_login(args.guided, force=args.force)
     if args.check_all:
         return check_all(mail=args.mail)
+    if args.promote:
+        return promote_action(args.promote)
+    if args.release:
+        return release_action(args.release)
     return None
 
 
-def main() -> int:
+# One early exit per CLI mode.
+def main() -> int:  # pylint: disable=too-many-return-statements,too-many-branches
     """CLI entry point."""
     ap = build_parser()
     args = ap.parse_args()
@@ -1209,6 +1815,8 @@ def main() -> int:
     rc = launch_action(args)
     if rc is not None:
         return rc
+    if args.validate_selectors:  # read-only: not even the agents file
+        return selector_audit()
     if args.snapshot:
         # First, before anything else touches the browser: a guided login
         # whose owner and watchdog both died leaves its record behind.
@@ -1216,6 +1824,7 @@ def main() -> int:
         if outcome is not None:
             print(outcome)
         data = overview(fresh=True)
+        prune_removed(data)
         _note, data["secrets"] = agent_login_secrets.secrets_state(
             broker_request, _state_path(AGENTS_FILE_NAME).parent, fresh=True
         )
@@ -1227,10 +1836,14 @@ def main() -> int:
         write_agent_summary()  # a check changed what agents can use
         return rc
     data = overview(fresh=args.refresh)
+    if args.refresh:
+        prune_removed(data)
     write_agent_summary(data)
     if args.agents:
         print(agent_summary(data, last_checks()), end="")
         return 0
+    if args.matrix:
+        return print_matrix(data, as_json=args.json)
     if args.keychain:
         agent_login_keychain.refresh(_state_path("keychain.json"), force=True)
         agent_login_keychain.print_list(_state_path("keychain.json"), _c, full=True)

@@ -7,10 +7,17 @@ host + port). A redirect to a look-alike host between two fills is caught
 because the check runs again right before each one.
 
 Success needs POSITIVE proof (``check_logged_in``): on the site's check page
-(``agent_check_url`` or a built-in default from ``DEFAULT_CHECK_URLS``) either
-the item's sentinel is visible, or the page ended OFF every fill origin with
-no visible password field. "The password field went away" alone proves
-nothing — page 2 of an identifier-first (Auth0) login has none either.
+(``agent_check_url`` or a built-in default from ``DEFAULT_CHECK_URLS``) the
+item's authenticated sentinel (``agent_logged_in_selector``) is visible; CSCS
+keeps its portal-token rule. "Ended off the fill origins with no password
+field" proves nothing — it also holds on an "Access denied" page — and an item
+without a sentinel is never logged in.
+
+Every recipe takes an ``attempt`` (``AttemptController``): ``entered()``
+before the password first reaches the page, ``mark_submitted()`` right before
+the click/Enter that submits a secret — the daemon persists both in its
+limiter, and the submit marker decides whether a failure counts against the
+site.
 
 Exceptions carry ``submitted``: whether a secret had already been submitted
 when the recipe gave up. The daemon maps a failure after submission to the
@@ -19,6 +26,8 @@ limiter's ``unknown`` outcome (never retried automatically).
 
 from __future__ import annotations
 
+# every recipe and its proof share the guarded helpers.
+# pylint: disable=too-many-lines
 import re
 import time
 import urllib.parse
@@ -38,7 +47,7 @@ from broker.login_form import (
 )
 from broker.origins import form_action_allowed, origin_allowed, origin_hint, url_origin
 from broker.otp_detect import OTP_CANDIDATE_SELECTOR, OTP_DESCRIBE_JS, otp_field_like
-from broker.page_state import (  # browser.py imports interstitial_title from here
+from broker.page_state import (
     challenge_reason,
     interstitial_title,
     sentinel_shown,
@@ -140,10 +149,27 @@ class RecipeError(Exception):
 
     code = "login_failed"
 
-    def __init__(self, detail: str, *, submitted: bool = False) -> None:
+    def __init__(
+        self,
+        detail: str,
+        *,
+        submitted: bool = False,
+        phase: str | None = None,
+        auth_proven: bool = False,
+        unsent: bool = False,
+    ) -> None:
         super().__init__(detail)
         self.detail = detail
         self.submitted = submitted
+        # Where it stopped (broker/phases.py); None = derived from the marker.
+        self.phase = phase
+        # The login itself was PROVEN (sentinel after a fresh submit) and a later
+        # step failed: the limiter treats it as a fresh authentication.
+        self.auth_proven = auth_proven
+        # Set only after the recipe VERIFIED, when giving up, that the typed
+        # password still sits in its field on a fill origin: the form was not
+        # submitted, although the password was entered.
+        self.unsent = unsent
 
 
 class LoginFailed(RecipeError):
@@ -160,6 +186,47 @@ class NeedsHuman(RecipeError):
     """A captcha / bot challenge or a missing second factor."""
 
     code = "needs_human"
+
+
+class ExportFailed(RecipeError):
+    """The login was proven, but the session could not be exported."""
+
+    code = "export_failed"
+
+
+class AttemptController:
+    """What a recipe tells the broker's limiter about its attempt.
+
+    ``entered()`` right before the password first reaches the page (a crash
+    from then on counts as post-submit); ``mark_submitted()`` right before the
+    click/Enter that submits a secret, after the element was found — the
+    marker decides the attempt's outcome. An exception from either aborts the
+    recipe BEFORE that step. This base class does nothing (tests, callers
+    without a limiter); the daemon passes one bound to its reservation.
+    """
+
+    submitted = False
+    was_entered = False
+
+    def entered(self) -> None:
+        """The password is about to be typed."""
+        self.was_entered = True
+
+    def mark_submitted(self) -> None:
+        """The submitting click/Enter is next."""
+        self.submitted = True
+
+
+# Stateless stand-in for helpers called without a controller (never marked).
+class _NoAttempt(AttemptController):
+    def entered(self) -> None:
+        """Nothing to record."""
+
+    def mark_submitted(self) -> None:
+        """Nothing to record."""
+
+
+NO_ATTEMPT: AttemptController = _NoAttempt()
 
 
 def parse_totp(seed_or_uri: str) -> Any:
@@ -280,27 +347,48 @@ def check_page_url(item: SiteItem) -> str:
     return item.check_url or item.login_url
 
 
+def proof_origins(item: SiteItem, *, dev: bool = False) -> list[str]:
+    """Where a proof may end: the check page's origin plus the item's
+    ``agent_proof_origins``."""
+    out = [o for o in [url_origin(check_page_url(item), dev=dev)] if o]
+    return out + [o for o in item.proof_origins if o not in out]
+
+
+# The answers of a logged-in proof.
+VALID, INVALID, INDETERMINATE = "valid", "invalid", "indeterminate"
+Proof = Callable[..., str]
+
+
 def logged_in(
     page: Any, item: SiteItem, *, wait_s: float = 8.0, dev: bool = False
 ) -> bool:
     """Positive success test on the CURRENT page (the check page).
 
-    True iff the item's sentinel is visible, or — the item has a check URL —
-    the page is off every fill origin, shows no bot challenge and no visible
-    password field. No check URL and no sentinel: never logged in. Only the
-    interstitial TITLE counts as a challenge here — a logged-in account page
-    may well embed a reCAPTCHA iframe.
+    With a sentinel (the STRICT proof): the page is on a proof origin
+    (``proof_origins``) and the item's authenticated sentinel is visible.
+    Without one: the OLD, weaker proof (``legacy_logged_in``) — kept only until
+    the item gets a sentinel; a scheduled login never relies on it.
     """
-    if item.logged_in_selector:
-        try:
-            page.wait_for_selector(
-                item.logged_in_selector, state="visible", timeout=wait_s * 1000
-            )
-            return True
-        except Exception:  # pylint: disable=broad-exception-caught
-            pass
-        if sentinel_shown(page, item.logged_in_selector):
-            return True
+    if not item.logged_in_selector:
+        return legacy_logged_in(page, item, dev=dev)
+    if url_origin(page.url, dev=dev) not in proof_origins(item, dev=dev):
+        return False
+    try:
+        page.wait_for_selector(
+            item.logged_in_selector, state="visible", timeout=wait_s * 1000
+        )
+    except Exception:  # pylint: disable=broad-exception-caught
+        if not sentinel_shown(page, item.logged_in_selector):
+            return False
+    # The sentinel may show while a redirect is still under way: re-check.
+    return url_origin(page.url, dev=dev) in proof_origins(item, dev=dev)
+
+
+def legacy_logged_in(page: Any, item: SiteItem, *, dev: bool = False) -> bool:
+    """The pre-WS1a proof of an item WITHOUT a sentinel: the item has a check
+    URL and the page ended off every fill origin, with no bot interstitial and
+    no visible password field. It also holds on an "Access denied" page — hence
+    weak, never for a scheduled login, never enough to promote a site."""
     if not item.check_url:
         return False
     if not off_fill_origins(page.url, list(item.fill_origins), dev=dev):
@@ -310,29 +398,85 @@ def logged_in(
     return _visible(page, PASSWORD_SELECTOR) is None
 
 
-def check_logged_in(
+def generic_proof(
     page: Any, item: SiteItem, *, dev: bool = False, wait_s: float = 8.0
-) -> bool:
-    """Navigate to the check page and decide (see ``logged_in``).
+) -> str:
+    """The generic proof on the loaded check page (strict with a sentinel,
+    the old one without)."""
+    return VALID if logged_in(page, item, wait_s=wait_s, dev=dev) else INVALID
 
-    CSCS keeps its own rule: the settled ``https://portal.cscs.ch`` app. An
-    HTTP error status on the check page is never a login.
+
+def _cscs_proof(
+    page: Any, item: SiteItem, *, dev: bool = False, wait_s: float = 8.0
+) -> str:
+    """CSCS: the portal app holds its token (its rule until WS2-cscs), AND —
+    once the item has one — the DOM sentinel on a proof origin."""
+    if item.logged_in_selector and (
+        generic_proof(page, item, dev=dev, wait_s=wait_s) != VALID
+    ):
+        return INVALID
+    return VALID if cscs_portal_ready(page, wait_s=max(wait_s, 8.0)) else INVALID
+
+
+# Site-specific proofs (a recipe's own answer on the loaded check page);
+# anything else uses `generic_proof`.
+PROOFS: dict[str, Proof] = {"cscs": _cscs_proof}
+
+
+def proof_for(site: str) -> Proof:
+    """The proof of `site` (``PROOFS`` entry, else ``generic_proof``)."""
+    return PROOFS.get(site, generic_proof)
+
+
+def strict_proof(item: SiteItem) -> bool:
+    """The item is proven by a sentinel (or CSCS's token rule), not the old
+    "off the fill origins" heuristic."""
+    return bool(item.logged_in_selector) or item.site == "cscs"
+
+
+# One return per answer of the proof, in the order they are decided.
+def check_proof(  # pylint: disable=too-many-return-statements
+    page: Any, item: SiteItem, *, dev: bool = False, wait_s: float = 8.0
+) -> str:
+    """Navigate to the check page and prove the login: ``valid``, ``invalid``
+    or ``indeterminate``.
+
+    Indeterminate: the page did not load, answered 5xx, the proof raised, or —
+    for the strict proof — the status is unknown (no Response, status 0).
+    HTTP 4xx → invalid. No check page → invalid.
     """
     url = check_page_url(item)
     if not url:
-        return False
-    resp = page.goto(url, wait_until="domcontentloaded")
+        return INVALID
+    try:
+        resp = page.goto(url, wait_until="domcontentloaded")
+    except Exception:  # pylint: disable=broad-exception-caught
+        return INDETERMINATE
     try:
         page.wait_for_load_state("load", timeout=10_000)
     except Exception:  # pylint: disable=broad-exception-caught
         pass
-    if item.site == "cscs":
-        return cscs_portal_ready(page, wait_s=max(wait_s, 8.0))
-    page.wait_for_timeout(1000)
-    status = getattr(resp, "status", None) if resp is not None else None
-    if isinstance(status, int) and status >= 400:
-        return False
-    return logged_in(page, item, wait_s=wait_s, dev=dev)
+    raw = getattr(resp, "status", None) if resp is not None else None
+    status = raw if isinstance(raw, int) and not isinstance(raw, bool) else 0
+    if status <= 0 and strict_proof(item):
+        return INDETERMINATE
+    if status >= 500:
+        return INDETERMINATE
+    if status >= 400:
+        return INVALID
+    try:
+        page.wait_for_timeout(1000)
+        answer = proof_for(item.site)(page, item, dev=dev, wait_s=wait_s)
+    except Exception:  # pylint: disable=broad-exception-caught
+        return INDETERMINATE
+    return answer if answer in (VALID, INVALID, INDETERMINATE) else INDETERMINATE
+
+
+def check_logged_in(
+    page: Any, item: SiteItem, *, dev: bool = False, wait_s: float = 8.0
+) -> bool:
+    """``check_proof(...) == "valid"``."""
+    return check_proof(page, item, dev=dev, wait_s=wait_s) == VALID
 
 
 # A freshly shown password page may still re-render (and clear inputs) while its
@@ -340,18 +484,26 @@ def check_logged_in(
 HYDRATE_S = 1.5
 
 
-def _fill_password(
-    page: Any, pw_field: Any, secret: Secret, allowed: list[str], *, dev: bool
+def _fill_password(  # pylint: disable=too-many-arguments
+    page: Any,
+    pw_field: Any,
+    secret: Secret,
+    allowed: list[str],
+    *,
+    dev: bool,
+    attempt: AttemptController | None = None,
 ) -> Any:
     """Type the password and make sure the field KEEPS it; returns the field used.
 
     One retry types it key by key into the (re-located) visible password field;
     a field that still drops the value fails BEFORE anything is submitted.
+    `attempt.entered()` runs right before the first character is typed.
     """
     page.wait_for_timeout(HYDRATE_S * 1000)
     _check_challenge(page, submitted=False)
     pw_field = _login_password(page) or pw_field
     _guard(page, pw_field, allowed, dev=dev)
+    (attempt or NO_ATTEMPT).entered()
     pw_field.fill(secret.password)
     page.wait_for_timeout(500)
     if _field_value(pw_field) == secret.password:
@@ -456,6 +608,7 @@ def _fill_otp(  # pylint: disable=too-many-arguments
     *,
     dev: bool,
     otp_label: str | None = None,
+    attempt: AttemptController | None = None,
 ) -> None:
     if not secret.totp_seed:
         raise NeedsHuman("otp required but the item has no TOTP seed", submitted=True)
@@ -473,6 +626,7 @@ def _fill_otp(  # pylint: disable=too-many-arguments
         raise
     otp_field.fill(code)
     _guard(page, otp_field, allowed, dev=dev)
+    (attempt or NO_ATTEMPT).mark_submitted()
     otp_field.press("Enter")
 
 
@@ -635,8 +789,24 @@ def _enabled(element: Any) -> bool:
         return False
 
 
-def _submit_password(
-    page: Any, pw_field: Any, allowed: list[str], *, dev: bool
+def _unsent(
+    page: Any, field: Any, secret: Secret | None, allowed: list[str], *, dev: bool
+) -> bool:
+    """True only when the typed password provably was NOT submitted: the page
+    is still on a fill origin and `field` still holds exactly the password."""
+    if secret is None or not origin_allowed(page.url, allowed, dev=dev):
+        return False
+    return _field_value(field) == secret.password
+
+
+def _submit_password(  # pylint: disable=too-many-arguments
+    page: Any,
+    pw_field: Any,
+    allowed: list[str],
+    *,
+    dev: bool,
+    attempt: AttemptController | None = None,
+    secret: Secret | None = None,
 ) -> None:
     """Submit the typed password: Enter in the field, unless Enter would fire
     a form button that does something else (``pick_submit_button``: a
@@ -655,20 +825,33 @@ def _submit_password(
         descs.append(desc if isinstance(desc, dict) else {})
     choice = pick_submit_button(descs)
     if choice is None:
+        (attempt or NO_ATTEMPT).mark_submitted()
         pw_field.press("Enter")
         return
     if choice < 0:
         raise LoginFailed(
             "Enter would press the form's non-login default button and no login"
-            " button is showing"
+            " button is showing",
+            unsent=_unsent(page, pw_field, secret, allowed, dev=dev),
         )
     button = buttons[choice]
     frame_url = _frame_url(button)
+    problem = ""
     if not origin_allowed(frame_url, allowed, dev=dev):
-        raise OriginViolation("the submit button is not on a fill origin")
-    own_action = button.get_attribute("formaction")
-    if own_action and not form_action_allowed(frame_url, own_action, allowed, dev=dev):
-        raise OriginViolation("submit button posts off the fill origins")
+        problem = "the submit button is not on a fill origin"
+    else:
+        own_action = button.get_attribute("formaction")
+        if own_action and not form_action_allowed(
+            frame_url, own_action, allowed, dev=dev
+        ):
+            problem = "submit button posts off the fill origins"
+        elif not origin_allowed(page.url, allowed, dev=dev):
+            problem = "page is not on a fill origin"
+    if problem:
+        raise OriginViolation(
+            problem, unsent=_unsent(page, pw_field, secret, allowed, dev=dev)
+        )
+    (attempt or NO_ATTEMPT).mark_submitted()
     _click_on_fill_origin(page, button, allowed, dev=dev)
 
 
@@ -692,6 +875,7 @@ def generic_login(
     *,
     dev: bool = False,
     settle_s: float = SETTLE_TIMEOUT_S,
+    attempt: AttemptController | None = None,
 ) -> None:
     """Username/password(/TOTP) form login, one-page or identifier-first.
 
@@ -727,8 +911,8 @@ def generic_login(
         if _needs_fill(user_field, secret.username):
             _guard(page, user_field, allowed, dev=dev)
             user_field.fill(secret.username)
-    pw_field = _fill_password(page, pw_field, secret, allowed, dev=dev)
-    _submit_password(page, pw_field, allowed, dev=dev)
+    pw_field = _fill_password(page, pw_field, secret, allowed, dev=dev, attempt=attempt)
+    _submit_password(page, pw_field, allowed, dev=dev, attempt=attempt, secret=secret)
 
     otp_done = False
     prompts_answered = 0
@@ -739,7 +923,13 @@ def generic_login(
         otp_field = None if otp_done else _otp_field(page)
         if otp_field is not None:
             _fill_otp(
-                page, otp_field, secret, allowed, dev=dev, otp_label=item.otp_label
+                page,
+                otp_field,
+                secret,
+                allowed,
+                dev=dev,
+                otp_label=item.otp_label,
+                attempt=attempt,
             )
             otp_done = True
             continue
@@ -820,7 +1010,9 @@ def cscs_portal_ready(page: Any, *, wait_s: float = 8.0) -> bool:
         page.wait_for_timeout(500)
 
 
-def click_keycloak_submit(page: Any) -> None:
+def click_keycloak_submit(page: Any, attempt: AttemptController | None = None) -> bool:
+    """Click Keycloak's login button; False when none is found (nothing sent).
+    `attempt.mark_submitted()` runs right before the click."""
     for sel in (
         "#kc-login",
         "input[name=login]",
@@ -829,8 +1021,10 @@ def click_keycloak_submit(page: Any) -> None:
     ):
         el = page.query_selector(sel)
         if el:
+            (attempt or NO_ATTEMPT).mark_submitted()
             el.click()
-            return
+            return True
+    return False
 
 
 def cscs_login(
@@ -840,6 +1034,7 @@ def cscs_login(
     *,
     dev: bool = False,
     settle_s: float = SETTLE_TIMEOUT_S,
+    attempt: AttemptController | None = None,
 ) -> None:
     """CSCS Keycloak login (port of ``browser.py cmd_cscs_login``) with exact hosts.
 
@@ -863,9 +1058,13 @@ def cscs_login(
     user.fill(secret.username)
     # Same protected entry as the generic recipe: wait for the page to settle,
     # verify the field KEPT the password, retry key by key, fail before submit.
-    pw_field = _fill_password(page, pw_field, secret, allowed, dev=dev)
+    pw_field = _fill_password(page, pw_field, secret, allowed, dev=dev, attempt=attempt)
     _guard(page, pw_field, allowed, dev=dev)
-    click_keycloak_submit(page)
+    if not click_keycloak_submit(page, attempt):
+        raise LoginFailed(
+            "Keycloak login button not found",
+            unsent=_unsent(page, pw_field, secret, allowed, dev=dev),
+        )
 
     otp_done = False
     deadline = time.monotonic() + settle_s
@@ -878,7 +1077,13 @@ def cscs_login(
             otp_field = _visible(page, OTP_SELECTOR)
             if otp_field is not None:
                 _fill_otp(
-                    page, otp_field, secret, allowed, dev=dev, otp_label=item.otp_label
+                    page,
+                    otp_field,
+                    secret,
+                    allowed,
+                    dev=dev,
+                    otp_label=item.otp_label,
+                    attempt=attempt,
                 )
                 otp_done = True
     raise LoginFailed("login did not reach the CSCS portal", submitted=True)
@@ -947,6 +1152,7 @@ def smartsheet_login(
     *,
     dev: bool = False,
     settle_s: float = SETTLE_TIMEOUT_S,
+    attempt: AttemptController | None = None,
 ) -> None:
     """Smartsheet e-mail/password login through its multi-step wizard.
 
@@ -964,9 +1170,12 @@ def smartsheet_login(
     if pw_field is None:
         _check_challenge(page, submitted=False)
         raise LoginFailed("no password field after the Smartsheet login steps")
-    pw_field = _fill_password(page, pw_field, secret, allowed, dev=dev)
+    pw_field = _fill_password(page, pw_field, secret, allowed, dev=dev, attempt=attempt)
     _guard(page, pw_field, allowed, dev=dev)
     button = _visible(page, SMARTSHEET_SIGN_IN)
+    if button is not None and not origin_allowed(page.url, allowed, dev=dev):
+        raise OriginViolation("page is not on a fill origin")  # unsent unprovable
+    (attempt or NO_ATTEMPT).mark_submitted()
     if button is not None:
         _click_on_fill_origin(page, button, allowed, dev=dev)
     else:

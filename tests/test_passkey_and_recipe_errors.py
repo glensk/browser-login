@@ -99,11 +99,11 @@ def test_unexpected_recipe_exception_is_a_recorded_login_failure(tmp_path, monke
     runner = daemon.PlaywrightRunner(tmp_path, dev=False)
     recorded: list[str] = []
 
-    def recipe(_page, _item, _secret, *, dev):
-        del dev
+    def recipe(_page, _item, _secret, *, dev, attempt):
+        del dev, attempt
         raise PlaywrightTimeout("ElementHandle.click: Timeout 30000ms exceeded")
 
-    monkeypatch.setattr(runner, "_profile_logged_in", lambda _page, _item: False)
+    monkeypatch.setattr(runner, "_profile_proof", lambda _page, _item: recipes.INVALID)
     monkeypatch.setattr(
         runner, "_record_failure", lambda _p, item, _s: recorded.append(item.site)
     )
@@ -124,11 +124,11 @@ def test_unexpected_recipe_exception_is_a_recorded_login_failure(tmp_path, monke
 def test_recipe_errors_pass_through_unchanged(tmp_path, monkeypatch):
     runner = daemon.PlaywrightRunner(tmp_path, dev=False)
 
-    def recipe(_page, _item, _secret, *, dev):
-        del dev
+    def recipe(_page, _item, _secret, *, dev, attempt):
+        del dev, attempt
         raise recipes.NeedsHuman("captcha")
 
-    monkeypatch.setattr(runner, "_profile_logged_in", lambda _page, _item: False)
+    monkeypatch.setattr(runner, "_profile_proof", lambda _page, _item: recipes.INVALID)
     monkeypatch.setattr(runner, "_record_failure", lambda *_a: None)
     monkeypatch.setattr(daemon, "recipe_for", lambda _site: recipe)
     secret = vault.Secret(username="a@b.ch", password=FIXTURE_PASSWORD)

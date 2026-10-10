@@ -437,7 +437,10 @@ def test_limiter_fsyncs_file_and_dir(tmp_path, monkeypatch):
 
     assert any(st.S_ISREG(m) for m in calls) and any(st.S_ISDIR(m) for m in calls)
     assert json.loads(state.read_text())["sites"]["s"]["attempts"][0][1] == "ok"
-    assert [p.name for p in state.parent.iterdir()] == ["lim.json"]
+    assert sorted(p.name for p in state.parent.iterdir()) == [
+        "lim.json",
+        "lim.json.lock",
+    ]
 
 
 def test_limiter_corrupt_state_fails_closed(tmp_path):
@@ -788,59 +791,139 @@ def _shop_item(**fields):
 
 
 @pytest.mark.parametrize(
-    "url, password, ok",
+    "url, sentinel, ok",
     [
-        # regression (2026-10-02): page 2 of an identifier-first login has no
-        # visible password field and a path other than the login URL's
-        (SHOP_FILL + "/u/login/identifier?state=x", False, False),
-        (SHOP_FILL + "/u/login/password?state=x", False, False),
-        (SHOP_CHECK, True, False),  # inline login form on the site itself
-        ("chrome-error://chromewebdata/", False, False),
-        ("http://www.shop.example/account", False, False),  # not https
-        (SHOP_CHECK, False, True),
+        # the sentinel alone is not enough: it must show on a proof origin
+        (SHOP_FILL + "/u/login/password?state=x", True, False),
+        ("chrome-error://chromewebdata/", True, False),
+        ("http://www.shop.example/account", True, False),  # not https
+        ("https://evil.example/account", True, False),  # another origin
+        # WS1a: "off the fill origins, no password field" no longer proves a
+        # login — it also holds on an "Access denied" page (zendesk)
+        (SHOP_CHECK, False, False),
+        (SHOP_CHECK, True, True),
     ],
 )
-def test_positive_check_rule(url, password, ok):
-    item = _shop_item(agent_check_url=SHOP_CHECK)
-    assert recipes.logged_in(_CheckPage(url, password=password), item, wait_s=0) is ok
+def test_positive_check_rule(url, sentinel, ok):
+    item = _shop_item(agent_check_url=SHOP_CHECK, agent_logged_in_selector="#me")
+    page = _CheckPage(url, sentinel=sentinel)
+    assert recipes.logged_in(page, item, wait_s=0) is ok
 
 
-def test_positive_check_challenge_and_sentinel():
-    item = _shop_item(agent_check_url=SHOP_CHECK)
-    page = _CheckPage(SHOP_CHECK, title="Just a moment...")
-    assert not recipes.logged_in(page, item, wait_s=0)
+def test_positive_check_needs_a_sentinel_and_honours_proof_origins():
+    no_sentinel = _shop_item(agent_check_url=SHOP_CHECK)
+    assert not no_sentinel.has_proof
+    # C2: without a sentinel the OLD proof stays (until the item gets one):
+    # off the fill origins, no visible password field
+    assert recipes.logged_in(_CheckPage(SHOP_CHECK), no_sentinel, wait_s=0)
+    page = _CheckPage(SHOP_CHECK, password=True)
+    assert not recipes.logged_in(page, no_sentinel, wait_s=0)
+    page = _CheckPage(SHOP_FILL + "/u/login/password?state=x")
+    assert not recipes.logged_in(page, no_sentinel, wait_s=0)
     only_sentinel = _shop_item(agent_logged_in_selector="#me")
     assert not recipes.logged_in(_CheckPage(SHOP_CHECK), only_sentinel, wait_s=0)
-    page = _CheckPage(SHOP_FILL + "/x", sentinel=True)
+    page = _CheckPage(SHOP_FILL + "/x", sentinel=True)  # check page = login URL
     assert recipes.logged_in(page, only_sentinel, wait_s=0)
+    extra = _shop_item(
+        agent_check_url=SHOP_CHECK,
+        agent_logged_in_selector="#me",
+        agent_proof_origins="https://app.shop.example",
+    )
+    page = _CheckPage("https://app.shop.example/home", sentinel=True)
+    assert recipes.logged_in(page, extra, wait_s=0)
+    assert extra.public()["proof_origins"] == ["https://app.shop.example"]
+    bad = _shop_item(agent_logged_in_selector="#me", agent_proof_origins="ftp://x")
+    assert bad.refused and "agent_proof_origins" in bad.refused
+
+
+class _Resp:
+    def __init__(self, status):
+        self.status = status
+
+
+class _ProofPage(_CheckPage):
+    """A page whose goto answers `status` (or raises) and lands on `url`."""
+
+    def __init__(self, url, *, status=200, raises=False, **kw):
+        super().__init__(url, **kw)
+        self._status = status
+        self._raises = raises
+
+    def goto(self, _url, **_kw):
+        if self._raises:
+            raise TimeoutError("navigation timeout")
+        return _Resp(self._status)
+
+    def wait_for_load_state(self, *_a, **_kw):
+        return None
+
+
+@pytest.mark.parametrize(
+    "status, raises, sentinel, want",
+    [
+        (200, False, True, recipes.VALID),
+        (403, False, True, recipes.INVALID),  # a 403 page showing the selector
+        (503, False, True, recipes.INDETERMINATE),
+        (200, True, True, recipes.INDETERMINATE),  # the page never loaded
+        (200, False, False, recipes.INVALID),
+    ],
+)
+def test_check_proof_is_tri_state(status, raises, sentinel, want):
+    item = _shop_item(agent_check_url=SHOP_CHECK, agent_logged_in_selector="#me")
+    page = _ProofPage(SHOP_CHECK, status=status, raises=raises, sentinel=sentinel)
+    assert recipes.check_proof(page, item, wait_s=0) == want
+    assert recipes.check_logged_in(page, item, wait_s=0) is (want == recipes.VALID)
+
+
+def test_check_proof_without_sentinel_keeps_the_old_rules():
+    """C2: no sentinel = the old proof, which also accepted an unknown status;
+    the STRICT proof calls an unknown status indeterminate (D5)."""
+    item = _shop_item(agent_check_url=SHOP_CHECK)
+    page = _ProofPage(SHOP_CHECK, status=None)
+    assert recipes.check_proof(page, item, wait_s=0) == recipes.VALID
+    strict = _shop_item(agent_check_url=SHOP_CHECK, agent_logged_in_selector="#me")
+    for status in (None, 0):
+        page = _ProofPage(SHOP_CHECK, status=status, sentinel=True)
+        assert recipes.check_proof(page, strict, wait_s=0) == recipes.INDETERMINATE
 
 
 def test_client_broker_logged_in_uses_check_url(monkeypatch, capsys):
-    entry = {
+    entry: dict[str, Any] = {
         "site": "shop",
         "fill_origins": [SHOP_FILL],
         "login_url": SHOP_FILL + "/",
         "check_url": SHOP_CHECK,
-        "logged_in_selector": None,
+        "logged_in_selector": "#me",
     }
     monkeypatch.setattr(browser, "_broker_entry_or_rc", lambda site: (entry, 0))
     opened = []
-    final = {"url": ""}
+    final: dict[str, Any] = {"url": "", "status": 200, "sentinel": True}
 
     viewports = []
+
+    from playwright.sync_api import TimeoutError as PlaywrightTimeout
 
     class _SizedPage(_CheckPage):
         def set_viewport_size(self, size):
             viewports.append(size)
 
+        def wait_for_selector(self, _sel, **_kw):
+            if not self._sentinel:
+                raise PlaywrightTimeout("no sentinel")
+            return _El()
+
     def fake_bg(port, url, prepare, fn):
         opened.append(url)
-        page = _SizedPage(final["url"])
+        page = _SizedPage(final["url"], sentinel=final["sentinel"])
         prepare(page)
-        return fn(page)
+        browser._BG_STATUS[id(page)] = final["status"]
+        try:
+            return fn(page)
+        finally:
+            browser._BG_STATUS.pop(id(page), None)
 
     monkeypatch.setattr(browser, "_with_prepared_background_page", fake_bg)
-    # still on the login (Auth0 page 2: no visible password) -> NOT logged in
+    # still on the login (Auth0 page 2): the sentinel is not on a proof origin
     final["url"] = SHOP_FILL + "/u/login/password?state=x"
     assert browser._broker_logged_in(9222, "shop") == 2
     final["url"] = SHOP_CHECK
@@ -848,11 +931,23 @@ def test_client_broker_logged_in_uses_check_url(monkeypatch, capsys):
     assert opened == [SHOP_CHECK, SHOP_CHECK]
     # the probe tab is sized like the broker's page before the check loads
     assert viewports == [browser.BROKER_PROBE_VIEWPORT] * 2
-    # neither check URL nor sentinel: refuses to call it logged in, opens nothing
-    entry["check_url"] = ""
+    # WS1a: the status decides first — 403 invalid, 503 / unknown indeterminate
+    for status in (403, 503, None, 0):
+        final["status"] = status
+        assert browser._broker_logged_in(9222, "shop") == 2, status
+    final["status"] = 200
+    # an "Access denied" page off the fill origins without the sentinel
+    final["sentinel"] = False
     assert browser._broker_logged_in(9222, "shop") == 2
-    assert len(opened) == 2
-    assert "no check URL or sentinel" in capsys.readouterr().err
+    # C2: no sentinel yet -> the OLD proof (a warning, not a refusal)
+    entry["logged_in_selector"] = None
+    final["sentinel"] = False
+    assert browser._broker_logged_in(9222, "shop") == 0  # off fill origin
+    assert browser._RESULT["proof_v"] == 0
+    final["url"] = SHOP_FILL + "/u/login/password?state=x"
+    assert browser._broker_logged_in(9222, "shop") == 2
+    # off a terminal (consumers capture stderr) the weak-proof warning stays out
+    assert "no agent_logged_in_selector" not in capsys.readouterr().err
 
 
 # ---------------------------------------------------------------------------
@@ -882,6 +977,14 @@ class StubRunner:
             self.calls += 1
         secret = get_secret()
         assert secret.password == PASSWORD
+        # Like a recipe: password typed, then the submit marker — unless the
+        # stub fails BEFORE the submit (an exception with submitted=False).
+        attempt = getattr(get_secret, "attempt", None)
+        if attempt is not None and (
+            self.raise_exc is None or getattr(self.raise_exc, "submitted", True)
+        ):
+            attempt.entered()
+            attempt.mark_submitted()
         if self.wait_for_waiter is not None:
             broker, site = self.wait_for_waiter
             deadline = time.monotonic() + 10
@@ -1014,8 +1117,16 @@ def test_daemon_post_submit_failure_cools_down(sockdir, tmp_path):
         first = json.loads(_ask(path, {"op": "login", "site": "ricardo"}))
         second = json.loads(_ask(path, {"op": "login", "site": "ricardo"}))
     assert first["error"] == "login_failed"
+    assert first["phase"] == "submit" and first["submitted"] is True
     assert second["error"] == "rate_limited" and "cooldown" in second["detail"]
-    assert runner.calls == 1
+    assert second["phase"] == "limiter" and second["submitted"] is False
+    assert (
+        second["limit"]["state"] == "cooldown"
+        and "install.sh -r ricardo" in (second["limit"]["reset"])
+    )
+    # WS1a: admission runs inside get_secret (a valid profile could still be
+    # re-exported in the cooldown), so the runner starts; the secret is refused.
+    assert runner.calls == 2
 
 
 def test_daemon_needs_human_and_origin_violation_codes(sockdir, tmp_path):
@@ -2213,18 +2324,21 @@ def test_fresh_login_clears_profile_cookies_before_the_recipe(
     runner = daemon.PlaywrightRunner(tmp_path, dev=False)
     checks: list = []
 
-    def profile_logged_in(_page, _item):
+    def profile_proof(_page, _item):
         checks.append([c["name"] for c in ctx.jar])
-        return True
+        return recipes.VALID
 
-    def recipe(_page, _item, secret, *, dev):
+    def recipe(_page, _item, secret, *, dev, attempt):
+        del dev, attempt
         events.append(("recipe", sorted(c["name"] for c in ctx.jar)))
         assert secret.password == PASSWORD
 
-    monkeypatch.setattr(runner, "_profile_logged_in", profile_logged_in)
+    monkeypatch.setattr(runner, "_profile_proof", profile_proof)
     monkeypatch.setattr(daemon, "recipe_for", lambda _site: recipe)
     monkeypatch.setattr(
-        runner, "export_bundle", lambda _ctx, it, via: {"site": it.site, "via": via}
+        runner,
+        "export_bundle",
+        lambda _ctx, it, via: {"site": it.site, "via": via, "cookies": [{"n": 1}]},
     )
     secret = vault.Secret(username="a@b.ch", password=PASSWORD)
     fresh = vault.site_item_from_json(

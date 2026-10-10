@@ -122,6 +122,20 @@ def _private_journal(tmp_path, monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def _private_agent_login_state(tmp_path, monkeypatch):
+    """agent-login's state (checks, site stages, quarantine) lives in tmp.
+
+    browser.py reads and writes ``~/.local/state/agent-login`` (quarantine,
+    the scheduled gate) through ``agent_login_state.state_dir``, which follows
+    ``AGENT_LOGIN_STATE_FILE``; subprocesses inherit it. A test may point it
+    elsewhere itself.
+    """
+    state = tmp_path / "agent-login-state"
+    state.mkdir(exist_ok=True)
+    monkeypatch.setenv("AGENT_LOGIN_STATE_FILE", str(state / "last-check.json"))
+
+
+@pytest.fixture(autouse=True)
 def _private_mode_state(tmp_path, monkeypatch):
     """The headless-invariant state files of every loaded browser.py live in tmp.
 

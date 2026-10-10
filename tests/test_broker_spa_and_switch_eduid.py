@@ -181,28 +181,55 @@ class _SpaProbePage:
             self._urls.pop(0)
         self.url = self._urls[0]
 
+    def wait_for_selector(self, _sel: str, **_kw) -> object:
+        return object()  # the DOM sentinel shows
+
+
+# WS1a: CSCS needs a DOM sentinel too (next to its token) and a known status.
+CSCS_ENTRY = {
+    "site": "cscs",
+    "check_url": PORTAL + "/profile/",
+    "logged_in_selector": "#me",
+}
+
+
+def _probe(page) -> str:
+    browser._BG_STATUS[id(page)] = 200
+    try:
+        return str(browser._broker_probe(page, CSCS_ENTRY))
+    finally:
+        browser._BG_STATUS.pop(id(page), None)
+
 
 def test_cscs_probe_waits_for_the_token():
-    entry = {"site": "cscs"}
     late = _SpaProbePage([PORTAL + "/profile/"] * 4, [False, False, True])
-    assert browser._broker_probe(late, entry)
+    assert _probe(late) == browser.PROOF_VALID
     assert late.waits == 2  # polled, no fixed 1 s sleep first
 
 
 def test_cscs_probe_on_portal_without_token_is_not_logged_in():
     """Regression: the old probe said "logged in" 1 s after load on the portal;
     the SPA moves a token-less session to Keycloak after that second."""
-    entry = {"site": "cscs"}
     redirect_after_1s = _SpaProbePage(
         [PORTAL + "/profile/", PORTAL + "/profile/", KEYCLOAK], []
     )
-    assert not browser._broker_probe(redirect_after_1s, entry)
+    assert _probe(redirect_after_1s) == browser.PROOF_INVALID
 
 
 def test_cscs_probe_gives_up_after_the_wait(monkeypatch):
     monkeypatch.setattr(browser, "CSCS_PROBE_WAIT_S", 0.2)
     never = _SpaProbePage([PORTAL + "/profile/"], [])
-    assert not browser._broker_probe(never, {"site": "cscs"})
+    assert _probe(never) == browser.PROOF_INVALID
+
+
+def test_cscs_without_a_dom_sentinel_keeps_its_token_proof():
+    """C2: until WS2-cscs, CSCS without a DOM sentinel keeps the old token rule
+    (also without a known status), recorded as the weak proof (proof_v 0)."""
+    page = _SpaProbePage([PORTAL + "/profile/"], [True])
+    assert browser._broker_probe(page, {"site": "cscs"}) == browser.PROOF_VALID
+    assert browser._RESULT["proof_v"] == 0
+    gone = _SpaProbePage([PORTAL + "/profile/", KEYCLOAK], [])
+    assert browser._broker_probe(gone, {"site": "cscs"}) == browser.PROOF_INVALID
 
 
 # ---------------------------------------------------------------------------

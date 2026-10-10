@@ -517,6 +517,7 @@ def test_cli_login_stuck_in_the_attach_exits_124_and_leaves_nothing(
     site = {
         "site": "fakesite",
         "check_url": "https://fakesite.example/account",
+        "logged_in_selector": "#me",
         "refused": False,
     }
     broker = broker_factory("ok", [site])

@@ -180,6 +180,16 @@ framework. It is a **provider**: other repos depend on it, not the reverse. See
   Runner calls (`agent_login_jobs.run_browser`/`_browser`) always pass an
   explicit `timeout_s` — `None` only for the two guided calls; the AST test in
   `tests/test_agent_login.py` enforces it.
+- **Login phases and limiter safety (WS1a, `PLAN_ws1a-diagnostics.md`)**: every
+  broker/client exit records a phase from `broker/phases.py` (never free page
+  text into `agents.md`). The broker limiter is admitted only inside
+  `get_secret`; recipes call `attempt.entered()` before typing the password and
+  `attempt.mark_submitted()` right before the submitting click/Enter (inside the
+  submit helpers) — a new recipe must do the same, or every failure counts as
+  pre-submit. A proof is `recipes.check_proof` (valid / invalid /
+  indeterminate: status + origin + sentinel); site-specific proofs plug into
+  `recipes.PROOFS`. Never add an automatic retry after phase `submit`/`unknown`;
+  `agent-login.py -c` stays scheduled (`browser.py login -s`).
 - **`security` (keychain) calls go through `_security_run` only**: new session, no
   timeout, never `kill`/`terminate` — killing a client mid-dialog crashed
   `securityd` (tp#504). Writes are delete-then-add pinned to the default keychain,

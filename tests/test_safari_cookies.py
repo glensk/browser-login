@@ -410,10 +410,13 @@ def test_agent_login_safari_flows() -> None:
 
 def test_agent_login_classify_safari() -> None:
     t = TARGETS["anibis"]
-    assert al.classify(t, {"anibis": {"site": "anibis"}})[0] == "safari"
-    refused = {"anibis": {"site": "anibis", "refused": True, "reason": "r"}}
+    listed = {"anibis": {"site": "anibis", "sentinel": True}}
+    assert al.classify(t, listed)[0] == "safari"
+    refused = {"anibis": {**listed["anibis"], "refused": True, "reason": "r"}}
     status, detail = al.classify(t, refused)
     assert status == "safari" and "refused: r" in detail
+    # C2: no sentinel yet -> still safari (the old proof), flagged on the row
+    assert al.classify(t, {"anibis": {"site": "anibis"}})[0] == "safari"
     assert al.classify(t, {})[0] == "missing"
     assert al.classify(t, {}, readable=False)[0] == "unchecked"
 
@@ -469,9 +472,10 @@ def test_check_all(monkeypatch, capsys) -> None:
     )
     seen = []
 
-    def ensure(site):
+    def ensure(site, gate=None):
+        del gate
         seen.append(site)
-        return (site == "anibis", "x")
+        return (site == "anibis", "x", None)
 
     mails: list[tuple[str, str]] = []
 
@@ -497,7 +501,9 @@ def test_check_all_all_good_sends_nothing(monkeypatch) -> None:
     monkeypatch.setattr(al, "ensure_browser_up", lambda: True)
     monkeypatch.setattr(al, "_browser", lambda *a, **_k: 0)  # reap-owned: no real run
     monkeypatch.setattr(al, "overview", lambda: _rows(("anibis", "safari")))
-    monkeypatch.setattr(al, "ensure_logged_in", lambda site: (True, "logged in"))
+    monkeypatch.setattr(
+        al, "ensure_logged_in", lambda site, gate=None: (True, "logged in", None)
+    )
     monkeypatch.setattr(al, "send_mail", pytest.fail)
     assert al.check_all(mail=True) == 0
 
@@ -516,7 +522,9 @@ def test_plist() -> None:
     assert "<string>com.albert.agent-login-check</string>" in plist
     assert "<key>Hour</key>\n        <integer>9</integer>" in plist
     assert "<key>Minute</key>\n        <integer>15</integer>" in plist
-    assert "<string>-c</string>\n        <string>-m</string>" in plist
+    # WS1a: no daily mail — logged-out sites are an infra/status item
+    assert "<string>-c</string>\n    </array>" in plist
+    assert "<string>-m</string>" not in plist
     assert str(Path(al.__file__).resolve()) in plist
 
 

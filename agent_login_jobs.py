@@ -5,12 +5,14 @@ from __future__ import annotations
 
 import contextlib
 import importlib.util
+import json
 import math
 import os
 import shutil
 import socket
 import subprocess
 import sys
+import tempfile
 import time
 from collections.abc import Iterator
 from dataclasses import dataclass
@@ -51,11 +53,12 @@ def snapshot_plist() -> str:
 def launchagent_plist(
     *,
     label: str = LAUNCH_LABEL,
-    args: tuple[str, ...] = ("-c", "-m"),
+    args: tuple[str, ...] = ("-c",),
     schedule: str = "",
     run_at_load: bool = False,
 ) -> str:
-    """A LaunchAgent running this script; default: daily `-c -m` at 09:15. Pure."""
+    """A LaunchAgent running this script; default: daily `-c` at 09:15, no mail
+    (logged-out sites are an infra/status item). Pure."""
     if not schedule:
         schedule = f"""<key>StartCalendarInterval</key>
     <dict>
@@ -132,7 +135,7 @@ def install_daily() -> int:
     rc = _install_agent(
         LAUNCH_LABEL,
         launchagent_plist(),
-        f"daily {LAUNCH_HOUR:02d}:{LAUNCH_MINUTE:02d}, -c -m; log {LAUNCH_LOG}",
+        f"daily {LAUNCH_HOUR:02d}:{LAUNCH_MINUTE:02d}, -c; log {LAUNCH_LOG}",
     )
     return rc or _install_agent(
         SNAPSHOT_LABEL,
@@ -314,16 +317,22 @@ def browser_timeout(cmd: str) -> float:
 
 @dataclass
 class BrowserRun:
-    """One `browser.py` run: its exit code (None when the runner killed it)."""
+    """One `browser.py` run: its exit code (None when the runner killed it)
+    and, for `result=True`, the phase record browser.py wrote (`-R`)."""
 
     rc: int | None
     killed: bool
     stdout: str
     elapsed_s: float
+    result: dict | None = None
 
 
 def run_browser(
-    *args: str, timeout_s: float | None, capture: bool = False, quiet: bool = False
+    *args: str,
+    timeout_s: float | None,
+    capture: bool = False,
+    quiet: bool = False,
+    result: bool = False,
 ) -> BrowserRun:
     """Run bin/browser.py with `args`, killed after `timeout_s` (None = never:
     only for a guided login, which waits for Albert).
@@ -332,8 +341,23 @@ def run_browser(
     both; neither = they go to our terminal. On a timeout ``subprocess.run``
     SIGKILLs browser.py only — its `security` children run in their own
     session and are left alone (tp#504). A killed run cannot close the tab it
-    owned, so `reap_owned_tabs` runs right after (tp#845).
+    owned, so `reap_owned_tabs` runs right after (tp#845). `result`: pass
+    ``-R <file>`` (login / logged-in) and return what browser.py recorded
+    there (None when it wrote nothing — then the exit code is all we know).
     """
+    if result:
+        with tempfile.TemporaryDirectory(prefix="agent-login-") as tmp:
+            path = Path(tmp) / "result.json"
+            run = run_browser(
+                *args,
+                "-R",
+                str(path),
+                timeout_s=timeout_s,
+                capture=capture,
+                quiet=quiet,
+            )
+            run.result = read_result(path)
+            return run
     argv = [sys.executable, str(BROWSER_PY), *args]
     t0 = time.monotonic()
     try:
@@ -356,6 +380,19 @@ def run_browser(
         return killed
     stdout = res.stdout if capture and isinstance(res.stdout, str) else ""
     return BrowserRun(res.returncode, False, stdout, time.monotonic() - t0)
+
+
+def read_result(path: Path) -> dict | None:
+    """browser.py's result record at `path` (None: missing or not a JSON object)."""
+    try:
+        raw = path.read_text(encoding="utf-8")
+    except OSError:  # not written: killed, or an older browser.py
+        return None
+    try:
+        data = json.loads(raw)
+    except ValueError:
+        return None
+    return data if isinstance(data, dict) else None
 
 
 def reap_owned_tabs() -> int | None:

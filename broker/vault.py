@@ -26,6 +26,8 @@ cannot zero ``str``/JSON copies: dropping a cache entry does not erase memory.
 
 from __future__ import annotations
 
+# item parsing, bootstrap and the bw CLI belong together.
+# pylint: disable=too-many-lines
 import json
 import os
 import re
@@ -103,8 +105,30 @@ class SiteItem:  # pylint: disable=too-many-instance-attributes
     # while page and element are on a fill origin) before the login fields are
     # looked for — e.g. Jellyfin's "Manual login" button behind its user picker.
     pre_click: str | None = None
+    # `agent_attempt_group`: an opaque slug shared by every item that logs into
+    # ONE account (e.g. two shop domains on one identity provider); the broker
+    # limiter then enforces its rules on `group:<id>` too.
+    attempt_group: str | None = None
+    # `agent_proof_origins`: further origins (besides the check URL's) where
+    # the logged-in proof may end after redirects.
+    proof_origins: list[str] = field(default_factory=list)
     refused: str | None = None
     item_id: str = ""
+
+    @property
+    def has_proof(self) -> bool:
+        """The STRICT proof is possible: an authenticated DOM sentinel exists
+        (or CSCS's portal-token rule, kept until WS2-cscs). Without one only
+        the old, weaker proof is left: never for a scheduled login."""
+        return bool(self.logged_in_selector) or self.site == "cscs"
+
+    @property
+    def limiter_keys(self) -> list[str]:
+        """The broker limiter keys of a login: the site, plus its group."""
+        keys = [self.site]
+        if self.attempt_group:
+            keys.append(f"group:{self.attempt_group}")
+        return keys
 
     @property
     def bundle_spec(self) -> SiteBundleSpec:
@@ -129,6 +153,9 @@ class SiteItem:  # pylint: disable=too-many-instance-attributes
             "logged_in_selector": self.logged_in_selector,
             "fresh_login": self.fresh_login,
             "pre_click": self.pre_click,
+            "attempt_group": self.attempt_group,
+            "sentinel": bool(self.logged_in_selector),
+            "proof_origins": list(self.proof_origins),
             "refused": self.refused is not None,
             "reason": self.refused or "",
         }
@@ -466,9 +493,25 @@ def _parse_flag(raw: str) -> bool | None:
     return None
 
 
-def _selector_ok(selector: str) -> bool:
-    """One CSS selector on one line, at most 512 characters."""
-    return len(selector) <= 512 and "\n" not in selector and "\r" not in selector
+# Playwright's own selector engines and pseudo-classes: not plain CSS, so a
+# sentinel or click target would mean something else in the client's probe.
+_PLAYWRIGHT_SELECTOR_RE = re.compile(
+    r"(>>|^\s*//|^\s*\.\.|"
+    # an engine prefix (`text=…`) — at the START only: `[data-testid=x]` is CSS
+    r"^\s*(text|xpath|css|id|data-testid|data-test-id|data-test|role|nth|"
+    r"internal|_react|_vue|visible)\s*=|"
+    r":(has-text|text|text-is|text-matches|nth-match|right-of|left-of|above|"
+    r"below|near)\(|:visible\b)",
+    re.IGNORECASE,
+)
+
+
+def selector_ok(selector: str) -> bool:
+    """One plain CSS selector on one line, at most 512 characters — no
+    Playwright engine (``text=``, ``xpath=``, ``>>``, ``:has-text(`` …)."""
+    if len(selector) > 512 or "\n" in selector or "\r" in selector:
+        return False
+    return _PLAYWRIGHT_SELECTOR_RE.search(selector) is None
 
 
 def _split_list(raw: str) -> list[str]:
@@ -514,7 +557,7 @@ def _default_cookie_hosts(fill_origins: list[str], check_url: str) -> list[str]:
 
 
 # A flat validator: one early `refused(...)` per field rule, in field order.
-# pylint: disable-next=too-many-return-statements,too-many-branches
+# pylint: disable-next=too-many-return-statements,too-many-branches,too-many-statements,too-many-locals
 def site_item_from_json(item: Mapping[str, Any], *, dev: bool = False) -> SiteItem:
     """Build a ``SiteItem`` from a Bitwarden item JSON; problems become ``refused``."""
     name = str(item.get("name") or "")
@@ -570,6 +613,11 @@ def site_item_from_json(item: Mapping[str, Any], *, dev: bool = False) -> SiteIt
     )
     if not check_url and not sentinel:
         return refused("needs agent_check_url (or agent_logged_in_selector)")
+    if sentinel is not None and not selector_ok(sentinel):
+        return refused(
+            "bad agent_logged_in_selector (one plain CSS selector, one line, ≤512 "
+            "chars; no Playwright text=/xpath=/>>)"
+        )
     hosts_raw = fields.get("agent_cookie_hosts", "").strip()
     if hosts_raw:
         cookie_hosts = [h.lstrip(".").lower() for h in _split_list(hosts_raw)]
@@ -588,8 +636,16 @@ def site_item_from_json(item: Mapping[str, Any], *, dev: bool = False) -> SiteIt
     if fresh_login is None:
         return refused("bad agent_fresh_login (true or false)")
     pre_click = fields.get("agent_pre_click", "").strip() or None
-    if pre_click is not None and not _selector_ok(pre_click):
+    if pre_click is not None and not selector_ok(pre_click):
         return refused("bad agent_pre_click (one CSS selector, one line, ≤512 chars)")
+    group, problem = _attempt_group(fields.get("agent_attempt_group", ""), item)
+    if problem:
+        return refused(problem)
+    raw_proof = fields.get("agent_proof_origins", "").strip()
+    try:
+        proof_origins = parse_fill_origins(raw_proof, dev=dev) if raw_proof else []
+    except ValueError as exc:
+        return refused(f"bad agent_proof_origins: {exc}")
     return SiteItem(
         fill_origins=fill_origins,
         cookie_hosts=cookie_hosts,
@@ -601,10 +657,29 @@ def site_item_from_json(item: Mapping[str, Any], *, dev: bool = False) -> SiteIt
         otp_label=fields.get("agent_otp_label", "").strip() or None,
         fresh_login=fresh_login,
         pre_click=pre_click,
+        attempt_group=group,
+        proof_origins=proof_origins,
         site=site,
         name=name,
         item_id=item_id,
     )
+
+
+def _attempt_group(raw: str, item: Mapping[str, Any]) -> tuple[str | None, str]:
+    """(group id or None, refusal reason or ''): an opaque slug that must not
+    reveal the account (neither the username nor its local part, >= 3 chars)."""
+    group = raw.strip().lower()
+    if not group:
+        return None, ""
+    if not SITE_ID_RE.match(group):
+        return None, "bad agent_attempt_group (a slug: a-z 0-9 . _ -, ≤64 chars)"
+    login = item.get("login") or {}
+    user = str(login.get("username") or "") if isinstance(login, Mapping) else ""
+    user = user.strip().lower()
+    for part in (user, user.split("@", 1)[0]):
+        if len(part) >= 3 and part in group:
+            return None, "agent_attempt_group must not reveal the account name"
+    return group, ""
 
 
 def build_items(raw_items: list[Any], *, dev: bool = False) -> list[SiteItem]:

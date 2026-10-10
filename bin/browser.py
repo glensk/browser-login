@@ -158,6 +158,7 @@ import signal
 import socket
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import urllib.error
@@ -173,6 +174,8 @@ from typing import Any, NamedTuple
 # and identity-provider helpers; browser.py reuses them instead of copies.
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.realpath(__file__))))
 # pylint: disable=wrong-import-position
+import agent_login_state as _als  # noqa: E402
+from broker import phases as _phases  # noqa: E402
 from broker import safari_cookies as _safari  # noqa: E402
 from broker.bundle import IDP_HOSTS as BROKER_IDP_HOSTS  # noqa: E402
 from broker.bundle import IDP_LABELS as BROKER_IDP_LABELS  # noqa: E402
@@ -598,10 +601,49 @@ def _add_login_parsers(sub: Any) -> None:
         "exit 4); waits up to 15 min until /api/account says EMAIL (exit 0), "
         "exit 2 when another account logged in.",
     )
+    pl.add_argument(
+        "-R",
+        "--result-file",
+        metavar="PATH",
+        default=None,
+        help="write where the login stopped (phase, code, redacted detail, "
+        "screenshot, limiter state) as JSON to PATH (agent-login.py reads it)",
+    )
+    pl.add_argument(
+        "-s",
+        "--scheduled",
+        action="store_true",
+        help="scheduled run (agent-login.py -c): no broker login unless the site "
+        "is promoted and not quarantined; the broker never retries a failure",
+    )
+    pl.add_argument(
+        "-x",
+        "--try-sentinel",
+        metavar="CSS",
+        default=None,
+        help="broker item WITHOUT agent_logged_in_selector: ONE login that "
+        "verifies CSS as its sentinel (absent before, present after); never "
+        "with -s — it is a real login attempt",
+    )
     pli = sub.add_parser(
         "logged-in", help="Exit 0 if SITE is logged in, 2 if not (no login)."
     )
     pli.add_argument("site", help="Site to check.")
+    pli.add_argument(
+        "-R",
+        "--result-file",
+        metavar="PATH",
+        default=None,
+        help="write the check's phase record as JSON to PATH",
+    )
+    pli.add_argument(
+        "-x",
+        "--try-sentinel",
+        metavar="CSS",
+        default=None,
+        help="is CSS an authenticated sentinel? present on the check page here "
+        "AND absent in a fresh logged-out broker profile (free, no login)",
+    )
 
 
 def _add_close_parser(sub: Any) -> argparse.ArgumentParser:
@@ -9322,6 +9364,92 @@ class BrokerUnavailable(Exception):
     """No (working) login broker answers on the socket."""
 
 
+# --- WS1a: the result file of `login`/`logged-in -R PATH` -------------------
+# One record per command: WHERE it stopped (broker/phases.py), why (a fixed
+# code + a redacted detail), the broker's screenshot and limiter state. The
+# exit code alone hid all of it (agent-login.py discards stderr). Written by
+# `_result_write` in the commands' finally, and by a firing LoginDeadline.
+PROOF_V = 1  # the strict proof (status + origin + sentinel): agent-login's -p needs it
+_RESULT: dict[str, Any] = {}
+_RESULT_FILE: list[str] = []
+# `login -s` (scheduled) / `-x CSS` (one-shot candidate sentinel), per process.
+_LOGIN_OPTS: dict[str, Any] = {"scheduled": False, "candidate": None}
+# The breadcrumb a deadline fired in -> the phase it stopped at.
+_STEP_PHASE = {
+    "resolve": "precheck",
+    "broker:precheck": "precheck",
+    "broker:request": "unknown",
+    "broker:cookies": "cookie-inject",
+    "broker:storage": "storage-inject",
+    "broker:verify": "client-proof",
+    "broker:after": "consumer-followup",
+}
+
+
+def _result_begin(cmd: str, site: str, path: str | None) -> None:
+    """Start this command's result record (`path` None = no result file)."""
+    _RESULT.clear()
+    _RESULT.update({"cmd": cmd, "site": site})
+    _RESULT_FILE[:] = [path] if path else []
+
+
+def _result_set(**fields: Any) -> None:
+    """Set fields of the result record (the latest phase wins)."""
+    _RESULT.update(fields)
+
+
+def _result_fail(phase: str, code: str, detail: object = "", **fields: Any) -> None:
+    """Record where and why the command failed (detail redacted, capped)."""
+    _RESULT.update(
+        {"phase": phase, "code": code, "detail": _phases.redact(detail), **fields}
+    )
+
+
+def _result_write(rc: int) -> None:
+    """Write the result file (0600, atomic); never raises."""
+    if not _RESULT_FILE:
+        return
+    rec = dict(_RESULT)
+    rec.pop("phase_hint", None)
+    if rc == 0:  # exit 0 IS logged in, whatever an earlier step noted
+        rec.update(phase="ok", code="ok")
+        rec.pop("detail", None)
+    elif "phase" not in rec:
+        rec["phase"], rec["code"] = {
+            3: ("precheck", "broker_unavailable"),
+            4: ("submit", "needs_human"),
+            BUSY_RC: ("precheck", "busy"),
+        }.get(rc, ("unknown", "internal"))
+    # proof_v: 1 only when the deciding check used the STRICT proof (a DOM
+    # sentinel); the old proof of a sentinel-less item is 0 (never promotable).
+    rec.setdefault("proof_v", 0)
+    rec.update({"v": _phases.PHASE_V, "rc": rc, "ok": rc == 0})
+    path = Path(_RESULT_FILE[0])
+    tmp = ""
+    try:
+        fd, tmp = tempfile.mkstemp(prefix=f".{path.name}.", dir=str(path.parent))
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            json.dump(rec, fh)
+        os.replace(tmp, path)
+    except Exception:  # pylint: disable=broad-exception-caught
+        if tmp:
+            with contextlib.suppress(Exception):
+                Path(tmp).unlink(missing_ok=True)
+
+
+def _result_timeout(step: str) -> None:
+    """A LoginDeadline fired: record where (from the last broker breadcrumb),
+    and quarantine a login that was inside the broker request."""
+    phase = str(_RESULT.get("phase_hint") or _STEP_PHASE.get(step, "unknown"))
+    _result_fail(phase, "timeout", f"no progress in step {step}")
+    if phase == "unknown":
+        _RESULT["submitted"] = None
+        site = str(_RESULT.get("broker_site") or "")
+        if _RESULT.get("cmd") == "login" and site:
+            with contextlib.suppress(Exception):
+                _als.quarantine(site, "unknown", "timeout")
+
+
 def _broker_rate_limit_detail(site: str) -> str | None:
     """The broker's detail (e.g. ``cooldown after a failed login: retry in
     1487s``) when this process's latest `_broker_login` of `site` was refused
@@ -9665,6 +9793,9 @@ class LoginDeadline:  # pylint: disable=too-many-instance-attributes
             rc = LOGIN_TIMEOUT_DIRTY_RC
         finally:
             with contextlib.suppress(Exception):
+                _result_timeout(step)
+                _result_write(rc)
+            with contextlib.suppress(Exception):
                 sys.stdout.flush()
                 sys.stderr.flush()
             _hard_exit(rc)
@@ -9686,7 +9817,13 @@ def _active_deadline() -> LoginDeadline | None:
 
 
 def _deadline_step(label: str) -> None:
-    """Breadcrumb for the active deadline (no-op without one)."""
+    """Breadcrumb for the active deadline (no-op without one); a broker step
+    also becomes the result record's phase hint (`_result_timeout`)."""
+    if label in _STEP_PHASE:
+        _RESULT["phase_hint"] = _STEP_PHASE[label]
+        # A new step: an earlier step's verdict no longer describes the run.
+        for key in ("phase", "code", "detail"):
+            _RESULT.pop(key, None)
     dl = _active_deadline()
     if dl is not None:
         dl.step_to(label)
@@ -9767,6 +9904,16 @@ def _with_prepared_background_page(
     return _background_page_run(port, url, prepare, fn)
 
 
+# The main-document HTTP status of a background page's `goto`, by id(page):
+# the broker probe's proof needs it (`_probe_status`).
+_BG_STATUS: dict[int, object] = {}
+
+
+def _probe_status(page: Any) -> object:
+    """The status `_background_page_run`'s goto got for `page` (None: unknown)."""
+    return _BG_STATUS.get(id(page))
+
+
 def _background_page_run(
     port: int,
     url: str,
@@ -9792,12 +9939,16 @@ def _background_page_run(
             with _owned_background_page(port, prepare=prepare) as page:
                 if url != "about:blank":
                     _deadline_step("bg:goto")
-                    page.goto(url, wait_until="domcontentloaded", timeout=15_000)
+                    resp = page.goto(url, wait_until="domcontentloaded", timeout=15_000)
+                    _BG_STATUS[id(page)] = getattr(resp, "status", None)
                     _deadline_step("bg:load")
                     with contextlib.suppress(PlaywrightError):
                         page.wait_for_load_state("load", timeout=10_000)
                 _deadline_step("bg:fn")
-                return fn(page)
+                try:
+                    return fn(page)
+                finally:
+                    _BG_STATUS.pop(id(page), None)
         except BrowserAttachTimeout:
             raise
         except Exception:  # pylint: disable=broad-exception-caught
@@ -10588,12 +10739,15 @@ def _broker_entry_or_rc(site: str) -> tuple[dict | None, int]:
     try:
         entry = _broker_site(site)
     except BrokerUnavailable as exc:
+        _result_fail("precheck", "broker_unavailable", exc)
         return None, _broker_fail(3, str(exc))
     if entry is None:
+        _result_fail("vault", "unknown_site")
         return None, _broker_fail(
             2, f"{site}: not whitelisted in Bitwarden agent-logins."
         )
     if entry.get("refused"):
+        _result_fail("vault", "refused", entry.get("reason"))
         return None, _broker_fail(
             2, f"{site}: agent-logins item refused — {entry.get('reason') or '?'}"
         )
@@ -10613,34 +10767,86 @@ def _broker_wait_sentinel(page, sentinel: str) -> bool:
         return bool(_broker_sentinel_shown(page, sentinel))
 
 
-def _broker_probe(page, entry: dict) -> bool:
-    """The broker's positive check, client side, on the loaded check page.
+def _proof_origins(entry: dict) -> list[str]:
+    """Where a proof may end: the check page's origin + `proof_origins`."""
+    url = str(entry.get("check_url") or entry.get("login_url") or "")
+    out = [o for o in [_url_origin(url)] if o]
+    return out + [str(o) for o in entry.get("proof_origins") or [] if o not in out]
 
-    Logged in iff the item's sentinel is visible, or — the item has a check
-    URL — the page ended OFF every fill origin (https only), shows no bot
-    challenge and no visible password field. CSCS: the portal app holds its
-    token (polled up to ``CSCS_PROBE_WAIT_S`` while on the portal).
-    "No password field" alone proves nothing (page 2 of an Auth0 login).
-    """
+
+# Tri-state answers of a logged-in proof (broker/recipes.py's VALID & co).
+PROOF_VALID, PROOF_INVALID, PROOF_UNDECIDED = "valid", "invalid", "indeterminate"
+
+
+def _legacy_probe(page, entry: dict) -> str:
+    """The pre-WS1a proof of an item WITHOUT a sentinel (C2: kept until the
+    item gets one): CSCS — the portal app holds its token; else the page
+    ended off every fill origin (https), with no bot interstitial and no
+    visible password field. Weak (an "Access denied" page passes): never for
+    a scheduled login, never enough to promote a site."""
     if entry.get("site") == "cscs":
-        # The SPA renders on the portal first and only then sends a token-less
-        # session to Keycloak: poll for the token while still on the portal.
         ready: bool = _broker_cscs_portal_ready(page, wait_s=CSCS_PROBE_WAIT_S)
-        return ready
+        return PROOF_VALID if ready else PROOF_INVALID
     page.wait_for_timeout(1000)
-    sentinel = entry.get("logged_in_selector")
-    if sentinel and _broker_wait_sentinel(page, str(sentinel)):
-        return True
     if not entry.get("check_url"):
-        return False
+        return PROOF_INVALID
     fill = [str(o) for o in entry.get("fill_origins") or []]
     if not _broker_off_fill_origins(page.url, fill, dev=False):
-        return False
+        return PROOF_INVALID
     if _broker_interstitial(page):
-        return False
-    return not any(
+        return PROOF_INVALID
+    visible = any(
         el.is_visible() for el in page.query_selector_all("input[type=password]")
     )
+    return PROOF_INVALID if visible else PROOF_VALID
+
+
+# One return per rule of the proof, in the order they are checked.
+def _broker_probe(  # pylint: disable=too-many-return-statements
+    page, entry: dict, sentinel: str | None = None
+) -> str:
+    """The broker's positive proof, client side, on the loaded check page:
+    ``valid`` / ``invalid`` / ``indeterminate``.
+
+    With a sentinel (the item's, or the candidate `sentinel`) the STRICT
+    proof: (a) the check page's HTTP status is known and < 400 (absent or 5xx:
+    indeterminate; 4xx: invalid), (b) the page is on a proof origin (the check
+    URL's, or one of the item's ``proof_origins``), (c) the sentinel is
+    visible; CSCS additionally needs its portal token (polled up to
+    ``CSCS_PROBE_WAIT_S``). Without one: the old proof (`_legacy_probe`).
+    Records the page's final origin either way (`-x`'s origin report).
+    """
+    sentinel = sentinel or entry.get("logged_in_selector")
+    origins = _proof_origins(entry)
+    try:
+        if not sentinel:
+            _RESULT["proof_v"] = 0
+            return _legacy_probe(page, entry)
+        _RESULT["proof_v"] = PROOF_V
+        status = _probe_status(page)
+        if not isinstance(status, int) or isinstance(status, bool) or status <= 0:
+            return PROOF_UNDECIDED
+        if status >= 500:
+            return PROOF_UNDECIDED
+        if status >= 400:
+            return PROOF_INVALID
+        if entry.get("site") == "cscs":
+            # The SPA renders on the portal first and only then sends a
+            # token-less session to Keycloak: poll the token while still there.
+            if not _broker_cscs_portal_ready(page, wait_s=CSCS_PROBE_WAIT_S):
+                return PROOF_INVALID
+        else:
+            page.wait_for_timeout(1000)
+        if _url_origin(page.url) not in origins:
+            return PROOF_INVALID
+        if not _broker_wait_sentinel(page, str(sentinel)):
+            return PROOF_INVALID
+        # The sentinel may have shown while a redirect was still under way.
+        return PROOF_VALID if _url_origin(page.url) in origins else PROOF_INVALID
+    finally:
+        final = _url_origin(str(getattr(page, "url", "") or ""))
+        _RESULT["final_origin"] = final
+        _RESULT["origin_ok"] = final in origins
 
 
 def _broker_logged_in(port: int, site: str) -> int:
@@ -10668,23 +10874,51 @@ def _broker_probe_viewport(page) -> None:
     page.set_viewport_size(BROKER_PROBE_VIEWPORT)
 
 
-def _broker_check_entry(port: int, site: str, entry: dict) -> int:
-    """`_broker_logged_in` for an entry already in hand (refused ones included)."""
+# Sites whose weak-proof warning this process already printed (consumers such
+# as cscs-api.py capture stderr: never a line per call, never off a terminal).
+_WEAK_PROOF_WARNED: set[str] = set()
+
+
+def _broker_check_entry(
+    port: int, site: str, entry: dict, *, sentinel: str | None = None
+) -> int:
+    """`_broker_logged_in` for an entry already in hand (refused ones
+    included): 0 logged in, 2 not (or cannot tell). `sentinel`: a candidate
+    instead of the item's (`logged-in -x`)."""
     check_url = str(entry.get("check_url") or "")
-    if not check_url and not entry.get("logged_in_selector"):
-        return _broker_fail(
-            2, f"{site}: the broker lists no check URL or sentinel — cannot verify."
-        )
+    legacy = not (sentinel or entry.get("logged_in_selector"))
+    if legacy:
+        _result_set(proof="legacy")
+        if site not in _WEAK_PROOF_WARNED and sys.stderr.isatty():
+            _WEAK_PROOF_WARNED.add(site)
+            print(
+                f"⚠️ {site}: no agent_logged_in_selector — checked with the old, "
+                "weaker proof (find one: browser.py logged-in SITE -x 'CSS').",
+                file=sys.stderr,
+            )
     url = check_url or str(entry.get("login_url") or "")
     if not url.startswith("https://"):
+        _result_fail("client-proof", "logged_out", "no https check URL")
         return _broker_fail(2, f"{site}: the broker lists no https check URL.")
 
-    if _with_prepared_background_page(
-        port, url, _broker_probe_viewport, lambda page: _broker_probe(page, entry)
-    ):
+    proof = _with_prepared_background_page(
+        port,
+        url,
+        _broker_probe_viewport,
+        lambda page: _broker_probe(page, entry, sentinel),
+    )
+    if proof == PROOF_VALID:
+        _result_set(phase="ok", code="ok")
         print(f"✓ Logged into {site} (checked {_tab_hint(url)}).")
         return 0
-    print(f"Not logged into {site} (checked {_tab_hint(url)}).", file=sys.stderr)
+    code = "logged_out" if proof == PROOF_INVALID else "indeterminate"
+    _result_fail("client-proof", code)
+    why = (
+        ""
+        if proof == PROOF_INVALID
+        else " — the check page did not load or answered 5xx"
+    )
+    print(f"Not logged into {site} (checked {_tab_hint(url)}){why}.", file=sys.stderr)
     return 2
 
 
@@ -10772,74 +11006,245 @@ def _broker_write_storage(port: int, bundle: dict) -> int:
     return written
 
 
-def _broker_after_login(port: int, site: str) -> int:
-    """Site-specific follow-up once logged in: CSCS caches its API token."""
-    return cmd_token(port) if site == "cscs" else 0
+def _broker_gate(site: str) -> int | None:
+    """The client gates before a broker login: a quarantined site never logs
+    in; a SCHEDULED run (`login -s`) also needs the site promoted (fail
+    closed). Returns the exit code of a refusal, None when it may go on."""
+    scheduled = bool(_LOGIN_OPTS.get("scheduled"))
+    q = _als.quarantined(site)
+    if q is not None:
+        _result_fail("precheck", "quarantined", f"after {q.get('phase')}")
+        return _broker_fail(
+            2,
+            f"{site}: quarantined after a failed login ({q.get('phase')}, "
+            f"{q.get('at_text')}) — release: ./agent-login.py -Q {site}",
+        )
+    if scheduled:
+        allowed, code, why = _als.scheduled_gate(site)
+        if not allowed:
+            _result_fail("precheck", code, why)
+            return _broker_fail(
+                2, f"{site}: no scheduled login — {why} (./agent-login.py -p {site})"
+            )
+    return None
 
 
-# One return per exit code of the broker contract (0 / 2 / 3 / 4) + the cscs follow-up.
-def _broker_login(port: int, site: str) -> int:  # pylint: disable=too-many-return-statements
-    """Log the shared browser into broker site `site` via a session bundle.
+def _broker_refused(site: str, resp: dict) -> int:
+    """Map a broker refusal: record phase/limit/screenshot, quarantine a
+    post-submit failure, print the reason; the exit code."""
+    code = str(resp.get("error"))
+    detail = str(resp.get("detail") or "")
+    _BROKER_REFUSALS[site] = (code, detail)
+    phase = _phases.phase_for_error(code, resp.get("phase"), detail)
+    submitted = resp.get("submitted")
+    raw_diag = resp.get("diag")
+    diag: dict = raw_diag if isinstance(raw_diag, dict) else {}
+    limit = resp.get("limit") if isinstance(resp.get("limit"), dict) else None
+    _result_fail(
+        phase,
+        str((limit or {}).get("state") or code) if phase == "limiter" else code,
+        detail,
+        submitted=submitted if isinstance(submitted, bool) else None,
+        limit=limit,
+        screenshot=str(diag.get("screenshot") or "") or None,
+        stop_origin=_url_origin(str(diag.get("url") or "")),
+    )
+    if _phases.post_submit(phase, submitted):
+        with contextlib.suppress(Exception):
+            _als.quarantine(site, phase, code)
+    msg = f"{site}: {BROKER_ERRORS.get(code, code)}"
+    _print_broker_diag(diag)
+    if limit and limit.get("reset"):
+        msg += f" — {limit['reset']}"
+    return _broker_fail(
+        4 if code == "needs_human" else 2,
+        msg + (f" ({detail})" if detail else "") + f" [phase {phase}]",
+    )
 
-    Already logged in → no broker call. Else: interaction lease (gate first,
-    via `_connect`, then the lease — the documented lock order), request the
-    bundle, replace the site's in-scope cookies, write its storage keys, then
-    verify with `_broker_logged_in`.
-    """
-    _BROKER_REFUSALS.pop(site, None)
-    _deadline_step("broker:precheck")
-    rc = _broker_logged_in(port, site)
-    if rc == 0:
-        _deadline_step("broker:after")
-        return _broker_after_login(port, site)
-    if rc != 2:
-        return rc
-    entry, rc = _broker_entry_or_rc(site)
-    if entry is None:
-        return rc
+
+def _broker_unavailable(site: str, exc: BrokerUnavailable) -> int:
+    """The broker did not answer the login request: before it was even
+    reached (precheck), or mid-request — then the password may have been
+    typed (phase unknown) and the site is quarantined."""
+    sent = not str(exc).startswith("no login broker at")
+    _result_fail(
+        "unknown" if sent else "precheck",
+        "broker_unavailable",
+        exc,
+        submitted=None if sent else False,
+    )
+    if sent:
+        with contextlib.suppress(Exception):
+            _als.quarantine(site, "unknown", "broker_unavailable")
+    return _broker_fail(3, str(exc))
+
+
+def _broker_fetch_inject(
+    port: int, site: str, opts: dict[str, Any]
+) -> tuple[int | None, dict, int, int]:
+    """Under the interaction lease: request the bundle, replace the site's
+    cookies, write its storage keys. (exit code of a failure or None, bundle,
+    cookies injected, storage keys written)."""
     pw, browser = _connect(port)
     connected = True
     try:
         with _interaction_lease(f"login {site}"):
             _deadline_step("broker:request")
             try:
-                resp = _broker_request("login", site=site)
+                resp = _broker_request("login", site=site, **opts)
             except BrokerUnavailable as exc:
-                return _broker_fail(3, str(exc))
+                return _broker_unavailable(site, exc), {}, 0, 0
             if not resp.get("ok"):
-                code = str(resp.get("error"))
-                detail = str(resp.get("detail") or "")
-                _BROKER_REFUSALS[site] = (code, detail)
-                msg = f"{site}: {BROKER_ERRORS.get(code, code)}"
-                _print_broker_diag(resp.get("diag"))
-                return _broker_fail(
-                    4 if code == "needs_human" else 2,
-                    msg + (f" ({detail})" if detail else ""),
+                return _broker_refused(site, resp), {}, 0, 0
+            if (
+                "candidate_sentinel" in opts
+                and resp.get("candidate_verified") is not True
+            ):
+                # An older broker ignores candidate_sentinel and logs in with
+                # its own (weak) proof: nothing was verified two-sided.
+                _result_fail(
+                    "broker-proof",
+                    "candidate_unverifiable",
+                    "the broker did not verify the candidate (an older broker?)",
                 )
-            bundle = resp.get("bundle") if isinstance(resp.get("bundle"), dict) else {}
+                return (
+                    _broker_fail(
+                        2,
+                        f"{site}: the broker did not verify the candidate sentinel "
+                        "(it may predate WS1a) — nothing injected, nothing verified.",
+                    ),
+                    {},
+                    0,
+                    0,
+                )
+            _result_set(fresh_auth=bool(resp.get("fresh_auth")), submitted=None)
+            raw_bundle = resp.get("bundle")
+            bundle: dict = raw_bundle if isinstance(raw_bundle, dict) else {}
             _deadline_step("broker:cookies")
-            n_cookies = _broker_replace_cookies(browser, bundle or {})
+            n_cookies = _broker_replace_cookies(browser, bundle)
             browser.close()
             pw.stop()
             connected = False
             _deadline_step("broker:storage")
-            n_keys = _broker_write_storage(port, bundle or {})
+            n_keys = _broker_write_storage(port, bundle)
             print(
                 f"Injected {n_cookies} cookie(s) and {n_keys} storage key(s) for {site}."
             )
+            return None, bundle, n_cookies, n_keys
     finally:
         if connected:
             browser.close()
             pw.stop()
+
+
+def _broker_inject_phase(bundle: dict, n_cookies: int, n_keys: int) -> None:
+    """After a failed verify: blame the injection when it visibly fell short."""
+    storage = bundle.get("storage") if isinstance(bundle.get("storage"), dict) else {}
+    want = sum(len(v) for v in (storage or {}).values() if isinstance(v, dict))
+    if bundle.get("cookies") and not n_cookies:
+        _result_fail(
+            "cookie-inject", "no_cookies", "no cookie of the bundle was injected"
+        )
+    elif n_keys < want:
+        _result_fail("storage-inject", "storage_failed", f"{n_keys} of {want} keys")
+
+
+# One return per exit code of the broker contract (0 / 2 / 3 / 4) + the cscs follow-up.
+def _broker_login(port: int, site: str) -> int:  # pylint: disable=too-many-return-statements
+    """Log the shared browser into broker site `site` via a session bundle.
+
+    Gates first (`_broker_gate`: quarantine, scheduled + pending). Already
+    logged in → no broker call. Else: interaction lease (gate first, via
+    `_connect`, then the lease — the documented lock order), request the
+    bundle, replace the site's in-scope cookies, write its storage keys, then
+    verify with `_broker_check_entry`. Every exit records its phase (`-R`).
+    """
+    _BROKER_REFUSALS.pop(site, None)
+    _result_set(broker_site=site, route="broker")
+    candidate = _LOGIN_OPTS.get("candidate")
+    _deadline_step("broker:precheck")
+    if not candidate:  # the free check first: logged in = done, gates or not
+        rc = _broker_logged_in(port, site)
+        if rc == 0:
+            _result_set(route="already")
+            _deadline_step("broker:after")
+            return _broker_after_login(port, site)
+        if rc != 2:
+            return rc
+    rc_gate = _broker_gate(site)  # only before a broker login
+    if rc_gate is not None:
+        return rc_gate
+    entry, rc = _broker_entry_or_rc(site)
+    if entry is None:
+        return rc
+    opts: dict[str, Any] = {}
+    if _LOGIN_OPTS.get("scheduled"):
+        opts["scheduled"] = True
+    if candidate:
+        opts["candidate_sentinel"] = str(candidate)
+    failed, bundle, n_cookies, n_keys = _broker_fetch_inject(port, site, opts)
+    if failed is not None:
+        return failed
     _deadline_step("broker:verify")
-    rc = _broker_logged_in(port, site)
-    if rc != 0:
+    if _broker_check_entry(port, site, entry, sentinel=candidate or None) != 0:
+        _broker_inject_phase(bundle, n_cookies, n_keys)
         return _broker_fail(
             2, f"{site}: session injected but the site is not logged in."
+        )
+    if candidate:
+        print(
+            f"✓ candidate sentinel verified for {site} (absent before, present "
+            f"after the login): broker-add.py … -L {json.dumps(candidate)}"
         )
     _record_login_event(site, "broker")
     _deadline_step("broker:after")
     return _broker_after_login(port, site)
+
+
+def _broker_after_login(port: int, site: str) -> int:
+    """Site-specific follow-up once logged in: CSCS caches its API token."""
+    if site != "cscs":
+        return 0
+    rc = cmd_token(port)
+    if rc != 0:
+        _result_fail(
+            "consumer-followup", "followup_failed", f"browser.py token exit {rc}"
+        )
+    return rc
+
+
+def cmd_try_sentinel(port: int, site_name: str, sentinel: str) -> int:
+    """`logged-in SITE -x CSS`: is CSS an AUTHENTICATED sentinel? Two-sided and
+    free: PRESENT on the check page in the shared browser (status, origin,
+    visible) and ABSENT there in a fresh logged-out profile inside the broker
+    (op `sentinel_absent`: no secret, no limiter). Exit 0 only when both hold."""
+    site = site_name.strip().lower()
+    try:
+        entry = _broker_site(site)
+    except BrokerUnavailable as exc:
+        return _broker_fail(3, str(exc))
+    if entry is None:
+        return _broker_fail(2, f"{site}: not listed by the broker.")
+    present = _broker_check_entry(port, site, entry, sentinel=sentinel) == 0
+    try:
+        resp = _broker_request("sentinel_absent", site=site, sentinel=sentinel)
+    except BrokerUnavailable as exc:
+        return _broker_fail(3, str(exc))
+    if not resp.get("ok"):
+        code = str(resp.get("error"))
+        return _broker_fail(2, f"{site}: {BROKER_ERRORS.get(code, code)}")
+    logged_out_ok = bool(resp.get("loaded")) and resp.get("present") is False
+    print(
+        f"{'✓' if present else '✗'} present when logged in (shared Chromium)\n"
+        f"{'✓' if logged_out_ok else '✗'} absent when logged out "
+        f"(fresh broker profile: loaded={resp.get('loaded')}, "
+        f"status={resp.get('status')}, present={resp.get('present')})"
+    )
+    if present and logged_out_ok:
+        print(f"✅ {site}: {sentinel!r} is an authenticated sentinel")
+        return 0
+    print(f"❌ {site}: {sentinel!r} does not prove a login", file=sys.stderr)
+    return 2
 
 
 def cmd_broker_sites() -> int:
@@ -11085,8 +11490,10 @@ def _safari_try_import(port: int, site: str, entry: dict) -> bool:
     """Copy Safari's session for `site` (if it holds one); True once logged in."""
     cookies, _rc = _safari_site_cookies(site)
     if not cookies:
+        _result_fail("safari-source", "no_safari_session")
         print(f"Safari holds no usable {site} session.", file=sys.stderr)
         return False
+    _result_set(route="safari")
     print(f"▶ route: Safari session ({len(cookies)} cookie(s))")
     _safari_inject(port, site, cookies)
     if _broker_check_entry(port, site, entry) != 0:
@@ -11104,6 +11511,7 @@ def _safari_login(port: int, site: str) -> int:
     if entry is None:
         return rc
     if _broker_check_entry(port, site, entry) == 0:
+        _result_set(route="already")
         print(f"route: already logged in ({site})")
         return 0
     if _safari_try_import(port, site, entry):
@@ -12570,20 +12978,43 @@ def _resolve_site(name: str, *, for_login: bool = False) -> Site:
     sys.exit(2)
 
 
-def cmd_login(port: int, site_name: str, expect: str | None = None) -> int:
+def cmd_login(  # pylint: disable=too-many-arguments
+    port: int,
+    site_name: str,
+    expect: str | None = None,
+    *,
+    result_file: str | None = None,
+    scheduled: bool = False,
+    candidate: str | None = None,
+) -> int:
     """Ensure SITE is logged in (automated or assisted, per the site).
 
     Bounded by a `LoginDeadline` (LOGIN_TIMEOUT_S → exit 124/125), armed before
     anything else — `_resolve_site` already talks to the broker — unless this
     process owns the live guided-login record (a guided login waits for a
     human; its children carry $CLAUDE_BROWSER_MAINTENANCE). `expect` (`-e`):
-    anthropic only, see `_anthropic_login_expect`.
+    anthropic only, see `_anthropic_login_expect`. `result_file` (`-R`): the
+    phase record; `scheduled` (`-s`): the daily check's gates; `candidate`
+    (`-x`): a one-shot candidate sentinel for a broker item without one.
     """
     key = site_name.strip().lower()
-    with _login_deadline(port, "login", key, LOGIN_TIMEOUT_S, end_event="login"):
-        if expect is not None:
-            return _cmd_login_expect(port, site_name, expect)
-        return _cmd_login(port, site_name)
+    _result_begin("login", key, result_file)
+    _LOGIN_OPTS.update(scheduled=scheduled, candidate=candidate)
+    rc = 1
+    try:
+        with _login_deadline(port, "login", key, LOGIN_TIMEOUT_S, end_event="login"):
+            if expect is not None:
+                rc = _cmd_login_expect(port, site_name, expect)
+            elif candidate and (scheduled or key in _safari.SAFARI_SITES):
+                rc = _fail("-x/--try-sentinel is a manual broker login (not with -s)")
+            else:
+                rc = _cmd_login(port, site_name)
+        return rc
+    except SystemExit as exc:
+        rc = exc.code if isinstance(exc.code, int) else 1
+        raise
+    finally:
+        _result_write(rc)
 
 
 def _cmd_login_expect(port: int, site_name: str, expect: str) -> int:
@@ -12609,21 +13040,44 @@ def _cmd_login(port: int, site_name: str) -> int:
     is_broker = (
         isinstance(site.login, functools.partial) and site.login.func is _broker_login
     )
+    if _LOGIN_OPTS.get("candidate") and not is_broker:
+        return _fail(
+            f"-x/--try-sentinel is for plain broker sites (and cscs), not {site.name!r}"
+        )
     _journal_note(site=site.name, flow="broker" if is_broker else "builtin")
     return site.login(port)
 
 
-def cmd_logged_in(port: int, site_name: str) -> int:
+def cmd_logged_in(
+    port: int,
+    site_name: str,
+    *,
+    result_file: str | None = None,
+    sentinel: str | None = None,
+) -> int:
     """Exit 0 if SITE is logged in, 2 if not (124/125: its deadline fired).
 
     Bounded like `cmd_login`, by LOGGED_IN_TIMEOUT_S — e.g. `logged-in cscs`
-    scans the portal tab with an unbounded ``evaluate``.
+    scans the portal tab with an unbounded ``evaluate``. `result_file` (`-R`):
+    the phase record; `sentinel` (`-x`): the two-sided candidate check.
     """
     key = site_name.strip().lower()
-    with _login_deadline(port, "logged-in", key, LOGGED_IN_TIMEOUT_S):
-        if key in _safari.SAFARI_SITES:
-            return _safari_logged_in(port, key)
-        return _resolve_site(site_name).logged_in(port)
+    _result_begin("logged-in", key, result_file)
+    rc = 1
+    try:
+        with _login_deadline(port, "logged-in", key, LOGGED_IN_TIMEOUT_S):
+            if sentinel:
+                rc = cmd_try_sentinel(port, key, sentinel)
+            elif key in _safari.SAFARI_SITES:
+                rc = _safari_logged_in(port, key)
+            else:
+                rc = _resolve_site(site_name).logged_in(port)
+        return rc
+    except SystemExit as exc:
+        rc = exc.code if isinstance(exc.code, int) else 1
+        raise
+    finally:
+        _result_write(rc)
 
 
 def cmd_store_creds(site_name: str) -> int:
@@ -12805,11 +13259,23 @@ def _dispatch(args: argparse.Namespace, port: int) -> int:
     # Generic multi-site commands.
     if args.cmd == "login":
         expect = getattr(args, "expect_account", None)
+        extra: dict[str, Any] = {}
+        if getattr(args, "result_file", None):
+            extra["result_file"] = args.result_file
+        if getattr(args, "scheduled", False):
+            extra["scheduled"] = True
+        if getattr(args, "try_sentinel", None):
+            extra["candidate"] = args.try_sentinel
         if expect is not None:
-            return cmd_login(port, args.site, expect=expect)
-        return cmd_login(port, args.site)
+            return cmd_login(port, args.site, expect=expect, **extra)
+        return cmd_login(port, args.site, **extra)
     if args.cmd == "logged-in":
-        return cmd_logged_in(port, args.site)
+        return cmd_logged_in(
+            port,
+            args.site,
+            result_file=getattr(args, "result_file", None),
+            sentinel=getattr(args, "try_sentinel", None),
+        )
     if args.cmd == "login-log":
         return cmd_login_log(args.site)
     if args.cmd == "store-creds":
