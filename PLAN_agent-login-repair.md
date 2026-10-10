@@ -225,6 +225,15 @@ manual acceptance steps under the attempt policy below.
         comment posted on CWA #1585.
   - [ ] Albert sets the `calibre` item to user `agent` + Keychain password, and drops the
         `192.168.178.72` URI.
+- [ ] WS1a release order (re-review 2026-10-10: B1–B5 and C1–C3 fixed; N1/N2 in round 2):
+  1. Commit and push the client. Sentinel-less sites keep the old proof, so nothing breaks.
+  2. Run the free `browser.py logged-in` for every sentinel site, then `agent-login.py -x`.
+     Every site whose page ends on another origin gets `agent_proof_origins`
+     (broker-add has no column for it yet → extend or edit by hand) BEFORE step 3.
+     Otherwise the stricter origin rule would quarantine working sites (risk R-a).
+  3. Selector check: done 2026-10-10, 0 of 48 current selectors fail the plain-CSS rule
+     (R-b). Re-run the new read-only helper right before the install.
+  4. `sudo install/install.sh` + selfcheck, then one canary, then the candidate logins.
 - [x] Sentinel batch 1 (broker-add, Albert's Touch ID, 2026-10-10): anibis, docker,
       docker-hub (check URL → app.docker.com), infomaniak, ricardo, tutti, zoho-desk, both
       NPMs (`a.card-link[href='/nginx/proxy']`), calibre (`#top_tasks`, check `/me`).
