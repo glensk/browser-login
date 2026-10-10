@@ -225,8 +225,8 @@ manual acceptance steps under the attempt policy below.
         comment posted on CWA #1585.
   - [ ] Albert sets the `calibre` item to user `agent` + Keychain password, and drops the
         `192.168.178.72` URI.
-- [ ] WS1a release order (re-review 2026-10-10: B1–B5 and C1–C3 fixed; N1/N2 in round 2):
-  1. Commit and push the client. Sentinel-less sites keep the old proof, so nothing breaks.
+- [ ] WS1a release order (re-review 2026-10-10: B1–B5, C1–C3, N1/N2 fixed; tp#893):
+  1. [x] Client committed and pushed 2026-10-10 (`5e55b33`). Sentinel-less sites keep the old proof.
   2. Run the free `browser.py logged-in` for every sentinel site, then `agent-login.py -x`.
      Every site whose page ends on another origin gets `agent_proof_origins`
      (broker-add has no column for it yet → extend or edit by hand) BEFORE step 3.
