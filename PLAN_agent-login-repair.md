@@ -151,7 +151,7 @@ manual acceptance steps under the attempt policy below.
       - hermetic portal fixture tests (stale/valid/503/export-fail).
 
       One live submit is needed.
-  - [ ] npm-nixos
+  - [x] npm-nixos — ✅ 2026-10-10: release 388456e, broker 388456eb4ade. Profile reuse with no secret during the cooldown; limiter hash unchanged.
     - [x] Root cause (read-only, Codex diagnose debate converged in round 1): the vault
           password is stale (len 19 `36d8`). The live one is SOPS `NPM_ADMIN_PASSWORD`
           (len 28 `e426`), verified against the NPM hash on nixos. All 3 `POST /api/tokens`
@@ -178,7 +178,7 @@ manual acceptance steps under the attempt policy below.
       - refresh the NPM JWT before export when less than 12 h remain (`GET /api/tokens`);
       - bundle completeness check;
       - sentinel `a.card-link[href='/nginx/proxy']` on both NPM items.
-  - [ ] npm-raspi: same failure, same fix. The password is unconfirmed (Home Assistant
+  - [x] npm-raspi — ✅ 2026-10-10 (one approved login after the release). Same failure, same fix. The password is unconfirmed (Home Assistant
         protection mode blocks docker), so one approved submit after the vault update is
         the test. Separate realm, so no shared attempt group. Off-LAN it must report
         `unreachable` (precheck), never submit.
