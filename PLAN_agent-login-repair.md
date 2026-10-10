@@ -286,6 +286,13 @@ manual acceptance steps under the attempt policy below.
       Still need a candidate login after WS1a: galaxus, galaxus-de, myfritz-alzenau,
       myfritz-prilly, runai-admin, runai-test3, cscs (`#quick-issue-toggle`), eduid.
       switch needs a code constant.
+- [x] Cloudflare item split (Albert's go, 2026-10-10): the new agent secret
+      `CLOUDFLARE_API_KEY` / `cloudflare-api-key` holds only the API key (len 52 `ab22`;
+      created via secret-run → Keychain → broker-add -x -N with Touch ID; the staging copy
+      is deleted). The `Cloudflare` login item was taken out of agent-secrets and lost
+      agent_secret_id/agent_secret_fields/api_key, done in Albert's Safari via AppleScript.
+      Verified: `secret-run -l` lists only cloudflare-api-key, and the Cloudflare broker
+      login still works. Phase 2 of the leaked DNS token's rotation is running (tp#97).
 - [ ] WS3 — onboarding guard (plan → codex-debate → implement): static validation of a new
       item (sentinel present, fill origins, cookie scope, attempt group), a budgeted
       promotion test (`pending` → `usable`), and a removal path (`broker-add.py` remove or
