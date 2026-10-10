@@ -101,6 +101,8 @@ from broker.phases import PHASE_V  # noqa: E402
 from broker.recipes import (  # noqa: E402
     INDETERMINATE,
     NO_PASSKEY_JS,
+    REFRESH_NONE,
+    REFRESH_REJECTED,
     VALID,
     AttemptController,
     ExportFailed,
@@ -109,6 +111,7 @@ from broker.recipes import (  # noqa: E402
     check_proof,
     cscs_portal_ready,
     recipe_for,
+    refresh_session,
 )
 from broker.runs import RunTable  # noqa: E402
 from broker.secret_ops import (  # noqa: E402
@@ -164,6 +167,144 @@ _TOKEN_KEYS_JS = (
 _STORAGE_JS = "keys => Object.fromEntries(keys.map(k => [k, localStorage.getItem(k)]))"
 
 
+# How long the broker profile's proof polls for the sentinel (an SPA boots:
+# reads its token, asks its API, renders).
+PROFILE_PROOF_WAIT_S = 8.0
+
+
+def clear_http_cache(ctx: Any) -> bool:
+    """Drop the profile's HTTP cache — cookies and storage stay.
+
+    A persistent profile serves a page with no ``Cache-Control`` from its
+    heuristic cache (10 % of its ``Last-Modified`` age) without asking the
+    server. After an app upgrade that is a stale SPA ``index.html`` naming
+    hashed chunks the server no longer has; the server's SPA fallback answers
+    them with HTML, the lazy route fails and the page stays blank — NPM
+    2026-10-10: the login succeeded server-side, the dashboard never rendered
+    (its Dashboard chunk of the old build came back as ``text/html``). Each
+    broker run starts on the server's current build instead.
+
+    When the clear fails, the first page ignores the cache instead
+    (``Network.setCacheDisabled`` on a session kept with the context) and a
+    warning goes to the broker log. Returns whether the cache was cleared."""
+    page = None
+    try:
+        page = ctx.pages[0] if ctx.pages else ctx.new_page()
+        session = ctx.new_cdp_session(page)
+        try:
+            session.send("Network.clearBrowserCache")
+        finally:
+            with contextlib.suppress(Exception):
+                session.detach()
+        return True
+    except Exception as exc:  # pylint: disable=broad-exception-caught
+        why = exception_site(exc)
+    fallback = "no fallback"
+    with contextlib.suppress(Exception):
+        session = ctx.new_cdp_session(page)
+        session.send("Network.enable")
+        session.send("Network.setCacheDisabled", {"cacheDisabled": True})
+        _NOCACHE_SESSIONS[id(ctx)] = session
+        fallback = "the first page ignores the cache"
+    print(f"⚠️ could not clear the HTTP cache ({why}); {fallback}", file=sys.stderr)
+    return False
+
+
+# id(context) -> the CDP session that keeps `clear_http_cache`'s fallback alive.
+_NOCACHE_SESSIONS: dict[int, Any] = {}
+
+
+def item_origins(item: SiteItem) -> list[str]:
+    """Every origin the item's login and session use: fill origins, storage
+    origins, the check / login pages' origins and the proof origins."""
+    out: list[str] = []
+    pages = [item.check_url, item.login_url]
+    for origin in [
+        *item.fill_origins,
+        *item.storage_keys,
+        *(
+            urllib.parse.urlsplit(u)._replace(path="", query="", fragment="").geturl()
+            for u in pages
+            if u
+        ),
+        *item.proof_origins,
+    ]:
+        if origin and origin not in out:
+            out.append(origin)
+    return out
+
+
+def clear_origin_workers(ctx: Any, origins: list[str]) -> bool:
+    """Unregister the service workers and drop the Cache Storage of
+    `origins` (``Storage.clearDataForOrigin``): a worker can serve a stale
+    app shell like the HTTP cache does (`clear_http_cache`). Cookies and
+    localStorage stay. Best effort; a failure is logged. True when cleared."""
+    try:
+        page = ctx.pages[0] if ctx.pages else ctx.new_page()
+        session = ctx.new_cdp_session(page)
+        try:
+            for origin in origins:
+                session.send(
+                    "Storage.clearDataForOrigin",
+                    {"origin": origin, "storageTypes": "service_workers,cache_storage"},
+                )
+        finally:
+            with contextlib.suppress(Exception):
+                session.detach()
+        return True
+    except Exception as exc:  # pylint: disable=broad-exception-caught
+        print(
+            f"⚠️ could not clear service workers ({exception_site(exc)})",
+            file=sys.stderr,
+        )
+        return False
+
+
+# id(context) -> file names of scripts the site answered with HTML in this run.
+_HTML_SCRIPTS: dict[int, list[str]] = {}
+
+
+def watch_script_mime(ctx: Any) -> list[str]:
+    """Record every script the site answers with ``text/html`` (path only).
+
+    A SPA whose server answers a missing hashed chunk with its HTML fallback
+    renders blank (a stale cached build, or an asset deleted by an upgrade):
+    the failure report names it, so the server side can be fixed too
+    (``Cache-Control: no-cache`` on the SPA HTML, 404 for missing assets)."""
+    seen: list[str] = []
+
+    def on_response(resp: Any) -> None:
+        try:
+            ctype = str(resp.headers.get("content-type") or "")
+            if resp.request.resource_type == "script" and "text/html" in ctype:
+                # The file name only: a path can carry a session token (Home
+                # Assistant's ingress URLs).
+                path = urllib.parse.urlsplit(str(resp.url)).path
+                seen.append(path.rsplit("/", 1)[-1][:80] or "/")
+        except Exception:  # pylint: disable=broad-exception-caught
+            pass
+
+    with contextlib.suppress(Exception):
+        ctx.on("response", on_response)
+        _HTML_SCRIPTS[id(ctx)] = seen
+    return seen
+
+
+def html_script_hint(page: Any) -> str:
+    """`` — the site served HTML for N script(s) (...)`` when that happened
+    in this run (`watch_script_mime`), else ``""``."""
+    try:
+        seen = _HTML_SCRIPTS.get(id(page.context)) or []
+    except Exception:  # pylint: disable=broad-exception-caught
+        return ""
+    if not seen:
+        return ""
+    return (
+        f" — the site served HTML for {len(set(seen))} script(s): a stale "
+        "cached build or a missing asset"
+    )
+
+
 def broker_user_agent(pw: Any) -> str:
     """``LOGIN_BROKER_USER_AGENT``, else the engine's own version
     (``engine_user_agent``), else ``FALLBACK_CHROME_UA``."""
@@ -204,7 +345,7 @@ class PlaywrightRunner:
         """The broker's own profile for `site`."""
         return self.home / "profiles" / site
 
-    def _launch(self, pw: Any, profile: Path) -> Any:
+    def _launch(self, pw: Any, profile: Path, item: SiteItem | None = None) -> Any:
         kwargs: dict[str, Any] = {
             "user_data_dir": str(profile),
             "headless": True,
@@ -223,20 +364,24 @@ class PlaywrightRunner:
             ctx = pw.chromium.launch_persistent_context(**kwargs)
         # Every page and frame of the context, the already open one included.
         ctx.add_init_script(NO_PASSKEY_JS)
+        clear_http_cache(ctx)
+        if item is not None:
+            clear_origin_workers(ctx, item_origins(item))
+        watch_script_mime(ctx)
         return ctx
 
     def _profile_proof(self, page: Any, item: SiteItem) -> str:
         """The tri-state proof (``recipes.check_proof``) on the broker's own
         profile; an exception is ``indeterminate``."""
         try:
-            return check_proof(page, item, dev=self.dev, wait_s=5.0)
+            return check_proof(page, item, dev=self.dev, wait_s=PROFILE_PROOF_WAIT_S)
         except Exception:  # pylint: disable=broad-exception-caught
             return INDETERMINATE
 
     def _record_failure(self, page: Any, item: SiteItem, secret: Secret) -> None:
         """Secret-free failure report + screenshot (password fields emptied first)."""
         try:
-            diag = diagnose(page, secret)
+            diag: dict[str, Any] = diagnose(page, secret)
         except Exception:  # pylint: disable=broad-exception-caught
             diag = {"error": "page could not be inspected"}
         diag["password_check"] = password_fingerprint(secret.password)
@@ -248,6 +393,10 @@ class PlaywrightRunner:
             diag["screenshot"] = str(shot)
         except Exception:  # pylint: disable=broad-exception-caught
             pass
+        with contextlib.suppress(Exception):
+            seen = _HTML_SCRIPTS.get(id(page.context)) or []
+            if seen:
+                diag["script_as_html"] = sorted(set(seen))[:3]
         self.last_diag[item.site] = diag
 
     def _with_portal_token_keys(
@@ -302,6 +451,9 @@ class PlaywrightRunner:
             "storage": filter_storage(raw, spec),
             "cookie_hosts": list(spec.cookie_hosts),
             "cookie_names": spec.cookie_names,
+            # The key NAMES the bundle must carry (the client checks the
+            # bundle is complete before it touches the shared browser).
+            "storage_keys": {o: list(k) for o, k in spec.storage_keys.items()},
         }
 
     def clear_site_cookies(self, ctx: Any, item: SiteItem) -> int:
@@ -352,12 +504,23 @@ class PlaywrightRunner:
         else:
             proof = self._profile_proof(page, item)
             if proof == VALID:
-                # (a candidate: present here + absent logged out = verified)
-                return self._export(ctx, item, "profile", proven=False)
+                # A storage token near its expiry is renewed first; a token
+                # the server rejects means the profile is not reusable.
+                refreshed = refresh_session(page, item, dev=self.dev)
+                if refreshed != REFRESH_REJECTED:
+                    # (a candidate: present here + absent logged out = verified)
+                    return self._export(
+                        ctx, item, "profile", proven=False, refresh=refreshed
+                    )
+            if getattr(get_secret, "refresh_only", False):
+                # Not reusable (invalid, indeterminate or token rejected): a
+                # refresh-only request ends here, as `refresh_unavailable`.
+                get_secret()
             if proof == INDETERMINATE:
                 raise LoginFailed(
                     "could not tell whether the broker profile is logged in "
-                    "(check page did not load or answered 5xx)",
+                    "(check page did not load, answered 5xx or stayed blank)"
+                    + html_script_hint(page),
                     phase="profile-proof",
                 )
             secret = get_secret()
@@ -369,6 +532,7 @@ class PlaywrightRunner:
         except RecipeError as exc:
             self._record_failure(page, item, secret)
             exc.submitted = exc.submitted or attempt.submitted
+            exc.detail += html_script_hint(page)
             raise
         except Exception as exc:  # pylint: disable=broad-exception-caught
             # A Playwright timeout or a detached element: report it like a
@@ -376,7 +540,8 @@ class PlaywrightRunner:
             # happened. The submit marker decides the limiter outcome.
             self._record_failure(page, item, secret)
             raise LoginFailed(
-                f"unexpected error in the login recipe: {exception_site(exc)}",
+                f"unexpected error in the login recipe: {exception_site(exc)}"
+                + html_script_hint(page),
                 submitted=True,
             ) from exc
         # Snapshot where the recipe ended — the check below navigates away.
@@ -390,10 +555,13 @@ class PlaywrightRunner:
             self._record_failure(page, item, secret)
             self.last_diag[item.site]["before_check"] = before
             raise LoginFailed(
-                "login did not reach a logged-in state (status / origin / sentinel)"
-                if proof != INDETERMINATE
-                else "the logged-in proof could not decide (check page did not "
-                "load or answered 5xx)",
+                (
+                    "login did not reach a logged-in state (status / origin / sentinel)"
+                    if proof != INDETERMINATE
+                    else "the logged-in proof could not decide (check page did not "
+                    "load, answered 5xx or stayed blank)"
+                )
+                + html_script_hint(page),
                 submitted=attempt.submitted,
                 phase="broker-proof",
             )
@@ -462,13 +630,21 @@ class PlaywrightRunner:
                 present = bool(sentinel_shown(page, sentinel))
                 return {"loaded": True, "status": status, "present": present}
             finally:
+                _NOCACHE_SESSIONS.pop(id(ctx), None)
+                _HTML_SCRIPTS.pop(id(ctx), None)
                 with contextlib.suppress(Exception):
                     ctx.close()
         finally:
             shutil.rmtree(tmp, ignore_errors=True)
 
     def _export(
-        self, ctx: Any, item: SiteItem, via: str, *, proven: bool
+        self,
+        ctx: Any,
+        item: SiteItem,
+        via: str,
+        *,
+        proven: bool,
+        refresh: str = REFRESH_NONE,
     ) -> dict[str, Any]:
         """`export_bundle`, raising ``ExportFailed`` when it fails or the
         bundle holds no cookie and no storage key. `proven`: a fresh login was
@@ -494,6 +670,7 @@ class PlaywrightRunner:
             )
             err.code = "empty_bundle"
             raise err
+        bundle["session_refresh"] = refresh
         return bundle
 
     def __call__(
@@ -512,10 +689,12 @@ class PlaywrightRunner:
                 self._candidate_absent(self._throwaway_answer(item, pw=pw))
                 with contextlib.suppress(AttributeError, TypeError):
                     setattr(get_secret, "candidate_checked", True)
-            ctx = self._launch(pw, profile)
+            ctx = self._launch(pw, profile, item)
             try:
                 return self.run_in_context(ctx, item, get_secret)
             finally:
+                _NOCACHE_SESSIONS.pop(id(ctx), None)
+                _HTML_SCRIPTS.pop(id(ctx), None)
                 with contextlib.suppress(Exception):
                     ctx.close()
 
@@ -749,9 +928,14 @@ class Broker(SecretOps):  # pylint: disable=too-many-instance-attributes  # deps
                     resp = _err("bad_request", "missing or invalid site id")
                 elif op == "login":
                     resp = self._login_request(site, req)
+                    bundle = resp.get("bundle")
                     extra.update(
                         scheduled=req.get("scheduled") in (True, "1", "true"),
                         candidate=req.get("candidate_sentinel") is not None,
+                        refresh_only=req.get("refresh_only") in (True, "1", "true"),
+                        session_refresh=bundle.get("session_refresh")
+                        if isinstance(bundle, dict)
+                        else None,
                         phase=resp.get("phase"),
                         fresh_auth=resp.get("fresh_auth"),
                     )
@@ -801,11 +985,25 @@ class Broker(SecretOps):  # pylint: disable=too-many-instance-attributes  # deps
                 shutil.rmtree(profile)
         return {"ok": True, "removed": existed}
 
-    def _login_request(self, site: str, req: dict[str, Any]) -> dict[str, Any]:
-        """``login`` with its options: ``scheduled`` (the daily check) and a
-        one-shot ``candidate_sentinel`` (never for a scheduled run)."""
+    # One return per refusal of an option combination, then one per route.
+    def _login_request(  # pylint: disable=too-many-return-statements
+        self, site: str, req: dict[str, Any]
+    ) -> dict[str, Any]:
+        """``login`` with its options: ``scheduled`` (the daily check), a
+        one-shot ``candidate_sentinel`` (never for a scheduled run) and
+        ``refresh_only`` (re-export a still-valid profile, its storage token
+        renewed when due — never a password: a profile that is not reusable
+        answers ``refresh_unavailable`` without touching the limiter)."""
         scheduled = req.get("scheduled") in (True, "1", "true")
         candidate = req.get("candidate_sentinel")
+        refresh_only = req.get("refresh_only") in (True, "1", "true")
+        if refresh_only and candidate is not None:
+            return _phase_err(
+                "bad_request", "refresh_only never tries a candidate", "precheck"
+            )
+        if refresh_only:
+            with self._site_lock(site):
+                return self._do_login(site, scheduled=scheduled, refresh_only=True)
         if candidate is None:
             return self._login(site, scheduled=scheduled)
         if not isinstance(candidate, str) or not selector_ok(candidate.strip()):
@@ -887,7 +1085,12 @@ class Broker(SecretOps):  # pylint: disable=too-many-instance-attributes  # deps
 
     # One return per protocol error code, in the order they are checked.
     def _do_login(  # pylint: disable=too-many-return-statements,too-many-branches
-        self, site: str, *, scheduled: bool = False, candidate: str | None = None
+        self,
+        site: str,
+        *,
+        scheduled: bool = False,
+        candidate: str | None = None,
+        refresh_only: bool = False,
     ) -> dict[str, Any]:
         """One login: item checks, then the runner. The limiter is consulted
         only when the runner asks for the secret (`_SecretGate`), so a validated
@@ -934,6 +1137,7 @@ class Broker(SecretOps):  # pylint: disable=too-many-instance-attributes  # deps
             )
         gate = _SecretGate(self, item, scheduled=scheduled)
         gate.candidate = candidate is not None
+        gate.refresh_only = refresh_only
         outcome = "not_submitted"
         try:
             bundle = self.runner(item, gate)
@@ -1021,6 +1225,19 @@ class _RateLimited(RecipeError):
         self.denied = denied
 
 
+class _RefreshUnavailable(RecipeError):
+    """A ``refresh_only`` request found no reusable profile (nothing reserved,
+    no secret read)."""
+
+    code = "refresh_unavailable"
+
+    def __init__(self) -> None:
+        super().__init__(
+            "the broker profile is not reusable; a refresh-only request never logs in",
+            phase="profile-proof",
+        )
+
+
 class _LimiterAttempt(AttemptController):
     """The recipe's `AttemptController`, bound to the gate's reservation:
     every mark is persisted before the step it announces (a write failure
@@ -1055,9 +1272,12 @@ class _SecretGate:  # pylint: disable=too-many-instance-attributes  # deps + att
         self.finished = False
         self.candidate = False
         self.candidate_checked = False  # the runner did the logged-out half
+        self.refresh_only = False  # a refresh never reaches the secret
         self.attempt = _LimiterAttempt(self)
 
     def __call__(self) -> Secret:
+        if self.refresh_only:
+            raise _RefreshUnavailable()
         if self.grant is None:
             got = self.broker.limiter.reserve_site(
                 self.item.site,

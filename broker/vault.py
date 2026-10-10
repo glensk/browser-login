@@ -42,7 +42,12 @@ from typing import Any, Protocol
 
 from broker.bundle import SiteBundleSpec, is_idp_host
 from broker.origins import parse_fill_origins
-from broker.recipes import DEFAULT_CHECK_URLS, DEFAULT_LOGGED_IN_SELECTORS
+from broker.recipes import (
+    DEFAULT_CHECK_URLS,
+    DEFAULT_LOGGED_IN_SELECTORS,
+    SESSION_REFRESHERS,
+    session_refresh_name,
+)
 from broker.vault_cache import (
     VaultCache,
 )
@@ -112,6 +117,10 @@ class SiteItem:  # pylint: disable=too-many-instance-attributes
     # `agent_proof_origins`: further origins (besides the check URL's) where
     # the logged-in proof may end after redirects.
     proof_origins: list[str] = field(default_factory=list)
+    # `agent_session_refresh`: the refresher (``recipes.SESSION_REFRESHERS``)
+    # that renews a storage token before a reused profile is exported; "none"
+    # switches a built-in default off; None = the default for the site id.
+    session_refresh: str | None = None
     refused: str | None = None
     item_id: str = ""
 
@@ -156,6 +165,8 @@ class SiteItem:  # pylint: disable=too-many-instance-attributes
             "attempt_group": self.attempt_group,
             "sentinel": bool(self.logged_in_selector),
             "proof_origins": list(self.proof_origins),
+            "storage_keys": {o: list(k) for o, k in self.storage_keys.items()},
+            "session_refresh": session_refresh_name(self),
             "refused": self.refused is not None,
             "reason": self.refused or "",
         }
@@ -646,6 +657,10 @@ def site_item_from_json(item: Mapping[str, Any], *, dev: bool = False) -> SiteIt
         proof_origins = parse_fill_origins(raw_proof, dev=dev) if raw_proof else []
     except ValueError as exc:
         return refused(f"bad agent_proof_origins: {exc}")
+    session_refresh = fields.get("agent_session_refresh", "").strip().lower() or None
+    if session_refresh not in (None, "none", *SESSION_REFRESHERS):
+        known = ", ".join(sorted(SESSION_REFRESHERS))
+        return refused(f"bad agent_session_refresh (none, {known})")
     return SiteItem(
         fill_origins=fill_origins,
         cookie_hosts=cookie_hosts,
@@ -659,6 +674,7 @@ def site_item_from_json(item: Mapping[str, Any], *, dev: bool = False) -> SiteIt
         pre_click=pre_click,
         attempt_group=group,
         proof_origins=proof_origins,
+        session_refresh=session_refresh,
         site=site,
         name=name,
         item_id=item_id,

@@ -767,7 +767,8 @@ class _CheckPage:
     def query_selector_all(self, selector):
         if selector == recipes.PASSWORD_SELECTOR or "password" in selector:
             return [_El(True)] if self._password else [_El(False)]
-        return []
+        # the sentinel: polled over every match (a hidden one first)
+        return [_El(False), _El(True)] if self._sentinel else [_El(False)]
 
     def eval_on_selector_all(self, _sel, _js):
         return []

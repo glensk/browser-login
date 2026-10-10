@@ -8,8 +8,11 @@ types, clicks or reads a field value.
 
 from __future__ import annotations
 
+import math
 import re
+import time
 import urllib.parse
+from collections.abc import Callable
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:  # annotations only
@@ -123,6 +126,141 @@ def sentinel_shown(page: Any, selector: str) -> bool:
         except Exception:  # pylint: disable=broad-exception-caught
             continue
     return False
+
+
+# How often a proof looks for its sentinel while a page boots.
+POLL_INTERVAL_MS = 300
+# At most this long for "network idle" before a NEGATIVE answer (an SPA still
+# busy with its boot requests); a page that keeps a connection open never gets
+# there, so it is bounded.
+NETWORK_IDLE_S = 3.0
+
+
+def wait_network_idle(page: Any, timeout_s: float) -> None:
+    """Bounded wait for the page's network to go idle; never raises."""
+    if timeout_s <= 0:
+        return
+    try:
+        page.wait_for_load_state("networkidle", timeout=timeout_s * 1000)
+    except Exception:  # pylint: disable=broad-exception-caught
+        pass
+
+
+def poll_sentinel(
+    page: Any,
+    selector: str,
+    wait_s: float,
+    *,
+    where: Callable[[Any], bool] | None = None,
+    give_up: Callable[[Any], bool] | None = None,
+) -> bool:
+    """Poll `sentinel_shown` (EVERY match, any visible one counts) until it
+    holds — and `where(page)` too, when given — or `wait_s` passed.
+
+    ``wait_for_selector(state="visible")`` looks at the FIRST match only and
+    times out when that one is hidden (NPM's navbar link before its dashboard
+    card); a one-shot scan misses an SPA that renders a moment later. At least
+    one look; the loop is also bounded by its tick count, so a page whose
+    ``wait_for_timeout`` returns at once (tests) cannot spin. `give_up(page)`
+    true ends the wait early with False (a settled logged-out page)."""
+    ticks = max(1, math.ceil(wait_s * 1000 / POLL_INTERVAL_MS))
+    deadline = time.monotonic() + wait_s
+    for tick in range(ticks + 1):
+        if (where is None or where(page)) and sentinel_shown(page, selector):
+            return True
+        if give_up is not None and _safe(give_up, page):
+            return False
+        if tick >= ticks or time.monotonic() >= deadline:
+            return False
+        try:
+            page.wait_for_timeout(POLL_INTERVAL_MS)
+        except Exception:  # pylint: disable=broad-exception-caught
+            return False
+    return False
+
+
+def await_sentinel(
+    page: Any,
+    selector: str,
+    wait_s: float,
+    *,
+    where: Callable[[Any], bool] | None = None,
+    give_up: Callable[[Any], bool] | None = None,
+) -> bool:
+    """`poll_sentinel` for `wait_s`; before giving up, a bounded wait for
+    network idle (``NETWORK_IDLE_S``: the SPA may still be fetching) and one
+    last look. A sentinel that shows early ends the wait at once; so does
+    `give_up(page)` (no network-idle wait then)."""
+    if poll_sentinel(page, selector, wait_s, where=where, give_up=give_up):
+        return True
+    if give_up is not None and _safe(give_up, page):
+        return False
+    wait_network_idle(page, min(NETWORK_IDLE_S, wait_s))
+    return poll_sentinel(page, selector, 0.0, where=where)
+
+
+def _safe(check: Callable[[Any], bool], page: Any) -> bool:
+    """`check(page)`, False when it raises (a page mid-navigation)."""
+    try:
+        return bool(check(page))
+    except Exception:  # pylint: disable=broad-exception-caught
+        return False
+
+
+def password_shown(page: Any) -> bool:
+    """A password field is visible (a login form); open shadow roots
+    included (Playwright's CSS engine pierces them). False when unreadable."""
+    try:
+        return any(el.is_visible() for el in page.query_selector_all(PASSWORD_CSS))
+    except Exception:  # pylint: disable=broad-exception-caught
+        return False
+
+
+PASSWORD_CSS = "input[type=password]"
+
+
+# Nothing a human could see: no rendered text and no element with a box that
+# shows something by itself (a field, a button, media, its own text) — in the
+# document or in any open shadow root (Home Assistant's login form lives in
+# one); text inside a hidden element does not count. A custom element whose
+# shadow root is closed counts as rendered once it has a box. An SPA whose
+# bundle failed, or one still booting or reloading, looks like this. The walk
+# is bounded; a page too big to walk counts as rendered.
+_BLANK_JS = """() => {
+  const b = document.body;
+  if (!b) return true;
+  if ((b.innerText || '').trim()) return false;
+  const shown = e => {
+    const r = e.getBoundingClientRect();
+    return r.width > 0 && r.height > 0 && getComputedStyle(e).visibility !== 'hidden';
+  };
+  const media = /^(INPUT|BUTTON|SELECT|TEXTAREA|IMG|SVG|CANVAS|VIDEO|IFRAME|OBJECT)$/i;
+  const ownText = n => [...n.childNodes].some(
+    c => c.nodeType === Node.TEXT_NODE && (c.textContent || '').trim());
+  const stack = [b];
+  let budget = 5000;
+  while (stack.length) {
+    if (budget-- <= 0) return false;
+    const n = stack.pop();
+    if (n !== b && (media.test(n.tagName) || ownText(n)) && shown(n)) return false;
+    // A custom element without an OPEN shadow root (closed, or rendered by
+    // other means) cannot be looked into: with a box, it counts as rendered.
+    if (n !== b && n.tagName.includes('-') && !n.shadowRoot && shown(n)) return false;
+    if (n.shadowRoot) stack.push(...n.shadowRoot.children);
+    stack.push(...n.children);
+  }
+  return true;
+}"""
+
+
+def page_blank(page: Any) -> bool:
+    """True only when the page PROVABLY shows nothing (``_BLANK_JS``); a page
+    that cannot be inspected counts as rendered (False) — the caller's old
+    answer stands then."""
+    try:
+        return page.evaluate(_BLANK_JS) is True
+    except Exception:  # pylint: disable=broad-exception-caught
+        return False
 
 
 # What a failure report lists: visible message-like elements and buttons.

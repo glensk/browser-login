@@ -168,6 +168,10 @@ manual acceptance steps under the attempt policy below.
           sentinel; blank page = indeterminate; NPM JWT refresher; `refresh_only`; bundle
           completeness + rollback. Server side: tp#898. Deferred to WS1b: a 6-hourly
           `login --refresh-only` keeps the 1-day token alive.
+          Review round 1 (2026-10-10) pulled that refresh forward: the client renews when
+          < 12 h are left, and `agent-login.py -c` runs `login -F` (pending sites included).
+          A live opt-in test shows NPM 2.16 does not renew its own token in a short tab.
+          Tick "refresh before export" after the release and a live check.
     - [ ] Code (after WS1a):
       - poll `sentinel_shown()` instead of `wait_for_selector`, since the first
             `a[href='/nginx/proxy']` is a hidden navbar item;

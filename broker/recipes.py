@@ -48,8 +48,11 @@ from broker.login_form import (
 from broker.origins import form_action_allowed, origin_allowed, origin_hint, url_origin
 from broker.otp_detect import OTP_CANDIDATE_SELECTOR, OTP_DESCRIBE_JS, otp_field_like
 from broker.page_state import (
+    await_sentinel,
     challenge_reason,
     interstitial_title,
+    page_blank,
+    password_shown,
     sentinel_shown,
     trust_prompt_button,
 )
@@ -359,29 +362,50 @@ VALID, INVALID, INDETERMINATE = "valid", "invalid", "indeterminate"
 Proof = Callable[..., str]
 
 
+def sentinel_proof(
+    page: Any, item: SiteItem, *, wait_s: float = 8.0, dev: bool = False
+) -> str:
+    """The STRICT proof on the CURRENT page (the check page), tri-state.
+
+    The page may still be booting (an SPA reads its token, asks its API, then
+    renders) or reloading, so nothing negative is concluded early:
+    ``await_sentinel`` polls every match (any visible one counts) on a proof
+    origin for `wait_s`, then waits (bounded) for network idle and looks once
+    more. Only then: sentinel shown → ``valid``;
+    off the proof origins, or a login form showing → ``invalid``; a blank,
+    unrendered page → ``indeterminate`` (it proves neither state); any other
+    rendered page → ``invalid``.
+    """
+    origins = proof_origins(item, dev=dev)
+
+    def on_origin(p: Any) -> bool:
+        return url_origin(p.url, dev=dev) in origins
+
+    def logged_out(p: Any) -> bool:  # an IdP login page: no need to wait
+        return not on_origin(p) and password_shown(p)
+
+    sentinel = str(item.logged_in_selector)
+    if await_sentinel(page, sentinel, wait_s, where=on_origin, give_up=logged_out):
+        # The sentinel may show while a redirect is still under way: re-check.
+        return VALID if on_origin(page) else INVALID
+    if not on_origin(page) or _visible(page, PASSWORD_SELECTOR) is not None:
+        return INVALID
+    return INDETERMINATE if page_blank(page) else INVALID
+
+
 def logged_in(
     page: Any, item: SiteItem, *, wait_s: float = 8.0, dev: bool = False
 ) -> bool:
     """Positive success test on the CURRENT page (the check page).
 
-    With a sentinel (the STRICT proof): the page is on a proof origin
-    (``proof_origins``) and the item's authenticated sentinel is visible.
-    Without one: the OLD, weaker proof (``legacy_logged_in``) — kept only until
-    the item gets a sentinel; a scheduled login never relies on it.
+    With a sentinel (the STRICT proof, ``sentinel_proof``): the page is on a
+    proof origin (``proof_origins``) and the item's authenticated sentinel is
+    visible. Without one: the OLD, weaker proof (``legacy_logged_in``) — kept
+    only until the item gets a sentinel; a scheduled login never relies on it.
     """
     if not item.logged_in_selector:
         return legacy_logged_in(page, item, dev=dev)
-    if url_origin(page.url, dev=dev) not in proof_origins(item, dev=dev):
-        return False
-    try:
-        page.wait_for_selector(
-            item.logged_in_selector, state="visible", timeout=wait_s * 1000
-        )
-    except Exception:  # pylint: disable=broad-exception-caught
-        if not sentinel_shown(page, item.logged_in_selector):
-            return False
-    # The sentinel may show while a redirect is still under way: re-check.
-    return url_origin(page.url, dev=dev) in proof_origins(item, dev=dev)
+    return sentinel_proof(page, item, wait_s=wait_s, dev=dev) == VALID
 
 
 def legacy_logged_in(page: Any, item: SiteItem, *, dev: bool = False) -> bool:
@@ -401,9 +425,11 @@ def legacy_logged_in(page: Any, item: SiteItem, *, dev: bool = False) -> bool:
 def generic_proof(
     page: Any, item: SiteItem, *, dev: bool = False, wait_s: float = 8.0
 ) -> str:
-    """The generic proof on the loaded check page (strict with a sentinel,
-    the old one without)."""
-    return VALID if logged_in(page, item, wait_s=wait_s, dev=dev) else INVALID
+    """The generic proof on the loaded check page: tri-state with a sentinel
+    (``sentinel_proof``), the old valid/invalid one without."""
+    if item.logged_in_selector:
+        return sentinel_proof(page, item, wait_s=wait_s, dev=dev)
+    return VALID if legacy_logged_in(page, item, dev=dev) else INVALID
 
 
 def _cscs_proof(
@@ -411,10 +437,10 @@ def _cscs_proof(
 ) -> str:
     """CSCS: the portal app holds its token (its rule until WS2-cscs), AND —
     once the item has one — the DOM sentinel on a proof origin."""
-    if item.logged_in_selector and (
-        generic_proof(page, item, dev=dev, wait_s=wait_s) != VALID
-    ):
-        return INVALID
+    if item.logged_in_selector:
+        answer = generic_proof(page, item, dev=dev, wait_s=wait_s)
+        if answer != VALID:
+            return answer
     return VALID if cscs_portal_ready(page, wait_s=max(wait_s, 8.0)) else INVALID
 
 
@@ -477,6 +503,180 @@ def check_logged_in(
 ) -> bool:
     """``check_proof(...) == "valid"``."""
     return check_proof(page, item, dev=dev, wait_s=wait_s) == VALID
+
+
+# ---------------------------------------------------------------------------
+# Session refresh before export (storage-token SPAs)
+# ---------------------------------------------------------------------------
+# A token kept in localStorage expires on its own schedule (NPM: 1 day). A
+# reused broker profile whose token is nearly expired would hand the shared
+# browser a session that dies within hours — and the next check would cost a
+# password submit. So, on a reuse, a site's refresher renews the token through
+# the app's own authenticated endpoint first. Refreshers are code (a broker
+# release, like recipes); the vault only picks one by name.
+#
+# Answers: "fresh" (enough time left, nothing done), "refreshed" (renewed,
+# written back and read back), "rejected" (the server refused the token: the
+# profile is not reusable, the key was dropped so the login form shows),
+# "failed" (could not tell / could not renew; the session as it is), "none"
+# (the item has no refresher).
+REFRESH_FRESH, REFRESH_DONE = "fresh", "refreshed"
+REFRESH_REJECTED, REFRESH_FAILED, REFRESH_NONE = "rejected", "failed", "none"
+# Renew when less than this is left.
+REFRESH_MIN_LEFT_S = 12 * 3600
+
+# Nginx Proxy Manager 2.x keeps `[{token, expires}, ...]` under
+# `authentications` (the last entry is the active one; `expires` an ISO date)
+# and renews with an authenticated `GET /api/tokens` (its own timer does the
+# same every 5 minutes, but only in a tab open that long). The token never
+# leaves the page: only a state and the seconds left come back. Bounded: the
+# fetch is aborted after REFRESH_FETCH_S, the whole script gives up after
+# REFRESH_TOTAL_S (a hang must never look like a failed login). Only a 401
+# drops the stored token; a 403 (a WAF, Cloudflare Access) says nothing about
+# it. The entry's other fields are kept.
+REFRESH_FETCH_S = 10
+REFRESH_TOTAL_S = 15
+_NPM_REFRESH_JS = """async ([key, minLeftS, fetchS, totalS]) => {
+  const expiry = v => {
+    if (typeof v === 'number') return v < 1e12 ? v * 1000 : v;
+    const t = Date.parse(String(v || ''));
+    return Number.isNaN(t) ? null : t;
+  };
+  const work = async () => {
+    let list;
+    try { list = JSON.parse(localStorage.getItem(key) || 'null'); }
+    catch (e) { return {state: 'failed', why: 'unparsable'}; }
+    if (!Array.isArray(list) || !list.length) return {state: 'failed', why: 'no token'};
+    const last = list[list.length - 1] || {};
+    const exp = expiry(last.expires);
+    if (typeof last.token !== 'string' || exp === null)
+      return {state: 'failed', why: 'malformed'};
+    const left = Math.round((exp - Date.now()) / 1000);
+    if (left > minLeftS) return {state: 'fresh', left_s: left};
+    const ctl = new AbortController();
+    const timer = setTimeout(() => ctl.abort(), fetchS * 1000);
+    let r;
+    try {
+      r = await fetch('/api/tokens', {headers: {Authorization: 'Bearer ' + last.token},
+        cache: 'no-store', credentials: 'same-origin', redirect: 'error',
+        signal: ctl.signal});
+    } catch (e) {
+      return {state: 'failed', why: e && e.name === 'AbortError' ? 'timeout' : 'network',
+              left_s: left};
+    } finally { clearTimeout(timer); }
+    if (r.status === 401) {
+      localStorage.removeItem(key);
+      return {state: 'rejected', status: r.status};
+    }
+    if (!r.ok) return {state: 'failed', why: 'status', status: r.status, left_s: left};
+    let body;
+    try { body = await r.json(); } catch (e) { return {state: 'failed', why: 'body'}; }
+    const nexp = body ? expiry(body.expires) : null;
+    if (!body || typeof body.token !== 'string' || !body.token || nexp === null)
+      return {state: 'failed', why: 'body', left_s: left};
+    list[list.length - 1] = {...last, token: body.token, expires: body.expires};
+    localStorage.setItem(key, JSON.stringify(list));
+    let back;
+    try { back = JSON.parse(localStorage.getItem(key) || 'null'); } catch (e) { back = null; }
+    const ok = Array.isArray(back) && back.length === list.length
+      && back[back.length - 1].token === body.token;
+    return ok ? {state: 'refreshed', left_s: Math.round((nexp - Date.now()) / 1000)}
+              : {state: 'failed', why: 'read-back'};
+  };
+  let timer;
+  const cap = new Promise(res => {
+    timer = setTimeout(() => res({state: 'failed', why: 'deadline'}), totalS * 1000);
+  });
+  try { return await Promise.race([work(), cap]); } finally { clearTimeout(timer); }
+}"""
+# The seconds left on the last stored NPM token (null: none / unreadable);
+# never the token itself.
+NPM_TOKEN_LEFT_JS = """key => {
+  try {
+    const l = JSON.parse(localStorage.getItem(key) || 'null');
+    if (!Array.isArray(l) || !l.length || !l[l.length - 1]) return null;
+    const v = l[l.length - 1].expires;
+    const t = typeof v === 'number' ? (v < 1e12 ? v * 1000 : v) : Date.parse(String(v || ''));
+    return Number.isNaN(t) ? null : Math.round((t - Date.now()) / 1000);
+  } catch (e) { return null; }
+}"""
+NPM_TOKEN_KEY = "authentications"
+
+
+def npm_jwt_refresh(
+    page: Any,
+    item: SiteItem,
+    *,
+    dev: bool = False,
+    min_left_s: float = REFRESH_MIN_LEFT_S,
+) -> str:
+    """NPM: renew the JWT in localStorage when less than `min_left_s` is left
+    (see ``_NPM_REFRESH_JS``). Runs only on an origin whose storage the item
+    exports with the ``authentications`` key — never elsewhere."""
+    origin = url_origin(page.url, dev=dev)
+    if origin is None or NPM_TOKEN_KEY not in item.storage_keys.get(origin, []):
+        return REFRESH_FAILED
+    try:
+        got = page.evaluate(
+            _NPM_REFRESH_JS,
+            [NPM_TOKEN_KEY, int(min_left_s), REFRESH_FETCH_S, REFRESH_TOTAL_S],
+        )
+    except Exception:  # pylint: disable=broad-exception-caught
+        return REFRESH_FAILED
+    state = got.get("state") if isinstance(got, dict) else None
+    ok = (REFRESH_FRESH, REFRESH_DONE, REFRESH_REJECTED, REFRESH_FAILED)
+    return state if state in ok else REFRESH_FAILED
+
+
+Refresher = Callable[..., str]
+# Refresher name -> code. An item picks one with `agent_session_refresh`
+# (validated against this table; "none" switches a default off).
+SESSION_REFRESHERS: dict[str, Refresher] = {"npm-jwt": npm_jwt_refresh}
+# Built-in choices by site id (an item's `agent_session_refresh` overrides).
+DEFAULT_SESSION_REFRESH = {"npm-nixos": "npm-jwt", "npm-raspi": "npm-jwt"}
+
+
+def session_refresh_name(item: SiteItem) -> str | None:
+    """The refresher an item uses: its own field, else the built-in default
+    for its site id; None when it has none ("none" included)."""
+    chosen = item.session_refresh
+    name = DEFAULT_SESSION_REFRESH.get(item.site) if chosen is None else chosen
+    return name if name in SESSION_REFRESHERS else None
+
+
+def refresh_session(page: Any, item: SiteItem, *, dev: bool = False) -> str:
+    """Run the item's refresher on the CURRENT page (the proven check page);
+    ``none`` without one, ``failed`` when it raises."""
+    name = session_refresh_name(item)
+    if name is None:
+        return REFRESH_NONE
+    try:
+        return SESSION_REFRESHERS[name](page, item, dev=dev)
+    except Exception:  # pylint: disable=broad-exception-caught
+        return REFRESH_FAILED
+
+
+# Refresher name -> (storage key, JS returning the seconds left on the stored
+# token): the CLIENT reads it in the shared browser to know when to ask the
+# broker for a `refresh_only` re-export. Never the token itself.
+SESSION_LEFT_JS: dict[str, tuple[str, str]] = {
+    "npm-jwt": (NPM_TOKEN_KEY, NPM_TOKEN_LEFT_JS)
+}
+
+
+def session_left_s(page: Any, name: str) -> int | None:
+    """Seconds left on the token refresher `name` manages, read on the
+    CURRENT page (its storage origin); None when unknown."""
+    spec = SESSION_LEFT_JS.get(name)
+    if spec is None:
+        return None
+    try:
+        left = page.evaluate(spec[1], spec[0])
+    except Exception:  # pylint: disable=broad-exception-caught
+        return None
+    if isinstance(left, bool) or not isinstance(left, (int, float)):
+        return None
+    return int(left)
 
 
 # A freshly shown password page may still re-render (and clear inputs) while its
@@ -944,6 +1144,12 @@ def generic_login(
         if trust is not None:
             trust.click(timeout=5000)
             prompts_answered += 1
+    if _visible(page, PASSWORD_SELECTOR) is None and page_blank(page):
+        # A blank page proves nothing either way: an SPA that is reloading or
+        # whose bundle failed to load (NPM 2026-10-10: the login had worked).
+        # The caller's positive proof reloads the check page and decides —
+        # blank there too is "indeterminate", never "wrong password".
+        return
     # Still on the login after the password: wrong password, an e-mail code, a
     # captcha... Fail HERE so the failure report shows this page.
     raise LoginFailed(

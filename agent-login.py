@@ -100,7 +100,7 @@ from agent_login_jobs import (  # noqa: E402
     wait_for_network,
 )
 from broker import phases, safari_cookies  # noqa: E402
-from broker.recipes import DEFAULT_CHECK_URLS  # noqa: E402
+from broker.recipes import DEFAULT_CHECK_URLS, REFRESH_MIN_LEFT_S  # noqa: E402
 from broker.vault import SITE_ID_RE, selector_ok  # noqa: E402
 
 # pylint: enable=wrong-import-position
@@ -421,6 +421,7 @@ def _broker_fields(entry: dict) -> dict:
         "cookie_hosts": list(entry.get("cookie_hosts") or []),
         "storage_origins": list(entry.get("storage_origins") or []),
         "proof_origins": list(entry.get("proof_origins") or []),
+        "session_refresh": entry.get("session_refresh"),
     }
 
 
@@ -1347,6 +1348,36 @@ def schedule_gate(row: dict) -> tuple[str, str] | None:
     return None
 
 
+def refresh_step(site: str, check: dict | None, how: str) -> str:
+    """A fresh ✅ of a site with a session refresher (NPM): when its stored
+    token has less than ``REFRESH_MIN_LEFT_S`` left (the free check read it,
+    ``session_left_s``), `browser.py login SITE -F` has the broker re-export
+    it renewed. Refresh-only never logs in or submits a password, so it also
+    runs for pending and quarantined sites — and it never quarantines. Returns
+    the row's `how`, with what happened."""
+    left = (check or {}).get("session_left_s")
+    if isinstance(left, bool) or not isinstance(left, int):
+        return how
+    if left >= REFRESH_MIN_LEFT_S:
+        return how
+    run = run_browser(
+        "login",
+        site,
+        "-F",
+        timeout_s=browser_timeout("login"),
+        capture=True,
+        result=True,
+    )
+    res = run.result or {}
+    if run.rc == 0 and res.get("refresh") == "refreshed":
+        return f"{how} (token renewed)"
+    if run.rc == 0:
+        why = res.get("refresh") or "not needed"
+        return f"{how} (token NOT renewed: {why}; {max(left, 0) // 3600} h left)"
+    print(f"⚠️ {site}: refresh-only run exit {run.rc} — the session may end soon")
+    return f"{how} (token refresh failed, exit {run.rc})"
+
+
 def _record_unchecked(data: dict | None, code: str, why: str) -> None:
     """A run that could not check anything records `unknown` for every
     checkable row (never success, never "logged out")."""
@@ -1414,6 +1445,8 @@ def check_all(*, mail: bool = False) -> int:  # pylint: disable=too-many-branche
             print(f"⏸  {site}: {how}")
             record_check(site, None, how, res)
             continue
+        if ok and row.get("session_refresh"):
+            how = refresh_step(site, res, how)
         print(f"{'✅' if ok else '❌'} {site}: {how}")
         record_check(site, ok, how, res)
         if not ok:
@@ -1553,7 +1586,10 @@ def refresh_policy(row: dict) -> str:
     if row.get("quarantine"):
         return "none (quarantined)"
     if row["status"] in ("ready", "extra"):
-        return "daily -c" if row.get("stage") == "usable" else "none (pending)"
+        base = "daily -c" if row.get("stage") == "usable" else "none (pending)"
+        if row.get("session_refresh"):  # -c renews its token, pending or not
+            base += f" + token refresh ({row['session_refresh']})"
+        return base
     return "none"
 
 

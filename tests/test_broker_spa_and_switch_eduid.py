@@ -164,6 +164,13 @@ def test_init_script_guards_the_origin():
 # ---------------------------------------------------------------------------
 
 
+class _ShownEl:
+    """A visible element."""
+
+    def is_visible(self) -> bool:
+        return True
+
+
 class _SpaProbePage:
     """URL/token sequence advanced by each wait (500 ms per poll)."""
 
@@ -181,8 +188,8 @@ class _SpaProbePage:
             self._urls.pop(0)
         self.url = self._urls[0]
 
-    def wait_for_selector(self, _sel: str, **_kw) -> object:
-        return object()  # the DOM sentinel shows
+    def query_selector_all(self, _sel: str) -> list[_ShownEl]:
+        return [_ShownEl()]  # the DOM sentinel shows
 
 
 # WS1a: CSCS needs a DOM sentinel too (next to its token) and a known status.

@@ -387,7 +387,7 @@ def test_candidate_login_sends_the_candidate(
         return 0
 
     monkeypatch.setattr(browser, "_broker_check_entry", check)
-    monkeypatch.setattr(browser, "_broker_write_storage", lambda _p, _b: 0)
+    monkeypatch.setattr(browser, "_broker_write_storage", lambda _p, _b, _o=None: 0)
     monkeypatch.setattr(browser, "_record_login_event", lambda *_a: None)
     assert browser._broker_login(9222, "shop") == 0
     assert sent == [("login", {"site": "shop", "candidate_sentinel": "#me"})]

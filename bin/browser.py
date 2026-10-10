@@ -179,13 +179,16 @@ from broker import phases as _phases  # noqa: E402
 from broker import safari_cookies as _safari  # noqa: E402
 from broker.bundle import IDP_HOSTS as BROKER_IDP_HOSTS  # noqa: E402
 from broker.bundle import IDP_LABELS as BROKER_IDP_LABELS  # noqa: E402
+from broker.page_state import await_sentinel as _broker_await_sentinel  # noqa: E402
+from broker.page_state import page_blank as _broker_page_blank  # noqa: E402
+from broker.recipes import REFRESH_MIN_LEFT_S as BROKER_REFRESH_MIN_LEFT_S  # noqa: E402
 from broker.recipes import click_keycloak_submit as _click_keycloak_submit  # noqa: E402
 from broker.recipes import cscs_portal_ready as _broker_cscs_portal_ready  # noqa: E402
 from broker.recipes import fresh_totp as _broker_fresh_totp  # noqa: E402
 from broker.recipes import interstitial_title as _broker_interstitial  # noqa: E402
 from broker.recipes import off_fill_origins as _broker_off_fill_origins  # noqa: E402
 from broker.recipes import parse_totp as _parse_totp  # noqa: E402
-from broker.recipes import sentinel_shown as _broker_sentinel_shown  # noqa: E402
+from broker.recipes import session_left_s as _broker_session_left_s  # noqa: E402
 from broker.useragent import engine_user_agent as _engine_user_agent  # noqa: E402
 
 # pylint: enable=wrong-import-position
@@ -624,6 +627,15 @@ def _add_login_parsers(sub: Any) -> None:
         help="broker item WITHOUT agent_logged_in_selector: ONE login that "
         "verifies CSS as its sentinel (absent before, present after); never "
         "with -s — it is a real login attempt",
+    )
+    pl.add_argument(
+        "-F",
+        "--refresh-only",
+        action="store_true",
+        help="broker item with a session refresher (e.g. NPM): when the site is "
+        "logged in and its token has < 12 h left, have the broker re-export it "
+        "renewed; NEVER logs in or submits a password (works for pending and "
+        "quarantined sites). Exit 0 = still logged in, 2 = not logged in",
     )
     pli = sub.add_parser(
         "logged-in", help="Exit 0 if SITE is logged in, 2 if not (no login)."
@@ -9373,12 +9385,18 @@ PROOF_V = 1  # the strict proof (status + origin + sentinel): agent-login's -p n
 _RESULT: dict[str, Any] = {}
 _RESULT_FILE: list[str] = []
 # `login -s` (scheduled) / `-x CSS` (one-shot candidate sentinel), per process.
-_LOGIN_OPTS: dict[str, Any] = {"scheduled": False, "candidate": None}
+_LOGIN_OPTS: dict[str, Any] = {
+    "scheduled": False,
+    "candidate": None,
+    "refresh_only": False,
+}
 # The breadcrumb a deadline fired in -> the phase it stopped at.
 _STEP_PHASE = {
     "resolve": "precheck",
     "broker:precheck": "precheck",
     "broker:request": "unknown",
+    # a refresh_only request never reaches a password: never quarantined
+    "broker:refresh": "profile-proof",
     "broker:cookies": "cookie-inject",
     "broker:storage": "storage-inject",
     "broker:verify": "client-proof",
@@ -9937,18 +9955,21 @@ def _background_page_run(
         _deadline_step("bg:create")
         try:
             with _owned_background_page(port, prepare=prepare) as page:
-                if url != "about:blank":
-                    _deadline_step("bg:goto")
-                    resp = page.goto(url, wait_until="domcontentloaded", timeout=15_000)
-                    _BG_STATUS[id(page)] = getattr(resp, "status", None)
-                    _deadline_step("bg:load")
-                    with contextlib.suppress(PlaywrightError):
-                        page.wait_for_load_state("load", timeout=10_000)
-                _deadline_step("bg:fn")
                 try:
+                    if url != "about:blank":
+                        _deadline_step("bg:goto")
+                        resp = page.goto(
+                            url, wait_until="domcontentloaded", timeout=15_000
+                        )
+                        _BG_STATUS[id(page)] = getattr(resp, "status", None)
+                        _deadline_step("bg:load")
+                        with contextlib.suppress(PlaywrightError):
+                            page.wait_for_load_state("load", timeout=10_000)
+                    _deadline_step("bg:fn")
                     return fn(page)
                 finally:
                     _BG_STATUS.pop(id(page), None)
+                    _BG_NOCACHE.pop(id(page), None)
         except BrowserAttachTimeout:
             raise
         except Exception:  # pylint: disable=broad-exception-caught
@@ -10754,17 +10775,70 @@ def _broker_entry_or_rc(site: str) -> tuple[dict | None, int]:
     return entry, 0
 
 
-def _broker_wait_sentinel(page, sentinel: str) -> bool:
-    """The item's sentinel is visible within 8 s — or, without a box of its
-    own (an inline custom element around a fixed-position child), shows a
-    visible descendant, like the broker's own check."""
-    from playwright.sync_api import Error as PlaywrightError
+# How long the client's proof gives a check page to show its sentinel.
+BROKER_SENTINEL_WAIT_S = 8.0
 
-    try:
-        page.wait_for_selector(sentinel, state="visible", timeout=8_000)
-        return True
-    except PlaywrightError:
-        return bool(_broker_sentinel_shown(page, sentinel))
+
+def _broker_wait_sentinel(
+    page,
+    sentinel: str,
+    where: Callable[[Any], bool] | None = None,
+    give_up: Callable[[Any], bool] | None = None,
+) -> bool:
+    """The item's sentinel shows within ``BROKER_SENTINEL_WAIT_S`` — ANY match
+    visible (or, without a box of its own, with a visible descendant), polled
+    like the broker's own check (`await_sentinel`): a hidden FIRST match (NPM's
+    navbar link) or an SPA that renders late does not end the wait. `where`:
+    a further condition on the page (on a proof origin); `give_up`: ends
+    the wait early (a logged-out login page)."""
+    return bool(
+        _broker_await_sentinel(
+            page, sentinel, BROKER_SENTINEL_WAIT_S, where=where, give_up=give_up
+        )
+    )
+
+
+# site -> seconds left on the stored session token, read by the last proof
+# in this process (`_broker_note_session_left`; only for items with a
+# `session_refresh`). None / missing = unknown.
+_SESSION_LEFT: dict[str, int | None] = {}
+
+
+def _broker_note_session_left(page, entry: dict) -> None:
+    """On a VALID proof of an item with a refresher: read the seconds left on
+    its stored token (never the token) when the page is on one of its storage
+    origins; recorded as `session_left_s` (result file) and `_SESSION_LEFT`."""
+    name = entry.get("session_refresh")
+    site = str(entry.get("site") or "")
+    if not isinstance(name, str) or not site:
+        return
+    origins = [str(o) for o in entry.get("storage_origins") or []]
+    left = None
+    if _url_origin(str(page.url)) in origins:
+        left = _broker_session_left_s(page, name)
+    _SESSION_LEFT[site] = left
+    _result_set(session_left_s=left)
+
+
+# Probe and storage tabs load the site's CURRENT build: a stale cached SPA
+# index.html (no Cache-Control) names chunks the server no longer has, and the
+# page stays blank (NPM, 2026-10-10). Bypassed loads also refresh the cache
+# for every other tab of the shared browser. id(page) -> the CDP session that
+# keeps the override alive until the tab closes.
+_BG_NOCACHE: dict[int, Any] = {}
+
+
+def _broker_bypass_cache(page) -> None:
+    """Make `page` ignore the HTTP cache and any service worker
+    (``Network.setCacheDisabled`` / ``setBypassServiceWorker`` need
+    ``Network.enable`` on the same session): a worker can serve a stale app
+    shell too. Best effort: without it the tab still works, only cached."""
+    with contextlib.suppress(Exception):
+        session = page.context.new_cdp_session(page)
+        _BG_NOCACHE[id(page)] = session
+        session.send("Network.enable")
+        session.send("Network.setCacheDisabled", {"cacheDisabled": True})
+        session.send("Network.setBypassServiceWorker", {"bypass": True})
 
 
 def _proof_origins(entry: dict) -> list[str]:
@@ -10795,10 +10869,16 @@ def _legacy_probe(page, entry: dict) -> str:
         return PROOF_INVALID
     if _broker_interstitial(page):
         return PROOF_INVALID
-    visible = any(
-        el.is_visible() for el in page.query_selector_all("input[type=password]")
-    )
-    return PROOF_INVALID if visible else PROOF_VALID
+    return PROOF_INVALID if _broker_password_shown(page) else PROOF_VALID
+
+
+def _broker_password_shown(page) -> bool:
+    """A password field is visible (a login form); False when unreadable."""
+    try:
+        fields = page.query_selector_all("input[type=password]")
+        return any(el.is_visible() for el in fields)
+    except Exception:  # pylint: disable=broad-exception-caught
+        return False
 
 
 # One return per rule of the proof, in the order they are checked.
@@ -10837,12 +10917,23 @@ def _broker_probe(  # pylint: disable=too-many-return-statements
                 return PROOF_INVALID
         else:
             page.wait_for_timeout(1000)
-        if _url_origin(page.url) not in origins:
+
+        def on_origin(p) -> bool:
+            return _url_origin(p.url) in origins
+
+        def logged_out(p) -> bool:  # an IdP login page: no need to wait
+            return not on_origin(p) and _broker_password_shown(p)
+
+        if _broker_wait_sentinel(page, str(sentinel), on_origin, logged_out):
+            # The sentinel may have shown while a redirect was under way.
+            if not on_origin(page):
+                return PROOF_INVALID
+            _broker_note_session_left(page, entry)
+            return PROOF_VALID
+        if not on_origin(page) or _broker_password_shown(page):
             return PROOF_INVALID
-        if not _broker_wait_sentinel(page, str(sentinel)):
-            return PROOF_INVALID
-        # The sentinel may have shown while a redirect was still under way.
-        return PROOF_VALID if _url_origin(page.url) in origins else PROOF_INVALID
+        # Blank (an SPA that did not render): proves neither state.
+        return PROOF_UNDECIDED if _broker_page_blank(page) else PROOF_INVALID
     finally:
         final = _url_origin(str(getattr(page, "url", "") or ""))
         _RESULT["final_origin"] = final
@@ -10872,6 +10963,13 @@ BROKER_PROBE_VIEWPORT = {"width": 1280, "height": 720}
 def _broker_probe_viewport(page) -> None:
     """Size the probe tab like the broker's page before the check URL loads."""
     page.set_viewport_size(BROKER_PROBE_VIEWPORT)
+
+
+def _broker_probe_prepare(page) -> None:
+    """The broker-site proof tab: the broker's size, and the site's current
+    build (`_broker_bypass_cache`)."""
+    _broker_probe_viewport(page)
+    _broker_bypass_cache(page)
 
 
 # Sites whose weak-proof warning this process already printed (consumers such
@@ -10904,7 +11002,7 @@ def _broker_check_entry(
     proof = _with_prepared_background_page(
         port,
         url,
-        _broker_probe_viewport,
+        _broker_probe_prepare,
         lambda page: _broker_probe(page, entry, sentinel),
     )
     if proof == PROOF_VALID:
@@ -10916,7 +11014,7 @@ def _broker_check_entry(
     why = (
         ""
         if proof == PROOF_INVALID
-        else " — the check page did not load or answered 5xx"
+        else " — the check page did not load, answered 5xx or stayed blank"
     )
     print(f"Not logged into {site} (checked {_tab_hint(url)}){why}.", file=sys.stderr)
     return 2
@@ -10969,8 +11067,13 @@ def _broker_storage_init_script(origin: str, kv: dict[str, str]) -> str:
     )
 
 
-def _broker_write_storage(port: int, bundle: dict) -> int:
+def _broker_write_storage(
+    port: int, bundle: dict, touched_origins: list[str] | None = None
+) -> int:
     """Write the bundle's localStorage keys, one background tab per origin.
+    Every origin a write was ATTEMPTED on is appended to `touched_origins`
+    first — a write that failed half-way (one key set, then a redirect) may
+    still have changed it, so a rollback must cover it too.
 
     A SPA may redirect a session without its token away right after ``load``
     (the CSCS portal sends it to Keycloak), so a post-load ``setItem`` loses the
@@ -10990,11 +11093,15 @@ def _broker_write_storage(port: int, bundle: dict) -> int:
 
         def prepare(page, origin=origin, values=values) -> None:
             page.add_init_script(script=_broker_storage_init_script(origin, values))
+            _broker_bypass_cache(page)
 
         def verify(page, origin=origin, values=values) -> bool:
             if _url_origin(page.url) != origin:  # redirected elsewhere: no proof
                 return False
             return bool(page.evaluate(_BROKER_STORAGE_CHECK_JS, values))
+
+        if touched_origins is not None:
+            touched_origins.append(str(origin))
 
         if _with_prepared_background_page(port, origin + "/", prepare, verify):
             written += len(values)
@@ -11079,17 +11186,166 @@ def _broker_unavailable(site: str, exc: BrokerUnavailable) -> int:
     return _broker_fail(3, str(exc))
 
 
+_MALFORMED_KEY = "\0malformed"
+
+
+def _broker_bundle_gap(bundle: dict, entry: dict | None) -> tuple[list[str], int, int]:
+    """(origins the bundle holds NOTHING for, keys missing on the other
+    origins, keys expected). Expected: every key the item names in the sites
+    list (``storage_keys``) UNION every key the bundle itself declares (a
+    broker since WS2; CSCS adds keys it finds at run time) — a bundle can add
+    requirements, never drop the item's. A listed storage origin with no known
+    key name (the deployed broker lists only ``storage_origins``) needs at
+    least one key. A malformed declaration empties its origin (fails closed).
+    Values are only checked for presence."""
+    raw = bundle.get("storage")
+    storage: dict = raw if isinstance(raw, dict) else {}
+
+    def got(origin: object) -> dict:
+        kv = storage.get(origin)
+        return kv if isinstance(kv, dict) else {}
+
+    need: dict[str, set[str]] = {}
+    for source in ((entry or {}).get("storage_keys"), bundle.get("storage_keys")):
+        for origin, keys in source.items() if isinstance(source, dict) else []:
+            names = need.setdefault(str(origin), set())
+            if isinstance(keys, list):
+                names.update(str(k) for k in keys)
+            else:
+                names.add(_MALFORMED_KEY)
+    for origin in (entry or {}).get("storage_origins") or []:
+        need.setdefault(str(origin), set())
+    empty: list[str] = []
+    want = missing = 0
+    for origin, names in need.items():
+        have = got(origin)
+        if not names:  # no name known: any key of that origin will do
+            want += 1
+            if not have:
+                empty.append(origin)
+            continue
+        want += len(names)
+        absent = [k for k in names if have.get(k) is None]
+        if _MALFORMED_KEY in names or len(absent) == len(names):
+            empty.append(origin)
+        else:
+            missing += len(absent)
+    return empty, missing, want
+
+
+# Removes the named keys and proves they are gone (names in, bool out).
+_BROKER_STORAGE_DROP_JS = (
+    "keys => { for (const k of keys) localStorage.removeItem(k);"
+    " return keys.every(k => localStorage.getItem(k) === null); }"
+)
+
+
+def _broker_drop_storage(port: int, bundle: dict, origins: list[str]) -> bool:
+    """Remove the bundle's keys again on each of `origins` (every origin
+    a write was attempted on; the injection failed); True when every origin
+    confirmed they are gone."""
+    storage = bundle.get("storage") if isinstance(bundle.get("storage"), dict) else {}
+    ok = True
+    for origin in origins:
+        kv = (storage or {}).get(origin)
+        keys = [str(k) for k in kv] if isinstance(kv, dict) else []
+
+        def drop(page, origin=origin, keys=keys) -> bool:
+            if _url_origin(page.url) != origin:
+                return False
+            return bool(page.evaluate(_BROKER_STORAGE_DROP_JS, keys))
+
+        ok = (
+            bool(
+                _with_prepared_background_page(
+                    port, origin + "/", _broker_bypass_cache, drop
+                )
+            )
+            and ok
+        )
+    return ok
+
+
+def _broker_rollback(
+    port: int, bundle: dict, n_cookies: int, origins: list[str]
+) -> str:
+    """Best effort: undo a partial injection (the bundle's in-scope cookies,
+    the keys written on `origins`). Never raises — the caller's own failure
+    stays the result. ``complete`` / ``partial``."""
+    complete = True
+    if n_cookies:
+        try:
+            _broker_drop_cookies(port, bundle)
+        except Exception:  # pylint: disable=broad-exception-caught
+            complete = False
+    if origins:
+        try:
+            complete = _broker_drop_storage(port, bundle, origins) and complete
+        except Exception:  # pylint: disable=broad-exception-caught
+            complete = False
+    return "complete" if complete else "partial"
+
+
+def _broker_drop_cookies(port: int, bundle: dict) -> int:
+    """Delete the bundle's in-scope cookies from the shared browser again (a
+    storage write failed after they were injected); the count deleted."""
+    hosts = [str(h) for h in bundle.get("cookie_hosts") or []]
+    raw_names = bundle.get("cookie_names")
+    names = [str(n) for n in raw_names] if isinstance(raw_names, list) else None
+    gone = 0
+    pw, browser = _connect(port)
+    try:
+        if not browser.contexts:
+            return 0
+        ctx = browser.contexts[0]
+        for ck in ctx.cookies():
+            if _broker_cookie_in_scope(
+                str(ck.get("domain")), str(ck.get("name")), hosts, names
+            ):
+                ctx.clear_cookies(name=ck["name"], domain=ck["domain"], path=ck["path"])
+                gone += 1
+    finally:
+        browser.close()
+        pw.stop()
+    return gone
+
+
+def _broker_bundle_keys(bundle: dict) -> int:
+    """How many storage keys injection must write: the bundle's keys on the
+    origins `_broker_write_storage` writes to (a dict on an exact https
+    origin) — the same filter, so the two counts compare."""
+    raw = bundle.get("storage")
+    storage: dict = raw if isinstance(raw, dict) else {}
+    return sum(
+        len(kv)
+        for origin, kv in storage.items()
+        if isinstance(kv, dict)
+        and _url_origin(str(origin)) == origin
+        and str(origin).startswith("https://")
+    )
+
+
 def _broker_fetch_inject(
-    port: int, site: str, opts: dict[str, Any]
+    port: int,
+    site: str,
+    opts: dict[str, Any],
+    entry: dict | None = None,
+    *,
+    refresh: bool = False,
 ) -> tuple[int | None, dict, int, int]:
-    """Under the interaction lease: request the bundle, replace the site's
-    cookies, write its storage keys. (exit code of a failure or None, bundle,
-    cookies injected, storage keys written)."""
+    """Under the interaction lease: request the bundle, check it is complete
+    (`_broker_bundle_gap`; else phase ``bundle-export``, nothing touched),
+    replace the site's cookies, write its storage keys (all of them, else
+    phase ``storage-inject``). (exit code of a failure or None, bundle,
+    cookies injected, storage keys written). `refresh`: a ``refresh_only``
+    re-export over a session that still works — its own deadline breadcrumb
+    (never quarantined) and no rollback of a short write (that would remove
+    the still-valid session)."""
     pw, browser = _connect(port)
     connected = True
     try:
         with _interaction_lease(f"login {site}"):
-            _deadline_step("broker:request")
+            _deadline_step("broker:refresh" if refresh else "broker:request")
             try:
                 resp = _broker_request("login", site=site, **opts)
             except BrokerUnavailable as exc:
@@ -11120,16 +11376,63 @@ def _broker_fetch_inject(
             _result_set(fresh_auth=bool(resp.get("fresh_auth")), submitted=None)
             raw_bundle = resp.get("bundle")
             bundle: dict = raw_bundle if isinstance(raw_bundle, dict) else {}
+            empty, missing, want = _broker_bundle_gap(bundle, entry)
+            if empty:
+                _result_fail(
+                    "bundle-export",
+                    "incomplete_bundle",
+                    f"no storage key for {len(empty)} origin(s)",
+                )
+                msg = (
+                    f"{site}: the broker's session holds none of the storage "
+                    f"keys for {len(empty)} origin(s) — nothing injected."
+                )
+                return _broker_fail(2, msg), bundle, 0, 0
+            if missing:  # some keys of an origin: inject what is there
+                _result_set(warning="partial_bundle", missing_keys=missing)
+                print(
+                    f"⚠️ {site}: the broker's session lacks {missing} of {want} "
+                    "storage key(s) — injecting the rest.",
+                    file=sys.stderr,
+                )
+            refresh = bundle.get("session_refresh")
+            if isinstance(refresh, str):
+                _result_set(session_refresh=refresh)
+            if refresh == "failed":
+                print(
+                    f"⚠️ {site}: the broker could not renew the session token — it "
+                    "keeps its old expiry.",
+                    file=sys.stderr,
+                )
             _deadline_step("broker:cookies")
             n_cookies = _broker_replace_cookies(browser, bundle)
             browser.close()
             pw.stop()
             connected = False
             _deadline_step("broker:storage")
-            n_keys = _broker_write_storage(port, bundle)
+            origins_written: list[str] = []
+            n_keys = _broker_write_storage(port, bundle, origins_written)
             print(
                 f"Injected {n_cookies} cookie(s) and {n_keys} storage key(s) for {site}."
             )
+            want_keys = _broker_bundle_keys(bundle)
+            if n_keys != want_keys:
+                _result_fail(
+                    "storage-inject", "storage_failed", f"{n_keys} of {want_keys} keys"
+                )
+                # No half session: what was just injected goes again (not on a
+                # refresh: the session it renews still works).
+                undone = (
+                    "skipped (refresh)"
+                    if refresh
+                    else _broker_rollback(port, bundle, n_cookies, origins_written)
+                )
+                _result_set(rollback=undone)
+                msg = (
+                    f"{site}: wrote {n_keys} of {want_keys} storage key(s); "
+                    f"the partial injection was rolled back ({undone})."
+                )
+                return _broker_fail(2, msg), bundle, n_cookies, n_keys
             return None, bundle, n_cookies, n_keys
     finally:
         if connected:
@@ -11149,6 +11452,27 @@ def _broker_inject_phase(bundle: dict, n_cookies: int, n_keys: int) -> None:
         _result_fail("storage-inject", "storage_failed", f"{n_keys} of {want} keys")
 
 
+def _broker_already(port: int, site: str) -> int | None:
+    """`_broker_login`'s free check: logged in → its token kept fresh
+    (`_broker_keep_fresh`) and the follow-up's exit code; a refresh-only run
+    that is not logged in → 2; None → go on with the gated broker login."""
+    _SESSION_LEFT.pop(site, None)
+    rc = _broker_logged_in(port, site)
+    if rc == 0:
+        _result_set(route="already")
+        if _broker_keep_fresh(port, site) is not None:
+            _deadline_step("broker:after")
+            return _broker_after_login(port, site)
+        _result_set(route="broker")  # the session ended: the normal path
+        rc = 2
+    if _LOGIN_OPTS.get("refresh_only") and rc == 2:
+        _result_fail("client-proof", "logged_out", "a refresh never logs in")
+        return _broker_fail(
+            2, f"{site}: not logged in — a refresh-only run never logs in."
+        )
+    return None if rc == 2 else rc
+
+
 # One return per exit code of the broker contract (0 / 2 / 3 / 4) + the cscs follow-up.
 def _broker_login(port: int, site: str) -> int:  # pylint: disable=too-many-return-statements
     """Log the shared browser into broker site `site` via a session bundle.
@@ -11164,13 +11488,9 @@ def _broker_login(port: int, site: str) -> int:  # pylint: disable=too-many-retu
     candidate = _LOGIN_OPTS.get("candidate")
     _deadline_step("broker:precheck")
     if not candidate:  # the free check first: logged in = done, gates or not
-        rc = _broker_logged_in(port, site)
-        if rc == 0:
-            _result_set(route="already")
-            _deadline_step("broker:after")
-            return _broker_after_login(port, site)
-        if rc != 2:
-            return rc
+        done = _broker_already(port, site)
+        if done is not None:
+            return done
     rc_gate = _broker_gate(site)  # only before a broker login
     if rc_gate is not None:
         return rc_gate
@@ -11182,7 +11502,7 @@ def _broker_login(port: int, site: str) -> int:  # pylint: disable=too-many-retu
         opts["scheduled"] = True
     if candidate:
         opts["candidate_sentinel"] = str(candidate)
-    failed, bundle, n_cookies, n_keys = _broker_fetch_inject(port, site, opts)
+    failed, bundle, n_cookies, n_keys = _broker_fetch_inject(port, site, opts, entry)
     if failed is not None:
         return failed
     _deadline_step("broker:verify")
@@ -11199,6 +11519,49 @@ def _broker_login(port: int, site: str) -> int:  # pylint: disable=too-many-retu
     _record_login_event(site, "broker")
     _deadline_step("broker:after")
     return _broker_after_login(port, site)
+
+
+def _broker_keep_fresh(port: int, site: str) -> bool | None:
+    """After a passing free check: renew the stored session token when the
+    item has a refresher (`session_refresh`) and less than
+    ``BROKER_REFRESH_MIN_LEFT_S`` is left (expired included) — a broker
+    ``refresh_only`` re-export that never reaches a password. True renewed (or
+    not due), False the refresh did not happen but the session still works,
+    None the session is gone (`login`: the normal path takes over; it may log
+    in, under its gates — a refresh-only run reports "not logged in")."""
+    left = _SESSION_LEFT.get(site)
+    if not isinstance(left, int) or left >= BROKER_REFRESH_MIN_LEFT_S:
+        return True
+    entry, _rc = _broker_entry_or_rc(site)
+    if entry is None or not entry.get("session_refresh"):
+        return True
+    hours = max(left, 0) / 3600
+    print(
+        f"↻ {site}: session token has {hours:.1f} h left — asking the broker to renew it"
+    )
+    _deadline_step("broker:refresh")
+    failed, _bundle, _c, _k = _broker_fetch_inject(
+        port, site, {"refresh_only": True}, entry, refresh=True
+    )
+    if failed is None and _broker_check_entry(port, site, entry) == 0:
+        _result_set(refresh="refreshed")
+        print(f"✓ {site}: session token renewed (no password).")
+        return True
+    code = _BROKER_REFUSALS.get(site, ("", ""))[0]
+    outcome = "unavailable" if code == "refresh_unavailable" else "failed"
+    _result_set(refresh=outcome)
+    if outcome == "unavailable" and not _LOGIN_OPTS.get("refresh_only"):
+        # The broker's own session is gone: renew through the normal path now,
+        # while the shared one still works (the WS1a gates apply there).
+        return None
+    if _broker_logged_in(port, site) != 0:
+        return None
+    print(
+        f"⚠️ {site}: the session token was not renewed ({outcome}); it still works "
+        f"for {hours:.1f} h.",
+        file=sys.stderr,
+    )
+    return False
 
 
 def _broker_after_login(port: int, site: str) -> int:
@@ -12986,6 +13349,7 @@ def cmd_login(  # pylint: disable=too-many-arguments
     result_file: str | None = None,
     scheduled: bool = False,
     candidate: str | None = None,
+    refresh_only: bool = False,
 ) -> int:
     """Ensure SITE is logged in (automated or assisted, per the site).
 
@@ -12995,11 +13359,14 @@ def cmd_login(  # pylint: disable=too-many-arguments
     human; its children carry $CLAUDE_BROWSER_MAINTENANCE). `expect` (`-e`):
     anthropic only, see `_anthropic_login_expect`. `result_file` (`-R`): the
     phase record; `scheduled` (`-s`): the daily check's gates; `candidate`
-    (`-x`): a one-shot candidate sentinel for a broker item without one.
+    (`-x`): a one-shot candidate sentinel for a broker item without one;
+    `refresh_only` (`-F`): renew a logged-in site's token, never log in.
     """
     key = site_name.strip().lower()
     _result_begin("login", key, result_file)
-    _LOGIN_OPTS.update(scheduled=scheduled, candidate=candidate)
+    _LOGIN_OPTS.update(
+        scheduled=scheduled, candidate=candidate, refresh_only=refresh_only
+    )
     rc = 1
     try:
         with _login_deadline(port, "login", key, LOGIN_TIMEOUT_S, end_event="login"):
@@ -13007,6 +13374,8 @@ def cmd_login(  # pylint: disable=too-many-arguments
                 rc = _cmd_login_expect(port, site_name, expect)
             elif candidate and (scheduled or key in _safari.SAFARI_SITES):
                 rc = _fail("-x/--try-sentinel is a manual broker login (not with -s)")
+            elif refresh_only and (candidate or key in _safari.SAFARI_SITES):
+                rc = _fail("-F/--refresh-only is for broker sites, never with -x")
             else:
                 rc = _cmd_login(port, site_name)
         return rc
@@ -13044,6 +13413,8 @@ def _cmd_login(port: int, site_name: str) -> int:
         return _fail(
             f"-x/--try-sentinel is for plain broker sites (and cscs), not {site.name!r}"
         )
+    if _LOGIN_OPTS.get("refresh_only") and not is_broker:
+        return _fail(f"-F/--refresh-only is for broker sites, not {site.name!r}")
     _journal_note(site=site.name, flow="broker" if is_broker else "builtin")
     return site.login(port)
 
@@ -13266,6 +13637,8 @@ def _dispatch(args: argparse.Namespace, port: int) -> int:
             extra["scheduled"] = True
         if getattr(args, "try_sentinel", None):
             extra["candidate"] = args.try_sentinel
+        if getattr(args, "refresh_only", False):
+            extra["refresh_only"] = True
         if expect is not None:
             return cmd_login(port, args.site, expect=expect, **extra)
         return cmd_login(port, args.site, **extra)

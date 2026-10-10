@@ -190,6 +190,21 @@ framework. It is a **provider**: other repos depend on it, not the reverse. See
   indeterminate: status + origin + sentinel); site-specific proofs plug into
   `recipes.PROOFS`. Never add an automatic retry after phase `submit`/`unknown`;
   `agent-login.py -c` stays scheduled (`browser.py login -s`).
+- **Sentinel proofs poll, blank is undecided (WS2-npm)**: a proof polls
+  `page_state.await_sentinel` (every match, any visible) — never
+  `wait_for_selector(state="visible")`, which sees the first match only; a
+  blank, unrendered page is `indeterminate`, never "still on the login page".
+  Every broker launch clears the profile's HTTP cache (`clear_http_cache`) and
+  the client's proof/storage tabs bypass it (`_broker_bypass_cache`): a stale
+  cached SPA `index.html` after an app upgrade imports chunks the server no
+  longer has and renders blank (NPM 2026-10-10). Storage-token sites renew
+  their token on a profile reuse via `recipes.SESSION_REFRESHERS` (vault field
+  `agent_session_refresh`, defaults by site id); `login` with `refresh_only`
+  re-exports without ever reaching the secret. The client keeps such a session
+  fresh: a passing check reads the token's expiry (never the token), and with
+  < 12 h left `browser.py login` asks for a `refresh_only` re-export
+  (`login -F/--refresh-only` never logs in; `agent-login.py -c` runs it for
+  every refreshable ✅, pending sites included). A refresh never quarantines.
 - **`security` (keychain) calls go through `_security_run` only**: new session, no
   timeout, never `kill`/`terminate` — killing a client mid-dialog crashed
   `securityd` (tp#504). Writes are delete-then-add pinned to the default keychain,
