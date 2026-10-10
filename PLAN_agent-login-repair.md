@@ -193,6 +193,13 @@ manual acceptance steps under the attempt policy below.
     - [ ] Albert: log in with the password from mail 52410, set a new one in `/me`, paste it
           into the `calibre` item, drop the `192.168.178.72` URI, purge both mails (tp#97).
           Decision: agents use `admin` or a dedicated non-admin user (recommended).
+          Done 2026-10-10 by the main session, with Albert's go:
+          - admin password reset in the container (nixrun stdin);
+          - stored in Albert's personal vault item `Calibre-Web (admin)` via Safari, and
+            verified equal;
+          - Keychain copy deleted;
+          - the reset mails deleted from both Gmail accounts (main: himalaya Bin + expunge;
+            kindle: IMAP inside calibre-web).
     - [ ] Fields (`broker-add.py -b`): `agent_logged_in_selector=#top_admin` (non-admin:
           `#top_tasks`), `agent_check_url=https://calibre.dom42.space/me`,
           `agent_cookie_names=session,remember_token`, `agent_fresh_login=true`.
