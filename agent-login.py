@@ -58,6 +58,7 @@ import os
 import socket
 import sys
 import time
+from collections.abc import Callable, Iterator
 from dataclasses import asdict, dataclass
 from pathlib import Path
 
@@ -72,7 +73,7 @@ from agent_login_claude import (  # noqa: E402
     browser_site,
     claude_account_email,
     claude_login_by_hand,
-    site_instance,
+    instance_session,
 )
 from agent_login_jobs import (  # noqa: E402
     BUSY_RC,
@@ -103,7 +104,11 @@ from agent_login_jobs import (  # noqa: E402
     uninstall_daily,
     wait_for_network,
 )
-from broker import phases, safari_cookies  # noqa: E402
+from broker import (  # noqa: E402
+    identity,  # noqa: E402
+    phases,
+    safari_cookies,
+)
 from broker.identity import scope_conflicts  # noqa: E402
 from broker.recipes import DEFAULT_CHECK_URLS, REFRESH_MIN_LEFT_S  # noqa: E402
 from broker.vault import NO_SUBMIT_SITES, SITE_ID_RE, selector_ok  # noqa: E402
@@ -318,6 +323,15 @@ def broker_state(*, fresh: bool = False) -> tuple[str, list[dict]]:
     return health, sites
 
 
+def _snapshot_sites() -> list[dict]:
+    """The last `sites` snapshot's entries, whatever its age ([] when none)."""
+    try:
+        data = json.loads(_state_path("sites.json").read_text(encoding="utf-8"))
+        return [s for s in data.get("sites") or [] if isinstance(s, dict)]
+    except (OSError, ValueError, AttributeError, TypeError):
+        return []
+
+
 def _broker_state_live(*, fresh: bool) -> tuple[str, list[dict]]:
     """(health message, broker site list); the list is empty when the broker is down."""
     if not CODE_DIR.exists():
@@ -458,6 +472,32 @@ def _broker_fields(entry: dict) -> dict:
         "storage_origins": list(entry.get("storage_origins") or []),
         "proof_origins": list(entry.get("proof_origins") or []),
         "session_refresh": entry.get("session_refresh"),
+        **_identity_fields(entry),
+    }
+
+
+def _slug_or_none(value: object) -> str | None:
+    """A validated site-id-shaped slug, else None (never free text)."""
+    return value if isinstance(value, str) and SITE_ID_RE.match(value) else None
+
+
+def _identity_fields(entry: dict) -> dict:
+    """The WS5 columns of a row, from the broker's `sites` entry: browser
+    instance, privilege, identity recipe, alias, same-account partner, the
+    broker's multi-account flag and whether the CLIENT can prove the account
+    (`identity.proof_ready`). Only fixed vocabularies and slugs survive."""
+    inst = identity.instance_of(entry) if entry else ""
+    privilege = entry.get("privilege") if entry else None
+    recipe = entry.get("identity") if entry else None
+    same = [s for s in (entry.get("same_account_as") or []) if _slug_or_none(s)]
+    return {
+        "instance": inst if inst in identity.INSTANCES else "?",
+        "privilege": privilege if privilege in identity.PRIVILEGES else None,
+        "identity": recipe if recipe in identity.IDENTITIES else None,
+        "alias": _slug_or_none(entry.get("alias")) if entry else None,
+        "same_account_as": same if entry else [],
+        "multi_account": bool(entry.get("multi_account")) if entry else False,
+        "proof_ready": identity.proof_ready(entry) if entry else False,
     }
 
 
@@ -502,6 +542,12 @@ def overview(*, fresh: bool = False) -> dict:
                 "detail": detail,
                 "in_bitwarden": bool(entry.get("fill_origins")),
                 **_broker_fields(entry),
+                # a static site's own instance (claude.ai private) wins
+                **(
+                    {"instance": SITE_INSTANCE[t.site]}
+                    if t.site in SITE_INSTANCE
+                    else {}
+                ),
                 "shares_login_with": list(shared.get(t.broker_site or t.site, ())),
                 **_stage_fields(stages.get(t.broker_site or t.site)),
                 **safari.get(t.site, {}),
@@ -611,6 +657,8 @@ def _summary_reason(row: dict, state: str, checks: dict[str, dict]) -> str:
     fixed setup reasons, fixed hints) — never a detail or a page's words."""
     site = row["site"]
     if state == "setup":
+        if row["status"] == "refused":
+            return refusal_text(row)
         if row["status"] in _SETUP_REASON:
             return _SETUP_REASON[row["status"]]
         return (
@@ -625,46 +673,156 @@ def _summary_reason(row: dict, state: str, checks: dict[str, dict]) -> str:
     return f"not logged in — {text}"
 
 
+# agents.md words for an item's `agent_privilege` (ADMIN in capitals: an
+# agent must choose an admin account consciously).
+_PRIVILEGE_WORDS = {
+    "admin": "ADMIN account",
+    "user": "user account",
+    "readonly": "read-only account",
+}
+
+
+def _instance_note(inst: str) -> str:
+    """How an agent reaches a role instance's browser (fixed text)."""
+    port = identity.ROLE_INSTANCE_PORTS.get(inst)
+    if port is None:
+        return ""
+    mcp = (
+        "; Playwright MCP only through the opt-in `playwright-admin` config"
+        if inst == "admin"
+        else "; not reachable by the Playwright MCP tools"
+    )
+    return (
+        f"its own browser (CDP 127.0.0.1:{port}), stopped when idle: "
+        f"`CLAUDE_BROWSER_INSTANCE={inst} browser.py up` first, `… down` when "
+        f"done; every browser.py call needs that prefix{mcp}"
+    )
+
+
+def _account_note(row: dict) -> str:
+    """The WS5 part of a row's agents.md line: privilege, alias, instance —
+    fixed words and validated slugs only."""
+    parts = []
+    word = _PRIVILEGE_WORDS.get(str(row.get("privilege") or ""))
+    if word:
+        parts.append(word)
+    alias = _slug_or_none(row.get("alias"))
+    if alias:
+        parts.append(f"the default — alias `{alias}`")
+    note = _instance_note(row_instance(row))
+    if note:
+        parts.append(note)
+    return "; ".join(parts)
+
+
+def _summary_line(
+    row: dict, checks: dict[str, dict], indent: str = ""
+) -> tuple[str, str] | None:
+    """(section, line) of one row in agents.md (None: no valid name)."""
+    name = _summary_name(row)
+    if name is None:
+        return None
+    site = row["site"]
+    state, _why = row_state(row, checks)
+    inst = row_instance(row)
+    # every non-default instance, `private` included (else the check would
+    # ask the shared browser, i.e. another claude.ai account)
+    prefix = f"CLAUDE_BROWSER_INSTANCE={inst} " if inst and inst != "?" else ""
+    if state == "ok":
+        how = _HOW_TO_USE.get(row["status"], "login broker")
+        if manual_import(site):
+            how = f"check only; Albert re-imports (`agent-login.py -t {site}`)"
+        if site in CLAUDE_ACCOUNTS:
+            how += f", {CLAUDE_ACCOUNTS[site]}"
+        inst = SITE_INSTANCE.get(site, "")
+        if inst:
+            how += (
+                f" — its own browser (CDP 127.0.0.1:9223), stopped when idle: "
+                f"`CLAUDE_BROWSER_INSTANCE={inst} browser.py up` first, "
+                "`… down` when done; every browser.py call needs that prefix"
+            )
+        note = _account_note(row)
+        if note:
+            how += f" — {note}"
+        if needs_sentinel(row):
+            how += " — weak proof (no sentinel yet)"
+        return "ok", f"{indent}- ✅ {name} (`{browser_site(site)}`): {how}"
+    if state == "unproven":
+        return "warn", f"{indent}- ⚠ {name} (`{site}`): {unproven_text(row)}"
+    if state in _CHECK_FIRST:
+        note = _account_note(row)
+        return "check", (
+            f"{indent}- ❓ {name} (`{browser_site(site)}`): {_CHECK_FIRST[state]} — "
+            f"check first: `{prefix}browser.py logged-in {browser_site(site)}`"
+            + (f" — {note}" if note else "")
+        )
+    return "bad", f"{indent}- ❌ {name}: {_summary_reason(row, state, checks)}"
+
+
+def _account_groups(rows: list[dict]) -> list[tuple[str, ...]]:
+    """The connected groups of rows that share a login (`shares_login`),
+    each sorted, groups sorted — validated site ids only."""
+    graph: dict[str, set[str]] = {}
+    for row in rows:
+        if not SITE_ID_RE.match(str(row.get("site") or "")):
+            continue
+        for other in shares_login(row):
+            graph.setdefault(row["site"], set()).add(other)
+            graph.setdefault(other, set()).add(row["site"])
+    return identity.connected_groups(graph)
+
+
+def _group_summary(
+    groups: list[tuple[str, ...]], rows: list[dict], checks: dict[str, dict]
+) -> dict[str, list[str]]:
+    """agents.md lines of the WS5 groups, per section (ok / check / warn /
+    bad): in each section a group's members land in, one header for the
+    site with several accounts, then those members indented."""
+    by_site = {r["site"]: r for r in rows}
+    out: dict[str, list[str]] = {}
+    for group in groups:
+        per: dict[str, list[str]] = {}
+        for site in group:
+            got = (
+                _summary_line(by_site[site], checks, indent="  ")
+                if site in by_site
+                else None
+            )
+            if got is not None:
+                per.setdefault(got[0], []).append(got[1])
+        for section, member_lines in per.items():
+            out.setdefault(section, []).append(
+                f"- one site, several accounts ({', '.join(group)}) — never two in "
+                "one browser; pick the account the task needs (ADMIN = admin rights):"
+            )
+            out[section] += member_lines
+    return out
+
+
 def agent_summary(data: dict, checks: dict[str, dict]) -> str:
     """The short Markdown every agent session gets at start (SessionStart hook).
 
     Prompt-injection surface: it renders ONLY fixed vocabulary (phase/code
     texts, fixed reasons and hints) and validated identifiers (static names,
     site ids, the expected claude.ai account) — never a detail, a broker
-    reason, a screenshot path or anything a page said."""
-    ok_lines, check_lines, warn_lines, bad_lines = [], [], [], []
-    for row in sorted(data["rows"], key=lambda r: str(r["name"]).lower()):
-        name = _summary_name(row)
-        if name is None:
+    reason, a screenshot path or anything a page said. Sites with several
+    accounts (WS5) are grouped, each member with its privilege (ADMIN in
+    capitals), the group's alias and its browser instance."""
+    lines: dict[str, list[str]] = {"ok": [], "check": [], "warn": [], "bad": []}
+    rows = sorted(data["rows"], key=lambda r: str(r["name"]).lower())
+    grouped = _account_groups(rows)
+    in_group = {site for group in grouped for site in group}
+    for row in rows:
+        if row["site"] in in_group:
             continue
-        site = row["site"]
-        state, _why = row_state(row, checks)
-        if state == "ok":
-            how = _HOW_TO_USE.get(row["status"], "login broker")
-            if manual_import(site):
-                how = f"check only; Albert re-imports (`agent-login.py -t {site}`)"
-            if site in CLAUDE_ACCOUNTS:
-                how += f", {CLAUDE_ACCOUNTS[site]}"
-            inst = SITE_INSTANCE.get(site)
-            if inst:
-                how += (
-                    f" — its own browser (CDP 127.0.0.1:9223), stopped when idle: "
-                    f"`CLAUDE_BROWSER_INSTANCE={inst} browser.py up` first, "
-                    "`… down` when done; every browser.py call needs that prefix"
-                )
-            if needs_sentinel(row):
-                how += " — weak proof (no sentinel yet)"
-            ok_lines.append(f"- ✅ {name} (`{browser_site(site)}`): {how}")
-        elif state == "unproven":
-            warn_lines.append(f"- ⚠ {name} (`{site}`): {unproven_text(row)}")
-        elif state in _CHECK_FIRST:
-            check_lines.append(
-                f"- ❓ {name} (`{browser_site(site)}`): {_CHECK_FIRST[state]} — "
-                f"check first: `browser.py logged-in {browser_site(site)}`"
-            )
-        else:
-            bad_lines.append(f"- ❌ {name}: {_summary_reason(row, state, checks)}")
+        got = _summary_line(row, checks)
+        if got is not None:
+            lines[got[0]].append(got[1])
+    for section, group_lines in _group_summary(grouped, rows, checks).items():
+        lines[section] += group_lines
     here = Path(__file__).resolve().parent
+    ok_lines, check_lines = lines["ok"], lines["check"]
+    warn_lines, bad_lines = lines["warn"], lines["bad"]
     out = [
         f"## Web logins agents can use (agent-login.py, {time.strftime('%Y-%m-%d %H:%M')})",
         "",
@@ -702,15 +860,37 @@ def write_agent_summary(data: dict | None = None) -> Path:
     return path
 
 
+def configured_instance(site: str) -> str:
+    """The browser instance `site` lives in: its static one (claude.ai
+    private), else its broker item's role instance from the last `sites`
+    snapshot (no broker call), else '' (the shared one). Never the ambient
+    $CLAUDE_BROWSER_INSTANCE."""
+    if site in SITE_INSTANCE:
+        return SITE_INSTANCE[site]
+    entry = next((s for s in _snapshot_sites() if s.get("site") == site), None)
+    inst = identity.instance_of(entry) if entry else ""
+    return inst if inst in identity.ROLE_INSTANCES else ""
+
+
 def record_check(
-    site: str, ok: bool | None, how: str, result: dict | None = None
+    site: str,
+    ok: bool | None,
+    how: str,
+    result: dict | None = None,
+    instance: str | None = None,
 ) -> None:
     """Remember a site's latest REAL check (`agent_login_state.record_check`):
     ok True / False / None (= could not tell), plus where it stopped —
-    browser.py's result record (`-R`) when there is one."""
+    browser.py's result record (`-R`) when there is one. The instance it
+    ran in: browser.py's own word, else `instance`, else the site's
+    configured one (`configured_instance`); the identity verdict (WS5) as
+    browser.py recorded it."""
     r = result or {}
     state = "ok" if ok else ("unknown" if ok is None else "failed")
     proof_v = r.get("proof_v")
+    inst = r.get("instance")
+    if not isinstance(inst, str):
+        inst = configured_instance(site) if instance is None else instance
     with contextlib.suppress(als.StateError, OSError):
         als.record_check(
             site,
@@ -726,6 +906,8 @@ def record_check(
             proof_v=proof_v if isinstance(proof_v, int) else 0,
             final_origin=str(r.get("final_origin") or ""),
             origin_ok=r.get("origin_ok"),
+            instance=inst,
+            identity=str(r.get("identity") or ""),
         )
 
 
@@ -779,7 +961,66 @@ def unproven_text(row: dict) -> str:
     )
 
 
-def row_state(row: dict, checks: dict[str, dict]) -> tuple[str, str]:
+def account_unproven(row: dict) -> bool:
+    """A multi-account row whose account the client cannot prove (WS5): no
+    usable identity recipe / privilege, or a broker without the identity
+    protocol. A proof-ready one is checked like any row — its check runs
+    the server identity proof, and only a proven account is ✅."""
+    return is_multi_account(row) and not row.get("proof_ready")
+
+
+def is_multi_account(row: dict) -> bool:
+    """The row shares its login scope with another account: by the client's
+    own `scope_conflicts`, or by the broker's `multi_account` flag."""
+    return bool(shares_login(row)) or row.get("multi_account") is True
+
+
+def row_instance(row: dict) -> str:
+    """The browser instance a row's session lives in ('' = the shared one)."""
+    inst = row.get("instance")
+    return inst if isinstance(inst, str) else ""
+
+
+# A WS5 refusal of the broker → a fixed text for agents.md (the broker's own
+# reason is free text: never shown to agents). First matching prefix wins.
+_WS5_REFUSALS = (
+    (
+        "shares its login scope",
+        "shares its login with another account — needs agent_privilege",
+    ),
+    (
+        "scope conflict in instance",
+        "another account of this site is in the same browser instance — needs agent_instance",
+    ),
+    ("agent_same_account_as", "its same-account declaration is refused"),
+    ("bad agent_alias", "its agent_alias is refused"),
+    ("agent_alias", "its agent_alias is refused"),
+    ("bad agent_instance", "unknown agent_instance"),
+    ("bad agent_privilege", "unknown agent_privilege"),
+    ("bad agent_identity", "its agent_identity is not usable"),
+    ("agent_identity", "its agent_identity is not usable"),
+    ("the vault holds an", "its agent_identity is not usable"),
+)
+
+
+def refusal_text(row: dict) -> str:
+    """The fixed agents.md reason of a refused row: the WS5 refusals by kind
+    (plus the validated site ids it shares its login with), else the plain
+    "Bitwarden item refused"."""
+    reason = str(row.get("detail") or "")
+    text = next((t for p, t in _WS5_REFUSALS if reason.startswith(p)), None)
+    if text is None:
+        return _SETUP_REASON["refused"]
+    shared = shares_login(row)
+    if shared:
+        text += f" (shares login with {', '.join(shared)})"
+    return f"{_SETUP_REASON['refused']}: {text}"
+
+
+# One return per state, in the order they are decided.
+def row_state(  # pylint: disable=too-many-return-statements
+    row: dict, checks: dict[str, dict]
+) -> tuple[str, str]:
     """(state, why) of one login: ``ok`` (setup complete AND the latest real
     check passed, fresh), ``stale`` (that ✅ is older than the max status
     age), ``unknown`` (the latest check could not tell), ``unreachable``
@@ -790,7 +1031,7 @@ def row_state(row: dict, checks: dict[str, dict]) -> tuple[str, str]:
     problem = _setup_problem(row)
     if problem:
         return "setup", problem
-    if shares_login(row):
+    if account_unproven(row):
         return "unproven", unproven_text(row)
     site = row["site"]
     rec = checks.get(site)
@@ -798,6 +1039,17 @@ def row_state(row: dict, checks: dict[str, dict]) -> tuple[str, str]:
     if not rec or fresh == "unchecked":
         return "unchecked", f"not checked yet — ./agent-login.py -t {site}"
     when = rec.get("at_text", "?")
+    # A record from before WS5 S3 has no instance: it ran where the site
+    # lived then (role instances did not exist yet).
+    checked_in = str(rec.get("instance", SITE_INSTANCE.get(site, "")) or "")
+    if checked_in != row_instance(row):
+        # WS5: the item moved to another browser instance since that check —
+        # its verdict says nothing about the session where it lives now.
+        return "stale", (
+            f"last check {when} ran in the {checked_in or 'default'} browser, the "
+            f"item now lives in the {row_instance(row) or 'default'} one — verify: "
+            f"./agent-login.py -t {site}"
+        )
     reason = phases.text(str(rec.get("phase") or ""), str(rec.get("code") or ""))
     if fresh == "stale":
         hours = als.max_status_age_s() / 3600
@@ -812,6 +1064,13 @@ def row_state(row: dict, checks: dict[str, dict]) -> tuple[str, str]:
         state = fresh if fresh in ("unknown", "unreachable") else "failed"
         told = " could not tell —" if state == "unknown" else ":"
         return state, f"last check {when}{told} {reason}"
+    if is_multi_account(row) and rec.get("identity") != "match":
+        # WS5: a ✅ of a multi-account item counts only with the account
+        # proven (an old ✅ from before it had siblings does not).
+        return "stale", (
+            f"last success {when} did not prove WHICH account — verify: "
+            f"./agent-login.py -t {site}"
+        )
     how = f"checked {when}"
     if row["status"] == "safari" and row.get("safari"):
         how += f", Safari session until {row.get('safari_expires')}"
@@ -849,6 +1108,13 @@ def _row_flags(row: dict) -> str:
     site = row["site"]
     item = row.get("broker_site") or site  # switch -> its broker item eduid
     flags = []
+    # WS5: where the account lives, its rights, the group alias
+    if row_instance(row) in identity.ROLE_INSTANCES:
+        flags.append(f"{row_instance(row)} browser")
+    if row.get("privilege") == "admin":
+        flags.append("ADMIN")
+    if row.get("alias"):
+        flags.append(f"default — alias {row['alias']}")
     if needs_sentinel(row):
         flags.append(
             "needs sentinel (old proof) — "
@@ -938,6 +1204,20 @@ def resolve_site(arg: str) -> str:
     for t in TARGETS:
         if key in (t.site, t.name.lower(), t.fill_origin.lower()):
             return t.site
+    # WS5: a group alias names its default member (after site ids, never
+    # before). From the last snapshot only (no broker call just to resolve a
+    # name); browser.py resolves aliases itself against the live listing.
+    sites = _snapshot_sites()
+    if any(s.get("site") == key for s in sites):
+        return key
+    hits = [
+        str(s["site"])
+        for s in sites
+        if s.get("alias") == key and not s.get("refused") and s.get("site")
+    ]
+    if len(hits) == 1:
+        print(f"↪ {key} = {hits[0]} (the group's default account)")
+        return hits[0]
     return arg
 
 
@@ -1024,9 +1304,51 @@ def run_test(site: str) -> int:
 
     The verdict is the positive check, never the login command's exit code
     alone. The result is recorded for the overview with WHERE it stopped
-    (browser.py's phase record). A test never promotes a site.
+    (browser.py's phase record). A test never promotes a site. A site in a
+    role instance (WS5) is tested there: the instance is started for the
+    test if it was down, and stopped again afterwards (`instance_session`).
     """
     site = resolve_site(site)
+    static = site in ASSISTED_SITES or site in safari_cookies.SAFARI_SITES
+    inst = "" if static else broker_instance(site)
+    if not inst:
+        return _run_test(site)
+    with instance_session(inst) as sess:
+        if not sess.up:
+            print(f"❌ {site}: the {inst} browser does not start (browser.py up)")
+            rc = 1
+        else:
+            print(f"▶ {site}: in the {inst} browser (CLAUDE_BROWSER_INSTANCE={inst})")
+            rc = _run_test(site)
+    for problem in sess.problems:
+        print(f"⚠️ {problem}")
+    return rc
+
+
+@contextlib.contextmanager
+def site_session(site: str) -> Iterator[None]:
+    """Every browser.py call inside runs in `site`'s browser instance: its
+    static one (claude.ai private) or its broker item's role instance
+    (WS5, from the last `sites` snapshot: `configured_instance`), started and
+    stopped like `instance_session`. A stale snapshot is safe: browser.py
+    itself refuses an item outside its instance."""
+    inst = configured_instance(site)
+    with instance_session(inst) as sess:
+        yield
+    for problem in sess.problems:
+        print(f"⚠️ {problem}")
+
+
+def broker_instance(site: str) -> str:
+    """The role instance (admin / alt) the broker puts `site` into, else ''."""
+    _health, sites = broker_state()
+    entry = next((s for s in sites if s.get("site") == site), None)
+    inst = identity.instance_of(entry) if entry else ""
+    return inst if inst in identity.ROLE_INSTANCES else ""
+
+
+def _run_test(site: str) -> int:
+    """`run_test`'s body, in the current browser instance."""
     if site in ASSISTED_SITES or _eduid_sso_assisted(site) or _no_submit_assisted(site):
         # its login needs you: -g; -t only checks
         print(f"▶ {site}: your own login (./agent-login.py -g {site}); checking only")
@@ -1129,8 +1451,9 @@ def manual_login(site: str, force: bool = False) -> int:
         print(f"❌ no guided login known for {site!r} (known: {known})")
         return 2
     # A no-submit site without a MANUAL_START URL starts at its broker item's
-    # login URL (browser.py resolves it).
-    return assisted_login_cmd(site, start, force=force, window=window)
+    # login URL (browser.py resolves it). WS5: in the item's own instance.
+    with site_session(site):
+        return assisted_login_cmd(site, start, force=force, window=window)
 
 
 def assisted_login_argv(
@@ -1165,7 +1488,7 @@ def viewer_login(site: str, force: bool = False) -> int:
         print(f"✅ {site}: {how} — nothing to do")
         record_check(site, True, how)
         return 0
-    with site_instance(site):
+    with site_session(site):
         rc = assisted_login_cmd(browser_site(site), force=force)
     ok, how = assisted_check(site)
     if ok is not None:
@@ -1187,7 +1510,7 @@ VIEWER_SITES = ASSISTED_SITES - set(CLAUDE_ACCOUNTS)
 
 def assisted_check(site: str) -> tuple[bool | None, str]:
     """(works?, how) for a site you log into yourself; never starts a login."""
-    with site_instance(site):
+    with site_session(site):
         return _assisted_check(site)
 
 
@@ -1251,7 +1574,7 @@ def assisted_login(site: str, force: bool = False) -> int:
         print(f"❌ {site}: {how}; log that account out first (claude.ai → Log out)")
         record_check(site, False, how)
         return 2
-    with site_instance(site):
+    with site_session(site):
         try:
             with guided_window(site, force=force) as win:
                 if site in SITE_INSTANCE and site in CLAUDE_ACCOUNTS:
@@ -1276,6 +1599,36 @@ UNREACHABLE_HOW = "unreachable off-LAN (Cloudflare Access) — not checked"
 
 Outcome = tuple[bool | None, str, dict | None]
 
+# WS5 verdicts of a check that cannot tell WHICH account right now (the
+# site's account API is unclear, the broker rate-limits or blocks the site's
+# account checks): "could not tell" — never a login, never a failure mail.
+IDENTITY_UNKNOWN_CODES = frozenset(
+    {"identity_indeterminate", "rate_limited", "identity_blocked"}
+)
+# Verdicts a login cannot fix: ❌ without a login attempt.
+IDENTITY_FATAL_CODES = frozenset(
+    {"privilege_mismatch", "wrong_instance", "identity_unproven"}
+)
+
+
+def identity_text(res: dict | None) -> str:
+    """The fixed text of a check's phase/code (never its detail)."""
+    r = res or {}
+    return phases.text(str(r.get("phase") or ""), str(r.get("code") or ""))
+
+
+def _identity_login_outcome(run: BrowserRun, res: dict, routes: list[str]) -> Outcome:
+    """`_after_login` when the login's verify ran the identity proof: exit 0
+    = ✅; an identity verdict that cannot tell (a blocked or rate-limited
+    challenge, typically right after a replaced foreign session) = unknown;
+    anything else = ❌."""
+    if run.rc == 0:
+        how = f"logged in again ({routes[-1] if routes else 'browser.py login'})"
+        return True, how, {**res, "phase": "ok", "code": "ok"}
+    if str(res.get("code") or "") in IDENTITY_UNKNOWN_CODES:
+        return None, f"could not tell — {identity_text(res)}", res
+    return False, failure_how(res, run.rc), res
+
 
 def probe(site: str, *, quiet: bool = True) -> tuple[int, dict | None]:
     """The free `browser.py logged-in SITE` check: (exit code, its phase
@@ -1290,7 +1643,10 @@ def probe(site: str, *, quiet: bool = True) -> tuple[int, dict | None]:
     return (KILLED_RC if run.rc is None else run.rc), run.result
 
 
-def ensure_logged_in(site: str, gate: tuple[str, str] | None = None) -> Outcome:
+# One return per verdict of the free check, then the login's.
+def ensure_logged_in(  # pylint: disable=too-many-return-statements
+    site: str, gate: tuple[str, str] | None = None
+) -> Outcome:
     """(logged in?, how, phase record) — positive check, else ONE scheduled
     `browser.py login -s`, then re-check.
 
@@ -1302,22 +1658,39 @@ def ensure_logged_in(site: str, gate: tuple[str, str] | None = None) -> Outcome:
     request (phase precheck); 125, an outer kill and any later phase are
     never retried — the broker may have typed the password."""
     rc, check = probe(site)
+    code = str((check or {}).get("code") or "")
     if rc == BUSY_RC:
         return None, BUSY_HOW, {"phase": "precheck", "code": "busy"}
-    if rc != 0 and (check or {}).get("code") == "access_gated":
+    if rc != 0 and code == "access_gated":
         # Off-LAN behind Cloudflare Access: unreachable, never a login.
         return None, UNREACHABLE_HOW, {**(check or {}), "phase": "precheck"}
+    if rc != 0 and code in IDENTITY_UNKNOWN_CODES:
+        # WS5: the account cannot be told right now — unknown, never a login.
+        return None, f"could not tell — {identity_text(check)}", check
     if rc == 0:
         weak = gate is not None and gate[0] == "needs_sentinel"
         how = "needs sentinel (old proof)" if weak else "logged in"
         return True, how, {**(check or {}), "phase": "ok", "code": "ok"}
+    if code in IDENTITY_FATAL_CODES:
+        # A login cannot fix it (wrong admin rights, wrong instance, unproven).
+        return False, f"NOT usable — {identity_text(check)}", check
+    if gate is not None and code == "wrong_account":
+        # WS5: the check itself cleared the foreign session (browser.py); a
+        # gated row is not logged in — ❌ with that verdict, no login.
+        return (
+            False,
+            f"NOT logged in — another account's session was here (cleared); {gate[1]}",
+            check,
+        )
     if gate is not None:
-        code, why = gate
+        gate_code, why = gate
         return (
             False,
             f"NOT logged in — {why}",
-            {**(check or {}), "phase": "precheck", "code": code},
+            {**(check or {}), "phase": "precheck", "code": gate_code},
         )
+    # A wrong_account probe already cleared the foreign session: the login's
+    # free check sees "logged out" (no challenge); its verify is the second.
     for attempt in (1, 2):
         run = run_browser(
             "login",
@@ -1386,6 +1759,10 @@ def _after_login(site: str, run: BrowserRun, *, retry_left: bool) -> Outcome | N
         for line in run.stdout.splitlines()
         if "route:" in line
     ]
+    if res.get("identity") and run.rc in (0, 2):
+        # WS5: the login's own verify ran the identity proof — its verdict is
+        # final (a re-probe would cost another broker challenge, ≤ 2 a run).
+        return _identity_login_outcome(run, res, routes)
     rc, check = probe(site)
     if BUSY_RC in (rc, run.rc):
         return None, BUSY_HOW, {"phase": "precheck", "code": "busy"}
@@ -1492,8 +1869,9 @@ def schedule_gate(row: dict) -> tuple[str, str] | None:
 def check_only_gate(row: dict) -> tuple[str, str] | None:
     """`schedule_gate`, plus: a Safari site whose import must not run
     unattended (``import_unattended``) is only checked by the daily run, and
-    a multi-account row (WS5) is never logged in."""
-    if shares_login(row):
+    a multi-account row whose account cannot be proven (WS5) is never logged
+    in (a proof-ready one goes through the gates below like any row)."""
+    if account_unproven(row):
         return "identity_unproven", unproven_text(row)
     rule = safari_cookies.SAFARI_SITES.get(row["site"])
     if row.get("flow") == SAFARI_FLOW and rule is not None:
@@ -1592,13 +1970,20 @@ def _unproven_skipped(row: dict) -> bool:
     """`-c` for a multi-account row (WS5): no check can tell which account the
     browser holds, so it is neither checked nor logged in — recorded as
     "could not tell" with its code, never as a failure (no mail). True when
-    skipped."""
-    if not shares_login(row):
+    skipped. A proof-ready one is checked (its check proves the account)."""
+    if not account_unproven(row):
         return False
     how = unproven_text(row)
     print(f"⚠️  {row['site']}: {how}")
     record_check(
-        row["site"], None, how, {"phase": "client-proof", "code": "identity_unproven"}
+        row["site"],
+        None,
+        how,
+        {
+            "phase": "client-proof",
+            "code": "identity_unproven",
+            "instance": row_instance(row),  # nothing ran: where it lives
+        },
     )
     return True
 
@@ -1632,47 +2017,121 @@ def check_all(*, mail: bool = False) -> int:  # pylint: disable=too-many-branche
     if not data["broker_ok"]:
         print(f"❌ login broker: {data['broker']}")
         failed.append(("login broker", data["broker"]))
+    by_instance: dict[str, list[dict]] = {}
     for row in data["rows"]:
-        site = row["site"]
-        if row["status"] == "assisted":
-            _check_assisted_row(site, failed)
-            continue
-        if row["status"] == "unchecked":  # the broker cannot read Bitwarden
-            record_check(
-                site,
-                None,
-                "broker unreadable — not checked",
-                {"phase": "precheck", "code": "broker_unavailable"},
-            )
-            continue
-        if row["status"] not in ("ready", "extra", "safari") or _unproven_skipped(row):
-            continue
-        rule = safari_cookies.SAFARI_SITES.get(site)
-        if rule is not None and not rule.auto:
-            print(f"⏭  {site}: not imported unattended (see SAFARI_SITES)")
-            continue
-        if not ensure_browser_up():
-            # The browser went away mid-run: stop instead of failing every site.
-            how = "shared Chromium went down mid-run and did not restart"
-            print(f"❌ {site}: {how} — remaining sites not checked")
-            failed.append(("shared Chromium", how))
+        by_instance.setdefault(check_instance(row), []).append(row)
+    for row in by_instance.pop("", []):
+        if not _check_row(row, failed, ensure_browser_up):
             break
-        ok, how, res = ensure_logged_in(site, gate=check_only_gate(row))
-        if ok is None:
-            print(f"⏸  {site}: {how}")
-            record_check(site, None, how, res)
-            continue
-        if ok and row.get("session_refresh"):
-            how = refresh_step(site, res, how)
-        if ok and (res or {}).get("renew_due"):
-            ok, how, res = renew_step(site, row, res, how)
-        print(f"{'✅' if ok else '❌'} {site}: {how}")
-        record_check(site, ok, how, res)
-        if not ok:
-            failed.append((site, how))
+    for inst in identity.ROLE_INSTANCES:
+        _check_role_instance(inst, by_instance.pop(inst, []), failed)
     if failed and mail:
         send_mail(*failure_mail(failed))
     return 1 if failed else 0
+
+
+def check_instance(row: dict) -> str:
+    """The role instance (WS5: admin / alt) `-c` checks `row` in; '' for the
+    default one — a static site's own instance (claude.ai private) is
+    handled by its assisted check itself."""
+    inst = row_instance(row)
+    return inst if inst in identity.ROLE_INSTANCES else ""
+
+
+def needs_browser(row: dict) -> bool:
+    """Does `-c` drive a browser for `row` (else it only records why not)?"""
+    if row["status"] not in ("ready", "extra", "safari") or account_unproven(row):
+        return False
+    rule = safari_cookies.SAFARI_SITES.get(row["site"])
+    return rule is None or rule.auto
+
+
+def _with_instance(res: dict | None, inst: str) -> dict | None:
+    """`res` with the row's instance when browser.py did not record one."""
+    if res is None:
+        return None
+    return res if isinstance(res.get("instance"), str) else {**res, "instance": inst}
+
+
+def _check_role_instance(
+    inst: str, rows: list[dict], failed: list[tuple[str, str]]
+) -> None:
+    """`-c` for the rows of role instance `inst`: the rows that need no
+    browser first, then — only when some row needs one — the instance is
+    started if it was down, its rows checked (same gates as the shared
+    browser), and stopped again if this run started it and nothing else
+    uses it (`instance_session`)."""
+    busy = [r for r in rows if needs_browser(r)]
+    for row in rows:
+        if row not in busy:
+            _check_row(row, failed, lambda: True)
+    if not busy:
+        return
+    with instance_session(inst) as sess:
+        if not sess.up:
+            how = f"the {inst} browser is down and `browser.py up` did not start it"
+            print(f"❌ {inst} browser: {how} — its sites not checked")
+            failed.append((f"{inst} browser", how))
+            for row in busy:
+                record_check(
+                    row["site"],
+                    None,
+                    how,
+                    {"phase": "precheck", "code": "browser_down", "instance": inst},
+                )
+        else:
+            for row in busy:
+                if not _check_row(row, failed, lambda: browser_mode() is not None):
+                    break
+    for problem in sess.problems:  # a failed stop, an unreadable client list
+        print(f"❌ {problem}")
+        failed.append((f"{inst} browser", problem))
+
+
+# One return per way a row ends (skipped, recorded, checked, browser gone).
+def _check_row(  # pylint: disable=too-many-return-statements
+    row: dict, failed: list[tuple[str, str]], alive: Callable[[], bool]
+) -> bool:
+    """`-c` for one row in the CURRENT browser instance; False when the
+    browser went away (the caller stops: never fail every remaining site)."""
+    site, inst = row["site"], row_instance(row)
+    if row["status"] == "assisted":
+        _check_assisted_row(site, failed)
+        return True
+    if row["status"] == "unchecked":  # the broker cannot read Bitwarden
+        record_check(
+            site,
+            None,
+            "broker unreadable — not checked",
+            {"phase": "precheck", "code": "broker_unavailable", "instance": inst},
+        )
+        return True
+    if row["status"] not in ("ready", "extra", "safari") or _unproven_skipped(row):
+        return True
+    rule = safari_cookies.SAFARI_SITES.get(site)
+    if rule is not None and not rule.auto:
+        print(f"⏭  {site}: not imported unattended (see SAFARI_SITES)")
+        return True
+    if not alive():
+        # The browser went away mid-run: stop instead of failing every site.
+        how = "the browser went down mid-run and did not restart"
+        print(f"❌ {site}: {how} — remaining sites not checked")
+        failed.append(("shared Chromium", how))
+        return False
+    ok, how, res = ensure_logged_in(site, gate=check_only_gate(row))
+    if ok is None:
+        print(f"⏸  {site}: {how}")
+        record_check(site, None, how, _with_instance(res, inst))
+        return True
+    if ok and row.get("session_refresh"):
+        how = refresh_step(site, res, how)
+    if ok and (res or {}).get("renew_due"):
+        ok, how, res = renew_step(site, row, res, how)
+    print(f"{'✅' if ok else '❌'} {site}: {how}")
+    record_check(site, ok, how, _with_instance(res, inst))
+    if not ok:
+        failed.append((site, how))
+    return True
 
 
 def prune_removed(data: dict) -> list[str]:
@@ -1755,9 +2214,10 @@ def promote_refusal(site: str) -> str | None:  # pylint: disable=too-many-return
     if not has_sentinel(entry):
         return "the item has no agent_logged_in_selector"
     siblings = scope_conflicts(sites).get(site)
-    if siblings:
+    multi = bool(siblings) or entry.get("multi_account") is True
+    if multi and not identity.proof_ready(entry):
         return (
-            f"account unproven: shares its login with {', '.join(siblings)} "
+            f"account unproven: shares its login with {', '.join(siblings or ())} "
             "(WS5: no proof of WHICH account the browser holds)"
         )
     if als.quarantined(site):
@@ -1767,6 +2227,16 @@ def promote_refusal(site: str) -> str | None:  # pylint: disable=too-many-return
         return f"no fresh successful check — run ./agent-login.py -t {site} first"
     if int(rec.get("proof_v") or 0) < 1:
         return "the last check predates the strict proof — re-run ./agent-login.py -t"
+    if str(rec.get("instance") or "") != identity.instance_of(entry):
+        return (
+            "the last check ran in another browser instance than the item's — "
+            f"re-run ./agent-login.py -t {site}"
+        )
+    if multi and rec.get("identity") != "match":
+        return (
+            "the last check did not prove WHICH account (WS5) — re-run "
+            f"./agent-login.py -t {site}"
+        )
     return None
 
 
@@ -1824,6 +2294,7 @@ def matrix_rows(data: dict, checks: dict[str, dict]) -> list[dict]:
     for row in data["rows"]:
         site = row["site"]
         consumer, privilege = MATRIX_META.get(site, ("?", "?"))
+        privilege = row.get("privilege") or privilege  # the item's agent_privilege
         rec = checks.get(site) or {}
         limit = row.get("limit") or {}
         sentinel = row.get("sentinel")
@@ -1844,8 +2315,17 @@ def matrix_rows(data: dict, checks: dict[str, dict]) -> list[dict]:
                 },
                 "attempt_group": row.get("attempt_group") or "",
                 "shares_login": ",".join(shares_login(row)),
+                # WS5: the browser instance, multi-account, the identity
+                # recipe and whether the client can prove it, the privilege,
+                # the group alias and a declared same-account partner
+                "instance": row_instance(row) or "default",
+                "multi": "yes" if is_multi_account(row) else "no",
+                "identity": (row.get("identity") or "-")
+                + (" (unproven)" if account_unproven(row) else ""),
+                "alias": row.get("alias") or "",
+                "same_account": ",".join(row.get("same_account_as") or []),
                 "refresh": "none (account unproven)"
-                if shares_login(row)
+                if account_unproven(row)
                 else refresh_policy(row),
                 "stage": row.get("stage")
                 or ("n/a" if row["status"] in ("assisted", "safari") else "unknown"),
@@ -1875,6 +2355,11 @@ def print_matrix(data: dict, *, as_json: bool) -> int:
         "sentinel",
         "attempt_group",
         "shares_login",
+        "instance",
+        "multi",
+        "identity",
+        "alias",
+        "same_account",
         "refresh",
         "stage",
         "limit",

@@ -304,9 +304,9 @@ def test_private_claude_lives_in_its_own_instance(monkeypatch) -> None:
         sys.modules["agent_login_claude"], "browser_mode", lambda: "headless"
     )
     monkeypatch.delenv("CLAUDE_BROWSER_INSTANCE", raising=False)
-    with al.site_instance("anthropic-private"):
+    with al.site_session("anthropic-private"):
         seen.append(os.environ["CLAUDE_BROWSER_INSTANCE"])
-    with al.site_instance("anthropic"):
+    with al.site_session("anthropic"):
         seen.append(os.environ["CLAUDE_BROWSER_INSTANCE"])
     assert seen == ["private", ""]
     assert "CLAUDE_BROWSER_INSTANCE" not in os.environ

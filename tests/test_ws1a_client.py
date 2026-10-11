@@ -386,8 +386,14 @@ def test_candidate_login_sends_the_candidate(
     monkeypatch.setattr(browser, "_broker_logged_in", _no_broker)  # no precheck
     seen: list = []
 
-    def check(_p: int, _s: str, _e: dict, sentinel: str | None = None) -> int:
-        seen.append(sentinel)
+    def check(
+        _p: int,
+        _s: str,
+        _e: dict,
+        sentinel: str | None = None,
+        claims_account: bool | None = None,
+    ) -> int:
+        seen.append((sentinel, claims_account))
         return 0
 
     monkeypatch.setattr(browser, "_broker_check_entry", check)
@@ -395,7 +401,8 @@ def test_candidate_login_sends_the_candidate(
     monkeypatch.setattr(browser, "_record_login_event", lambda *_a: None)
     assert browser._broker_login(9222, "shop") == 0
     assert sent == [("login", {"site": "shop", "candidate_sentinel": "#me"})]
-    assert seen == ["#me"]
+    # the verify claims the item's account (WS5: the identity proof applies)
+    assert seen == [("#me", True)]
     del fresh_result
 
 

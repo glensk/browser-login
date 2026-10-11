@@ -103,6 +103,14 @@ CODE_TEXT = {
     "wrong_account": "logged in as another account than the item's",
     "privilege_mismatch": "the account's admin rights do not match the item's",
     "identity_indeterminate": "the site's account check could not tell which account",
+    # WS5 S2: the client side of the proof and the role browser instances.
+    "wrong_instance": (
+        "the site lives in another browser instance (CLAUDE_BROWSER_INSTANCE)"
+    ),
+    "identity_blocked": (
+        "the broker blocks this site's account checks after a mismatch "
+        "(cooldown, or until a root reset)"
+    ),
 }
 
 # Broker error code -> phase, for replies WITHOUT a phase (an older broker).

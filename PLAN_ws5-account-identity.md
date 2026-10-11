@@ -290,17 +290,17 @@ value.
       identity field and the admin bit; normalise; hash `nonce || value` with
       `crypto.subtle`; return `{state: found | logged_out (401/403) | indeterminate,
       digest, admin}`. Raw values never cross CDP. No fallback source.
-- [ ] `_broker_probe` → for a multi-account entry, after a VALID sentinel or server proof:
+- [x] `_broker_probe` → for a multi-account entry, after a VALID sentinel or server proof:
       challenge → recipe in the SAME page → answer. `match` plus a matching admin bit →
       valid. `mismatch` → `wrong_account`. Admin-bit mismatch → `privilege_mismatch`.
       `logged_out` → invalid. Anything else, a broker error included → indeterminate.
-- [ ] Instances: `INSTANCE_PORTS` += `admin: 9224`, `alt: 9225`. `login`/`logged-in` of an
+- [x] Instances: `INSTANCE_PORTS` += `admin: 9224`, `alt: 9225`. `login`/`logged-in` of an
       item whose `instance` differs from `CLAUDE_BROWSER_INSTANCE` → exit 2, code
       `wrong_instance`, naming the exact prefix to use. Doctor and coordination files work
       per instance as for `private`.
-- [ ] Alias resolution in `_resolve_site`: static names first, as today; then broker site
+- [x] Alias resolution in `_resolve_site`: static names first, as today; then broker site
       ids; then aliases. An alias never shadows either, and S1 refuses such an alias.
-- [ ] Tests (extend `tests/test_ws5_client.py`; one `launches_chrome` test runs each recipe
+- [x] Tests (extend `tests/test_ws5_client.py`; one `launches_chrome` test runs each recipe
       against a local fixture page via `page.route`): match / mismatch / admin-bit
       mismatch / logged_out / wrong content type / cross-origin redirect / non-ASCII;
       an out-of-band account change (the fixture flips its identity between two probes);
@@ -309,26 +309,141 @@ value.
 
 ### S3 — agent-login.py, agents.md, scheduler
 
-- [ ] Rows carry `instance`. `checks.json` rows record the instance they were checked in,
+- [x] Rows carry `instance`. `checks.json` rows record the instance they were checked in,
       and `row_state` reads a row whose recorded instance differs from the item's current
       `instance` as stale (❓). There is no `displaced` state: the server proof at check
       time decides.
-- [ ] agents.md and the overview group multi-account members under their group:
+- [x] agents.md and the overview group multi-account members under their group:
       `✅ gitlab-sdsc-glensk (default; alias gitlab-sdsc; user)` and `✅ gitlab-sdsc-admin
       (ADMIN; own browser: CLAUDE_BROWSER_INSTANCE=admin browser.py up first, … down when
       done)`. `identity_unproven` rows read `⚠ account unproven` and are never ✅. Fixed
       vocabulary only.
-- [ ] `-c`: default-instance items as today. For each role instance: start it only if it
+- [x] `-c`: default-instance items as today. For each role instance: start it only if it
       was down, run the checks (logins only for promoted items, same gates as today), and
       stop it again if this run started it. An admin session is therefore not running in
       any browser between uses. `identity_unproven` items are never logged in by `-c`.
-- [ ] `-x` matrix: columns `instance`, `multi`, `identity`, `privilege`, `alias`,
+- [x] `-x` matrix: columns `instance`, `multi`, `identity`, `privilege`, `alias`,
       `same-account`.
 - [ ] ~~`-s A B`~~ dropped (security review M2): the same-account question is the root-only `sudo install/install.sh -S A B`.
-- [ ] Tests in `tests/test_agent_login.py`: grouped rendering (no username, fixed
+- [x] Tests in `tests/test_agent_login.py`: grouped rendering (no username, fixed
       vocabulary); instance prefix in agents.md; `-c` starts and stops only instances
       that were down; a stale row after an instance change; unproven rows never ✅ and
       never logged in.
+- [x] S2 + S3 built 2026-10-11 (one worktree, not yet released; CLIENT-ONLY: no broker
+      behaviour change, no `install.sh` needed — `broker/identity.py` gains the pure
+      `proof_ready`, `connected_groups`, `ROLE_INSTANCE_PORTS`, `broker/phases.py` two code
+      texts; the next broker install ships them unchanged in effect). Decisions:
+  - **Proof-ready** (`identity.proof_ready`): not refused, `identity_v >= 1`, a usable
+    recipe, a known privilege. A multi-account item that is not proof-ready stays
+    `identity_unproven` (S0 behaviour, also against a rolled-back broker); a proof-ready one
+    passes the gate and its check runs the proof.
+  - **Client proof** (`_client_identity_proof`, bin/browser.py): only after a VALID
+    sentinel/server proof, in the same probe page: `identity_challenge {site, instance}`
+    → `RECIPE_JS(recipe_args(recipe, check URL, nonce))` in a fresh CDP isolated world
+    (`_evaluate_isolated`, the client copy of the daemon's; a CDP failure is
+    indeterminate, no main-world fallback) → `identity_answer` → `admin_verdict`. The
+    challenge's `identity` / `privilege` must equal the entry's. Codes (phase
+    `client-proof`): `wrong_account`, `privilege_mismatch`, `identity_indeterminate`,
+    `identity_unproven`; broker refusals map to `wrong_instance`, `rate_limited` and the
+    new `identity_blocked` (the guard's cooldown / quarantine / unreadable / unwritable).
+    `_RESULT` records `identity` (+ a whitelisted `identity_why`, an int status, the
+    broker's redacted detail) — never a nonce, digest or name.
+  - **The verify after an injection claims the account** (`claims_account=True`), so a
+    candidate-sentinel login (`login -x`) of a multi-account item is proven too;
+    `logged-in -x CSS` stays a DOM-only question (no identity gate, no proof, "sentinel
+    present" instead of "Logged into", no session-age note) — but never in another
+    instance's browser (`_instance_gate`).
+  - **The CHECK clears a foreign session** (review round 2; replaces round 1's `login
+    -W`): no sibling may live in an instance (S1), so a `wrong_account` verdict of ANY
+    `logged-in` (agents, `-c`, a login's free check) deletes at once, in this browser
+    only, the item's cookies on its cookie hosts and their subdomains (never a parent
+    domain; its `cookie_names` only when it has them, as `logout` does) — never storage,
+    never the broker's profile — and exits 2 `client-proof` · `wrong_account`, "foreign
+    session cleared". It is not a login: no gate applies (pending, quarantined rows are
+    cleared too). The next check sees no sentinel → no challenge, no further mismatch, so
+    the guard's 1 h → 6 h → quarantine escalation stops; a login's free check sees
+    "logged out" and logs in normally (its verify is the second challenge, blocked by the
+    guard's cooldown right after a mismatch → recorded as unknown).
+    `privilege_mismatch`, `identity_indeterminate`, `identity_blocked`, `rate_limited`
+    stop a login before any broker request (`IDENTITY_STOP_CODES`). Known gap: a foreign
+    session held in localStorage (the audiobookshelf bearer token) is NOT cleared by
+    cookies alone — its next check re-mismatches until a login overwrites the token.
+  - **Pinned runs** (review rounds 1–2, B1/SF3): ANY `--cdp-port` on the command line
+    pins the run (`_self_run` always passes one); a routed re-run refuses a port that is
+    not its instance's; `_instance_gate` compares the PORT too: a port of ANOTHER known
+    instance is refused, also under a disposable cache dir or the test guard; only a port
+    no instance owns (a disposable browser) passes. `logout` and `assisted-login` run the
+    same gate; a guided login of a non-static name refuses an alias, an unlisted name and
+    an unreachable broker (agent-login `-g` runs in the item's instance, `site_session`).
+  - **agent-login identity verdicts**: `identity_indeterminate` / `rate_limited` /
+    `identity_blocked` are "could not tell" (no login, no mail); `privilege_mismatch` /
+    `wrong_instance` / `identity_unproven` ❌ without a login; `wrong_account` (already
+    cleared by the probe) → a plain `login -s` when ungated, else ❌ `wrong_account`
+    "(cleared)" without a login. ≤ 2 challenges a run. A login whose verify ran the
+    proof is not re-probed. `checks.json` stores the
+    verdict (`identity`); a multi-account ✅ without `identity: match` reads ❓ (an old ✅
+    from before the siblings), and `-p` requires it.
+  - **Instances**: `INSTANCE_PORTS` += `admin` 9224, `alt` 9225 (from
+    `identity.ROLE_INSTANCE_PORTS`). The gate refuses an item of another instance
+    (`precheck` · `wrong_instance`, naming `CLAUDE_BROWSER_INSTANCE=<x> browser.py <cmd>
+    <site>` or `env -u CLAUDE_BROWSER_INSTANCE …`) for every broker item, Safari imports
+    included. `main` re-executes `login` / `logged-in` of a role-instance item into its
+    instance (`os.execve`, `CLAUDE_BROWSER_INSTANCE_ROUTED=1`) BEFORE any registration,
+    preflight or journal entry — only when the run is not pinned (no explicit instance,
+    no `--cdp-port` / `CLAUDE_BROWSER_CDP_PORT` / `CLAUDE_BROWSER_CACHE_DIR`, no guided-login
+    child, not already routed); a pinned run is refused by the gate. "Browser down"
+    hints name the instance prefix.
+  - **Aliases**: static names, then broker site ids, then exactly one non-refused
+    item's `alias` (ambiguous or refused → unknown). `browser.py` resolves against the
+    live listing; `agent-login.py -t/-p/…` from the last `sites` snapshot only.
+  - **agent-login rows** carry `instance`, `privilege`, `identity`, `alias`,
+    `same_account_as`, `multi_account`, `proof_ready`. `checks.json` records `instance`
+    (browser.py's `-R` word, else the row's / the site's configured instance — never the
+    ambient env, review round 1 B2); a record without it (pre-S3) counts
+    as the site's old instance (`""`, `private` for anthropic-private), so the release
+    does not turn every ✅ into ❓. `-p` also refuses a check from another instance.
+  - **agents.md**: each conflict group is one block (`- one site, several accounts (…)`)
+    with every member indented — ✅ with `ADMIN account` / `user account` / `read-only
+    account`, `the default — alias`…``, and for role instances the up/down prefix
+    (admin: "Playwright MCP only through the opt-in `playwright-admin` config"); ❓ lines
+    name the prefixed `logged-in`; refused members get fixed texts by kind
+    (`refusal_text`: privilege missing, in-instance conflict, alias, same-account,
+    identity) plus the sibling ids — never the broker's reason. Replayed on the live
+    snapshot (copy): the 8 groups render as blocks of refused members with "needs
+    agent_privilege".
+  - **`-c`**: rows are split by role instance; a role instance is started (via
+    `instance_session`, which `site_instance` now uses too) only when one of its rows
+    needs a browser (`needs_browser`: a ready/extra/Safari row whose account is not
+    unproven; refused or unproven rows are only recorded), checked
+    with the same gates, and stopped only if this run started it AND `instance_users()`
+    finds no registered (or unregistered) CDP client — read in-process from that
+    instance's registry. An instance that does not start records `browser_down` for its
+    rows (unknown, never "logged out") and fails the run. "Started here" = it was down
+    and a browser answers within ~10 s after the `up` attempt (polled; an `up` timeout or
+    a slow Chrome is still stopped); a failed stop or an unreadable client list goes into the run's failures
+    (the mail). `-t` runs in the item's instance the same way. Group headers appear in
+    each agents.md section their members land in.
+  - **`-x`**: columns `instance`, `multi`, `identity` (`(unproven)` when not
+    proof-ready), `alias`, `same_account`; `privilege` shows the item's `agent_privilege`.
+  - Tests: `tests/test_ws5_client_s2.py` (the REAL `daemon.Broker` behind its socket
+    server with a fake vault; the recipe in a throwaway headless Chromium with routed
+    fixture endpoints; a page that hooks `Response.json` / `crypto.subtle`; leak checks
+    over stdout, stderr, the journal and `-R`) and `tests/test_ws5_agent_login_s3.py`
+    (a real registration in a throwaway registry blocks the stop).
+  - **What S4 needs**: the vault fields (broker-add columns), then per pair one positive
+    and one wrong-sibling proof in the item's own instance; `CLAUDE_BROWSER_INSTANCE=admin
+    browser.py up` once to create its profile; the `playwright-admin` MCP config in
+    mydotfiles (proposal from this slice); README "Accounts that share a site". The live
+    default browser may still hold an admin session from before (tp#833): the first
+    proof of the default member answers `wrong_account` and clears that session (cookies
+    only); the 1 h guard cooldown then delays the positive proof — plan the acceptance
+    proofs after it.
+  - Incidental (review round 1): `broker/selfcheck.py` `probe_forbidden` tolerates the
+    EPIPE of its send when the broker answered `forbidden` and closed first (the answer
+    is still read) — the cause of the flaky `test_selfcheck_forbidden_probe`; the
+    test helper `_ask` likewise. A deterministic regression test sends late; an empty
+    reply (a broker that closes without a word) is "got no answer", never a pass
+    (review round 2, tested).
 
 ### S4 — migration and live acceptance (main session; Albert's Touch ID for vault writes)
 
@@ -408,7 +523,7 @@ cd /Users/albert/obsidian/42-Git/home/browser-login && uv run ruff format --chec
 cd /Users/albert/obsidian/42-Git/home/browser-login && uv run ruff check bin/ broker/ agent-login.py agent_login_jobs.py
 cd /Users/albert/obsidian/42-Git/home/browser-login && uv run mypy bin/browser.py agent-login.py
 cd /Users/albert/obsidian/42-Git/home/browser-login && uv run pylint bin/browser.py
-cd /Users/albert/obsidian/42-Git/home/browser-login && uv run pytest -q tests/test_ws5_broker.py tests/test_ws5_client.py tests/test_agent_login.py
+cd /Users/albert/obsidian/42-Git/home/browser-login && uv run pytest -q tests/test_ws5_broker.py tests/test_ws5_client.py tests/test_ws5_client_s2.py tests/test_ws5_agent_login_s3.py tests/test_agent_login.py
 cd /Users/albert/obsidian/42-Git/home/browser-login && uv run pytest -q tests
 cd /Users/albert/obsidian/42-Git/home/browser-login && uv run pre-commit run --all-files
 cd /Users/albert/obsidian/42-Git/home/browser-login && install/install.sh -n

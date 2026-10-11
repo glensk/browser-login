@@ -9,9 +9,17 @@ from __future__ import annotations
 import contextlib
 import json
 import os
+import time
 from collections.abc import Iterator
+from dataclasses import dataclass, field
 
-from agent_login_jobs import _browser, browser_mode, browser_timeout, run_browser
+from agent_login_jobs import (
+    _browser,
+    _browser_module,
+    browser_mode,
+    browser_timeout,
+    run_browser,
+)
 
 # The claude.ai accounts: one browser profile holds ONE claude.ai session, so the
 # logged-in account's email decides which line is ✅.
@@ -34,23 +42,102 @@ CLAUDE_LOGIN_WAIT_S = 15 * 60
 
 @contextlib.contextmanager
 def site_instance(site: str) -> Iterator[None]:
-    """Point every browser.py call inside at `site`'s browser instance.
+    """Point every browser.py call inside at `site`'s browser instance
+    (`instance_session`)."""
+    with instance_session(SITE_INSTANCE.get(site, "")):
+        yield
+
+
+def instance_users() -> tuple[str, str] | None:
+    """Who uses the CURRENT browser instance ($CLAUDE_BROWSER_INSTANCE) right
+    now: ``("busy", why)`` for its registered CDP clients (an MCP server or
+    another wrapper started with `browser.py register-exec`, a running
+    browser.py) or unregistered ones (lsof), ``("unreadable", why)`` when that
+    cannot be told, None when nobody. Asked in-process through browser.py's
+    own registry (`_registry_live_clients`, which also reaps dead entries).
+    Callers never stop an instance on either answer — stopping a browser
+    under a client breaks it, leaving it up only costs memory."""
+    try:
+        mod = _browser_module()
+        live = mod._registry_live_clients()  # pylint: disable=protected-access
+        unknown = mod._unknown_cdp_clients(mod.DEFAULT_CDP_PORT)  # pylint: disable=protected-access
+    except Exception as exc:  # pylint: disable=broad-exception-caught
+        return "unreadable", f"its clients cannot be listed ({type(exc).__name__})"
+    if live:
+        tools = sorted({str(rec.get("tool") or "?") for rec in live})
+        return "busy", f"{len(live)} registered client(s): {', '.join(tools)}"
+    if unknown is None:
+        return "unreadable", "its CDP clients cannot be verified (no lsof)"
+    if unknown:
+        return "busy", f"{len(unknown)} unregistered CDP client(s)"
+    return None
+
+
+@dataclass
+class InstanceSession:
+    """What `instance_session` yields: is the instance up, and what went
+    wrong around it (a failed stop, an unreadable client list) — for the
+    caller's failure list and mail."""
+
+    up: bool = True
+    problems: list[str] = field(default_factory=list)
+
+
+# After an `up` attempt: how long a slow Chrome may take to answer before the
+# instance counts as "did not start" (it is then still stopped at the end
+# once it answers).
+UP_SETTLE_S = 10.0
+UP_POLL_S = 1.0
+
+
+def _came_up() -> bool:
+    """Does the current instance run, polled for up to UP_SETTLE_S?"""
+    deadline = time.monotonic() + UP_SETTLE_S
+    while True:
+        if browser_mode() is not None:
+            return True
+        if time.monotonic() >= deadline:
+            return False
+        time.sleep(UP_POLL_S)
+
+
+@contextlib.contextmanager
+def instance_session(inst: str) -> Iterator[InstanceSession]:
+    """Point every browser.py call inside at browser instance `inst` ('' =
+    the shared one); yields an `InstanceSession` (`up`; `problems` filled on
+    the way out).
 
     A named instance that is down is started headless for the duration and
-    stopped again afterwards: its sessions live in its profile on disk, so it
-    needs to run only while something uses it.
+    stopped again afterwards — its sessions live in its profile on disk, so it
+    runs only while something uses it, and an admin session is not left in a
+    running browser between uses. "Started here" = it was down before and a
+    browser runs after the `up` attempt (an `up` that timed out while Chrome
+    came up is still stopped). Never stopped while something else uses it
+    (`instance_users`): then it stays up and the reason is printed; an
+    unreadable client list or a failed stop also lands in `problems`. An
+    instance that was already up is never stopped here.
     """
-    inst = SITE_INSTANCE.get(site, "")
     old = os.environ.get("CLAUDE_BROWSER_INSTANCE")
     os.environ["CLAUDE_BROWSER_INSTANCE"] = inst
+    session = InstanceSession()
     started = False
     try:
         if inst and browser_mode() is None:
-            started = _browser("up", quiet=True, timeout_s=browser_timeout("up")) == 0
-        yield
+            _browser("up", quiet=True, timeout_s=browser_timeout("up"))
+            started = _came_up()
+            session.up = started
+        yield session
     finally:
         if started:
-            _browser("down", quiet=True, timeout_s=browser_timeout("down"))
+            users = instance_users()
+            if users is not None:
+                print(f"⏸  the {inst} browser stays up — {users[1]}")
+                if users[0] == "unreadable":
+                    session.problems.append(f"the {inst} browser stays up: {users[1]}")
+            elif _browser("down", quiet=True, timeout_s=browser_timeout("down")) != 0:
+                session.problems.append(
+                    f"the {inst} browser did not stop (browser.py down)"
+                )
         if old is None:
             os.environ.pop("CLAUDE_BROWSER_INSTANCE", None)
         else:

@@ -31,6 +31,7 @@ Examples:
 from __future__ import annotations
 
 import argparse
+import contextlib
 import json
 import os
 import pwd
@@ -144,10 +145,16 @@ def probe_forbidden(sock: Path, timeout: float = 10.0) -> tuple[bool, str]:
         with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as s:
             s.settimeout(timeout)
             s.connect(str(sock))
-            s.sendall(json.dumps(req).encode() + b"\n")
+            # The broker answers `forbidden` and closes WITHOUT reading the
+            # request: when that wins the race, our send fails (EPIPE) while
+            # its answer already waits in our buffer — read it anyway.
+            with contextlib.suppress(BrokenPipeError, ConnectionResetError):
+                s.sendall(json.dumps(req).encode() + b"\n")
             with s.makefile("rb") as reader:
                 line = reader.readline()
-        resp = json.loads(line or b"{}")
+        if not line.strip():  # closed without a word: no answer, never a pass
+            return False, f"g) secret probe as uid {uid} got no answer (empty reply)"
+        resp = json.loads(line)
     except (OSError, ValueError) as exc:
         return False, f"g) secret probe as uid {uid} got no answer ({exc})"
     if (

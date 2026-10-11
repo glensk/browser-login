@@ -130,7 +130,14 @@ def scope_conflicts(
 
 def conflict_groups(sites: Iterable[Mapping[str, object]]) -> list[tuple[str, ...]]:
     """The connected groups of `scope_conflicts` (each sorted, groups sorted)."""
-    graph = scope_conflicts(sites)
+    return connected_groups(scope_conflicts(sites))
+
+
+def connected_groups(
+    graph: Mapping[str, Iterable[str]],
+) -> list[tuple[str, ...]]:
+    """The connected groups of an undirected `graph` ``{node: neighbours}``
+    (each sorted, groups sorted)."""
     seen: set[str] = set()
     groups = []
     for start in graph:
@@ -165,6 +172,9 @@ IDENTITY_V = 1
 # Browser instances an item may live in besides the shared one ("" = 9222).
 # Their CDP ports are browser.py's `INSTANCE_PORTS` (S2): admin 9224, alt 9225.
 ROLE_INSTANCES = ("admin", "alt")
+# Their CDP ports (browser.py builds its INSTANCE_PORTS from this; agents.md
+# names them).
+ROLE_INSTANCE_PORTS = {"admin": 9224, "alt": 9225}
 INSTANCES = (DEFAULT_INSTANCE, *ROLE_INSTANCES)
 # `agent_privilege`: what the account may do on the site. The recipe's admin
 # bit must say "admin" for `admin` and "not admin" for the others.
@@ -414,6 +424,23 @@ def usable_recipe(name: object) -> IdentityRecipe | None:
     if recipe is None or not recipe.live_confirmed or recipe.admin_field is None:
         return None
     return recipe
+
+
+def proof_ready(entry: Mapping[str, object]) -> bool:
+    """A ``sites`` entry the CLIENT can prove the account of (S2): not
+    refused, a broker that speaks the identity protocol (``identity_v`` >= 1),
+    a usable recipe and a known privilege. A multi-account entry that is not
+    proof-ready stays ``identity_unproven`` (fail closed: a rolled-back
+    broker, an item without its WS5 fields)."""
+    version = entry.get("identity_v")
+    if isinstance(version, bool) or not isinstance(version, int) or version < 1:
+        return False
+    if entry.get("refused"):
+        return False
+    return (
+        usable_recipe(entry.get("identity")) is not None
+        and entry.get("privilege") in PRIVILEGES
+    )
 
 
 FETCH_MS = 8000

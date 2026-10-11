@@ -278,6 +278,21 @@ framework. It is a **provider**: other repos depend on it, not the reverse. See
   (own profile `~/.cache/claude-browser-private`, CDP 9223, own coordination
   files) — for Albert's private claude.ai account, since one profile holds one
   claude.ai session. Known instances: `INSTANCE_PORTS` in `bin/browser.py`.
+  WS5 role instances `admin` (CDP 9224) and `alt` (9225) hold the accounts of a
+  site that must not share a cookie jar with its default account (a broker
+  item's `instance`): `login`/`logged-in` of such an item re-run themselves in
+  its instance when `CLAUDE_BROWSER_INSTANCE` is unset, and refuse
+  (`wrong_instance`) when a run is pinned to another one (an explicit instance,
+  ANY `--cdp-port`, or a port that is not the instance's); `logout` and
+  `assisted-login` refuse the same way. A `logged-in` that finds a foreign
+  account's session in an item's instance (`wrong_account`) clears it at once —
+  the item's cookies only (its cookie hosts and subdomains, its `cookie_names`),
+  never storage or the broker's profile; the next login then starts logged out. A multi-account item
+  passes `logged-in` only with the server identity proof (the reviewed recipe in
+  an isolated world of the probe tab + the broker's one-use challenge); only a
+  digest ever crosses CDP or the socket. `agent-login.py -c` starts a role
+  instance only when one of its rows needs it and stops it again unless a
+  registered client (e.g. the opt-in `playwright-admin` MCP) uses it.
 - **Keychain list = names only**: `agent_login_keychain.py` reads attributes and
   access lists (`dump-keychain -a`, never `-d`), and masks any service/account
   name that looks like a secret value (`safe_name`) — some items store the

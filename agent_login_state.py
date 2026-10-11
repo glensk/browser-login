@@ -176,12 +176,16 @@ def record_check(  # pylint: disable=too-many-arguments
     proof_v: int = 0,
     final_origin: str = "",
     origin_ok: object = None,
+    instance: str = "",
+    identity: str = "",
     now: float | None = None,
 ) -> dict[str, Any]:
     """Record a site's LATEST check (checks.json v2 + the legacy projection).
 
     `state` is ok / failed / unknown; an `unknown` never overwrites the
-    previous `last_success`, and only `ok` sets it. Returns the record.
+    previous `last_success`, and only `ok` sets it. `instance`: the browser
+    instance the check ran in ('' = the shared one; WS5: a ✅ from another
+    instance than the item's current one is stale). Returns the record.
     """
     if state not in STATES:
         raise ValueError(f"state must be one of {sorted(STATES)}")
@@ -208,6 +212,10 @@ def record_check(  # pylint: disable=too-many-arguments
         if re.match(r"^https?://[^/\s]+$", final_origin or "")
         else "",
         "origin_ok": origin_ok if isinstance(origin_ok, bool) else None,
+        "instance": instance if re.match(r"^[a-z]{0,16}$", instance or "") else "?",
+        # WS5: the identity proof's verdict (a word of browser.py's fixed set;
+        # '' = no proof ran).
+        "identity": identity if re.match(r"^[a-z_]{0,32}$", identity or "") else "?",
     }
 
     def put(data: dict[str, Any]) -> None:

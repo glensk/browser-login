@@ -201,7 +201,10 @@ from broker.useragent import engine_user_agent as _engine_user_agent  # noqa: E4
 # Named instances: a second shared browser with its OWN profile, port and
 # coordination files (e.g. "private" for Albert's private claude.ai account — one
 # profile holds one claude.ai session). Unset = the default shared browser.
-INSTANCE_PORTS = {"": 9222, "private": 9223}
+# "admin" and "alt" are the WS5 role instances (tp#833): a broker item's
+# `instance` puts it there, so ONE instance never holds two accounts of one
+# site (admin accounts live only in "admin", started on demand).
+INSTANCE_PORTS = {"": 9222, "private": 9223, **_identity.ROLE_INSTANCE_PORTS}
 INSTANCE = os.environ.get("CLAUDE_BROWSER_INSTANCE", "").strip().lower()
 if INSTANCE not in INSTANCE_PORTS:
     sys.exit(
@@ -211,6 +214,11 @@ if INSTANCE not in INSTANCE_PORTS:
 DEFAULT_CDP_PORT = int(
     os.environ.get("CLAUDE_BROWSER_CDP_PORT", str(INSTANCE_PORTS[INSTANCE]))
 )
+
+
+def _instance_prefix(instance: str) -> str:
+    """The shell prefix that selects `instance` ('' for the default one)."""
+    return f"CLAUDE_BROWSER_INSTANCE={instance} " if instance else ""
 
 
 def _env_seconds(raw: str | None, default: float = 30.0) -> float:
@@ -768,6 +776,11 @@ def parse_args() -> argparse.Namespace:
             "  ./browser.py broker-sites       # sites the login broker may log into\n"
             "  ./browser.py login ricardo      # broker site: session bundle, no password\n"
             "  ./browser.py logout ricardo     # drop that session again\n"
+            "  ./browser.py login gitlab-sdsc  # a group alias: its default account\n"
+            "  CLAUDE_BROWSER_INSTANCE=admin ./browser.py up  # the admin browser "
+            "(CDP 9224;\n"
+            "                                  # login/logged-in of an admin item "
+            "run there)\n"
             "  ./browser.py import-safari -n anibis  # Safari cookies (names only)\n"
             "  ./browser.py import-safari anibis     # reuse your Safari session\n"
             "  ./browser.py down               # quit the shared browser\n"
@@ -776,9 +789,10 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--cdp-port",
         type=int,
-        default=DEFAULT_CDP_PORT,
+        default=None,
         help=f"CDP remote-debugging port (default {DEFAULT_CDP_PORT}; "
-        "env CLAUDE_BROWSER_CDP_PORT).",
+        "env CLAUDE_BROWSER_CDP_PORT). Given explicitly, it pins the run to "
+        "that browser (a broker item of another instance is refused).",
     )
     sub = p.add_subparsers(dest="cmd", required=True)
     pup = sub.add_parser(
@@ -963,9 +977,19 @@ def parse_args() -> argparse.Namespace:
         help="Human-only: the pre-broker CSCS login (keychain / 1Password), "
         "refused without a terminal.",
     )
-    args = p.parse_args()
+    args = _resolve_cdp_port(p.parse_args())
     if args.cmd == "close":
         _check_close_args(pcl, args)
+    return args
+
+
+def _resolve_cdp_port(args: argparse.Namespace) -> argparse.Namespace:
+    """`--cdp-port` given → `cdp_port_given` (it pins the run to that
+    browser: WS5 routing never re-runs it elsewhere); absent → the
+    instance's default port."""
+    args.cdp_port_given = args.cdp_port is not None
+    if args.cdp_port is None:
+        args.cdp_port = DEFAULT_CDP_PORT
     return args
 
 
@@ -4233,7 +4257,8 @@ def cmd_switch(  # pylint: disable=too-many-arguments
     live = _browser_mode(port)
     if live is None:
         return _fail(
-            "Nothing to switch — the shared browser is down. Run: browser.py up"
+            "Nothing to switch — the shared browser is down. Run: "
+            f"{_instance_prefix(INSTANCE)}browser.py up"
         )
     if live == target:
         healed = _heal_running_record(port, live)
@@ -4321,7 +4346,8 @@ def cmd_status(port: int, full_urls: bool = False, probe: bool = False) -> int:
     ver = _cdp_get(port, "/json/version")
     if ver is None:
         print(
-            f"✗ Shared browser is DOWN (no CDP on http://localhost:{port}). Run: browser.py up"
+            f"✗ Shared browser is DOWN (no CDP on http://localhost:{port}). "
+            f"Run: {_instance_prefix(INSTANCE)}browser.py up"
         )
         _print_lifecycle(port)
         return 1
@@ -5098,7 +5124,9 @@ def _connect(port: int, purpose: str = ""):
     from playwright.sync_api import sync_playwright
 
     if not _is_up(port):
-        sys.exit("Shared browser is down. Run: browser.py up")
+        sys.exit(
+            f"Shared browser is down. Run: {_instance_prefix(INSTANCE)}browser.py up"
+        )
     _ensure_page_target(port)  # zero tabs => connect_over_cdp dies (tp#317)
     atexit.register(_registry_register("browser.py", purpose or _purpose(), port))
     pw = sync_playwright().start()
@@ -5342,7 +5370,9 @@ def _open_new_raw(port: int, url: str) -> int:
     lease. Exit 1 when the tab cannot be created.
     """
     if not _is_up(port):
-        sys.exit("Shared browser is down. Run: browser.py up")
+        sys.exit(
+            f"Shared browser is down. Run: {_instance_prefix(INSTANCE)}browser.py up"
+        )
     _ensure_page_target(port)  # zero tabs: createTarget may open a window
     release = _registry_register("browser.py", _purpose(), port)
     try:
@@ -5460,7 +5490,9 @@ def _eval_target_raw(port: int, tid: str, js: str, budget_s: float) -> int:
         return max(0.0, deadline - time.monotonic())
 
     if not _is_up(port):
-        sys.exit("Shared browser is down. Run: browser.py up")
+        sys.exit(
+            f"Shared browser is down. Run: {_instance_prefix(INSTANCE)}browser.py up"
+        )
     release = _registry_register("browser.py", _purpose(), port)
     try:
         listing = _cdp_get(port, "/json/list", timeout=max(0.01, min(2.0, left())))
@@ -9639,7 +9671,9 @@ _STEP_PHASE = {
 def _result_begin(cmd: str, site: str, path: str | None) -> None:
     """Start this command's result record (`path` None = no result file)."""
     _RESULT.clear()
-    _RESULT.update({"cmd": cmd, "site": site})
+    # `instance`: the browser instance the command ran in (agent-login records
+    # it; a check from another instance is stale for a moved item, WS5).
+    _RESULT.update({"cmd": cmd, "site": site, "instance": INSTANCE})
     _RESULT_FILE[:] = [path] if path else []
 
 
@@ -9797,11 +9831,11 @@ def _broker_request(op: str, *, timeout: float = BROKER_TIMEOUT_S, **kw: Any) ->
     return resp
 
 
-def _broker_sites() -> list[dict]:
+def _broker_sites(timeout: float = 60.0) -> list[dict]:
     """The broker's ``sites`` list (cached per process)."""
     if _BROKER_SITES_CACHE:
         return _BROKER_SITES_CACHE[0]
-    resp = _broker_request("sites", timeout=60)
+    resp = _broker_request("sites", timeout=timeout)
     if not resp.get("ok"):
         code = str(resp.get("error"))
         raise BrokerUnavailable(
@@ -9821,34 +9855,171 @@ def _broker_site(site: str) -> dict | None:
     return None
 
 
-def _broker_identity_gate(site: str) -> int | None:
-    """WS5 S0 (tp#833): exit 2 when `site` shares its cookie scope with a
-    broker item of another account (``broker.identity.scope_conflicts``),
-    else None. Such an item's logged-in proof says "someone is logged in",
-    never WHICH account, and its login would overwrite a sibling's session:
-    it is never ✅ and never logged in until the server identity proof (S2,
-    a broker advertising ``identity_v >= 1``) exists — fail closed, also
-    against a rolled-back broker. Broker unreachable: None (the caller's own
-    lookup reports it)."""
+def _broker_alias_target(key: str) -> str | None:
+    """The site id whose `alias` is `key` (WS5: a conflict group's default
+    member answers to the group's name, e.g. ``gitlab-sdsc``), or None: no
+    item, a refused one, or more than one claims it (the broker refuses
+    duplicates; the client does not guess). Callers try static names and
+    broker site ids first — an alias never shadows either."""
     try:
-        siblings = _identity.scope_conflicts(_broker_sites()).get(site)
+        hits = [
+            str(e.get("site"))
+            for e in _broker_sites()
+            if e.get("alias") == key and not e.get("refused") and e.get("site")
+        ]
     except BrokerUnavailable:
         return None
-    if not siblings:
-        return None
-    names = ", ".join(siblings)
-    _result_fail(
-        "client-proof",
-        "identity_unproven",
-        f"shares its login with {names}",
-        multi_account=True,
-        shares_login_with=list(siblings),
+    return hits[0] if len(hits) == 1 else None
+
+
+def _note_alias(alias: str, site: str) -> None:
+    """Say (stderr) and record that `alias` resolved to `site`."""
+    _result_set(site=site, alias=alias)
+    print(f"↪ {alias} = {site} (the group's default account)", file=sys.stderr)
+
+
+def _is_static_site(key: str) -> bool:
+    """`key` names a built-in site (or a test-hook one): never a broker item."""
+    return key in _test_sites() or any(
+        key == s.name or key in s.aliases for s in _sites()
     )
+
+
+def _broker_canonical_site(key: str) -> str:
+    """`key`, or the site id its alias names (static and broker ids first)."""
+    if _is_static_site(key):
+        return key
+    try:
+        if _broker_site(key) is not None:
+            return key
+    except BrokerUnavailable:
+        return key
+    target = _broker_alias_target(key)
+    if target is None:
+        return key
+    _note_alias(key, target)
+    return target
+
+
+# Client gate codes: the item cannot be checked or logged in from here.
+IDENTITY_GATE_CODES = frozenset({"identity_unproven", "wrong_instance"})
+# Verdicts of the client identity proof that end a `login` before any broker
+# request (`_broker_already`): a login cannot fix them, or cannot be proven.
+# (`wrong_account` is not one: a foreign session is replaced.)
+IDENTITY_STOP_CODES = frozenset(
+    {
+        "privilege_mismatch",
+        "identity_indeterminate",
+        "identity_unproven",
+        "identity_blocked",
+        "wrong_instance",
+        "rate_limited",
+    }
+)
+
+
+def _instance_gate(
+    site: str, entry: dict, port: int | None = None, cmd: str | None = None
+) -> int | None:
+    """Exit 2 (phase ``precheck``, code ``wrong_instance``) when the broker
+    puts `site` into another browser instance than this process's
+    (``CLAUDE_BROWSER_INSTANCE``) — or `port` is not that instance's CDP port
+    (an explicit `--cdp-port` must never point an item's session at another
+    browser) — naming the exact command; else None. Its session lives only
+    there: a check here proves nothing, and a login here would put a second
+    account of the site into this instance."""
+    inst = _identity.instance_of(entry)
+    # The port half: a run aimed at ANOTHER known instance's browser (e.g.
+    # `--cdp-port 9222` with the admin instance) is refused; a port no
+    # instance owns is a disposable browser (doctor, tests) and passes.
+    port_ok = (
+        port is None
+        or inst not in INSTANCE_PORTS
+        or port == INSTANCE_PORTS[inst]
+        or port not in INSTANCE_PORTS.values()
+    )
+    if inst == INSTANCE and port_ok:
+        return None
+    if inst not in INSTANCE_PORTS:
+        _result_fail("precheck", "wrong_instance", "unknown browser instance")
+        return _broker_fail(
+            2,
+            f"{site}: the broker puts it into a browser instance this browser.py "
+            "does not know — update browser-login.",
+        )
+    cmd = cmd or str(_RESULT.get("cmd") or "logged-in")
+    prefix = _instance_prefix(inst) or "env -u CLAUDE_BROWSER_INSTANCE "
+    _result_fail(
+        "precheck",
+        "wrong_instance",
+        f"lives in instance {inst or 'default'}",
+        instance_wanted=inst,
+    )
+    here = INSTANCE or "the default one"
+    if inst == INSTANCE:
+        here = f"CDP port {port}"
+    return _broker_fail(
+        2,
+        f"{site}: lives in the {inst or 'default (shared, 9222)'} browser "
+        f"instance (CDP {INSTANCE_PORTS[inst]}), not in {here} — run: "
+        f"{prefix}browser.py {cmd} {site}",
+    )
+
+
+def _broker_identity_gate(site: str, port: int | None = None) -> int | None:
+    """WS5 (tp#833): exit 2 when `site` cannot be checked or logged in from
+    this process, else None. Broker unreachable or `site` unlisted: None
+    (the caller's own lookup reports it).
+
+    - its broker item lives in another browser instance → ``wrong_instance``
+      (`_instance_gate`);
+    - it shares its cookie scope with a broker item of another account
+      (``broker.identity.scope_conflicts``, or the broker's own
+      ``multi_account``) and the client cannot prove WHICH account the
+      browser holds (`identity.proof_ready`: a broker speaking
+      ``identity_v >= 1``, a usable recipe, a privilege) → phase
+      ``client-proof``, ``identity_unproven`` — fail closed, also against a
+      rolled-back broker. A proof-ready item passes here; its check runs
+      the server identity proof (`_client_identity_proof`)."""
+    try:
+        sites = _broker_sites()
+    except BrokerUnavailable:
+        return None
+    entry = next((e for e in sites if e.get("site") == site), None)
+    if entry is None:
+        return None
+    wrong = _instance_gate(site, entry, port)
+    if wrong is not None:
+        return wrong
+    siblings = _identity.scope_conflicts(sites).get(site, ())
+    if not siblings and entry.get("multi_account") is not True:
+        return None
+    _result_set(multi_account=True, shares_login_with=list(siblings))
+    if _identity.proof_ready(entry):
+        return None
+    names = ", ".join(siblings) or "another item"
+    _result_fail("client-proof", "identity_unproven", f"shares its login with {names}")
     return _broker_fail(
         2,
         f"{site}: account unproven: shares its login with {names} — the check "
         "cannot tell which account the shared browser holds (nothing checked, "
         "nothing logged in).",
+    )
+
+
+def _identity_needed(site: str) -> bool:
+    """Does a logged-in claim for `site` need the server identity proof? A
+    multi-account item does; so does any item when the broker listing is
+    unreadable (the proof then fails closed)."""
+    try:
+        sites = _broker_sites()
+    except BrokerUnavailable:
+        return True
+    entry = next((e for e in sites if e.get("site") == site), None)
+    if entry is None:
+        return False
+    return bool(
+        _identity.scope_conflicts(sites).get(site) or entry.get("multi_account") is True
     )
 
 
@@ -10651,7 +10822,9 @@ def _owned_background_page(
     `OwnedTabError` when the tab cannot be recorded, created or adopted.
     """
     if not _is_up(port):
-        sys.exit("Shared browser is down. Run: browser.py up")
+        sys.exit(
+            f"Shared browser is down. Run: {_instance_prefix(INSTANCE)}browser.py up"
+        )
     release = _registry_register("browser.py", _purpose(), port)
     tid: str | None = None
     marker = secrets.token_hex(16)
@@ -11425,17 +11598,249 @@ def _broker_probe_prepare(page) -> None:
 _WEAK_PROOF_WARNED: set[str] = set()
 
 
-def _broker_check_entry(
-    port: int, site: str, entry: dict, *, sentinel: str | None = None
+# ---------------------------------------------------------------------------
+# WS5 S2 (tp#833): the client's server identity proof
+# ---------------------------------------------------------------------------
+# A multi-account item's sentinel says "someone is logged in". After a VALID
+# proof, the SAME probe page asks the broker for a one-use challenge, runs
+# the item's reviewed recipe (broker/identity.py RECIPE_JS, `recipe_args`) in
+# a CDP isolated world — the page's own scripts cannot hook its fetch, JSON
+# parser or hash — and hands the broker only sha256(nonce || name). The
+# broker says match / mismatch; the recipe's admin bit must match the item's
+# privilege. The account name never leaves the page, the vault's never the
+# broker: nothing of either reaches stdout, stderr, the journal or `-R`.
+
+# One identity broker request (challenge or answer): short, it is local.
+IDENTITY_BROKER_TIMEOUT_S = 8.0
+# The client proof's verdicts besides the recipe ones (`_client_identity_proof`).
+IDENTITY_MATCH = "match"
+# The recipe's own `why` words that may be recorded (anything else: "other").
+_IDENTITY_WHY = frozenset(
+    {
+        "origin",
+        "nonce",
+        "crypto",
+        "auth",
+        "timeout",
+        "network",
+        "redirect",
+        "status",
+        "content-type",
+        "body",
+        "schema",
+        "api",
+        "impersonation",
+        "identity",
+        "deadline",
+        "error",
+        "no token",
+    }
+)
+# A challenge the broker refused → the client's code (default: indeterminate).
+_IDENTITY_REFUSALS = {
+    "wrong_instance": "wrong_instance",
+    "identity_unproven": "identity_unproven",
+    "refused": "identity_unproven",
+    "needs_sentinel": "identity_unproven",
+    "unknown_site": "identity_unproven",
+    "rate_limited": "rate_limited",
+    "identity_cooldown": "identity_blocked",
+    "identity_quarantined": "identity_blocked",
+    "identity_blocked": "identity_blocked",
+    "identity_unreadable": "identity_blocked",
+    "identity_unwritable": "identity_blocked",
+}
+# What the check prints per verdict (fixed text; the site id is prefixed).
+_IDENTITY_MESSAGES = {
+    "wrong_account": (
+        "logged in as ANOTHER account than the item's (the site's server "
+        "identity proof disagrees)"
+    ),
+    "privilege_mismatch": (
+        "the logged-in account's admin rights do not match the item's "
+        "agent_privilege — not usable"
+    ),
+    "identity_indeterminate": (
+        "logged in, but the site's account check could not tell WHICH "
+        "account — not usable"
+    ),
+    "identity_unproven": "the broker serves no identity proof for this item",
+    "identity_blocked": (
+        "the broker blocks this site's account checks after an identity "
+        "mismatch (cooldown, or until a root reset)"
+    ),
+    "rate_limited": "the broker rate-limits this site's account checks",
+    "wrong_instance": "the broker says the item lives in another browser instance",
+}
+
+
+def _evaluate_isolated(page: Any, js: str, arg: Any) -> Any:
+    """``js(arg)`` (an async function's source) in a FRESH CDP isolated world
+    of `page`'s main frame, its value returned by value — the client copy of
+    broker/daemon.py ``evaluate_isolated`` (the broker release does not ship
+    browser.py and browser.py does not import the daemon). Page scripts
+    share the DOM, not the world's ``fetch`` / ``crypto`` / prototypes.
+    Service workers are bypassed for this DevTools session only (detaching
+    drops it). Any CDP or script failure raises; the caller reads that as
+    indeterminate — there is no main-world fallback."""
+    session = page.context.new_cdp_session(page)
+    try:
+        tree = session.send("Page.getFrameTree")
+        frame_id = tree["frameTree"]["frame"]["id"]
+        world = session.send(
+            "Page.createIsolatedWorld",
+            {"frameId": frame_id, "worldName": f"ws5c-{secrets.token_hex(6)}"},
+        )
+        context_id = world["executionContextId"]
+        this = session.send(
+            "Runtime.evaluate", {"expression": "globalThis", "contextId": context_id}
+        )
+        object_id = this["result"]["objectId"]
+        session.send("Network.enable")
+        session.send("Network.setBypassServiceWorker", {"bypass": True})
+        got = session.send(
+            "Runtime.callFunctionOn",
+            {
+                "functionDeclaration": js,
+                "objectId": object_id,
+                "arguments": [{"value": arg}],
+                "awaitPromise": True,
+                "returnByValue": True,
+            },
+        )
+        if got.get("exceptionDetails"):
+            raise RuntimeError("the identity recipe raised")
+        return (got.get("result") or {}).get("value")
+    finally:
+        with contextlib.suppress(Exception):
+            session.detach()
+
+
+def _identity_note(verdict: str, why: object = "", status: object = None) -> str:
+    """Record the proof's verdict (fixed words only) and return it."""
+    fields: dict[str, Any] = {"identity": verdict}
+    if why:
+        fields["identity_why"] = why if why in _IDENTITY_WHY else "other"
+    if isinstance(status, int) and not isinstance(status, bool):
+        fields["identity_status"] = status
+    _result_set(**fields)
+    return verdict
+
+
+# One return per verdict of the protocol, in the order they are decided.
+def _client_identity_proof(  # pylint: disable=too-many-return-statements,too-many-branches
+    page: Any, site: str, entry: dict, url: str
+) -> str:
+    """The WS5 server identity proof in the probe `page` (already on `url`,
+    the item's check page): ``match``, ``logged_out`` (the site's API says
+    401/403), ``wrong_account``, ``privilege_mismatch``,
+    ``identity_indeterminate`` or one of the broker's refusals
+    (``_IDENTITY_REFUSALS``). Only ``match`` ever passes."""
+    _deadline_step("bg:identity")
+    recipe = _identity.usable_recipe(entry.get("identity"))
+    privilege = str(entry.get("privilege") or "")
+    if recipe is None or privilege not in _identity.PRIVILEGES:
+        return _identity_note("identity_unproven")
+    try:
+        chal = _broker_request(
+            "identity_challenge",
+            timeout=IDENTITY_BROKER_TIMEOUT_S,
+            site=site,
+            instance=INSTANCE,
+        )
+    except BrokerUnavailable:
+        return _identity_note("identity_indeterminate", "broker")
+    if not chal.get("ok"):
+        code = _IDENTITY_REFUSALS.get(str(chal.get("error")), "identity_indeterminate")
+        _result_set(identity_detail=_phases.redact(chal.get("detail") or ""))
+        return _identity_note(code)
+    nonce, cid = chal.get("nonce"), chal.get("challenge_id")
+    if (
+        not _identity.is_digest(nonce)
+        or not isinstance(cid, str)
+        or not cid
+        or chal.get("identity") != recipe.name
+        or chal.get("privilege") != privilege
+    ):
+        return _identity_note("identity_indeterminate", "schema")
+    args = _identity.recipe_args(recipe, url, str(nonce))
+    try:
+        answer = _evaluate_isolated(page, _identity.RECIPE_JS, args)
+    except Exception:  # pylint: disable=broad-exception-caught
+        return _identity_note("identity_indeterminate", "error")
+    if not isinstance(answer, dict):
+        return _identity_note("identity_indeterminate", "error")
+    why, status = answer.get("why"), answer.get("status")
+    if answer.get("state") == _identity.LOGGED_OUT:
+        return _identity_note(_identity.LOGGED_OUT, why, status)
+    digest = answer.get("digest")
+    if answer.get("state") != "found" or not _identity.is_digest(digest):
+        return _identity_note("identity_indeterminate", why, status)
+    try:
+        reply = _broker_request(
+            "identity_answer",
+            timeout=IDENTITY_BROKER_TIMEOUT_S,
+            challenge_id=cid,
+            digest=digest,
+        )
+    except BrokerUnavailable:
+        return _identity_note("identity_indeterminate", "broker")
+    result = reply.get("result") if reply.get("ok") else None
+    if result == "mismatch":
+        return _identity_note(_identity.WRONG_ACCOUNT)
+    if result != _identity.MATCH:
+        return _identity_note("identity_indeterminate", "expired")
+    verdict = _identity.admin_verdict(answer.get("admin"), privilege)
+    if verdict == _identity.MATCH:
+        return _identity_note(IDENTITY_MATCH)
+    if verdict == _identity.PRIVILEGE_MISMATCH:
+        return _identity_note(_identity.PRIVILEGE_MISMATCH)
+    return _identity_note("identity_indeterminate", "admin")
+
+
+def _broker_probe_account(
+    page: Any, site: str, entry: dict, sentinel: str | None, prove_url: str | None
+) -> str:
+    """`_broker_probe`, then — for a multi-account item (`prove_url` set) and
+    only after a VALID proof — the server identity proof in the same page:
+    ``match`` keeps VALID, ``logged_out`` is INVALID, any other verdict is
+    returned as its code (never VALID)."""
+    answer = _broker_probe(page, entry, sentinel)
+    if answer != PROOF_VALID or prove_url is None:
+        return answer
+    verdict = _client_identity_proof(page, site, entry, prove_url)
+    if verdict == IDENTITY_MATCH:
+        return PROOF_VALID
+    if verdict == _identity.LOGGED_OUT:
+        return PROOF_INVALID
+    return verdict
+
+
+# One return per outcome of the proof, in the order they are decided.
+def _broker_check_entry(  # pylint: disable=too-many-return-statements
+    port: int,
+    site: str,
+    entry: dict,
+    *,
+    sentinel: str | None = None,
+    claims_account: bool | None = None,
 ) -> int:
     """`_broker_logged_in` for an entry already in hand (refused ones
     included): 0 logged in, 2 not (or cannot tell). `sentinel`: a candidate
-    instead of the item's (`logged-in -x`): a DOM-only question that claims
-    no account, so the identity gate (`_broker_identity_gate`) is skipped."""
-    if sentinel is None:
-        gated = _broker_identity_gate(site)
-        if gated is not None:
-            return gated
+    instead of the item's. `claims_account` (default: no candidate): the
+    answer says the ITEM'S account is logged in, so the WS5 gate
+    (`_broker_identity_gate`) runs first and a multi-account item needs the
+    server identity proof; `logged-in -x CSS` is a DOM-only question that
+    claims no account and skips both — but never runs in another instance's
+    browser (`_instance_gate`)."""
+    claims = sentinel is None if claims_account is None else claims_account
+    gated = (
+        _broker_identity_gate(site, port)
+        if claims
+        else _instance_gate(site, entry, port)
+    )
+    if gated is not None:
+        return gated
     check_url = str(entry.get("check_url") or "")
     legacy = not (
         sentinel or entry.get("logged_in_selector") or _broker_has_server_proof(site)
@@ -11454,12 +11859,29 @@ def _broker_check_entry(
         _result_fail("client-proof", "logged_out", "no https check URL")
         return _broker_fail(2, f"{site}: the broker lists no https check URL.")
 
+    prove_url = url if claims and _identity_needed(site) else None
     proof = _with_prepared_background_page(
         port,
         url,
         _broker_probe_prepare,
-        lambda page: _broker_probe(page, entry, sentinel),
+        lambda page: _broker_probe_account(page, site, entry, sentinel, prove_url),
     )
+    if prove_url is not None and proof in _IDENTITY_MESSAGES:
+        code = str(proof)
+        detail = _RESULT.get("identity_detail") or _RESULT.get("identity_why") or ""
+        cleared = ""
+        if code == "wrong_account":
+            cleared = _broker_clear_foreign(port, site, entry)
+        _result_fail("client-proof", code, detail)
+        return _broker_fail(
+            2,
+            f"{site}: {_IDENTITY_MESSAGES[code]}{cleared} (checked {_tab_hint(url)}).",
+        )
+    if proof == PROOF_VALID and not claims:
+        # A DOM-only answer: says nothing about which account (nor its age).
+        _result_set(phase="ok", code="ok")
+        print(f"✓ sentinel present on {site} (checked {_tab_hint(url)}).")
+        return 0
     if proof == PROOF_VALID:
         _result_set(phase="ok", code="ok")
         _broker_note_session_age(site, entry)
@@ -12132,7 +12554,10 @@ def _broker_inject_phase(bundle: dict, n_cookies: int, n_keys: int) -> None:
         _result_fail("storage-inject", "storage_failed", f"{n_keys} of {want} keys")
 
 
-def _broker_already(port: int, site: str) -> int | None:
+# One return per verdict of the free check, in the order they are decided.
+def _broker_already(  # pylint: disable=too-many-return-statements
+    port: int, site: str
+) -> int | None:
     """`_broker_login`'s free check: logged in → its token kept fresh
     (`_broker_keep_fresh`) and the follow-up's exit code — or, when its
     session is due for renewal (`_SESSION_DUE`), None with ``renewal: due``;
@@ -12145,6 +12570,13 @@ def _broker_already(port: int, site: str) -> int | None:
     rc = _broker_logged_in(port, site)
     if rc == 2 and _RESULT.get("code") == "access_gated":
         return 2  # off-LAN: the broker could not reach it either
+    # A `wrong_account` check has already cleared the foreign session
+    # (`_broker_clear_foreign`): logged out now — the normal login goes on.
+    if rc == 2 and _RESULT.get("code") in IDENTITY_STOP_CODES:
+        # WS5: a login cannot fix these (wrong admin rights) or could not be
+        # proven afterwards (the broker blocks or rate-limits the site's
+        # account checks, the site's API cannot tell) — no broker request.
+        return 2
     if rc == 0:
         _result_set(route="already")
         if (
@@ -12189,7 +12621,7 @@ def _broker_login(port: int, site: str) -> int:
     """
     _BROKER_REFUSALS.pop(site, None)
     _result_set(broker_site=site, route="broker")
-    gated = _broker_identity_gate(site)  # before any check, request or inject
+    gated = _broker_identity_gate(site, port)  # before any check, request or inject
     if gated is not None:
         return gated
     candidate = _LOGIN_OPTS.get("candidate")
@@ -12249,14 +12681,22 @@ def _broker_login_gated(  # pylint: disable=too-many-return-statements
     if failed is not None:
         return failed
     _deadline_step("broker:verify")
-    if _broker_check_entry(port, site, entry, sentinel=candidate or None) != 0:
+    # The verify claims the item's account (a candidate sentinel included):
+    # a multi-account item passes only with the server identity proof.
+    if (
+        _broker_check_entry(
+            port, site, entry, sentinel=candidate or None, claims_account=True
+        )
+        != 0
+    ):
         # Only when the site's API itself rejected the injected session (a
         # server proof said `invalid`) — never on a missing sentinel, a 4xx or
         # a slow SPA, which may still hold a working session. Only values that
         # are still exactly the bundle's go (a session another login installed
         # meanwhile stays); a candidate check never undoes.
         dead = _RESULT.get("server_proof") == PROOF_INVALID and not candidate
-        _broker_inject_phase(bundle, n_cookies, n_keys)
+        if _RESULT.get("code") not in _IDENTITY_MESSAGES:  # keep a WS5 verdict
+            _broker_inject_phase(bundle, n_cookies, n_keys)
         if dead:
             _result_set(rollback=_broker_undo_injection(port, site, bundle))
         return _broker_fail(
@@ -12336,7 +12776,7 @@ def cmd_try_sentinel(port: int, site_name: str, sentinel: str) -> int:
     free: PRESENT on the check page in the shared browser (status, origin,
     visible) and ABSENT there in a fresh logged-out profile inside the broker
     (op `sentinel_absent`: no secret, no limiter). Exit 0 only when both hold."""
-    site = site_name.strip().lower()
+    site = _broker_canonical_site(site_name.strip().lower())
     try:
         entry = _broker_site(site)
     except BrokerUnavailable as exc:
@@ -12403,6 +12843,11 @@ def cmd_broker_logout(port: int, site_name: str) -> int:
     site = site_name.strip().lower()
     try:
         entry = _broker_site(site)
+        # WS5: never clear a session in another instance's browser (that
+        # would be a sibling account's), nor drop the profile from there.
+        wrong = None if entry is None else _instance_gate(site, entry, port, "logout")
+        if wrong is not None:
+            return wrong
         resp = _broker_request("logout", site=site)
     except BrokerUnavailable as exc:
         return _broker_fail(3, str(exc))
@@ -12420,27 +12865,75 @@ def cmd_broker_logout(port: int, site_name: str) -> int:
             f"{site} is not listed by the broker — its cookie scope is unknown, so "
             "no cookie in the shared browser was touched.",
         )
+    names = _item_cookie_names(entry)
+    gone = _broker_clear_cookies(port, site, entry, names, why="logout")
+    print(f"✓ deleted {gone} {site} cookie(s) from the shared browser.")
+    return 0
+
+
+def _broker_clear_cookies(
+    port: int, site: str, entry: dict, names: list[str] | None, *, why: str
+) -> int:
+    """Delete `site`'s cookies (its cookie hosts; only `names` when given)
+    from THIS browser under the interaction lease; how many went. Nothing
+    else: no storage, never the broker's profile."""
     hosts = [str(h) for h in entry.get("cookie_hosts") or []]
-    raw_names = entry.get("cookie_names")
-    names = [str(n) for n in raw_names] if isinstance(raw_names, list) else None
     pw, browser = _connect(port)
     try:
-        with _interaction_lease(f"logout {site}"):
+        with _interaction_lease(f"{why} {site}"):
             ctx = browser.contexts[0] if browser.contexts else browser.new_context()
-            gone = 0
-            for ck in ctx.cookies():
-                if _broker_cookie_in_scope(
-                    str(ck.get("domain")), str(ck.get("name")), hosts, names
-                ):
-                    ctx.clear_cookies(
-                        name=ck["name"], domain=ck["domain"], path=ck["path"]
-                    )
-                    gone += 1
+            doomed = _scope_cookies(ctx.cookies(), hosts, names)
+            for ck in doomed:
+                ctx.clear_cookies(name=ck["name"], domain=ck["domain"], path=ck["path"])
     finally:
         browser.close()
         pw.stop()
-    print(f"✓ deleted {gone} {site} cookie(s) from the shared browser.")
-    return 0
+    return len(doomed)
+
+
+def _scope_cookies(
+    cookies: Sequence[Mapping[str, Any]], hosts: Sequence[str], names: list[str] | None
+) -> list[Mapping[str, Any]]:
+    """The cookies of a site's scope: on its cookie hosts or their
+    subdomains (never a parent domain), identity-provider hosts only when
+    named exactly, only `names` when given (`_broker_cookie_in_scope`)."""
+    return [
+        ck
+        for ck in cookies
+        if _broker_cookie_in_scope(
+            str(ck.get("domain")), str(ck.get("name")), hosts, names
+        )
+    ]
+
+
+def _item_cookie_names(entry: dict) -> list[str] | None:
+    """The item's `cookie_names` allowlist, None when it has none."""
+    raw = entry.get("cookie_names")
+    return [str(n) for n in raw] if isinstance(raw, list) else None
+
+
+def _broker_clear_foreign(port: int, site: str, entry: dict) -> str:
+    """The identity proof found ANOTHER account's session in THIS browser:
+    delete it here at once — the item's cookies on its cookie hosts and
+    their subdomains, its `cookie_names` only when it has them (as `logout`
+    does); never storage, never the broker's profile (that holds the RIGHT
+    account). No sibling may live in this instance (the broker refuses two
+    accounts of one site per instance), so such a session is always
+    foreign. The next check then sees no sentinel: no further challenge, no
+    further mismatch for the broker's guard. Not a login: no gate applies.
+    Returns the message suffix (fixed words and a count)."""
+    try:
+        gone = _broker_clear_cookies(
+            port, site, entry, _item_cookie_names(entry), why="clear-foreign"
+        )
+    except Exception as exc:  # pylint: disable=broad-exception-caught
+        _result_set(foreign_cleared=None)
+        return f" — the foreign session could NOT be cleared ({type(exc).__name__})"
+    _result_set(foreign_cleared=gone)
+    return (
+        f" — foreign session cleared ({gone} cookie(s) in this browser; storage "
+        "and the broker's profile untouched)"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -12457,13 +12950,13 @@ def cmd_broker_logout(port: int, site_name: str) -> int:
 SAFARI_FIX = "open the site in Safari and log in, then run ./agent-login.py -t {site}"
 
 
-def _safari_gated_entry(site: str) -> tuple[dict | None, int]:
+def _safari_gated_entry(site: str, port: int) -> tuple[dict | None, int]:
     """`_safari_entry_or_rc`, then the WS5 identity gate: a Safari import of a
     multi-account site would overwrite a sibling account's session."""
     entry, rc = _safari_entry_or_rc(site)
     if entry is None:
         return None, rc
-    gated = _broker_identity_gate(site)
+    gated = _broker_identity_gate(site, port)  # also: the item's browser instance
     return (None, gated) if gated is not None else (entry, 0)
 
 
@@ -12599,9 +13092,9 @@ def cmd_import_safari(
 
 def _import_safari(port: int, site: str, *, dry_run: bool) -> int:
     """`cmd_import_safari`'s body."""
-    entry, rc = _safari_gated_entry(site)
+    entry, rc = _safari_gated_entry(site, port)
     if entry is None:
-        if _RESULT.get("code") != "identity_unproven":
+        if _RESULT.get("code") not in IDENTITY_GATE_CODES:
             _result_fail(
                 "precheck", "broker_unavailable" if rc == 3 else "unknown_site"
             )
@@ -12627,7 +13120,8 @@ def _import_safari(port: int, site: str, *, dry_run: bool) -> int:
         _record_login_event(site, "safari")
         print(f"✅ {site}: logged in with your Safari session.")
         return 0
-    _result_fail("client-proof", "logged_out")
+    if _RESULT.get("code") not in _IDENTITY_MESSAGES:  # keep an identity verdict
+        _result_fail("client-proof", "logged_out")
     return _broker_fail(
         rc,
         f"{site}: Safari session copied but the site is NOT logged in — "
@@ -12673,7 +13167,7 @@ def _safari_login(port: int, site: str) -> int:
     """`login SITE` for a Safari-import site: Safari session first, then — only
     for sites with ``broker_fallback`` and a non-refused broker item — the broker.
     Prints the route it used."""
-    entry, rc = _safari_gated_entry(site)  # before the import or a broker login
+    entry, rc = _safari_gated_entry(site, port)  # before the import or a login
     if entry is None:
         return rc
     if _broker_check_entry(port, site, entry) == 0:
@@ -13935,9 +14429,45 @@ def cmd_assisted_login(port: int, req: GuidedRequest) -> int:
         return _assisted_login_tty(tty, port, req)
 
 
+def _guided_instance_gate(key: str, port: int) -> int | None:
+    """WS5 gate of a guided login of a non-static site: it must be a broker
+    item listed under its own id (an alias is refused: name the site id) in
+    THIS browser instance. Exit 2 when it cannot be confirmed — never a
+    guided login that skipped the gate."""
+    try:
+        entry = _broker_site(key)
+        alias_of = None if entry is not None else _broker_alias_target(key)
+    except BrokerUnavailable as exc:
+        return _broker_fail(
+            2,
+            f"{key}: cannot confirm its browser instance — the login broker does "
+            f"not answer ({exc}); nothing started.",
+        )
+    if alias_of is not None:
+        return _broker_fail(
+            2,
+            f"{key} is an alias — start the guided login with the site id: "
+            f"browser.py assisted-login {alias_of}",
+        )
+    if entry is None:
+        return _broker_fail(
+            2,
+            f"{key}: not a built-in site and not listed by the login broker — "
+            "nothing started.",
+        )
+    return _instance_gate(key, entry, port, "assisted-login")
+
+
 def _assisted_precheck(tty: Any, port: int, req: GuidedRequest) -> int | None:
     """Before the transaction: a start URL, a running browser, already logged
-    in, the typed confirmation. An exit code, or None to go ahead."""
+    in, the typed confirmation. An exit code, or None to go ahead. A broker
+    item of another browser instance is refused first (WS5: the login would
+    land in a browser where its sibling account lives)."""
+    key = req.site.strip().lower()
+    if not _is_static_site(key):
+        wrong = _guided_instance_gate(key, port)
+        if wrong is not None:
+            return wrong
     start = _guided_start_url(req.site, req.url)
     if start is None and _static_site_name(req.site) not in GUIDED_BUILTIN_WINDOW:
         print(
@@ -14144,6 +14674,10 @@ def _resolve_site(name: str, *, for_login: bool = False) -> Site:
         entry, reason = None, f" ({exc})"
     if entry is not None and not entry.get("refused"):
         return _broker_site_obj(key)
+    target = None if entry is not None or reason else _broker_alias_target(key)
+    if target is not None:  # WS5: a group's default member (after ids, never before)
+        _note_alias(key, target)
+        return _broker_site_obj(target)
     if entry is not None:
         reason = f" (agent-logins item refused: {entry.get('reason') or '?'})"
     avail = "\n".join(f"  {s.name:<10} {s.blurb}" for s in _sites())
@@ -14288,10 +14822,90 @@ def _fail(msg: str) -> int:
     return 1
 
 
+# Subcommands that follow a broker item into its browser instance (WS5).
+_INSTANCE_ROUTED_CMDS = frozenset({"login", "logged-in"})
+# Set on the re-executed process: it never routes again.
+INSTANCE_ROUTED_ENV = "CLAUDE_BROWSER_INSTANCE_ROUTED"
+
+
+# The routing lookup runs before the command's deadline: short.
+INSTANCE_ROUTE_TIMEOUT_S = 10.0
+
+
+def _instance_pinned(args: argparse.Namespace) -> bool:
+    """This process is pinned to ONE browser: an explicit non-default
+    instance, any `--cdp-port` on the command line (`_self_run` always passes
+    one), a CDP port or cache dir override, a guided login's child, or a run
+    that was already routed. A pinned run is never re-executed into another
+    instance — the gate refuses it with ``wrong_instance``."""
+    return bool(
+        INSTANCE
+        or getattr(args, "cdp_port_given", False)
+        or os.environ.get("CLAUDE_BROWSER_CDP_PORT")
+        or os.environ.get("CLAUDE_BROWSER_CACHE_DIR")
+        or os.environ.get("CLAUDE_BROWSER_MAINTENANCE")
+        or os.environ.get(INSTANCE_ROUTED_ENV)
+        or args.cdp_port != INSTANCE_PORTS[INSTANCE]
+    )
+
+
+def _instance_route(args: argparse.Namespace) -> str | None:
+    """The browser instance `login`/`logged-in SITE` must run in when it is
+    not this one and this run may follow it (`_instance_pinned`), else None
+    (static sites, broker down or slow, an unlisted site: the command
+    reports). One short `sites` request; the re-run looks up on its own."""
+    site = getattr(args, "site", None)
+    if (
+        args.cmd not in _INSTANCE_ROUTED_CMDS
+        or not site
+        or _instance_pinned(args)
+        or _is_static_site(str(site).strip().lower())
+    ):
+        return None
+    key = str(site).strip().lower()
+    try:  # its own id, else the alias's member (the re-run says so itself)
+        _broker_sites(timeout=INSTANCE_ROUTE_TIMEOUT_S)
+        entry = _broker_site(key) or _broker_site(_broker_alias_target(key) or "")
+    except BrokerUnavailable:
+        entry = None
+    inst = _identity.instance_of(entry) if entry is not None else INSTANCE
+    return inst if inst != INSTANCE and inst in INSTANCE_PORTS else None
+
+
+def _reexec_in_instance(inst: str) -> None:
+    """Run this very command again in browser instance `inst` (never returns)."""
+    print(
+        f"↪ {' '.join(sys.argv[1:3])}: the item lives in the {inst} browser "
+        f"instance — running it as {_instance_prefix(inst)}browser.py …",
+        file=sys.stderr,
+    )
+    sys.stderr.flush()
+    sys.stdout.flush()
+    env = {**os.environ, "CLAUDE_BROWSER_INSTANCE": inst, INSTANCE_ROUTED_ENV: "1"}
+    script = os.path.realpath(__file__)
+    os.execve(sys.executable, [sys.executable, script, *sys.argv[1:]], env)
+
+
 def main() -> int:
     """Parse, bootstrap, and dispatch; a timed-out Playwright attach is a ❌ line."""
     args = parse_args()
     ensure_deps()
+    # WS5: `login`/`logged-in` of a broker item that lives in a role instance
+    # (admin/alt) run there — before any registration, gate or journal entry
+    # of THIS instance. A pinned run is refused by the gate instead.
+    inst = _instance_route(args)
+    if inst is not None:
+        _reexec_in_instance(inst)
+    if (
+        os.environ.get(INSTANCE_ROUTED_ENV)
+        and args.cdp_port != INSTANCE_PORTS[INSTANCE]
+    ):
+        # A routed re-run drives its instance's own browser, nothing else.
+        return _broker_fail(
+            2,
+            f"routed into the {INSTANCE or 'default'} browser instance, but the "
+            f"run names CDP port {args.cdp_port} — refusing (wrong_instance).",
+        )
     # Say what we are doing BEFORE anything attaches over CDP: this is the
     # `purpose` every client registration reports to whoever waits on the gate.
     site = getattr(args, "site", None)

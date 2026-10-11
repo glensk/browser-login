@@ -1154,7 +1154,10 @@ def _ask(path, obj, raw=None):
     with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as s:
         s.settimeout(30)
         s.connect(path)
-        s.sendall(raw if raw is not None else json.dumps(obj).encode() + b"\n")
+        # A `forbidden` answer comes without reading the request: the send
+        # may then fail (EPIPE) while the answer already waits to be read.
+        with contextlib.suppress(BrokenPipeError, ConnectionResetError):
+            s.sendall(raw if raw is not None else json.dumps(obj).encode() + b"\n")
         chunks: list[bytes] = []
         while not chunks or not chunks[-1].endswith(b"\n"):
             chunk = s.recv(65536)
@@ -3169,6 +3172,51 @@ def test_selfcheck_secret_run_checks(tmp_path):
     assert verdicts["secret-runs.json"] is True
     assert verdicts["secret-limiter.json"] is False
     assert verdicts["leakcheck-labels.json"] is True  # not created yet
+
+
+def test_selfcheck_forbidden_probe_survives_the_early_close(
+    sockdir, tmp_path, monkeypatch
+):
+    """The broker answers `forbidden` and closes without reading: when it
+    wins the race, the probe's send fails (EPIPE) — the answer is still
+    read. Made deterministic: the probe sends only after the close."""
+    real = socket.socket
+
+    class LateSender(real):  # type: ignore[misc,valid-type]
+        def sendall(self, *a, **k):  # pylint: disable=signature-differs
+            time.sleep(0.3)  # the broker has answered and closed by now
+            return super().sendall(*a, **k)
+
+    with running(sockdir, tmp_path, StubRunner(), allow_uid=os.getuid() + 1) as (
+        _b,
+        path,
+    ):
+        monkeypatch.setattr(selfcheck.socket, "socket", LateSender)
+        ok, msg = selfcheck.probe_forbidden(Path(path))
+        monkeypatch.setattr(selfcheck.socket, "socket", real)
+    assert ok and "forbidden" in msg, msg
+
+
+def test_selfcheck_forbidden_probe_fails_on_a_silent_close(sockdir):
+    """A socket that closes without a word is "no answer" — never a pass,
+    also now that a failed send is tolerated."""
+    path = os.path.join(str(sockdir), "silent.sock")
+    srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    srv.bind(path)
+    srv.listen(1)
+
+    def close_at_once():
+        conn, _ = srv.accept()
+        conn.close()
+
+    thread = threading.Thread(target=close_at_once, daemon=True)
+    thread.start()
+    try:
+        ok, msg = selfcheck.probe_forbidden(Path(path), timeout=5)
+    finally:
+        thread.join(5)
+        srv.close()
+    assert not ok and "got no answer" in msg
 
 
 def test_selfcheck_forbidden_probe(sockdir, tmp_path):
