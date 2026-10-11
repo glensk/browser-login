@@ -60,6 +60,9 @@ manual acceptance steps under the attempt policy below.
   release under `/usr/local/libexec/login-broker/releases`.
 - **Debate.** Once the root cause is found: `codex-debate` mode=diagnose (no Codex seat →
   `opus-plan-critique`). Every root cause gets a sanitized fixture plus a regression test.
+- **Tests never contain credential-shaped literals** (a quoted fake password assigned to a password field): the repo's git-secrets
+  hook blocks the commit. Generate fake values at runtime (`secrets.token_hex`), or build
+  action words from parts. This blocked 3 releases on 2026-10-11.
 - **Never** page text in `agents.md` (prompt-injection surface). Show phase codes and fixed
   text only.
 
@@ -265,7 +268,7 @@ manual acceptance steps under the attempt policy below.
         an agent secret (needs Touch ID), and drop the browser item.
   - [ ] mullvad: account-number login with no password. Albert 2026-10-11: teach the broker
         (`agent_login_mode=username-only`), builder running.
-  - [ ] portainer-ds218: root cause = OUR bug. The strict proof's `goto(check_url)` was a hash-only
+  - [x] portainer-ds218 ✅ promoted 2026-10-11 (fix 535e692, broker 535e692552ed). Root cause = OUR bug. The strict proof's `goto(check_url)` was a hash-only
         (same-document) navigation, so Playwright returns None → status 0 → indeterminate. The
         login itself worked. Jellyfin is hit the same way. Fix: `load_document` via about:blank
         + a proof reason channel (builder running). 1 `unknown` on the limiter (no reset); release
