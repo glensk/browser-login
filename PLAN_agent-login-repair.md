@@ -253,7 +253,8 @@ manual acceptance steps under the attempt policy below.
             a grace period that resets on navigation; never click);
       - snapshot the challenge page at detection time;
       - no `fresh_login` for myfritz (it would drop CLOUD_SSO_DEVICE).
-    - [ ] Albert decided 2026-10-11: MERGE the Alzenau box into the gmail MyFRITZ account,
+    - [x] Merge done 2026-10-11 ~15:20 by session status-35 via Albert's Safari: the Alzenau 7520 is now on albert.glensk@gmail.com (both boxes on /devices). `myfritz-alzenau` was removed from the agent-login collection (main session, Safari); broker list verified. Pending: Touch ID batch renames the prilly item to site `myfritz` + sentinel `#dropdownMenuButtonHeader`; captcha fix.
+    - [ ] (old) Albert decided 2026-10-11: MERGE the Alzenau box into the gmail MyFRITZ account,
           then remove `myfritz-alzenau` and keep one `myfritz` site. Waits on the box
           re-registration (FRITZ!Box UI → Internet → MyFRITZ!-Konto) plus the confirmation
           mail in Gmail, which the main session can click.
