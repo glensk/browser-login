@@ -176,6 +176,7 @@ from typing import Any, NamedTuple
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.realpath(__file__))))
 # pylint: disable=wrong-import-position
 import agent_login_state as _als  # noqa: E402
+from broker import identity as _identity  # noqa: E402
 from broker import phases as _phases  # noqa: E402
 from broker import safari_cookies as _safari  # noqa: E402
 from broker.bundle import IDP_HOSTS as BROKER_IDP_HOSTS  # noqa: E402
@@ -9809,6 +9810,37 @@ def _broker_site(site: str) -> dict | None:
     return None
 
 
+def _broker_identity_gate(site: str) -> int | None:
+    """WS5 S0 (tp#833): exit 2 when `site` shares its cookie scope with a
+    broker item of another account (``broker.identity.scope_conflicts``),
+    else None. Such an item's logged-in proof says "someone is logged in",
+    never WHICH account, and its login would overwrite a sibling's session:
+    it is never ✅ and never logged in until the server identity proof (S2,
+    a broker advertising ``identity_v >= 1``) exists — fail closed, also
+    against a rolled-back broker. Broker unreachable: None (the caller's own
+    lookup reports it)."""
+    try:
+        siblings = _identity.scope_conflicts(_broker_sites()).get(site)
+    except BrokerUnavailable:
+        return None
+    if not siblings:
+        return None
+    names = ", ".join(siblings)
+    _result_fail(
+        "client-proof",
+        "identity_unproven",
+        f"shares its login with {names}",
+        multi_account=True,
+        shares_login_with=list(siblings),
+    )
+    return _broker_fail(
+        2,
+        f"{site}: account unproven: shares its login with {names} — the check "
+        "cannot tell which account the shared browser holds (nothing checked, "
+        "nothing logged in).",
+    )
+
+
 def _broker_cookie_in_scope(
     domain: str, name: str, hosts: Sequence[str], names: Sequence[str] | None
 ) -> bool:
@@ -11387,7 +11419,12 @@ def _broker_check_entry(
 ) -> int:
     """`_broker_logged_in` for an entry already in hand (refused ones
     included): 0 logged in, 2 not (or cannot tell). `sentinel`: a candidate
-    instead of the item's (`logged-in -x`)."""
+    instead of the item's (`logged-in -x`): a DOM-only question that claims
+    no account, so the identity gate (`_broker_identity_gate`) is skipped."""
+    if sentinel is None:
+        gated = _broker_identity_gate(site)
+        if gated is not None:
+            return gated
     check_url = str(entry.get("check_url") or "")
     legacy = not (
         sentinel or entry.get("logged_in_selector") or _broker_has_server_proof(site)
@@ -12141,6 +12178,9 @@ def _broker_login(port: int, site: str) -> int:
     """
     _BROKER_REFUSALS.pop(site, None)
     _result_set(broker_site=site, route="broker")
+    gated = _broker_identity_gate(site)  # before any check, request or inject
+    if gated is not None:
+        return gated
     candidate = _LOGIN_OPTS.get("candidate")
     _deadline_step("broker:precheck")
     if not candidate:  # the free check first: logged in = done, gates or not
@@ -12406,6 +12446,16 @@ def cmd_broker_logout(port: int, site_name: str) -> int:
 SAFARI_FIX = "open the site in Safari and log in, then run ./agent-login.py -t {site}"
 
 
+def _safari_gated_entry(site: str) -> tuple[dict | None, int]:
+    """`_safari_entry_or_rc`, then the WS5 identity gate: a Safari import of a
+    multi-account site would overwrite a sibling account's session."""
+    entry, rc = _safari_entry_or_rc(site)
+    if entry is None:
+        return None, rc
+    gated = _broker_identity_gate(site)
+    return (None, gated) if gated is not None else (entry, 0)
+
+
 def _safari_entry_or_rc(site: str) -> tuple[dict | None, int]:
     """(broker entry, 0) when `site` may be imported from Safari, else (None, rc)."""
     if site not in _safari.SAFARI_SITES:
@@ -12538,9 +12588,12 @@ def cmd_import_safari(
 
 def _import_safari(port: int, site: str, *, dry_run: bool) -> int:
     """`cmd_import_safari`'s body."""
-    entry, rc = _safari_entry_or_rc(site)
+    entry, rc = _safari_gated_entry(site)
     if entry is None:
-        _result_fail("precheck", "broker_unavailable" if rc == 3 else "unknown_site")
+        if _RESULT.get("code") != "identity_unproven":
+            _result_fail(
+                "precheck", "broker_unavailable" if rc == 3 else "unknown_site"
+            )
         return rc
     cookies, rc = _safari_site_cookies(site)
     if rc:
@@ -12609,7 +12662,7 @@ def _safari_login(port: int, site: str) -> int:
     """`login SITE` for a Safari-import site: Safari session first, then — only
     for sites with ``broker_fallback`` and a non-refused broker item — the broker.
     Prints the route it used."""
-    entry, rc = _safari_entry_or_rc(site)
+    entry, rc = _safari_gated_entry(site)  # before the import or a broker login
     if entry is None:
         return rc
     if _broker_check_entry(port, site, entry) == 0:

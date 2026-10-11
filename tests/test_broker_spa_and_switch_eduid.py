@@ -460,6 +460,7 @@ def _refusing_broker(monkeypatch, error: str, detail: str) -> list[str]:
         return {"ok": False, "error": error, "detail": detail}
 
     monkeypatch.setattr(browser, "_broker_login", _REAL_BROKER_LOGIN)
+    monkeypatch.setattr(browser, "_broker_sites", lambda: [{"site": "eduid"}])
     monkeypatch.setattr(browser, "_broker_logged_in", lambda port, site: 2)
     monkeypatch.setattr(browser, "_connect", lambda port: (_FakePw(), _FakeBrowser()))
     monkeypatch.setattr(browser, "_broker_request", request)

@@ -90,6 +90,10 @@ CODE_TEXT = {
     "browser_down": "the shared Chromium is down — not checked",
     "state_unreadable": "agent-login's site state is unreadable",
     "needs_sentinel_old_proof": "no sentinel yet — checked with the old, weaker proof",
+    # WS5 (tp#833): the item shares its cookie scope with another account.
+    "identity_unproven": (
+        "account unproven: the site shares its login with another account"
+    ),
 }
 
 # Broker error code -> phase, for replies WITHOUT a phase (an older broker).

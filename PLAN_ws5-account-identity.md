@@ -115,22 +115,32 @@ value.
 
 ### S0 — client guard, fail closed (bin/browser.py only; ships first)
 
-- [ ] A pure function `scope_conflicts(sites)` (new module `broker/identity.py`, imported by
+- [x] A pure function `scope_conflicts(sites)` (new module `broker/identity.py`, imported by
       browser.py like `broker.recipes`): items conflict when their `cookie_hosts`
       domain-match in either direction (parent domains included: `docker.com` covers
       `app.docker.com`) or they share a storage origin. Cookie names and paths are
       ignored, on purpose: over-inclusion only costs a refusal, never a wrong account.
       Instance = the entry's `instance` field, absent = `""`. Declared same-account
       pairs (`same_account_as`) do not conflict.
-- [ ] In `_broker_check_entry`: an item that conflicts with another item → `multi_account`.
+- [x] In `_broker_check_entry`: an item that conflicts with another item → `multi_account`.
       A multi-account item passes only through the identity proof (S2). Until then (and
       whenever the broker does not advertise `identity_v >= 1` in `sites`) → exit 2,
       phase `client-proof`, code `identity_unproven`. A rollback of the broker to a
       pre-WS5 release therefore keeps the client closed.
-- [ ] Tests (`tests/test_ws5_client.py`): the tp#833 regression (three gitlab entries, all
+- [x] Tests (`tests/test_ws5_client.py`): the tp#833 regression (three gitlab entries, all
       sentinels visible → every one exits 2 `identity_unproven`); parent-domain overlap;
       storage-only overlap; disjoint hosts pass as before; a pre-WS5 `sites` view (no
       `identity_v`) stays closed.
+- [x] Built 2026-10-11 (worktree, not yet released). Additions beyond the boxes above,
+      per the overseer's S0 brief: fill-origin hosts join the scope too (conservative; no
+      live difference); same-account needs BOTH items to name each other; refused items
+      take part. `login` (broker, Safari import and Safari login) refuses at its start,
+      before the free check, any broker request or injection; `logged-in -x CSS` (a
+      DOM-only sentinel question) is not gated. agent-login: rows carry
+      `shares_login_with`, state `unproven` (never ✅; agents.md `⚠ … account unproven
+      (shares login with …)`, fixed text), `-x` column `shares_login`, `-p` refuses,
+      `-c` neither checks nor logs them in (records `client-proof` · `identity_unproven`
+      as "could not tell", no mail). Live snapshot: exactly the 8 groups of the table.
 
 ### S1 — broker (release via install.sh; after the WS1a broker release)
 

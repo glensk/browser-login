@@ -104,6 +104,7 @@ from agent_login_jobs import (  # noqa: E402
     wait_for_network,
 )
 from broker import phases, safari_cookies  # noqa: E402
+from broker.identity import scope_conflicts  # noqa: E402
 from broker.recipes import DEFAULT_CHECK_URLS, REFRESH_MIN_LEFT_S  # noqa: E402
 from broker.vault import NO_SUBMIT_SITES, SITE_ID_RE, selector_ok  # noqa: E402
 
@@ -485,6 +486,7 @@ def overview(*, fresh: bool = False) -> dict:
     except als.StateError:
         stages = {}
     safari = safari_state([t.site for t in TARGETS if t.flow == SAFARI_FLOW])
+    shared = scope_conflicts(sites)  # WS5: items sharing a login with another account
     rows = []
     for t in TARGETS:
         status, detail = classify(t, listed, readable=readable)
@@ -500,6 +502,7 @@ def overview(*, fresh: bool = False) -> dict:
                 "detail": detail,
                 "in_bitwarden": bool(entry.get("fill_origins")),
                 **_broker_fields(entry),
+                "shares_login_with": list(shared.get(t.broker_site or t.site, ())),
                 **_stage_fields(stages.get(t.broker_site or t.site)),
                 **safari.get(t.site, {}),
             }
@@ -526,6 +529,7 @@ def overview(*, fresh: bool = False) -> dict:
                 "detail": detail,
                 "in_bitwarden": bool(entry.get("fill_origins")),
                 **_broker_fields(entry),
+                "shares_login_with": list(shared.get(site, ())),
                 **_stage_fields(stages.get(site)),
             }
         )
@@ -543,6 +547,7 @@ def overview(*, fresh: bool = False) -> dict:
                     "detail": "broker unreadable — known from earlier runs",
                     "in_bitwarden": None,
                     **_broker_fields({}),
+                    "shares_login_with": [],
                     **_stage_fields(stages.get(site)),
                 }
             )
@@ -627,7 +632,7 @@ def agent_summary(data: dict, checks: dict[str, dict]) -> str:
     texts, fixed reasons and hints) and validated identifiers (static names,
     site ids, the expected claude.ai account) — never a detail, a broker
     reason, a screenshot path or anything a page said."""
-    ok_lines, check_lines, bad_lines = [], [], []
+    ok_lines, check_lines, warn_lines, bad_lines = [], [], [], []
     for row in sorted(data["rows"], key=lambda r: str(r["name"]).lower()):
         name = _summary_name(row)
         if name is None:
@@ -650,6 +655,8 @@ def agent_summary(data: dict, checks: dict[str, dict]) -> str:
             if needs_sentinel(row):
                 how += " — weak proof (no sentinel yet)"
             ok_lines.append(f"- ✅ {name} (`{browser_site(site)}`): {how}")
+        elif state == "unproven":
+            warn_lines.append(f"- ⚠ {name} (`{site}`): {unproven_text(row)}")
         elif state in _CHECK_FIRST:
             check_lines.append(
                 f"- ❓ {name} (`{browser_site(site)}`): {_CHECK_FIRST[state]} — "
@@ -671,6 +678,7 @@ def agent_summary(data: dict, checks: dict[str, dict]) -> str:
         "",
         *ok_lines,
         *check_lines,
+        *warn_lines,
         *bad_lines,
         *agent_login_secrets.summary_lines(data.get("secrets") or []),
         "",
@@ -755,15 +763,35 @@ def _setup_problem(row: dict) -> str | None:
     return problem
 
 
+def shares_login(row: dict) -> list[str]:
+    """The validated site ids `row` shares its cookie scope with, when they
+    are another account (WS5, ``broker.identity.scope_conflicts``)."""
+    return [s for s in row.get("shares_login_with") or [] if SITE_ID_RE.match(s)]
+
+
+def unproven_text(row: dict) -> str:
+    """The fixed ⚠ text of a multi-account row (site ids only, never a name
+    read from Bitwarden or a page)."""
+    return (
+        f"account unproven (shares login with {', '.join(shares_login(row))}) — "
+        "the check cannot tell which account the shared browser holds; not "
+        "usable by agents, never logged in"
+    )
+
+
 def row_state(row: dict, checks: dict[str, dict]) -> tuple[str, str]:
     """(state, why) of one login: ``ok`` (setup complete AND the latest real
     check passed, fresh), ``stale`` (that ✅ is older than the max status
     age), ``unknown`` (the latest check could not tell), ``unreachable``
     (it met a Cloudflare Access login: off-LAN), ``unchecked``, ``failed``,
-    or ``setup`` (cannot work whatever a check says)."""
+    ``setup`` (cannot work whatever a check says), or ``unproven`` (it
+    shares its login with another account: never ✅ whatever a check said,
+    WS5)."""
     problem = _setup_problem(row)
     if problem:
         return "setup", problem
+    if shares_login(row):
+        return "unproven", unproven_text(row)
     site = row["site"]
     rec = checks.get(site)
     fresh = als.freshness(rec)
@@ -853,8 +881,15 @@ def print_overview(data: dict) -> None:
     print(f"  broker: {'🟢' if ok else '🔴'} {data['broker']}\n")
     checks = last_checks()
     judged = [(r, *row_state(r, checks)) for r in rows]
-    order = {"ok": 0, "stale": 1, "unknown": 1, "unreachable": 1, "unchecked": 1}
-    judged.sort(key=lambda x: (order.get(x[1], 2), x[0]["name"].lower()))
+    order = {
+        "ok": 0,
+        "stale": 1,
+        "unknown": 1,
+        "unreachable": 1,
+        "unchecked": 1,
+        "unproven": 2,
+    }
+    judged.sort(key=lambda x: (order.get(x[1], 3), x[0]["name"].lower()))
     width = max(len(r["name"]) for r in rows)
     col = "agent_fill_origins"
     icons = {
@@ -863,6 +898,7 @@ def print_overview(data: dict) -> None:
         "unknown": "❓",
         "unreachable": "❓",
         "unchecked": "❓",
+        "unproven": "⚠️",
     }
     print(_c("2", f"     {'login'.ljust(width)}  {col}  status"))
     for r, state, why in judged:
@@ -1455,7 +1491,10 @@ def schedule_gate(row: dict) -> tuple[str, str] | None:
 
 def check_only_gate(row: dict) -> tuple[str, str] | None:
     """`schedule_gate`, plus: a Safari site whose import must not run
-    unattended (``import_unattended``) is only checked by the daily run."""
+    unattended (``import_unattended``) is only checked by the daily run, and
+    a multi-account row (WS5) is never logged in."""
+    if shares_login(row):
+        return "identity_unproven", unproven_text(row)
     rule = safari_cookies.SAFARI_SITES.get(row["site"])
     if row.get("flow") == SAFARI_FLOW and rule is not None:
         if not rule.import_unattended:
@@ -1549,6 +1588,21 @@ def _record_unchecked(data: dict | None, code: str, why: str) -> None:
             record_check(row["site"], None, why, {"phase": "precheck", "code": code})
 
 
+def _unproven_skipped(row: dict) -> bool:
+    """`-c` for a multi-account row (WS5): no check can tell which account the
+    browser holds, so it is neither checked nor logged in — recorded as
+    "could not tell" with its code, never as a failure (no mail). True when
+    skipped."""
+    if not shares_login(row):
+        return False
+    how = unproven_text(row)
+    print(f"⚠️  {row['site']}: {how}")
+    record_check(
+        row["site"], None, how, {"phase": "client-proof", "code": "identity_unproven"}
+    )
+    return True
+
+
 def check_all(*, mail: bool = False) -> int:  # pylint: disable=too-many-branches
     """Every usable site (Safari or broker): logged in? If not — and a
     scheduled login is allowed (`schedule_gate`) — ONE `browser.py login -s`.
@@ -1591,7 +1645,7 @@ def check_all(*, mail: bool = False) -> int:  # pylint: disable=too-many-branche
                 {"phase": "precheck", "code": "broker_unavailable"},
             )
             continue
-        if row["status"] not in ("ready", "extra", "safari"):
+        if row["status"] not in ("ready", "extra", "safari") or _unproven_skipped(row):
             continue
         rule = safari_cookies.SAFARI_SITES.get(site)
         if rule is not None and not rule.auto:
@@ -1700,6 +1754,12 @@ def promote_refusal(site: str) -> str | None:  # pylint: disable=too-many-return
         return f"the broker refuses the item ({entry.get('reason') or '?'})"
     if not has_sentinel(entry):
         return "the item has no agent_logged_in_selector"
+    siblings = scope_conflicts(sites).get(site)
+    if siblings:
+        return (
+            f"account unproven: shares its login with {', '.join(siblings)} "
+            "(WS5: no proof of WHICH account the browser holds)"
+        )
     if als.quarantined(site):
         return f"quarantined — release first: ./agent-login.py -Q {site}"
     rec = als.checks().get(site)
@@ -1783,7 +1843,10 @@ def matrix_rows(data: dict, checks: dict[str, dict]) -> list[dict]:
                     "storage_origins": row.get("storage_origins") or [],
                 },
                 "attempt_group": row.get("attempt_group") or "",
-                "refresh": refresh_policy(row),
+                "shares_login": ",".join(shares_login(row)),
+                "refresh": "none (account unproven)"
+                if shares_login(row)
+                else refresh_policy(row),
                 "stage": row.get("stage")
                 or ("n/a" if row["status"] in ("assisted", "safari") else "unknown"),
                 "quarantine": bool(row.get("quarantine")),
@@ -1811,6 +1874,7 @@ def print_matrix(data: dict, *, as_json: bool) -> int:
         "privilege",
         "sentinel",
         "attempt_group",
+        "shares_login",
         "refresh",
         "stage",
         "limit",

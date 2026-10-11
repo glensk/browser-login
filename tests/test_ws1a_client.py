@@ -138,7 +138,11 @@ def test_prune_drops_removed_sites_everywhere() -> None:
 
 
 @pytest.fixture(name="fresh_result")
-def _fresh_result(tmp_path: Path) -> Any:
+def _fresh_result(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Any:
+    # The broker lists "shop" alone: no item shares its login (WS5's identity
+    # gate passes without asking the broker for its list).
+    lone = [{"site": "shop", "cookie_hosts": ["shop.example"]}]
+    monkeypatch.setattr(browser, "_broker_sites", lambda: lone)
     path = tmp_path / "result.json"
     browser._result_begin("login", "shop", str(path))
     browser._LOGIN_OPTS.update(scheduled=False, candidate=None)
