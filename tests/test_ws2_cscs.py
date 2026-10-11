@@ -869,8 +869,10 @@ class _RewritingSpa:
 
     def evaluate(self, js: str, arg: Any = None) -> bool:
         assert js == browser._BROKER_STORAGE_CHECK_JS
-        assert EXPIRES_KEY not in arg  # volatile: never compared
-        return all(self.storage.get(k) == v for k, v in arg.items())
+        assert EXPIRES_KEY not in arg  # volatile: never checked
+        # The init script read every value back before the app ran; after
+        # load only presence counts.
+        return bool(self.scripts) and all(self.storage.get(k) for k in arg)
 
 
 def test_the_storage_write_ignores_the_volatile_expiry(

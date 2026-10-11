@@ -63,6 +63,7 @@ class _FakeSpa:
         self.scripts: list[str] = []
         self.storage: dict[str, str] = {}
         self.goto_urls: list[str] = []
+        self.proof = False  # the init script's own document-start read-back
 
     def add_init_script(self, script: str) -> None:
         self.scripts.append(script)
@@ -75,12 +76,14 @@ class _FakeSpa:
             assert m, "init script lost its JSON literals"
             if json.loads(m.group(1)) == target:  # the location.origin guard
                 self.storage.update(json.loads(m.group(2)))
+                assert browser.BROKER_STORAGE_PROOF_VAR in script
+                self.proof = True
         has = any(re.search(r"\b[0-9a-f]{40}\b", v) for v in self.storage.values())
         self.url = url if has else KEYCLOAK  # the SPA's post-load redirect
 
     def evaluate(self, js: str, arg=None):
         assert js == browser._BROKER_STORAGE_CHECK_JS
-        return all(self.storage.get(k) == v for k, v in arg.items())
+        return self.proof and all(self.storage.get(k) is not None for k in arg)
 
 
 def _prepared(page: _FakeSpa, calls: list):

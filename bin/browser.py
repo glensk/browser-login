@@ -11461,25 +11461,41 @@ def _broker_replace_cookies(browser, bundle: dict) -> int:
     return len(cookies)
 
 
+# The window property where the init script records its own read-back.
+BROKER_STORAGE_PROOF_VAR = "__agentLoginStorageWritten"
 # The init script _broker_write_storage installs: it sets the bundle's keys at
 # document start, and only on the bundle's own origin (a redirect, an iframe
-# or a later navigation elsewhere gets nothing). Placeholders are JSON literals.
+# or a later navigation elsewhere gets nothing), then reads them back BEFORE
+# any app code runs and records the verdict (read-only) under
+# BROKER_STORAGE_PROOF_VAR. Placeholders are JSON literals.
 _BROKER_STORAGE_INIT_JS = (
     "(() => { const origin = __ORIGIN__; const kv = __KV__;"
     " if (location.origin !== origin) return;"
-    " try { for (const [k, v] of Object.entries(kv)) localStorage.setItem(k, v); }"
+    " let ok = false;"
+    " try { for (const [k, v] of Object.entries(kv)) localStorage.setItem(k, v);"
+    " ok = Object.entries(kv).every(([k, v]) => localStorage.getItem(k) === v); }"
+    " catch (e) {}"
+    " try { Object.defineProperty(window, __PROOF__, {value: ok}); }"
     " catch (e) {} })();"
 )
-# Read-back proof: every key holds exactly the bundle's value (names in, bool out).
+# The proof after load (the app has run): the init script wrote and read back
+# every key on THIS document, and every key in `stable` is still present. The
+# app may have rewritten a value (a token it renews on boot: Navidrome's
+# JWT refresher, Home Assistant's hassTokens) — only a session it threw away
+# (a key removed) fails. Whether the session is valid is the client proof's
+# job. Names in, bool out.
 _BROKER_STORAGE_CHECK_JS = (
-    "kv => Object.entries(kv).every(([k, v]) => localStorage.getItem(k) === v)"
-)
+    "keys => window[__PROOF__] === true"
+    " && keys.every(k => localStorage.getItem(k) !== null)"
+).replace("__PROOF__", json.dumps(BROKER_STORAGE_PROOF_VAR))
 
 
 def _broker_storage_init_script(origin: str, kv: dict[str, str]) -> str:
     """The `_BROKER_STORAGE_INIT_JS` source for one origin's keys (never logged)."""
-    return _BROKER_STORAGE_INIT_JS.replace("__ORIGIN__", json.dumps(origin)).replace(
-        "__KV__", json.dumps(kv)
+    return (
+        _BROKER_STORAGE_INIT_JS.replace("__ORIGIN__", json.dumps(origin))
+        .replace("__PROOF__", json.dumps(BROKER_STORAGE_PROOF_VAR))
+        .replace("__KV__", json.dumps(kv))
     )
 
 
@@ -11496,9 +11512,13 @@ def _broker_write_storage(
     race. Instead the tab starts on ``about:blank``, gets an init script that
     sets the keys at document start when ``location.origin`` is the bundle's
     origin, then navigates there (``STORAGE_PAGE_PATHS``: the CSCS portal's
-    ``/profile/``, never its `/`); the keys are read back on that page as the
-    proof — all but the ``VOLATILE_STORAGE_KEYS`` the app itself rewrites.
-    Values never reach a log line — only key counts and origins.
+    ``/profile/``, never its `/`). The proof is two-part: the init script read
+    every value back at document start, before the app ran (the write landed
+    on that page), and after load every key — all but the
+    ``VOLATILE_STORAGE_KEYS`` — is still present. Values are not compared
+    after load: an app may renew its token on boot (Navidrome answers every
+    API call with a fresh JWT), which is a working session, not a failed
+    write. Values never reach a log line — only key counts and origins.
     """
     written = 0
     storage = bundle.get("storage") or {}
@@ -11509,7 +11529,7 @@ def _broker_write_storage(
             continue
         values = {str(k): str(v) for k, v in kv.items()}
         volatile = VOLATILE_STORAGE_KEYS.get(str(origin), frozenset())
-        stable = {k: v for k, v in values.items() if k not in volatile}
+        stable = [k for k in values if k not in volatile]
 
         def prepare(page, origin=origin, values=values) -> None:
             page.add_init_script(script=_broker_storage_init_script(origin, values))
