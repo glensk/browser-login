@@ -294,8 +294,15 @@ manual acceptance steps under the attempt policy below.
             identity verdict in checks.json, grouped agents.md. Two review rounds (2 blockers,
             port exemption + `-W` removed). Known gap for S4: audiobookshelf keeps its session in
             localStorage, cookie clearing does not remove a foreign abs session.
-      - [ ] S4 vault fields (Albert's Touch ID), live confirmations, admin MCP config, then log in
-            the held-back group members.
+      - [x] S4a/S4b released 2026-10-11: broker-add identity options (mydotfiles b1aece79, push
+            pending: YubiKey signing refused), navidrome recipe + storage-token foreign clear
+            (1d54bd3, broker 1d54bd358b31); playwright-admin MCP config + `cba` alias.
+            runai-test3 vault password was stale → rotated (test fixture). Docker/docker-hub:
+            Albert: neither → leave the broker (the Safari collection removal did not persist; redo).
+      - [ ] S4c (PLAN_ws5-s4c-runai-keycloak.md, tp#931, debated): Keycloak realm-path scopes +
+            server-bound Run:ai token recipe — builder running.
+      - [ ] S4 vault fields via `broker-add.py -I/-p/-i/-A` (Albert's Touch ID; -25308 when he is
+            away), live proofs, then log in the held-back group members.
       Original line: account identity (tp#833, hit 2026-10-10): 8 same-scope groups report ✅ for
       the wrong account; gitlab-sdsc-test passed while the browser was `albertadmin`.
       Plan → codex-debate → implement:
