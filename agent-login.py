@@ -7,12 +7,15 @@ passed) or ❌ with the reason. Read-only: it asks the broker for its site list 
 secret), reads the names and expiry dates (never values) of Safari's cookies, and logs
 into nothing unless you pass -t, -g or -c.
 
-The marketplace sites (anibis, tutti, Ricardo, Kleinanzeigen) run on YOUR Safari
-session: you log in in Safari, `browser.py login SITE` copies that site's session
-cookies into the shared Chromium (Kleinanzeigen falls back to the broker). CSCS and
-Smartsheet log in through the broker. SWITCH Cloud logs in with the portal's SSO click,
-on the browser's own edu-ID session first, then on the broker's (no window; your own
-login only when neither works). Anthropic, OpenAI and Slack need you once (email code /
+The marketplace sites (anibis, tutti, Ricardo, Kleinanzeigen) and Galaxus run on YOUR
+Safari session: you log in in Safari, `browser.py login SITE` copies that site's
+session cookies into the shared Chromium (Kleinanzeigen falls back to the broker).
+The broker never submits a password for galaxus and galaxus-de (their bot check
+rejects it; any item opts in with agent_no_submit=true): galaxus-de, like every such
+site, needs your own login, `-g SITE` in the shown window; -t and -c only check it.
+CSCS and Smartsheet log in through the broker. SWITCH Cloud logs in with the portal's
+SSO click, on the browser's own edu-ID session first, then on the broker's (no window;
+your own login only when neither works). Anthropic, OpenAI and Slack need you once (email code /
 SSO): `-g SITE` asks you on the terminal, then shows a remote view of a headless tab
 (the window only as a fallback) and waits; -t and -c only check them.
 
@@ -25,6 +28,7 @@ Examples:
   ./agent-login.py -t https://auth.cscs.ch   # SITE may also be a name or login address
   ./agent-login.py -g anibis    # guided login: confirm, then log in via the remote view
   ./agent-login.py -g anthropic # your login (email code) in the shown shared Chromium
+  ./agent-login.py -g galaxus-de # your login, straight in the shown window (bot check)
   ./agent-login.py -g notion -F # the same, even with unregistered CDP clients attached
   ./agent-login.py -P           # print the daily LaunchAgent (-I installs, -U removes)
   ./agent-login.py -j           # the same overview as JSON
@@ -101,7 +105,7 @@ from agent_login_jobs import (  # noqa: E402
 )
 from broker import phases, safari_cookies  # noqa: E402
 from broker.recipes import DEFAULT_CHECK_URLS, REFRESH_MIN_LEFT_S  # noqa: E402
-from broker.vault import SITE_ID_RE, selector_ok  # noqa: E402
+from broker.vault import NO_SUBMIT_SITES, SITE_ID_RE, selector_ok  # noqa: E402
 
 # pylint: enable=wrong-import-position
 
@@ -158,6 +162,14 @@ TARGETS = (
         "Cloudflare blocks automated browsers: agents work in your Safari directly",
     ),
     Target("tutti", "tutti", "https://auth.tutti.ch", SAFARI_FLOW, _SAFARI_NOTE),
+    Target(
+        "galaxus",
+        "Galaxus",
+        "https://id.digitecgalaxus.ch",
+        SAFARI_FLOW,
+        _SAFARI_NOTE + " (the broker never submits a password here; or your "
+        "own login: ./agent-login.py -g galaxus)",
+    ),
     Target(
         "cscs",
         "CSCS",
@@ -389,11 +401,27 @@ def _classify_listed(target: Target, entry: dict) -> tuple[str, str]:
         return "safari", target.note
     if refused:
         return "refused", reason
+    if is_no_submit(target.site, entry):
+        return "assisted", NO_SUBMIT_NOTE.format(site=target.site)
     if target.flow == "manual":
         status = "manual"
     else:
         status = "ready" if target.flow in SUPPORTED_FLOWS else "needs-flow"
     return status, target.note
+
+
+NO_SUBMIT_NOTE = (
+    "the broker never submits a password here (agent_no_submit) — your own "
+    "login: ./agent-login.py -g {site}"
+)
+
+
+def is_no_submit(site: str, entry: dict | None = None) -> bool:
+    """The broker never submits a password for `site`: built in
+    (``vault.NO_SUBMIT_SITES``) or its item says so (`no_submit`, advertised
+    by a broker with the guard). Such a site is logged in by Albert — a
+    guided login or his Safari session — and only ever CHECKED by agents."""
+    return site in NO_SUBMIT_SITES or bool((entry or {}).get("no_submit"))
 
 
 def safari_state(sites: list[str]) -> dict[str, dict]:
@@ -484,6 +512,8 @@ def overview(*, fresh: bool = False) -> dict:
         status, detail = "extra", ""
         if refused:
             status, detail = "refused", str(entry.get("reason") or "")
+        elif is_no_submit(site, entry):
+            status, detail = "assisted", NO_SUBMIT_NOTE.format(site=site)
         rows.append(
             {
                 "site": site,
@@ -584,6 +614,8 @@ def _summary_reason(row: dict, state: str, checks: dict[str, dict]) -> str:
     text = phases.text(str(rec.get("phase") or ""), str(rec.get("code") or ""))
     if row.get("flow") == ASSISTED_FLOW or row["status"] == "assisted":
         return f"not logged in — needs Albert: ./agent-login.py -g {site}"
+    if manual_import(site):
+        return f"not logged in — needs Albert: ./agent-login.py -t {site}"
     return f"not logged in — {text}"
 
 
@@ -603,6 +635,8 @@ def agent_summary(data: dict, checks: dict[str, dict]) -> str:
         state, _why = row_state(row, checks)
         if state == "ok":
             how = _HOW_TO_USE.get(row["status"], "login broker")
+            if manual_import(site):
+                how = f"check only; Albert re-imports (`agent-login.py -t {site}`)"
             if site in CLAUDE_ACCOUNTS:
                 how += f", {CLAUDE_ACCOUNTS[site]}"
             inst = SITE_INSTANCE.get(site)
@@ -772,6 +806,7 @@ def needs_sentinel(row: dict) -> bool:
         "ready",
         "extra",
         "safari",
+        "assisted",
     )
 
 
@@ -871,6 +906,27 @@ def _eduid_sso_assisted(site: str) -> bool:
     return classify(target, listed, readable=readable)[0] == "assisted"
 
 
+def manual_import(site: str) -> bool:
+    """A Safari site whose import never runs unattended (``import_unattended``
+    False): `browser.py login` refuses it, the daily check only checks it,
+    and only `-t` (Albert) imports — through `browser.py import-safari`."""
+    rule = safari_cookies.SAFARI_SITES.get(site)
+    return rule is not None and not rule.import_unattended
+
+
+def _no_submit_assisted(site: str) -> bool:
+    """True for a broker site whose password the broker never submits and
+    that has no Safari session import: `-t` then only checks (the login
+    would only answer submit_disabled)."""
+    if site in safari_cookies.SAFARI_SITES:
+        return False
+    if site in NO_SUBMIT_SITES:
+        return True
+    _health, sites = broker_state()
+    entry = next((s for s in sites if s.get("site") == site), None)
+    return entry is not None and is_no_submit(site, entry)
+
+
 # One return per exit-code meaning.
 def derived_result(run: BrowserRun) -> dict:  # pylint: disable=too-many-return-statements
     """The phase record of a `browser.py login` that wrote none (killed,
@@ -924,7 +980,7 @@ def run_test(site: str) -> int:
     (browser.py's phase record). A test never promotes a site.
     """
     site = resolve_site(site)
-    if site in ASSISTED_SITES or _eduid_sso_assisted(site):
+    if site in ASSISTED_SITES or _eduid_sso_assisted(site) or _no_submit_assisted(site):
         # its login needs you: -g; -t only checks
         print(f"▶ {site}: your own login (./agent-login.py -g {site}); checking only")
         ok, how = assisted_check(site)
@@ -934,11 +990,23 @@ def run_test(site: str) -> int:
         record_check(site, ok, how)
         print(f"{'✅' if ok else '❌'} {site}: {how}")
         return 0 if ok else 2
-    print(
-        f"▶ browser.py login {site}  (Safari session or login broker; "
-        "you see no password)"
-    )
-    login = run_browser("login", site, timeout_s=browser_timeout("login"), result=True)
+    if manual_import(site):
+        # `browser.py login` refuses it (never unattended): the explicit import
+        print(f"▶ browser.py import-safari {site}  (your Safari session, by hand)")
+        login = run_browser(
+            "import-safari",
+            site,
+            timeout_s=browser_timeout("import-safari"),
+            result=True,
+        )
+    else:
+        print(
+            f"▶ browser.py login {site}  (Safari session or login broker; "
+            "you see no password)"
+        )
+        login = run_browser(
+            "login", site, timeout_s=browser_timeout("login"), result=True
+        )
     res = derived_result(login)
     failed = login_run_failure(login)
     if failed is not None:  # 125 or an outer kill: never retried, no check
@@ -979,7 +1047,14 @@ MANUAL_START = {
     "anibis": "https://www.anibis.ch/fr/user/searches",
     "tutti": "https://www.tutti.ch/de/myads/active",
     "ricardo": "https://www.ricardo.ch/de/my-ricardo/saved/articles/",
+    "galaxus": "https://www.galaxus.ch/de/orders",
+    "galaxus-de": "https://www.galaxus.de/de/orders",
 }
+# Guided logins that go straight to the shown window (`assisted-login -a`):
+# the relayed headless tab keeps the headless browser's bot fingerprint, which
+# these IdPs (Akamai Bot Manager + reCAPTCHA) reject even for a human's typing.
+# Every no-submit broker site (`is_no_submit`) takes the window too.
+WINDOW_START = frozenset({"galaxus", "galaxus-de"})
 
 
 def manual_login(site: str, force: bool = False) -> int:
@@ -1001,30 +1076,38 @@ def manual_login(site: str, force: bool = False) -> int:
     if site in ASSISTED_SITES or site in EDUID_SSO_SITES:
         return assisted_login(site, force=force)
     start = MANUAL_START.get(site)
-    if not start:
+    window = site in WINDOW_START or _no_submit_assisted(site)
+    if not start and not window:
         known = ", ".join([*MANUAL_START, *sorted(ASSISTED_SITES | EDUID_SSO_SITES)])
         print(f"❌ no guided login known for {site!r} (known: {known})")
         return 2
-    return assisted_login_cmd(site, start, force=force)
+    # A no-submit site without a MANUAL_START URL starts at its broker item's
+    # login URL (browser.py resolves it).
+    return assisted_login_cmd(site, start, force=force, window=window)
 
 
 def assisted_login_argv(
-    site: str, start: str | None = None, force: bool = False
+    site: str, start: str | None = None, force: bool = False, window: bool = False
 ) -> list[str]:
-    """The browser.py arguments `assisted-login SITE [-u START] [-f]`."""
+    """The browser.py arguments `assisted-login SITE [-u START] [-a] [-f]`."""
     argv = ["assisted-login", site]
     if start:
         argv += ["-u", start]
+    if window:
+        argv.append("-a")
     if force:
         argv.append("-f")
     return argv
 
 
-def assisted_login_cmd(site: str, start: str | None = None, force: bool = False) -> int:
-    """`browser.py assisted-login SITE [-u START] [-f]` (it asks on the terminal).
+def assisted_login_cmd(
+    site: str, start: str | None = None, force: bool = False, window: bool = False
+) -> int:
+    """`browser.py assisted-login SITE [-u START] [-a] [-f]` (it asks on the
+    terminal; `window`: straight to the shown window, path A).
 
     No time limit: a guided login waits for Albert (it bounds itself)."""
-    return _browser(*assisted_login_argv(site, start, force), timeout_s=None)
+    return _browser(*assisted_login_argv(site, start, force, window), timeout_s=None)
 
 
 def viewer_login(site: str, force: bool = False) -> int:
@@ -1283,7 +1366,7 @@ def safari_fix(site: str) -> str:
     """What Albert does when `site` is logged out (depends on its login flow)."""
     here = Path(__file__).resolve().parent
     flow = next((t.flow for t in TARGETS if t.site == site), "")
-    if flow == ASSISTED_FLOW:
+    if flow == ASSISTED_FLOW or (flow != SAFARI_FLOW and _no_submit_assisted(site)):
         return f"run ./agent-login.py -g {site} and finish the login (in {here})"
     if flow == EDUID_SSO_FLOW:
         return (
@@ -1353,6 +1436,19 @@ def schedule_gate(row: dict) -> tuple[str, str] | None:
     if row.get("stage") != "usable":
         return "pending", f"pending — promote: ./agent-login.py -p {site}"
     return None
+
+
+def check_only_gate(row: dict) -> tuple[str, str] | None:
+    """`schedule_gate`, plus: a Safari site whose import must not run
+    unattended (``import_unattended``) is only checked by the daily run."""
+    rule = safari_cookies.SAFARI_SITES.get(row["site"])
+    if row.get("flow") == SAFARI_FLOW and rule is not None:
+        if not rule.import_unattended:
+            return "manual_import", (
+                "the Safari import runs by hand only — "
+                f"./agent-login.py -t {row['site']}"
+            )
+    return schedule_gate(row)
 
 
 def refresh_step(site: str, check: dict | None, how: str) -> str:
@@ -1447,7 +1543,7 @@ def check_all(*, mail: bool = False) -> int:  # pylint: disable=too-many-branche
             print(f"❌ {site}: {how} — remaining sites not checked")
             failed.append(("shared Chromium", how))
             break
-        ok, how, res = ensure_logged_in(site, gate=schedule_gate(row))
+        ok, how, res = ensure_logged_in(site, gate=check_only_gate(row))
         if ok is None:
             print(f"⏸  {site}: {how}")
             record_check(site, None, how, res)

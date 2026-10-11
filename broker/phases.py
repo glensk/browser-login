@@ -54,6 +54,12 @@ CODE_TEXT = {
     "needs_sentinel": "the item has no logged-in sentinel — cannot prove a login",
     "vault_error": "the broker cannot read Bitwarden",
     "needs_human": "the site wants a human (captcha / bot check / second factor)",
+    "submit_disabled": "the broker never submits a password here — Albert's session only",
+    # The identity provider's own answer to the password (allowlisted enum of
+    # its JSON reply, broker/idp_reasons.py) — never its words.
+    "idp_invalid_credentials": "the identity provider answered: invalid credentials",
+    "idp_unknown": "the identity provider refused without a reason (often a bot check)",
+    "captcha_required": "the identity provider wants a captcha",
     "origin_violation": "the login page left the fill origins",
     "login_failed": "the login did not reach a logged-in state",
     "export_failed": "the session could not be exported",
@@ -66,6 +72,7 @@ CODE_TEXT = {
     "storage_failed": "localStorage could not be written",
     "followup_failed": "the follow-up step failed",
     "no_safari_session": "Safari holds no usable session",
+    "manual_import": "the Safari import of this site runs by hand only",
     "timeout": "the step did not finish in time",
     "killed": "the run was killed by its runner",
     "internal": "internal error",
@@ -88,6 +95,7 @@ _ERROR_PHASE = {
     "unknown_site": "vault",
     "refused": "vault",
     "needs_sentinel": "vault",
+    "submit_disabled": "vault",
     "forbidden": "precheck",
     "bad_request": "precheck",
 }

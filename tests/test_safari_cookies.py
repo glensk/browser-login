@@ -10,7 +10,6 @@ from __future__ import annotations
 # pylint: disable=wrong-import-position,too-few-public-methods,redefined-outer-name
 # pylint: disable=unused-argument
 import contextlib
-import dataclasses
 import importlib.util
 import struct
 import sys
@@ -88,7 +87,7 @@ JAR: list[list[dict]] = [
     [
         {
             "domain": ".www.anibis.ch",
-            "name": "session",
+            "name": "mp_session_id",
             "value": SECRET,
             "secure": True,
             "http_only": True,
@@ -126,7 +125,7 @@ def test_parse_roundtrip(jar) -> None:
     first = cookies[0]
     assert (first.domain, first.name, first.value, first.path) == (
         ".www.anibis.ch",
-        "session",
+        "mp_session_id",
         SECRET,
         "/",
     )
@@ -184,6 +183,7 @@ def test_site_rules() -> None:
         "tutti": ("tutti.ch",),
         "ricardo": ("ricardo.ch",),
         "kleinanzeigen": ("kleinanzeigen.de",),
+        "galaxus": ("galaxus.ch", "digitecgalaxus.ch"),
     }
     assert [s for s, r in sc.SAFARI_SITES.items() if r.broker_fallback] == [
         "kleinanzeigen"
@@ -192,7 +192,7 @@ def test_site_rules() -> None:
 
 def test_site_cookies_filters_domain_deny_and_expiry(jar) -> None:
     picked = sc.site_cookies(sc.read_binarycookies(), "anibis", now=NOW)
-    assert sorted(c.name for c in picked) == ["_ga", "session"]
+    assert sorted(c.name for c in picked) == ["_ga", "mp_session_id"]
     assert sc.site_cookies(sc.read_binarycookies(), "kleinanzeigen", now=NOW) == []
     n, latest = sc.session_summary("anibis", now=NOW)
     assert n == 2 and latest is not None and abs(latest - FUTURE) < 1e-3
@@ -340,7 +340,7 @@ def test_import_replaces_only_site_cookies(jar, listed, fake_chromium, monkeypat
     assert ctx.cleared == [
         (".anibis.ch", "session")
     ]  # Chromium's own cf_clearance stays
-    assert sorted(c["name"] for c in ctx.added) == ["_ga", "session"]
+    assert sorted(c["name"] for c in ctx.added) == ["_ga", "mp_session_id"]
     assert all(c["domain"].endswith("anibis.ch") for c in ctx.added)
 
 
@@ -422,12 +422,7 @@ def test_agent_login_classify_safari() -> None:
 
 
 def test_agent_login_overview_safari_column(jar, monkeypatch) -> None:
-    # the synthetic jar names anibis' login cookie "session"
-    monkeypatch.setitem(
-        sc.SAFARI_SITES,
-        "anibis",
-        dataclasses.replace(sc.SAFARI_SITES["anibis"], session_cookies=("session",)),
-    )
+    # the synthetic jar holds anibis' real login cookie name (mp_session_id)
     sites = [{"site": "anibis"}, {"site": "tutti"}, {"site": "ricardo"}]
     monkeypatch.setattr(
         al, "broker_state", lambda **_k: ("running, Bitwarden ok", sites)

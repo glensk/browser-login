@@ -1225,7 +1225,10 @@ def test_agent_login_g_routes_human_logins_to_assisted_login(monkeypatch):
 
     forced: list[bool] = []
 
-    def cmd(site: str, start: str | None = None, force: bool = False) -> int:
+    def cmd(
+        site: str, start: str | None = None, force: bool = False, window: bool = False
+    ) -> int:
+        del window  # the window route: test_ws2_galaxus.py
         calls.append((site, start))
         forced.append(force)
         return 0

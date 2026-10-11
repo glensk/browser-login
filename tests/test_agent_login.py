@@ -234,18 +234,18 @@ def test_agent_summary_lists_both_sides() -> None:
         _row("cscs", "ready", flow="cscs"),
         _row("anthropic", "assisted", flow=al.ASSISTED_FLOW),
         _row("geizhals", "unknown"),
-        _row("galaxus", "extra"),
+        _row("shopx", "extra"),
     ]
     checks = {
         "cscs": _rec("ok"),
         "anthropic": {**_rec("ok"), "how": "logged in as evil@x.example"},
-        "galaxus": _rec("ok", age_s=40 * 3600),
+        "shopx": _rec("ok", age_s=40 * 3600),
     }
     text = al.agent_summary({"rows": rows, "broker_ok": True}, checks)
     assert "- ✅ CSCS (`cscs`): login broker" in text
     assert al.CLAUDE_ACCOUNTS["anthropic"] in text and "evil@" not in text
     assert "- ❌ geizhals: no Vaultwarden item / login address yet" in text
-    assert "- ❓ galaxus (`galaxus`)" in text
+    assert "- ❓ shopx (`shopx`)" in text
     assert "browser.py login <site>" in text
 
 

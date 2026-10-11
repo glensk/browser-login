@@ -34,7 +34,10 @@ _COOKIE_MIN = 56  # fixed part of a cookie record: up to and incl. the creation 
 
 # Bot-management cookies (Cloudflare, Akamai): bound to Safari's user agent / IP,
 # so copying them into Chromium would only make the site distrust the session.
-# Analytics / ad cookies are harmless and stay in.
+# Analytics / ad cookies are harmless and stay in. Akamai Bot Manager names its
+# cookies `bm_*` (bm_sz, bm_mi, bm_sv, bm_s, bm_so, bm_lso, …): one pattern for
+# every site — an application cookie of a Safari site that starts with `bm_`
+# would stay behind too (none known; add a site-specific `deny` if one shows up).
 BOT_COOKIE_DENY: tuple[str, ...] = (
     "cf_clearance",
     "__cf_bm",
@@ -42,9 +45,11 @@ BOT_COOKIE_DENY: tuple[str, ...] = (
     "_cfuvid",
     "_abck",
     "ak_bmsc",
-    "bm_sz",
-    "bm_mi",
-    "bm_sv",
+    "bm_*",
+    # Akamai's crypto challenge (sec_cpt) and its behavioral session cookies
+    # (sbsd, sbsd_o, sbsd_ss): bound to the browser that solved them, too.
+    "sec_cpt",
+    "sbsd*",
 )
 
 
@@ -58,9 +63,20 @@ class SafariSite:
     # Names of the cookies that ARE the login (their presence/expiry is what the
     # overview reports); empty = any allowed cookie counts.
     session_cookies: tuple[str, ...] = ()
-    # Imported by the unattended daily check. False where an import is not safe
-    # or cannot work unattended (see SAFARI_SITES).
+    # Handled by the unattended daily check at all. False where even a check
+    # makes no sense (see SAFARI_SITES).
     auto: bool = True
+    # The daily check may IMPORT when its free check fails. False: it only
+    # checks, the import runs by hand (`agent-login.py -t SITE`) — for a site
+    # whose copied session's durability is unproven (an import replaces the
+    # shared browser's cookies, possibly a newer rotated token, with Safari's).
+    import_unattended: bool = True
+    # The import also deletes the shared Chromium's OWN bot-management cookies
+    # (the `deny` ones) in the site's domains, so the bot manager scores the
+    # imported session afresh. For sites where Chromium's cookies carry a failed
+    # verdict (Akamai `_abck` with validation flag -1 after rejected logins);
+    # by default Chromium's own bot cookies stay.
+    drop_bot_cookies: bool = False
 
 
 SAFARI_SITES: dict[str, SafariSite] = {
@@ -75,6 +91,21 @@ SAFARI_SITES: dict[str, SafariSite] = {
         ("kleinanzeigen.de",),
         broker_fallback=True,
         session_cookies=("refresh_token",),
+    ),
+    # Galaxus (Akamai Bot Manager + reCAPTCHA) answers the headless broker's
+    # password with "credentials wrong": the broker never submits there
+    # (vault.NO_SUBMIT_SITES). The shop's `.at` (180 days, refreshes the 30-min
+    # access token `.atinfo`) lives on www.galaxus.ch; the IdP session
+    # (`.AspNetCore.Identity.Application`, `DeviceCookie_*`, `Tenant`) on
+    # id.digitecgalaxus.ch. Chromium's own Akamai cookies hold the verdict of
+    # the rejected broker logins, so they are dropped on import. Whether a
+    # copied `.at` survives its refresh (rotation) and the IdP cookie's 30-day
+    # expiry is unproven: the daily check only checks; imports run by hand.
+    "galaxus": SafariSite(
+        ("galaxus.ch", "digitecgalaxus.ch"),
+        session_cookies=(".at",),
+        drop_bot_cookies=True,
+        import_unattended=False,
     ),
 }
 
@@ -195,19 +226,43 @@ def denied(name: str, rules: SafariSite) -> bool:
     return any(fnmatch.fnmatchcase(name, pat) for pat in rules.deny)
 
 
+def in_site(domain: str, site: str) -> bool:
+    """True if cookie `domain` belongs to one of `site`'s domains."""
+    return any(domain_matches(domain, r) for r in SAFARI_SITES[site].domains)
+
+
+def importable(domain: str, name: str, site: str) -> bool:
+    """True if a cookie may be copied INTO the shared browser for `site`:
+    in its domains and not a bot-management cookie."""
+    return in_site(domain, site) and not denied(name, SAFARI_SITES[site])
+
+
+def replaced_on_import(domain: str, name: str, site: str) -> bool:
+    """True if the shared browser's OWN cookie is deleted by an import of
+    `site`: every cookie in its domains, except the bot-management ones —
+    which go too for a site with ``drop_bot_cookies``."""
+    rules = SAFARI_SITES[site]
+    return in_site(domain, site) and (rules.drop_bot_cookies or not denied(name, rules))
+
+
+def has_session(site: str, cookies: Iterable[Cookie]) -> bool:
+    """True if `cookies` (already filtered by `site_cookies`) hold at least one
+    of `site`'s ``session_cookies`` — the login itself (any cookie counts for
+    a site that names none). Without it an import must change NOTHING: a
+    logged-out Safari never wipes the shared browser's good session."""
+    names = SAFARI_SITES[site].session_cookies
+    cookies = list(cookies)
+    if not names:
+        return bool(cookies)
+    return any(c.name in names for c in cookies)
+
+
 def site_cookies(
     cookies: Iterable[Cookie], site: str, *, now: float | None = None
 ) -> list[Cookie]:
     """`site`'s cookies from `cookies`: in its domains, not denied, not expired."""
-    rules = SAFARI_SITES[site]
     at = time.time() if now is None else now
-    return [
-        c
-        for c in cookies
-        if any(domain_matches(c.domain, r) for r in rules.domains)
-        and not denied(c.name, rules)
-        and c.expires > at
-    ]
+    return [c for c in cookies if importable(c.domain, c.name, site) and c.expires > at]
 
 
 def session_summary(

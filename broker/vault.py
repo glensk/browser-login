@@ -54,6 +54,39 @@ from broker.vault_cache import (
 )
 
 SITE_ID_RE = re.compile(r"^[a-z0-9][a-z0-9._-]{0,63}$")
+# Sites the broker NEVER submits a password for, whatever the item says: their
+# IdP answers the headless broker's password with "credentials wrong" (a bot
+# check), and every such submit risks a vendor-side lock. Agents use Albert's
+# session there (Safari import, guided login). Any other item opts in with the
+# custom field ``agent_no_submit=true``. This set cannot be lifted from the
+# vault (``agent_no_submit=false`` keeps it), only by a code change.
+NO_SUBMIT_SITES = frozenset({"galaxus", "galaxus-de"})
+# The same by WHERE the password would be typed, whatever the item is called
+# (a renamed or duplicate item, e.g. "digitec.ch galaxus.ch"): a fill origin on
+# one of these registrable domains (or a subdomain) makes the item no-submit.
+# Digitec Galaxus' IdPs: id.digitecgalaxus.ch (CH, digitec.ch shares it) and
+# id.galaxus.eu (the EU shops), plus every shop's own domain.
+NO_SUBMIT_DOMAINS = (
+    "digitecgalaxus.ch",
+    "galaxus.eu",
+    "galaxus.ch",
+    "galaxus.de",
+    "galaxus.at",
+    "galaxus.fr",
+    "galaxus.it",
+    "galaxus.nl",
+    "galaxus.be",
+    "digitec.ch",
+)
+# A no-submit domain anywhere in a URI as written — also inside a Bitwarden
+# regex URI (`^https://.*\.galaxus\.ch`, backslashes dropped first): a label
+# boundary on both sides, so `notgalaxus.ch` does not match.
+_NO_SUBMIT_TOKEN_RE = re.compile(
+    r"(?<![a-z0-9-])(?:"
+    + "|".join(re.escape(d) for d in NO_SUBMIT_DOMAINS)
+    + r")(?![a-z0-9-])"
+)
+NO_SUBMIT_SECRET = "a no-submit login item is never exposed as a secret"
 SAFE_NAME_RE = re.compile(r"^[A-Za-z0-9._ -]{1,64}$")
 BW_TIMEOUT_S = 120.0
 # A value shorter than this is refused unless the item sets
@@ -122,6 +155,12 @@ class SiteItem:  # pylint: disable=too-many-instance-attributes
     # that renews a storage token before a reused profile is exported; "none"
     # switches a built-in default off; None = the default for the site id.
     session_refresh: str | None = None
+    # `agent_no_submit`, the site in ``NO_SUBMIT_SITES`` or a fill origin on
+    # ``NO_SUBMIT_DOMAINS``: the login runner never asks for the secret, so it
+    # never types or submits a password for this site (``submit_disabled``); a
+    # reusable broker profile is still exported. (The `fingerprint` op still
+    # hashes the password: it never logs in.)
+    no_submit: bool = False
     refused: str | None = None
     item_id: str = ""
 
@@ -172,6 +211,7 @@ class SiteItem:  # pylint: disable=too-many-instance-attributes
             "proof_origins": list(self.proof_origins),
             "storage_keys": {o: list(k) for o, k in self.storage_keys.items()},
             "session_refresh": session_refresh_name(self),
+            "no_submit": self.no_submit or self.site in NO_SUBMIT_SITES,
             "refused": self.refused is not None,
             "reason": self.refused or "",
         }
@@ -184,7 +224,12 @@ class Vault(Protocol):
         """Every item of the collection, refused ones included."""
 
     def secret(self, site: str) -> Secret:
-        """The secret of a non-refused site (VaultError otherwise)."""
+        """The LOGIN secret of a non-refused site (VaultError otherwise, and for
+        a no-submit site)."""
+
+    def fingerprint_secret(self, site: str) -> Secret:
+        """The secret for the `fingerprint` op only (no-submit sites too: it
+        never logs in)."""
 
     def secret_items(self) -> list[SecretItem]:
         """Items of the secrets collection (SecretsNotConfigured without one)."""
@@ -287,6 +332,61 @@ def is_short(value: str) -> bool:
     return value_bytes(value) < SHORT_BELOW_BYTES
 
 
+def mentions_no_submit_domain(text: str) -> bool:
+    """True when `text` (a URI as written, a Bitwarden regex included) names a
+    ``NO_SUBMIT_DOMAINS`` domain: lowercased, backslashes and ``[.]`` dropped."""
+    norm = text.lower().replace("\\", "").replace("[.]", ".")
+    return _NO_SUBMIT_TOKEN_RE.search(norm) is not None
+
+
+def _no_submit_reason(item: Mapping[str, Any], fields: Mapping[str, str]) -> str | None:
+    """Why the secret ops refuse a secrets-collection item that is (a copy of)
+    a no-submit login, else None: its ``agent_no_submit`` says so (or is
+    malformed), its ``agent_site`` is in ``NO_SUBMIT_SITES``, or a fill origin /
+    login URI names a ``NO_SUBMIT_DOMAINS`` domain. An origin or URI that
+    cannot be read is refused too (``malformed URI``: fail closed) — covers a
+    secrets collection holding a copy, or one configured equal to agent-logins."""
+    texts, problem = _item_origin_texts(item, fields)
+    if (
+        # true, or a malformed value: fail closed
+        _parse_flag(fields.get("agent_no_submit", "")) is not False
+        or (fields.get("agent_site") or "").strip().lower() in NO_SUBMIT_SITES
+        or any(mentions_no_submit_domain(t) for t in texts)
+    ):
+        return NO_SUBMIT_SECRET
+    if not problem:
+        try:
+            return NO_SUBMIT_SECRET if no_submit_by_origin(texts) else None
+        except ValueError:
+            problem = "unparsable"
+    return f"malformed URI ({problem}): cannot tell whether it is a no-submit login"
+
+
+def _item_origin_texts(
+    item: Mapping[str, Any], fields: Mapping[str, str]
+) -> tuple[list[str], str]:
+    """(an item's ``agent_fill_origins`` + login URIs as written, the first
+    structural problem or ''). Fixed problem texts only (never a value)."""
+    raw_origins = fields.get("agent_fill_origins", "").strip()
+    texts = _split_list(raw_origins)
+    problem = ""
+    if raw_origins:
+        try:
+            parse_fill_origins(raw_origins)  # the login items' strict parser
+        except ValueError:
+            problem = "bad agent_fill_origins"
+    login = item.get("login") or {}
+    uris = login.get("uris") if isinstance(login, Mapping) else None
+    if not isinstance(login, Mapping) or not isinstance(uris or [], list):
+        return texts, "login block"
+    for uri in uris or []:
+        if not isinstance(uri, Mapping):
+            problem = problem or "login URI entry"
+        elif uri.get("uri"):
+            texts.append(str(uri["uri"]))
+    return texts, problem
+
+
 # A flat validator: one early refusal per rule, in field order.
 # pylint: disable-next=too-many-locals,too-many-return-statements,too-many-branches
 def secret_item_from_json(
@@ -306,6 +406,9 @@ def secret_item_from_json(
 
     if not SITE_ID_RE.match(raw_id):
         return refused("invalid agent_secret_id")
+    why = _no_submit_reason(item, fields)
+    if why:
+        return refused(why)
     counts = _custom_field_counts(item)
     if any(c > 1 for c in counts.values()):
         return refused("duplicate custom field names")
@@ -534,6 +637,21 @@ def _split_list(raw: str) -> list[str]:
     return [p.strip() for p in re.split(r"[,\n]", raw) if p.strip()]
 
 
+def no_submit_by_origin(fill_origins: list[str]) -> bool:
+    """True when an origin/URL's host is on a ``NO_SUBMIT_DOMAINS`` domain.
+
+    Canonical host: a value without a scheme is read as ``https://VALUE``,
+    the host is lowercased and loses a trailing DNS dot (``id.galaxus.eu.``).
+    An unparsable value raises ValueError (callers fail closed)."""
+    for origin in fill_origins:
+        raw = origin.strip()
+        url = raw if "://" in raw else "https://" + raw
+        host = (urllib.parse.urlsplit(url).hostname or "").lower().rstrip(".")
+        if any(host == d or host.endswith("." + d) for d in NO_SUBMIT_DOMAINS):
+            return True
+    return False
+
+
 def _site_domain(host: str) -> str:
     """``www.kleinanzeigen.de`` -> ``kleinanzeigen.de`` (last two labels; enough for
     the .de/.ch/.com sites this broker serves, and an IP or bare host stays as is)."""
@@ -666,6 +784,9 @@ def site_item_from_json(item: Mapping[str, Any], *, dev: bool = False) -> SiteIt
     if session_refresh not in (None, "none", *SESSION_REFRESHERS):
         known = ", ".join(sorted(SESSION_REFRESHERS))
         return refused(f"bad agent_session_refresh (none, {known})")
+    no_submit = _parse_flag(fields.get("agent_no_submit", ""))
+    if no_submit is None:
+        return refused("bad agent_no_submit (true or false)")
     return SiteItem(
         fill_origins=fill_origins,
         cookie_hosts=cookie_hosts,
@@ -680,6 +801,9 @@ def site_item_from_json(item: Mapping[str, Any], *, dev: bool = False) -> SiteIt
         attempt_group=group,
         proof_origins=proof_origins,
         session_refresh=session_refresh,
+        no_submit=no_submit
+        or site in NO_SUBMIT_SITES
+        or no_submit_by_origin(fill_origins),
         site=site,
         name=name,
         item_id=item_id,
@@ -747,12 +871,22 @@ def secret_from_json(item: Mapping[str, Any]) -> Secret:
     )
 
 
-def _find(raw_items: list[Any], site: str, *, dev: bool) -> Mapping[str, Any]:
+def _find(
+    raw_items: list[Any], site: str, *, dev: bool, login: bool = True
+) -> Mapping[str, Any]:
+    """The raw item of `site` from a FRESH read. `login`: the secret is for a
+    login, so a no-submit item (``SiteItem.no_submit``, judged on this fresh
+    read, not on a cached list) is refused; the fingerprint passes False."""
     items = build_items(raw_items, dev=dev)
     for it, raw in zip(items, [r for r in raw_items if isinstance(r, Mapping)]):
         if it.site == site:
             if it.refused:
                 raise VaultError(f"site {site!r} is refused: {it.refused}")
+            if login and it.no_submit:
+                raise VaultError(
+                    f"site {site!r} is no-submit: the broker never logs in with "
+                    "its password"
+                )
             return raw
     raise VaultError(f"unknown site {site!r}")
 
@@ -802,8 +936,12 @@ class FixtureVault(_SecretSource):
         return build_items(self._raw(), dev=self.dev)
 
     def secret(self, site: str) -> Secret:
-        """The fixture secret of `site`."""
+        """The fixture LOGIN secret of `site` (never for a no-submit site)."""
         return secret_from_json(_find(self._raw(), site, dev=self.dev))
+
+    def fingerprint_secret(self, site: str) -> Secret:
+        """The fixture secret of `site` for the `fingerprint` op."""
+        return secret_from_json(_find(self._raw(), site, dev=self.dev, login=False))
 
     def _secrets_key(self) -> tuple[str, ...]:
         data = self._data()
@@ -1033,9 +1171,16 @@ class BwVault(_SecretSource):
         )
 
     def secret(self, site: str) -> Secret:
-        """Username, password and TOTP seed of `site` (fresh unlock, then lock)."""
+        """Username, password and TOTP seed of `site` for a LOGIN (fresh unlock,
+        then lock); a no-submit item is refused on this fresh read, so an item
+        flagged since the cached site list was filled never reaches a login."""
         raw = self._raw(self.boot.organization_id, self.boot.collection_id)
         return secret_from_json(_find(raw, site, dev=False))
+
+    def fingerprint_secret(self, site: str) -> Secret:
+        """`secret` for the `fingerprint` op (no-submit sites too)."""
+        raw = self._raw(self.boot.organization_id, self.boot.collection_id)
+        return secret_from_json(_find(raw, site, dev=False, login=False))
 
     def _secrets_key(self) -> tuple[str, ...]:
         if not self.boot.secrets_collection_id:

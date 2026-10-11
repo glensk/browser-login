@@ -277,6 +277,8 @@ KILLED_RC = -9
 # `eval`/`eval-fresh` are always called with `-t 30`).
 BROWSER_TIMEOUTS = {
     "logged-in": 120.0 + RUNNER_MARGIN_S,
+    # the explicit Safari import: cookie copy + the logged-in check
+    "import-safari": 120.0 + RUNNER_MARGIN_S,
     "status": 30.0,
     "up": 120.0,
     "switch": 120.0,

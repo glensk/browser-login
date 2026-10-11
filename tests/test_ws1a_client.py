@@ -455,7 +455,7 @@ def test_prune_only_after_a_fresh_listing() -> None:
 def test_matrix_rows(monkeypatch: pytest.MonkeyPatch) -> None:
     rows = [
         _row("cscs", stage="usable", sentinel=True, attempt_group="", limit={}),
-        _row("galaxus", "extra", sentinel=False, attempt_group="gx"),
+        _row("shopx", "extra", sentinel=False, attempt_group="gx"),
     ]
     out = al.matrix_rows({"rows": rows, "broker_ok": True}, {})
     by = {r["site"]: r for r in out}
@@ -463,11 +463,9 @@ def test_matrix_rows(monkeypatch: pytest.MonkeyPatch) -> None:
         by["cscs"]["consumer"].startswith("cscs-api")
         and by["cscs"]["refresh"] == "daily -c"
     )
-    assert (
-        by["galaxus"]["sentinel"] == "none" and by["galaxus"]["attempt_group"] == "gx"
-    )
-    assert by["galaxus"]["refresh"] == "none (needs a sentinel)"
-    assert by["galaxus"]["consumer"] == "?"
+    assert by["shopx"]["sentinel"] == "none" and by["shopx"]["attempt_group"] == "gx"
+    assert by["shopx"]["refresh"] == "none (needs a sentinel)"
+    assert by["shopx"]["consumer"] == "?"
     down = al.matrix_rows(
         {"rows": [_row("x", "unchecked", sentinel=None)], "broker_ok": False}, {}
     )
@@ -479,10 +477,10 @@ def test_matrix_rows(monkeypatch: pytest.MonkeyPatch) -> None:
 def test_overview_keeps_known_extras_when_the_broker_is_down(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    als.ensure_known(["galaxus"])
+    als.ensure_known(["shopx"])
     monkeypatch.setattr(al, "broker_state", lambda **_k: ("not installed", []))
     rows = {r["site"]: r for r in al.overview()["rows"]}
-    assert rows["galaxus"]["status"] == "unchecked"
+    assert rows["shopx"]["status"] == "unchecked"
 
 
 # ---------------------------------------------------------------------------
@@ -569,20 +567,18 @@ def test_no_attempt_stand_in_is_stateless() -> None:
 def test_c2_a_sentinel_less_site_stays_usable_for_agents(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    row = _row("galaxus", "extra", sentinel=False, stage="usable")
-    als.record_check("galaxus", "ok", "needs sentinel (old proof)", proof_v=0)
+    row = _row("shopx", "extra", sentinel=False, stage="usable")
+    als.record_check("shopx", "ok", "needs sentinel (old proof)", proof_v=0)
     checks = als.checks()
     assert al.row_state(row, checks)[0] == "ok"  # not ❌
     text = al.agent_summary({"rows": [row], "broker_ok": True}, checks)
-    assert "- ✅ galaxus (`galaxus`): login broker" in text
+    assert "- ✅ shopx (`shopx`): login broker" in text
     assert "weak proof (no sentinel yet)" in text
     assert "needs sentinel (old proof)" in al._row_flags(row)
     # never scheduled, never promoted
     assert al.schedule_gate(row)[0] == "needs_sentinel"
-    _fresh_listing(
-        monkeypatch, {"site": "galaxus", "refused": False, "sentinel": False}
-    )
-    assert "agent_logged_in_selector" in al.promote_refusal("galaxus")
+    _fresh_listing(monkeypatch, {"site": "shopx", "refused": False, "sentinel": False})
+    assert "agent_logged_in_selector" in al.promote_refusal("shopx")
 
 
 def test_c3_skipped_rows_keep_infra_status_truthful(
@@ -754,7 +750,7 @@ def test_n1_an_unverified_candidate_reply_is_not_verified(
 def test_minor_a_no_dead_needs_sentinel_status() -> None:
     assert "needs-sentinel" not in al.STATUS
     assert "needs-sentinel" not in al._SETUP_REASON
-    row = _row("galaxus", "extra", sentinel=False, stage="usable")
+    row = _row("shopx", "extra", sentinel=False, stage="usable")
     assert al.refresh_policy(row) == "none (needs a sentinel)"
 
 

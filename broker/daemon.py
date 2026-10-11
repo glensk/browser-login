@@ -79,6 +79,10 @@ if __package__ in (None, ""):  # run as a script: make `broker` importable
 
 # pylint: disable=wrong-import-position
 from broker.bundle import filter_cookies, filter_storage  # noqa: E402
+from broker.idp_reasons import MAX_KEPT as IDP_MAX_KEPT  # noqa: E402
+from broker.idp_reasons import body_too_large  # noqa: E402
+from broker.idp_reasons import classify as idp_classify  # noqa: E402
+from broker.idp_reasons import rule_for as idp_rule_for  # noqa: E402
 from broker.leakcheck import (  # noqa: E402
     DEFAULT_SOCKET as SECRETKEEPER_SOCKET,
 )
@@ -446,6 +450,51 @@ def watch_script_mime(ctx: Any) -> list[str]:
     return seen
 
 
+# id(context) -> the finished requests to IdP password endpoints
+# (``broker/idp_reasons.py``) of this run.
+_IDP_RESPONSES: dict[int, list[Any]] = {}
+
+
+def watch_idp_responses(ctx: Any) -> list[Any]:
+    """Keep the FINISHED requests to known IdP password endpoints (POST, https,
+    allowlisted host + path; the last ``IDP_MAX_KEPT``). Only the request
+    objects: their responses are read once the recipe is done (`idp_reason`),
+    never in the handler — and a finished request's body is complete, so the
+    read never waits for the network."""
+    kept: list[Any] = []
+
+    def on_finished(req: Any) -> None:
+        try:
+            if idp_rule_for(str(req.method), str(req.url)) is not None:
+                kept.append(req)
+                del kept[:-IDP_MAX_KEPT]
+        except Exception:  # pylint: disable=broad-exception-caught
+            pass
+
+    with contextlib.suppress(Exception):
+        ctx.on("requestfinished", on_finished)
+        _IDP_RESPONSES[id(ctx)] = kept
+    return kept
+
+
+def idp_reason(ctx: Any) -> str | None:
+    """The phase code of the run's LAST readable IdP password answer
+    (``idp_invalid_credentials`` / ``idp_unknown`` / ``captcha_required``), or
+    None. Call it right after the recipe, before anything navigates away (a
+    navigation discards the bodies)."""
+    for req in reversed(_IDP_RESPONSES.get(id(ctx)) or []):
+        try:
+            resp = req.response()
+            if resp is None or body_too_large(resp.headers):
+                continue
+            return idp_classify(
+                str(req.method), str(req.url), int(resp.status), resp.body()
+            )
+        except Exception:  # pylint: disable=broad-exception-caught
+            continue
+    return None
+
+
 def html_script_hint(page: Any) -> str:
     """`` — the site served HTML for N script(s) (...)`` when that happened
     in this run (`watch_script_mime`), else ``""``."""
@@ -524,6 +573,7 @@ class PlaywrightRunner:
         if item is not None:
             clear_origin_workers(ctx, item_origins(item))
         watch_script_mime(ctx)
+        watch_idp_responses(ctx)
         return ctx
 
     def _profile_proof(self, page: Any, item: SiteItem) -> str:
@@ -554,6 +604,17 @@ class PlaywrightRunner:
             if seen:
                 diag["script_as_html"] = sorted(set(seen))[:3]
         self.last_diag[item.site] = diag
+
+    def _note_idp(
+        self, item: SiteItem, reason: str | None, exc: RecipeError
+    ) -> RecipeError:
+        """The IdP's answer (`idp_reason`) in the failure report and, for a
+        plain ``login_failed``, as its code (the phase stays). Returns `exc`."""
+        if reason:
+            self.last_diag.setdefault(item.site, {})["idp_reason"] = reason
+            if exc.code == "login_failed":
+                exc.code = reason
+        return exc
 
     def _cscs_portal_storage(self, ctx: Any, item: SiteItem) -> dict[str, str]:
         """CSCS: the portal's allowlisted storage (``recipes.CSCS_EXPORT_KEYS``
@@ -708,7 +769,9 @@ class PlaywrightRunner:
         try:
             recipe_for(item.site)(page, item, secret, dev=self.dev, attempt=attempt)
         except RecipeError as exc:
+            reason = idp_reason(ctx)  # before anything navigates away
             self._record_failure(page, item, secret)
+            self._note_idp(item, reason, exc)
             exc.submitted = exc.submitted or attempt.submitted
             exc.detail += html_script_hint(page)
             raise
@@ -723,6 +786,7 @@ class PlaywrightRunner:
                 submitted=True,
             ) from exc
         # Snapshot where the recipe ended — the check below navigates away.
+        reason = idp_reason(ctx)
         try:
             before = diagnose(page, secret)
         except Exception:  # pylint: disable=broad-exception-caught
@@ -731,8 +795,8 @@ class PlaywrightRunner:
         proof = self._profile_proof(page, item)
         if proof != VALID:
             self._record_failure(page, item, secret)
-            self.last_diag[item.site]["before_check"] = before
-            raise LoginFailed(
+            self.last_diag.setdefault(item.site, {})["before_check"] = before
+            failed = LoginFailed(
                 (
                     "login did not reach a logged-in state (status / origin / sentinel)"
                     if proof != INDETERMINATE
@@ -743,6 +807,7 @@ class PlaywrightRunner:
                 submitted=attempt.submitted,
                 phase="broker-proof",
             )
+            raise self._note_idp(item, reason, failed)
         return self._export(ctx, item, "login", proven=True)
 
     def _before_secret(  # pylint: disable=too-many-arguments
@@ -844,6 +909,7 @@ class PlaywrightRunner:
             finally:
                 _NOCACHE_SESSIONS.pop(id(ctx), None)
                 _HTML_SCRIPTS.pop(id(ctx), None)
+                _IDP_RESPONSES.pop(id(ctx), None)
                 with contextlib.suppress(Exception):
                     ctx.close()
         finally:
@@ -941,7 +1007,13 @@ class PlaywrightRunner:
                         overdue.auth_proven = True
                         raise overdue
                     return bundle
-                except (DeadlineError, NeedsHuman, OriginViolation, _RateLimited):
+                except (
+                    DeadlineError,
+                    NeedsHuman,
+                    OriginViolation,
+                    _RateLimited,
+                    _SubmitDisabled,
+                ):
                     # unchanged past the deadline too: exit 4, the origin
                     # violation's audit and the limiter's answer stay theirs
                     raise
@@ -953,6 +1025,7 @@ class PlaywrightRunner:
                     if ctx is not None:
                         _NOCACHE_SESSIONS.pop(id(ctx), None)
                         _HTML_SCRIPTS.pop(id(ctx), None)
+                        _IDP_RESPONSES.pop(id(ctx), None)
                         with contextlib.suppress(Exception):
                             ctx.close()
 
@@ -1048,6 +1121,10 @@ class _LazyBwVault:
     def secret(self, site: str) -> Secret:
         """See ``BwVault.secret``."""
         return self._vault().secret(site)
+
+    def fingerprint_secret(self, site: str) -> Secret:
+        """See ``BwVault.fingerprint_secret``."""
+        return self._vault().fingerprint_secret(site)
 
 
 def password_fingerprint(password: str) -> str:
@@ -1230,7 +1307,7 @@ class Broker(SecretOps):  # pylint: disable=too-many-instance-attributes  # deps
         """Length + 4 hex of the SHA-256 of the password the vault holds for `site`
         — to compare with Albert's copy without a login attempt or the value."""
         try:
-            secret = self.vault.secret(site)
+            secret = self.vault.fingerprint_secret(site)
         except VaultError as exc:
             return _err("vault_error", str(exc))
         return {"ok": True, "password_check": password_fingerprint(secret.password)}
@@ -1519,6 +1596,21 @@ class _RefreshUnavailable(RecipeError):
         )
 
 
+class _SubmitDisabled(RecipeError):
+    """The item is ``no_submit`` (``agent_no_submit``, ``vault.NO_SUBMIT_SITES`` or
+    a fill origin on ``vault.NO_SUBMIT_DOMAINS``): the login never gets the
+    secret, nothing is reserved, nothing typed or submitted."""
+
+    code = "submit_disabled"
+
+    def __init__(self) -> None:
+        super().__init__(
+            "the broker never submits a password for this site (agent_no_submit): "
+            "its session comes from Albert (Safari import or guided login)",
+            phase="vault",
+        )
+
+
 class _LimiterAttempt(AttemptController):
     """The recipe's `AttemptController`, bound to the gate's reservation:
     every mark is persisted before the step it announces (a write failure
@@ -1560,6 +1652,10 @@ class _SecretGate:  # pylint: disable=too-many-instance-attributes  # deps + att
     def __call__(self) -> Secret:
         if self.refresh_only:
             raise _RefreshUnavailable()
+        if self.item.no_submit:
+            # Before the deadline check and the reservation: the limiter is
+            # never touched and the login never gets the secret.
+            raise _SubmitDisabled()
         if (
             self.grant is None
             and self.deadline is not None

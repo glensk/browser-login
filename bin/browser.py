@@ -106,7 +106,8 @@ human.
   import-safari SITE [-n]
                     Copy SITE's session cookies from Safari (sites in
                     SAFARI_SITES the broker lists = Albert's consent); bot-check
-                    cookies stay behind; -n lists names/expiry only. `login SITE`
+                    cookies stay behind (galaxus: Chromium's own are dropped
+                    too); -n lists names/expiry only. `login SITE`
                     for such a site tries Safari first, then the broker
                     (kleinanzeigen only). $SAFARI_COOKIES overrides the file.
   login-cscs-assisted
@@ -937,6 +938,14 @@ def parse_args() -> argparse.Namespace:
         "--dry-run",
         action="store_true",
         help="only list the cookies that would be copied (names, never values)",
+    )
+    pis.add_argument(
+        "-R",
+        "--result-file",
+        metavar="PATH",
+        default=None,
+        help="write where the import stopped (phase, code) as JSON to PATH "
+        "(agent-login.py -t reads it)",
     )
     _add_guided_parsers(sub)
     _add_reap_parser(sub)
@@ -9557,7 +9566,15 @@ BROKER_ERRORS = {
     "timeout": "the broker run did not finish within its deadline",
     "bundle_export": "the broker could not export the site's required session token",
     "bundle_rejected": "the site's API rejects the broker's session",
+    "submit_disabled": "the broker never submits a password for this site — "
+    "Albert's session only (agent-login.py -g SITE, or his Safari session)",
+    "idp_invalid_credentials": "the identity provider answered: invalid credentials",
+    "idp_unknown": "the identity provider refused the password without a reason "
+    "(often its bot check)",
+    "captcha_required": "the identity provider wants a captcha",
 }
+# Broker refusals that need Albert (exit NEEDS_ALBERT_RC, 4).
+BROKER_NEEDS_ALBERT = frozenset({"needs_human", "captcha_required", "submit_disabled"})
 _BROKER_SITES_CACHE: list[list[dict]] = []
 # The broker's refusal of this process's latest `login` per site: (error code,
 # detail) — read by callers that need the structured reason behind the exit code
@@ -9681,6 +9698,7 @@ def _print_broker_diag(diag: object) -> None:
     print("  broker stopped at:", diag.get("url", "?"), f"— {diag.get('title', '')!r}")
     for key, label in (
         ("challenge", "bot check"),
+        ("idp_reason", "identity provider answered"),
         ("messages", "page says"),
         ("inputs", "visible fields"),
         ("buttons", "buttons"),
@@ -11365,7 +11383,7 @@ def _broker_refused(site: str, resp: dict) -> int:
     if limit and limit.get("reset"):
         msg += f" — {limit['reset']}"
     return _broker_fail(
-        4 if code == "needs_human" else 2,
+        4 if code in BROKER_NEEDS_ALBERT else 2,
         msg + (f" ({detail})" if detail else "") + f" [phase {phase}]",
     )
 
@@ -12164,20 +12182,19 @@ def _safari_replace_cookies(
     browser, site: str, cookies: Sequence[_safari.Cookie]
 ) -> int:
     """Delete the shared browser's cookies for `site`'s domains (bot-check ones
-    stay: they are Chromium's own), add `cookies`; return how many were added."""
-    rules = _safari.SAFARI_SITES[site]
-
-    def in_scope(domain: str, name: str) -> bool:
-        return any(
-            _safari.domain_matches(domain, r) for r in rules.domains
-        ) and not _safari.denied(name, rules)
-
+    stay — they are Chromium's own — unless the site sets ``drop_bot_cookies``),
+    add `cookies`; return how many were added. Refuses (ValueError, nothing
+    touched) when `cookies` hold none of the site's session cookies."""
+    if not _safari.has_session(site, cookies):
+        raise ValueError(f"{site}: no session cookie in Safari's set")
     ctx = browser.contexts[0] if browser.contexts else browser.new_context()
     for ck in ctx.cookies():
-        if in_scope(str(ck.get("domain")), str(ck.get("name"))):
+        if _safari.replaced_on_import(str(ck.get("domain")), str(ck.get("name")), site):
             ctx.clear_cookies(name=ck["name"], domain=ck["domain"], path=ck["path"])
     # Defence in depth: never inject a cookie outside the site's scope.
-    picked = [c.to_playwright() for c in cookies if in_scope(c.domain, c.name)]
+    picked = [
+        c.to_playwright() for c in cookies if _safari.importable(c.domain, c.name, site)
+    ]
     if picked:
         ctx.add_cookies(picked)
     return len(picked)
@@ -12206,37 +12223,69 @@ def _safari_dry_run(site: str, cookies: Sequence[_safari.Cookie]) -> int:
     return 0
 
 
-def cmd_import_safari(port: int, site_name: str, *, dry_run: bool = False) -> int:
+def cmd_import_safari(
+    port: int,
+    site_name: str,
+    *,
+    dry_run: bool = False,
+    result_file: str | None = None,
+) -> int:
     """Copy SITE's Safari session into the shared browser, then the positive check.
 
     Exit 0 logged in (dry run: cookies found), 2 not logged in / not allowed /
     nothing in Safari, 3 broker unreachable (consent cannot be confirmed).
+    The explicit import: it also runs for a site whose import is never
+    unattended (``import_unattended``; `agent-login.py -t` calls it).
+    `result_file` (`-R`): the phase record.
     """
     site = site_name.strip().lower()
+    _result_begin("import-safari", site, result_file)
+    rc = 1
+    try:
+        rc = _import_safari(port, site, dry_run=dry_run)
+        return rc
+    finally:
+        _result_write(rc)
+
+
+def _import_safari(port: int, site: str, *, dry_run: bool) -> int:
+    """`cmd_import_safari`'s body."""
     entry, rc = _safari_entry_or_rc(site)
     if entry is None:
+        _result_fail("precheck", "broker_unavailable" if rc == 3 else "unknown_site")
         return rc
     cookies, rc = _safari_site_cookies(site)
     if rc:
+        _result_fail("safari-source", "no_safari_session", "cookie file unreadable")
         return rc
     if dry_run:
         return _safari_dry_run(site, cookies)
-    if not cookies:
+    if not _safari.has_session(site, cookies):
+        _result_fail("safari-source", "no_safari_session")
         return _broker_fail(
             2,
-            f"{site}: Safari holds no usable session — {SAFARI_FIX.format(site=site)}",
+            f"{site}: Safari holds no usable session "
+            f"({_safari_session_names(site)}) — nothing replaced; "
+            + SAFARI_FIX.format(site=site),
         )
+    _result_set(route="safari")
     _safari_inject(port, site, cookies)
     rc = _broker_check_entry(port, site, entry)
     if rc == 0:
         _record_login_event(site, "safari")
         print(f"✅ {site}: logged in with your Safari session.")
         return 0
+    _result_fail("client-proof", "logged_out")
     return _broker_fail(
         rc,
         f"{site}: Safari session copied but the site is NOT logged in — "
         + SAFARI_FIX.format(site=site),
     )
+
+
+def _safari_session_names(site: str) -> str:
+    """The session cookies an import needs, for messages (names only)."""
+    return ", ".join(_safari.SAFARI_SITES[site].session_cookies) or "any cookie"
 
 
 def _safari_logged_in(port: int, site: str) -> int:
@@ -12250,9 +12299,13 @@ def _safari_logged_in(port: int, site: str) -> int:
 def _safari_try_import(port: int, site: str, entry: dict) -> bool:
     """Copy Safari's session for `site` (if it holds one); True once logged in."""
     cookies, _rc = _safari_site_cookies(site)
-    if not cookies:
+    if not _safari.has_session(site, cookies):
         _result_fail("safari-source", "no_safari_session")
-        print(f"Safari holds no usable {site} session.", file=sys.stderr)
+        print(
+            f"Safari holds no usable {site} session ({_safari_session_names(site)})"
+            " — nothing replaced.",
+            file=sys.stderr,
+        )
         return False
     _result_set(route="safari")
     print(f"▶ route: Safari session ({len(cookies)} cookie(s))")
@@ -12275,6 +12328,15 @@ def _safari_login(port: int, site: str) -> int:
         _result_set(route="already")
         print(f"route: already logged in ({site})")
         return 0
+    if not _safari.SAFARI_SITES[site].import_unattended:
+        # Its copied session's durability is unproven: only Albert re-imports
+        # (agent-login.py -t SITE -> browser.py import-safari SITE).
+        _result_fail("safari-source", "manual_import")
+        return _broker_fail(
+            NEEDS_ALBERT_RC,
+            f"needs Albert: agent-login.py -t {site} — the Safari import of "
+            f"{site} runs by hand only",
+        )
     if _safari_try_import(port, site, entry):
         return 0
     if _safari.SAFARI_SITES[site].broker_fallback and not entry.get("refused"):
@@ -14059,7 +14121,9 @@ def _dispatch(args: argparse.Namespace, port: int) -> int:
     if args.cmd == "logout":
         return cmd_broker_logout(port, args.site)
     if args.cmd == "import-safari":
-        return cmd_import_safari(port, args.site, dry_run=args.dry_run)
+        return cmd_import_safari(
+            port, args.site, dry_run=args.dry_run, result_file=args.result_file
+        )
     if args.cmd == "login-cscs-assisted":
         return cmd_login_cscs_assisted(port)
     if args.cmd == "assisted-login":
