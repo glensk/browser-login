@@ -856,6 +856,36 @@ def test_a_short_storage_write_is_storage_inject(
     assert browser._RESULT["session_refresh"] == recipes.REFRESH_FAILED
 
 
+@pytest.mark.parametrize(
+    "renewal", [recipes.REFRESH_NONE, recipes.REFRESH_FRESH, recipes.REFRESH_DONE]
+)
+def test_a_short_write_is_rolled_back_whatever_the_bundle_renewal_says(
+    inject: dict[str, Any], monkeypatch: pytest.MonkeyPatch, renewal: str
+) -> None:
+    """Regression (WS2-cscs review): the bundle's `session_refresh` string
+    shadowed the `refresh` flag, so every bundle of a WS2 broker (which
+    always says at least "none") skipped the rollback of a short write."""
+    inject["reply"] = {
+        "ok": True,
+        "bundle": {
+            "storage": {ORIGIN: {TOKEN_KEY: "[]"}},
+            "storage_keys": {ORIGIN: [TOKEN_KEY]},
+            "session_refresh": renewal,
+        },
+    }
+    monkeypatch.setattr(browser, "_broker_write_storage", _writes(0))
+    rc, _bundle, _c, _keys = browser._broker_fetch_inject(9222, "npm-nixos", {}, {})
+    assert rc == 2 and inject.get("dropped") == 1
+    assert browser._RESULT["rollback"] == "complete"
+    inject["dropped"] = 0
+    browser._RESULT.clear()
+    rc, _b, _c, _k = browser._broker_fetch_inject(
+        9222, "npm-nixos", {}, {}, refresh=True
+    )
+    assert rc == 2 and inject["dropped"] == 0  # a refresh keeps the old session
+    assert browser._RESULT["rollback"] == "skipped (refresh)"
+
+
 def _writes(n: int) -> Any:
     def write(_port: int, bundle: dict[str, Any], origins: Any = None) -> int:
         if n and origins is not None:

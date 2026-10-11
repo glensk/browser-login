@@ -11422,10 +11422,10 @@ def _broker_fetch_inject(
                     "storage key(s) — injecting the rest.",
                     file=sys.stderr,
                 )
-            refresh = bundle.get("session_refresh")
-            if isinstance(refresh, str):
-                _result_set(session_refresh=refresh)
-            if refresh == "failed":
+            renewal = bundle.get("session_refresh")
+            if isinstance(renewal, str):
+                _result_set(session_refresh=renewal)
+            if renewal == "failed":
                 print(
                     f"⚠️ {site}: the broker could not renew the session token — it "
                     "keeps its old expiry.",
