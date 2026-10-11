@@ -240,7 +240,7 @@ manual acceptance steps under the attempt policy below.
       - Both stay `pending` forever, so the scheduled check probes and never submits.
   - [x] galaxus-de ✅ 2026-10-11 (Albert's guided login; check-only by design, never promoted). Same analysis. No Safari cookies and no TOTP, so it gets an assisted
         login (Albert once, in the window) plus monitoring.
-  - [ ] myfritz-alzenau / myfritz-prilly
+  - [x] myfritz ✅ 2026-10-11 (captcha fix d629f6c, broker d629f6c41caa; one login through the invisible reCAPTCHA). On demand per Albert (10 h session), not promoted. Formerly myfritz-alzenau / myfritz-prilly
     - [x] Root cause (read-only, Codex diagnose converged in round 1): phase `submit`, a
           false `needs_human`. sso.myfritz.net (Keycloak) shows an INVISIBLE, self-submitting
           reCAPTCHA page between password and OTP. `challenge_reason` flags any visible
