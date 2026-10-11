@@ -218,7 +218,7 @@ manual acceptance steps under the attempt policy below.
       - re-login at 28 days or more of session age;
       - the promotion gate requires the sentinel visible after a real login.
     - [ ] Security defects in CWA itself: tp#886 (needs Albert's decision).
-  - [ ] galaxus — code released 2026-10-11 (f0f4b16, broker f0f4b16a2490): never-submit guard (field + built-in sites/domains), Safari import manual-only and refused without a Safari session, galaxus.ch via Safari, galaxus-de assisted. Secrets baseline unchanged (28/28). Open: the vault batch (sentinel + /de/orders) needs Albert at the Mac for Touch ID, then `agent-login.py -t galaxus` (import) and Albert's `-g galaxus-de`.
+  - [x] galaxus ✅ 2026-10-11: vault batch (sentinel + /de/orders) written with Touch ID; `-t galaxus` imported 19 Safari cookies, positive check ✅. Code released 2026-10-11 (f0f4b16, broker f0f4b16a2490): never-submit guard (field + built-in sites/domains), Safari import manual-only and refused without a Safari session, galaxus.ch via Safari, galaxus-de assisted. Secrets baseline unchanged (28/28). Open: the vault batch (sentinel + /de/orders) needs Albert at the Mac for Touch ID, then `agent-login.py -t galaxus` (import) and Albert's `-g galaxus-de`.
     - [x] Root cause (read-only, Codex diagnose converged in round 1): phase `submit`. The
           identity server accepts the e-mail, then shows "Deine Anmeldedaten sind nicht
           korrekt" for the password. Galaxus' frontend shows that text for `InvalidCredentials`
@@ -265,9 +265,9 @@ manual acceptance steps under the attempt policy below.
   - [x] navidrome-albert: ✅ after the storage-check fix (`fix(browser): storage write proven at
         document start`). The app rotates its JWT on every call, and the old exact-value
         read-back could never pass.
-  - [ ] uptimerobot: no password (SSO + API keys). Albert 2026-10-11: read-only API key as
+  - [x] uptimerobot: agent secret `uptimerobot-api-key` already = the read-only key (fingerprint-verified); browser item taken out of agent-login (Safari). No password (SSO + API keys). Albert 2026-10-11: read-only API key as
         an agent secret (needs Touch ID), and drop the browser item.
-  - [ ] mullvad: account-number login with no password. Albert 2026-10-11: teach the broker
+  - [x] mullvad ✅ promoted 2026-10-11 (d88dc81, broker d88dc81291ac): `agent_login_mode=username-only` on the item; secret `mullvad-account` tagged too (secret-run refuses it, Albert's choice). Account-number login with no password. Albert 2026-10-11: teach the broker
         (`agent_login_mode=username-only`), builder running.
   - [x] portainer-ds218 ✅ promoted 2026-10-11 (fix 535e692, broker 535e692552ed). Root cause = OUR bug. The strict proof's `goto(check_url)` was a hash-only
         (same-document) navigation, so Playwright returns None → status 0 → indeterminate. The
