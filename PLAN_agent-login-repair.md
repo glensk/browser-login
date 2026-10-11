@@ -238,7 +238,7 @@ manual acceptance steps under the attempt policy below.
       - Vault: sentinel `[data-testid="customer-account-button"]`, check `/de/orders`; Albert
             sets the groups `digitecgalaxus-ch` / `galaxus-eu` by hand.
       - Both stay `pending` forever, so the scheduled check probes and never submits.
-  - [ ] galaxus-de: same analysis. No Safari cookies and no TOTP, so it gets an assisted
+  - [x] galaxus-de ✅ 2026-10-11 (Albert's guided login; check-only by design, never promoted). Same analysis. No Safari cookies and no TOTP, so it gets an assisted
         login (Albert once, in the window) plus monitoring.
   - [ ] myfritz-alzenau / myfritz-prilly
     - [x] Root cause (read-only, Codex diagnose converged in round 1): phase `submit`, a
@@ -300,7 +300,7 @@ manual acceptance steps under the attempt policy below.
         server-side tri-state probe, tri-state through to the mail (2× invalid before
         "log in once"), expiry telemetry (warn < 30 days), `_record_login_event` for guided
         logins, logout tests only on throwaway instances.
-- [ ] WS1b — durability per flow, after WS2's root causes: broker re-export before expiry,
+- [ ] WS1b — durability per flow, after WS2's root causes. Albert 2026-10-11: assisted/guided logins (galaxus-de, notion, openai, slack, Safari sites) are done by AGENTS in Albert's Safari (`safari.py -L/-O` from the Vaultwarden tab) plus a Safari cookie import into the shared Chromium — never a `-g` to-do for Albert (only CAPTCHA / locked vault / hardware or push approval / SMS stay his). Build: a SAFARI_SITES entry for galaxus-de and an `agent-login.py` path that runs the Safari login + import itself. The guided-login confirm is now 'press Enter'. broker re-export before expiry,
       credential-change handling, Safari-cookie expiry, monitoring of assisted sessions with
       an alert to Albert. Plan → codex-debate → implement.
 - [ ] WS4 — no more unsynced rotations (Albert, 2026-10-10: layers 1 and 2). Plan →
