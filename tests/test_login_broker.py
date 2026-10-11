@@ -2009,7 +2009,7 @@ class _DiagPage:
     def title(self) -> str:
         return f"Hello {USERNAME_FOR_DIAG}"
 
-    def evaluate(self, _js: str) -> dict:
+    def evaluate(self, _js: str, _arg: object = None) -> dict:
         return {
             "messages": [f"Wrong password {PASSWORD} for {USERNAME_FOR_DIAG}"],
             "buttons": ["Continue"],

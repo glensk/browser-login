@@ -38,12 +38,14 @@ from collections.abc import Callable
 from typing import TYPE_CHECKING, Any
 
 from broker.login_form import (
+    FIELD_DESCRIBE_JS,
     FORM_ACTION_JS,
     REMEMBER_BOX_HANDLES_JS,
     REMEMBER_BOXES_JS,
     SUBMIT_BUTTON_JS,
     USERNAME_JS,
     body_pairs,
+    concealed,
     describe_buttons,
     pick_login_password,
     pick_login_username,
@@ -51,6 +53,7 @@ from broker.login_form import (
     pick_submit_button,
     pick_visible,
     read_submit_buttons,
+    registration_field_like,
     secondary_button_like,
     secondary_hit,
     secondary_pairs,
@@ -84,6 +87,37 @@ USERNAME_SELECTOR = (
     "input[name=username], input[name=email], input[name=identifier], input#username"
 )
 OTP_SELECTOR = "input[autocomplete=one-time-code], input[name*=otp i], #otp"
+# `agent_login_mode=username-only` (``vault.USERNAME_ONLY`` is this value:
+# vault imports this module): the item's username alone is the credential,
+# typed and submitted like a password (``_credential_login``).
+USERNAME_ONLY_MODE = "username-only"
+# Where a username-only login's account number / username may go when the page
+# does not mask it in a password field (Mullvad does: type=password
+# name=account_number): the username candidates plus account-number fields.
+ACCOUNT_SELECTOR = (
+    USERNAME_SELECTOR + ", input[name*=account i], input[id*=account i], "
+    "input[autocomplete~=username]"
+)
+# Input types an account number can be typed into.
+ACCOUNT_FIELD_TYPES = frozenset({"", "text", "email", "tel", "number", "password"})
+# The OTHER visible text-like inputs of a field's form — `form.elements`, so
+# controls outside the <form> tag joined by `form=` count too — or, for a
+# form-less field, the page's other form-less ones. A username-only login types
+# into a field only when this is 0: a form that also asks for something else
+# is a password login, never guessed at.
+OTHER_FIELDS_JS = """e => {
+  const vis = el => !!(el.offsetWidth || el.offsetHeight || el.getClientRects().length);
+  const skip = ['hidden', 'checkbox', 'radio', 'submit', 'button', 'image', 'reset',
+                'file', 'range', 'color'];
+  const all = e.form ? Array.from(e.form.elements)
+      : Array.from(e.ownerDocument.querySelectorAll('input, textarea')).filter(i => !i.form);
+  return all.filter(i =>
+      i !== e && (i.tagName === 'INPUT' || i.tagName === 'TEXTAREA') && vis(i)
+      && !(i.tagName === 'INPUT' && skip.includes((i.type || 'text').toLowerCase()))
+  ).length;
+}"""
+# A field whose name / id says "account" (Mullvad: name=account_number).
+ACCOUNT_NAME_RE = re.compile(r"account", re.IGNORECASE)
 STEP_TIMEOUT_S = 20.0
 # Post-login prompts answered per login (page_state.POST_LOGIN_PROMPTS): Zoho
 # can ask "Trust this browser?" and then "Review your account details".
@@ -873,30 +907,53 @@ def _fill_password(  # pylint: disable=too-many-arguments
     *,
     dev: bool,
     attempt: AttemptController | None = None,
+    locate: Callable[[Any], Any] | None = None,
+    sent: Callable[[], bool] | None = None,
 ) -> Any:
     """Type the password and make sure the field KEEPS it; returns the field used.
 
     One retry types it key by key into the (re-located) visible password field;
     a field that still drops the value fails BEFORE anything is submitted.
     `attempt.entered()` runs right before the first character is typed.
+    `locate` re-locates the field (default: the login password field; a
+    username-only login: ``_credential_field``, never another field).
+    `sent` (a username-only login: the tripwire's ``secret_sent``): the page
+    sent the value by itself — it is not checked or typed again.
     """
+    find = locate or _login_password
+    went = sent or (lambda: False)
     page.wait_for_timeout(HYDRATE_S * 1000)
     _check_challenge(page, submitted=False)
-    pw_field = _login_password(page) or pw_field
+    pw_field = find(page) or pw_field
     _guard(page, pw_field, allowed, dev=dev)
     (attempt or NO_ATTEMPT).entered()
     pw_field.fill(secret.password)
     page.wait_for_timeout(500)
-    if _field_value(pw_field) == secret.password:
+    if went() or _holds(_field_value(pw_field), secret):
         return pw_field
-    pw_field = _login_password(page) or pw_field
+    pw_field = find(page) or pw_field
     _guard(page, pw_field, allowed, dev=dev)
     pw_field.fill("")
     pw_field.press_sequentially(secret.password, delay=60)
     page.wait_for_timeout(500)
-    if _field_value(pw_field) != secret.password:
+    if not went() and not _holds(_field_value(pw_field), secret):
         raise LoginFailed("the password field did not keep the typed value")
     return pw_field
+
+
+def _compact(value: str) -> str:
+    return re.sub(r"[\s-]+", "", value)
+
+
+def _holds(value: str | None, secret: Secret) -> bool:
+    """The field `value` is exactly the typed secret — for a username-only
+    login up to the spaces / hyphens a page inserts into an account number
+    (``1234 5678 …``)."""
+    if value is None:
+        return False
+    if secret.mode == USERNAME_ONLY_MODE:
+        return _compact(value) == _compact(secret.password)
+    return value == secret.password
 
 
 def _field_value(field: Any) -> str | None:
@@ -1195,18 +1252,42 @@ class SubmitTripwire:  # pylint: disable=too-many-instance-attributes  # screen 
     origin, popups included — is one this tripwire PROVABLY aborted (by
     request identity)."""
 
-    def __init__(self, page: Any, allowed: list[str], *, dev: bool) -> None:
+    def __init__(
+        self,
+        page: Any,
+        allowed: list[str],
+        *,
+        dev: bool,
+        attempt: AttemptController | None = None,
+    ) -> None:
         self.page = page
         self.allowed = list(allowed)
         self.dev = dev
         self.protect: set[str] = set()
+        # The keys of the fields that hold the SECRET (the password field, a
+        # username-only login's field): once armed, a request carrying one is
+        # the secret leaving — the attempt is marked submitted before it goes
+        # (a page that submits by itself while the broker types), and a
+        # marker that cannot be written stops it (``marker_failed``).
+        self.secret_keys: set[str] = set()
+        # the secret itself: a request counts only when it carries ALL of it
+        # (an empty or partial check request is not the submit)
+        self._secret: Secret | None = None
+        self.attempt = attempt
+        self.marker_failed = False
+        self._carries_secret = False
         # (name, value) of the CURRENT step's secondary submit buttons
         self.button_pairs: set[tuple[str, str]] = set()
         self.tripped: str | None = None
         # identities of the requests that could carry the password since
         # `arm`: seen by the context / provably aborted here
         self.ids: dict[str, set[Any]] = {"seen": set(), "aborted": set()}
-        self.proof = {"armed": False, "workers": False, "login_sent": False}
+        self.proof = {
+            "armed": False,
+            "workers": False,
+            "login_sent": False,
+            "secret_sent": False,
+        }
 
     def _match(self, url: str) -> bool:
         return origin_allowed(url, self.allowed, dev=self.dev)
@@ -1251,7 +1332,9 @@ class SubmitTripwire:  # pylint: disable=too-many-instance-attributes  # screen 
 
     def _verdict(self, req: Any) -> tuple[str | None, bool]:
         """(what makes `req` a secondary action or None, whether it carries
-        a shielded key) — see the class docstring for what is screened."""
+        a shielded key) — see the class docstring for what is screened.
+        Sets ``_carries_secret`` (a ``secret_keys`` key in it) as it goes."""
+        self._carries_secret = False
         method = str(req.method).upper()
         nav = self._navigation(req)
         query = urllib.parse.urlsplit(str(req.url)).query
@@ -1271,6 +1354,11 @@ class SubmitTripwire:  # pylint: disable=too-many-instance-attributes  # screen 
             path_url = str(req.url)
         shield = {p.lower() for p in self.protect}
         shielded = any(k.lower() in shield for k, _v in every)
+        keys = {k.lower() for k in self.secret_keys}
+        held = self._secret
+        self._carries_secret = held is not None and any(
+            k.lower() in keys and _holds(v, held) for k, v in every
+        )
         if not shielded and (self.proof["login_sent"] or not form_nav):
             return None, False
         hit = secondary_hit(
@@ -1283,6 +1371,11 @@ class SubmitTripwire:  # pylint: disable=too-many-instance-attributes  # screen 
             hit, shielded = self._verdict(route.request)
         except Exception:  # pylint: disable=broad-exception-caught
             hit, shielded = None, False  # unreadable: let it pass (counted as seen)
+            self._carries_secret = False
+        if not hit and self._carries_secret and self.proof["armed"]:
+            if not self._mark_secret_sent():
+                self._abort(route)  # no marker on record: it must not go
+                return
         if not hit:
             with contextlib.suppress(Exception):
                 route.continue_()
@@ -1290,6 +1383,22 @@ class SubmitTripwire:  # pylint: disable=too-many-instance-attributes  # screen 
                 self.proof["login_sent"] = True
             return
         self.tripped = self.tripped or hit
+        self._abort(route)
+
+    def _mark_secret_sent(self) -> bool:
+        """The secret is leaving: mark the attempt submitted first (idempotent
+        in the limiter). False when the marker could not be written."""
+        try:
+            if self.attempt is not None and not self.attempt.submitted:
+                self.attempt.mark_submitted()
+        except Exception:  # pylint: disable=broad-exception-caught
+            self.marker_failed = True
+            return False
+        self.proof["secret_sent"] = True
+        return True
+
+    def _abort(self, route: Any) -> None:
+        """Abort `route` in the browser; counted when provably stopped."""
         try:
             route.abort("blockedbyclient")
         except Exception:  # pylint: disable=broad-exception-caught
@@ -1314,9 +1423,27 @@ class SubmitTripwire:  # pylint: disable=too-many-instance-attributes  # screen 
         with contextlib.suppress(Exception):
             context.remove_listener("request", self._seen)
 
+    @property
+    def secret_sent(self) -> bool:
+        """A request carrying the secret went out (the attempt is marked)."""
+        return bool(self.proof["secret_sent"])
+
+    def secret_fields(self, *fields: Any, secret: Secret | None = None) -> None:
+        """These fields hold `secret`: shielded, and a request carrying one of
+        their keys WITH the whole secret as its value marks the attempt
+        submitted before it goes."""
+        if secret is not None:
+            self._secret = secret
+        self.shield(*fields)
+        self.secret_keys.update(
+            n for f in fields if f is not None if (n := _field_name(f))
+        )
+
     def shield(self, *fields: Any) -> None:
         """Never read the values of these fields' keys (username, password,
-        OTP); a request carrying one of them is the login itself."""
+        OTP) for the secondary-action verdict; a request carrying one of them
+        is the login itself. (``secret_fields`` compares the secret field's
+        value with the secret, only to mark the attempt submitted.)"""
         self.protect.update(n for f in fields if f is not None if (n := _field_name(f)))
 
     def step(self, descs: list[dict[str, Any]], *fields: Any) -> None:
@@ -1348,7 +1475,13 @@ class SubmitTripwire:  # pylint: disable=too-many-instance-attributes  # screen 
         )
 
     def check(self) -> None:
-        """Raise ``SecondaryActionBlocked`` once a request was aborted."""
+        """Raise ``SecondaryActionBlocked`` once a request was aborted, and
+        ``LoginFailed`` once the secret was stopped for want of a marker."""
+        if self.marker_failed:
+            raise LoginFailed(
+                "the submit marker could not be recorded — the login request "
+                "was stopped in the browser"
+            )
         if self.tripped:
             raise SecondaryActionBlocked(
                 f"a submit named a secondary form action ({self.tripped}) — "
@@ -1480,7 +1613,20 @@ def _unsent(
     is still on a fill origin and `field` still holds exactly the password."""
     if secret is None or not origin_allowed(page.url, allowed, dev=dev):
         return False
-    return _field_value(field) == secret.password
+    return _holds(_field_value(field), secret)
+
+
+def _sent_by_itself(tripwire: SubmitTripwire | None, secret: Secret | None) -> bool:
+    """A username-only login whose page sent the account number by itself
+    while it was typed (the tripwire marked the attempt first): never a
+    second submit. Password logins keep their submit — a page may post the
+    password field in a check request before its form is sent."""
+    return (
+        tripwire is not None
+        and tripwire.secret_sent
+        and secret is not None
+        and secret.mode == USERNAME_ONLY_MODE
+    )
 
 
 def _submit_password(  # pylint: disable=too-many-arguments
@@ -1504,10 +1650,15 @@ def _submit_password(  # pylint: disable=too-many-arguments
     instead; with none showing, ``SubmitUnidentified``. Guarded like every
     submit: the field, the button's own frame and its ``formaction`` stay on
     a fill origin. ``attempt.mark_submitted()`` runs only right before the
-    Enter or the click on the identified button."""
+    Enter or the click on the identified button. A username-only login the
+    page already sent by itself is not submitted again (``_sent_by_itself``)."""
+    if _sent_by_itself(tripwire, secret):
+        return
     _guard(page, pw_field, allowed, dev=dev)
     read = read_submit_buttons(pw_field)
     if read is None:
+        if _sent_by_itself(tripwire, secret):
+            return
         raise SubmitUnidentified(
             "the login form's submit buttons could not be read — nothing submitted",
             unsent=_unsent(page, pw_field, secret, allowed, dev=dev),
@@ -1515,6 +1666,8 @@ def _submit_password(  # pylint: disable=too-many-arguments
     buttons, descs = read
     if tripwire is not None:
         tripwire.step(descs, pw_field)
+    if _sent_by_itself(tripwire, secret):
+        return
     choice = pick_submit_button(descs)
     if choice is None:
         (attempt or NO_ATTEMPT).mark_submitted()
@@ -1637,6 +1790,11 @@ def generic_login(
     _check_challenge(page, submitted=False)
     if item.pre_click:
         _pre_click(page, item.pre_click, allowed, dev=dev)
+    if secret.mode == USERNAME_ONLY_MODE:
+        _credential_login(
+            page, item, secret, dev=dev, settle_s=settle_s, attempt=attempt
+        )
+        return
     user_field, pw_field = _wait_login_fields(page, STEP_TIMEOUT_S)
     if user_field is None and pw_field is None:
         if access_gated(page.url):
@@ -1645,7 +1803,7 @@ def generic_login(
         raise LoginFailed("no visible username or password field on the login page")
     if access_gated(page.url):
         raise AccessGated()  # its e-mail field is not the site's
-    with SubmitTripwire(page, allowed, dev=dev) as trip:
+    with SubmitTripwire(page, allowed, dev=dev, attempt=attempt) as trip:
         _login_steps(
             page,
             item,
@@ -1691,10 +1849,12 @@ def _login_steps(  # pylint: disable=too-many-arguments,too-many-locals
         if _needs_fill(user_field, secret.username):
             _guard(page, user_field, allowed, dev=dev)
             user_field.fill(secret.username)
-    trip.shield(user_field, pw_field)
+    trip.shield(user_field)
+    trip.secret_fields(pw_field, secret=secret)
     _tick_remember_me(page, pw_field, allowed, dev=dev)
     trip.arm()
     pw_field = _fill_password(page, pw_field, secret, allowed, dev=dev, attempt=attempt)
+    trip.secret_fields(pw_field)  # re-located: its key may differ
     _submit_password(
         page,
         pw_field,
@@ -1704,7 +1864,171 @@ def _login_steps(  # pylint: disable=too-many-arguments,too-many-locals
         secret=secret,
         tripwire=trip,
     )
+    _settle(page, item, secret, dev=dev, settle_s=settle_s, attempt=attempt, trip=trip)
 
+
+def _account_like(desc: dict[str, Any]) -> bool:
+    """A visible field an account number can be typed into: a text-like type,
+    neither concealed nor a registration field."""
+    return (
+        str(desc.get("type") or "") in ACCOUNT_FIELD_TYPES
+        and not concealed(desc)
+        and not registration_field_like(desc)
+    )
+
+
+def _credential_candidates(page: Any) -> list[tuple[Any, dict[str, Any]]]:
+    """Every visible (field, descriptor) a username-only login could type into:
+    login password fields (Mullvad masks its account number in one) and
+    username / account-number fields (``ACCOUNT_SELECTOR``), each once."""
+    out: list[tuple[Any, dict[str, Any]]] = []
+    try:
+        for el in page.query_selector_all(PASSWORD_SELECTOR + ", " + ACCOUNT_SELECTOR):
+            if not el.is_visible():
+                continue
+            desc = el.evaluate(FIELD_DESCRIBE_JS)
+            if isinstance(desc, dict) and _account_like(desc):
+                out.append((el, desc))
+    except Exception:  # pylint: disable=broad-exception-caught
+        return []  # re-rendered: look again
+    return out
+
+
+def _credential_field(page: Any) -> Any:
+    """A username-only login's field, or None while none shows: the ONE
+    visible candidate (``_credential_candidates``), or — among several — the
+    one whose name / id says "account". Several candidates and no single
+    account field, or a field that is not the ONLY visible text-like input of
+    its form (``OTHER_FIELDS_JS``: that form asks for more than the username),
+    raise ``LoginFailed``: nothing is typed on a page the broker would have
+    to guess on."""
+    found = _credential_candidates(page)
+    if not found:
+        return None
+    if len(found) > 1:
+        named = [
+            el
+            for el, d in found
+            if ACCOUNT_NAME_RE.search(f"{d.get('name') or ''} {d.get('id') or ''}")
+        ]
+        if len(named) != 1:
+            raise LoginFailed(
+                "agent_login_mode=username-only, but the page shows several "
+                "fields it could go into — nothing typed"
+            )
+        field = named[0]
+    else:
+        field = found[0][0]
+    try:
+        others = int(field.evaluate(OTHER_FIELDS_JS))
+    except Exception:  # pylint: disable=broad-exception-caught
+        return None  # re-rendered: look again
+    if others:
+        raise LoginFailed(
+            "agent_login_mode=username-only, but the login form asks for more "
+            "than the username/account number — nothing typed"
+        )
+    return field
+
+
+def _wait_credential_field(page: Any, timeout_s: float) -> Any:
+    """``_credential_field`` once it shows (polled), or None after `timeout_s`."""
+    deadline = time.monotonic() + timeout_s
+    while True:
+        field = _credential_field(page)
+        if field is not None or time.monotonic() >= deadline:
+            return field
+        _check_challenge(page, submitted=False)
+        page.wait_for_timeout(250)
+
+
+def _credential_login(  # pylint: disable=too-many-arguments
+    page: Any,
+    item: SiteItem,
+    secret: Secret,
+    *,
+    dev: bool,
+    settle_s: float,
+    attempt: AttemptController | None,
+) -> None:
+    """``generic_login`` for ``agent_login_mode=username-only``: the item's
+    username (``Secret.password`` of such an item, e.g. Mullvad's account
+    number) is the ONLY thing typed, into the form's only field
+    (``_credential_field``), and submitted with the password's rules — the
+    tripwire armed before typing, the form's buttons read fail-closed, the
+    submit marker right before the Enter / click — then the same settle loop."""
+    allowed = list(item.fill_origins)
+    field = _wait_credential_field(page, STEP_TIMEOUT_S)
+    if access_gated(page.url):
+        raise AccessGated()
+    if field is None:
+        _check_challenge(page, submitted=False)
+        raise LoginFailed("no visible username/account-number field on the login page")
+    with SubmitTripwire(page, allowed, dev=dev, attempt=attempt) as trip:
+        trip.secret_fields(field, secret=secret)
+        _tick_remember_me(page, field, allowed, dev=dev)
+        trip.arm()
+        field = _fill_password(
+            page,
+            field,
+            secret,
+            allowed,
+            dev=dev,
+            attempt=attempt,
+            locate=_credential_field,
+            sent=lambda: trip.secret_sent,
+        )
+        trip.secret_fields(field)
+        trip.check()  # a marker that could not be written stopped a self-submit
+        _submit_password(
+            page,
+            field,
+            allowed,
+            dev=dev,
+            attempt=attempt,
+            secret=secret,
+            tripwire=trip,
+        )
+        _settle(
+            page,
+            item,
+            secret,
+            dev=dev,
+            settle_s=settle_s,
+            attempt=attempt,
+            trip=trip,
+            credential=field,
+        )
+
+
+def _same_field(field: Any, other: Any) -> bool:
+    """`field` is `other` (still on the page); True when it cannot be told —
+    the caller then never types into it."""
+    if not _still_there(other):
+        return False
+    try:
+        return bool(field.evaluate("(a, b) => a === b", other))
+    except Exception:  # pylint: disable=broad-exception-caught
+        return True
+
+
+# The settle loop after the submit: one branch per thing the page may show.
+def _settle(  # pylint: disable=too-many-arguments
+    page: Any,
+    item: SiteItem,
+    secret: Secret,
+    *,
+    dev: bool,
+    settle_s: float,
+    attempt: AttemptController | None,
+    trip: SubmitTripwire,
+    credential: Any = None,
+) -> None:
+    """After the (password / username-only) submit: answer an OTP step and
+    known post-login prompts until the page left the login (`settle_s`).
+    `credential`: a username-only login's field — never taken for an OTP
+    field (an account-number field looks numeric)."""
+    allowed = list(item.fill_origins)
     otp_done = False
     prompts_answered = 0
     deadline = time.monotonic() + settle_s
@@ -1713,6 +2037,12 @@ def _login_steps(  # pylint: disable=too-many-arguments,too-many-locals
         trip.check()
         _check_challenge(page, submitted=True)
         otp_field = None if otp_done else _otp_field(page)
+        if (
+            otp_field is not None
+            and credential is not None
+            and _same_field(otp_field, credential)
+        ):
+            otp_field = None
         if otp_field is not None:
             _fill_otp(
                 page,
@@ -1747,8 +2077,13 @@ def _login_steps(  # pylint: disable=too-many-arguments,too-many-locals
         return
     # Still on the login after the password: wrong password, an e-mail code, a
     # captcha... Fail HERE so the failure report shows this page.
+    what = (
+        "the username/account number"
+        if secret.mode == USERNAME_ONLY_MODE
+        else "the password"
+    )
     raise LoginFailed(
-        "still on the login page after submitting the password", submitted=True
+        f"still on the login page after submitting {what}", submitted=True
     )
 
 

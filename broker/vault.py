@@ -46,7 +46,10 @@ from broker.recipes import (
     DEFAULT_CHECK_URLS,
     DEFAULT_LOGGED_IN_SELECTORS,
     SESSION_REFRESHERS,
+    USERNAME_ONLY_MODE,
+    generic_login,
     has_server_proof,
+    recipe_for,
     session_refresh_name,
 )
 from broker.vault_cache import (
@@ -87,6 +90,25 @@ _NO_SUBMIT_TOKEN_RE = re.compile(
     + r")(?![a-z0-9-])"
 )
 NO_SUBMIT_SECRET = "a no-submit login item is never exposed as a secret"
+# `agent_login_mode`: how the broker logs in with an item. `password` (the
+# default) types username + password; `username-only` types ONLY the item's
+# username — e.g. Mullvad's account number, which is the whole credential.
+# Such a username is a secret like a password: it reaches the recipe as
+# ``Secret.password`` (so every masking path treats it as one) and the secret
+# ops never expose the item.
+PASSWORD_MODE = "password"
+USERNAME_ONLY = USERNAME_ONLY_MODE
+LOGIN_MODES = (PASSWORD_MODE, USERNAME_ONLY)
+USERNAME_ONLY_SECRET = "a username-only login item is never exposed as a secret"
+NO_PASSWORD = (
+    "the item has no password (if it logs in with only a username/account "
+    "number, set agent_login_mode=username-only; if it should have one, check "
+    "the item or the collection permission 'Can view' vs 'except passwords')"
+)
+NO_USERNAME = (
+    "the item has no username (agent_login_mode=username-only logs in with "
+    "the username/account number alone)"
+)
 SAFE_NAME_RE = re.compile(r"^[A-Za-z0-9._ -]{1,64}$")
 BW_TIMEOUT_S = 120.0
 # A value shorter than this is refused unless the item sets
@@ -102,6 +124,18 @@ BW_LOCK = threading.RLock()
 class VaultError(RuntimeError):
     """The vault could not be read. The message never carries a secret."""
 
+    code = "vault_error"
+
+
+class MissingSecret(VaultError):
+    """The item was read but lacks the secret its login mode needs: no
+    password (``no_password``), or a username-only item without a username
+    (``no_username``). Not a Bitwarden read failure."""
+
+    def __init__(self, code: str, message: str) -> None:
+        super().__init__(message)
+        self.code = code
+
 
 class SecretsNotConfigured(VaultError):
     """The bootstrap names no secrets collection (``secret``/``totp`` refuse)."""
@@ -109,14 +143,28 @@ class SecretsNotConfigured(VaultError):
 
 @dataclass(frozen=True)
 class Secret:
-    """Login secret for one site. ``repr`` is redacted on purpose."""
+    """Login secret for one site. ``repr`` is redacted on purpose.
+
+    `mode` ``username-only``: the item's username IS the credential (an
+    account number). It is carried as `password` — the fingerprint, the
+    diagnostics' masking, the field checks and the tripwire treat it as the
+    secret — and `username` stays empty, so no path types or shows it as a
+    user name."""
 
     username: str = field(repr=False)
     password: str = field(repr=False)
     totp_seed: str | None = field(default=None, repr=False)
+    mode: str = PASSWORD_MODE
 
     def __repr__(self) -> str:
         return "Secret(<redacted>)"
+
+    @property
+    def identity(self) -> str:
+        """WHICH account this secret logs into, for an identity proof (WS5):
+        the username — for a username-only login the account number, which
+        is the secret itself (compare it in the page, never print it)."""
+        return self.password if self.mode == USERNAME_ONLY else self.username
 
 
 @dataclass(frozen=True)
@@ -168,6 +216,9 @@ class SiteItem:  # pylint: disable=too-many-instance-attributes
     # while the session still works. Only with `agent_fresh_login` (a reused
     # broker profile would hand back the same ageing session). None = no limit.
     max_session_days: int | None = None
+    # `agent_login_mode`: ``password`` (default) or ``username-only`` (the
+    # username alone is typed and submitted; see ``Secret``).
+    login_mode: str = PASSWORD_MODE
     refused: str | None = None
     item_id: str = ""
 
@@ -220,6 +271,9 @@ class SiteItem:  # pylint: disable=too-many-instance-attributes
             "session_refresh": session_refresh_name(self),
             "no_submit": self.no_submit or self.site in NO_SUBMIT_SITES,
             "max_session_days": self.max_session_days,
+            # a flag, not the mode's name: the `sites` view never says
+            # "password" (a leak canary in the tests checks for the word)
+            "username_only": self.login_mode == USERNAME_ONLY,
             "refused": self.refused is not None,
             "reason": self.refused or "",
         }
@@ -417,6 +471,15 @@ def secret_item_from_json(
     why = _no_submit_reason(item, fields)
     if why:
         return refused(why)
+    mode, _problem = login_mode(fields.get("agent_login_mode", ""))
+    if mode != PASSWORD_MODE:
+        # A (copy of a) username-only login: its username is the credential.
+        # A malformed mode fails closed: it may be meant as username-only.
+        return refused(
+            USERNAME_ONLY_SECRET
+            if mode == USERNAME_ONLY
+            else "bad agent_login_mode: cannot tell whether it is a username-only login"
+        )
     counts = _custom_field_counts(item)
     if any(c > 1 for c in counts.values()):
         return refused("duplicate custom field names")
@@ -603,6 +666,16 @@ def _page_url_ok(url: str, *, dev: bool) -> bool:
     if url.startswith("https://"):
         return True
     return dev and url.startswith("http://127.0.0.1")
+
+
+def login_mode(raw: str) -> tuple[str | None, str]:
+    """(mode, refusal reason or '') of an ``agent_login_mode`` value: empty or
+    ``password`` -> ``password``, ``username-only`` -> ``username-only``
+    (case-insensitive); anything else -> (None, reason)."""
+    value = raw.strip().lower() or PASSWORD_MODE
+    if value in LOGIN_MODES:
+        return value, ""
+    return None, f"bad agent_login_mode ({' or '.join(LOGIN_MODES)})"
 
 
 _TRUE = frozenset({"true", "1", "yes", "on"})
@@ -800,6 +873,15 @@ def site_item_from_json(item: Mapping[str, Any], *, dev: bool = False) -> SiteIt
     )
     if problem:
         return refused(problem)
+    mode, problem = login_mode(fields.get("agent_login_mode", ""))
+    if problem:
+        return refused(problem)
+    # (an empty username is the login's `no_username`, from `secret_from_json`)
+    if mode == USERNAME_ONLY and recipe_for(site) is not generic_login:
+        return refused(
+            "agent_login_mode=username-only needs the generic login recipe "
+            "(this site has its own)"
+        )
     return SiteItem(
         fill_origins=fill_origins,
         cookie_hosts=cookie_hosts,
@@ -818,6 +900,7 @@ def site_item_from_json(item: Mapping[str, Any], *, dev: bool = False) -> SiteIt
         or site in NO_SUBMIT_SITES
         or no_submit_by_origin(fill_origins),
         max_session_days=max_days,
+        login_mode=mode or PASSWORD_MODE,
         site=site,
         name=name,
         item_id=item_id,
@@ -879,26 +962,33 @@ def build_items(raw_items: list[Any], *, dev: bool = False) -> list[SiteItem]:
 
 
 def secret_from_json(item: Mapping[str, Any]) -> Secret:
-    """The login part of a Bitwarden item."""
+    """The login part of a Bitwarden item, for its ``agent_login_mode``:
+    username + password, or (``username-only``) the username alone, carried
+    as the secret (``Secret``). A missing one raises ``MissingSecret``."""
     login = item.get("login") or {}
     if not isinstance(login, Mapping):
         login = {}
     totp = login.get("totp")
+    seed = str(totp) if totp else None
+    mode, _problem = login_mode(_fields(item).get("agent_login_mode", ""))
+    if mode == USERNAME_ONLY:
+        # The username IS the credential; a password on the item is ignored.
+        account = str(login.get("username") or "").strip()
+        if not account:
+            raise MissingSecret("no_username", NO_USERNAME)
+        return Secret(username="", password=account, totp_seed=seed, mode=USERNAME_ONLY)
     password = str(login.get("password") or "")
     if not password:
         # Typing an empty password only produces "invalid username or password"
         # at the site (and counts as a failed login). Bitwarden hands an item over
         # WITHOUT its password when the broker account's collection permission is
-        # "Can view, except passwords".
-        raise VaultError(
-            "the item has no password for the broker — set the broker account's "
-            "permission on the agent-login collection to 'Can view' "
-            "(not 'Can view, except passwords')"
-        )
+        # "Can view, except passwords" — or the item has none at all (an
+        # account-number login: agent_login_mode=username-only).
+        raise MissingSecret("no_password", NO_PASSWORD)
     return Secret(
         username=str(login.get("username") or ""),
         password=password,
-        totp_seed=str(totp) if totp else None,
+        totp_seed=seed,
     )
 
 

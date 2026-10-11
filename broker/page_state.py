@@ -264,18 +264,22 @@ def page_blank(page: Any) -> bool:
 
 
 # What a failure report lists: visible message-like elements and buttons.
-_DIAG_JS = """() => {
+# Texts come back long (``DIAG_RAW_CHARS``) and are cut in Python only AFTER
+# masking: a secret cut at the page-side limit would leave its prefix unmasked.
+DIAG_RAW_CHARS = 2000
+DIAG_LIMITS = {"messages": 200, "buttons": 40, "title": 120}
+_DIAG_JS = """(raw) => {
   const vis = e => !!(e.offsetWidth || e.offsetHeight || e.getClientRects().length);
   const txt = e => (e.innerText || e.value || e.getAttribute('aria-label') || '')
     .replace(/\\s+/g, ' ').trim();
-  const pick = (sel, n, len) => [...document.querySelectorAll(sel)].filter(vis)
-    .map(txt).filter(Boolean).map(t => t.slice(0, len)).slice(0, n);
+  const pick = (sel, n) => [...document.querySelectorAll(sel)].filter(vis)
+    .map(txt).filter(Boolean).map(t => t.slice(0, raw)).slice(0, n);
   const inputs = [...document.querySelectorAll('input')].filter(vis)
     .map(i => (i.type || 'text') + (i.name ? ':' + i.name : '')).slice(0, 10);
   return {
     messages: pick('[role=alert], [aria-live], .error, [class*=error i], [class*=alert i],'
-      + ' [id*=error i], .ulp-input-error-message, .ulp-validator-error', 5, 200),
-    buttons: pick('button, input[type=submit]', 6, 40),
+      + ' [id*=error i], .ulp-input-error-message, .ulp-validator-error', 5),
+    buttons: pick('button, input[type=submit]', 6),
     inputs: inputs,
     frames: [...document.querySelectorAll('iframe')].map(f => {
       try { return new URL(f.src).host; } catch (e) { return ''; } }).filter(Boolean)
@@ -284,31 +288,75 @@ _DIAG_JS = """() => {
 }"""
 
 
+# Separators a page may put into an echoed value ("1234 5678 9012 3456").
+_ECHO_SEPARATORS = r"[\s-]*"
+_LOOSE_MIN_CHARS = 4
+
+
+def _loose_pattern(value: str) -> re.Pattern[str] | None:
+    """`value` with any run of whitespace / hyphens allowed between its
+    characters (an account number shown in groups), or None when fewer than
+    ``_LOOSE_MIN_CHARS`` characters are left."""
+    chars = [c for c in value if not c.isspace() and c != "-"]
+    if len(chars) < _LOOSE_MIN_CHARS:
+        return None
+    return re.compile(_ECHO_SEPARATORS.join(re.escape(c) for c in chars))
+
+
 def _redact(text: str, secret: Secret) -> str:
-    """Mask the username and password wherever a page echoes them."""
-    for value in (secret.password, secret.username):
-        if value:
-            text = text.replace(value, "***")
+    """Mask the username and password wherever a page echoes them — also
+    regrouped with spaces or hyphens (a username-only login's account number
+    is the secret, and pages show it in groups). Longest value first: a
+    password inside the username must not leave the username's rest."""
+    values = sorted(
+        {v for v in (secret.password, secret.username) if v}, key=len, reverse=True
+    )
+    for value in values:
+        text = text.replace(value, "***")
+    for value in values:
+        loose = _loose_pattern(value)
+        if loose is not None:
+            text = loose.sub("***", text)
     return text
 
 
 def diagnose(page: Any, secret: Secret) -> dict[str, Any]:
     """Secret-free picture of the page a login stopped on.
 
-    URL without query/fragment, title, visible inputs (type:name only, never
-    values), message-like texts and buttons (username/password masked), iframe
-    hosts, and whether a bot challenge is showing.
+    URL without user info, query and fragment (host and decoded path
+    masked), title, visible inputs (type:name only, never values),
+    message-like texts and buttons (username/password masked BEFORE they are
+    cut to length), iframe hosts, and whether a bot challenge is showing —
+    every string masked.
     """
     parts = urllib.parse.urlsplit(page.url)
-    raw = page.evaluate(_DIAG_JS)
+    raw = page.evaluate(_DIAG_JS, DIAG_RAW_CHARS)
     raw = raw if isinstance(raw, dict) else {}
+
+    def clean(text: object, key: str) -> str:
+        shown = str(text)
+        if len(shown) >= DIAG_RAW_CHARS:
+            # cut page-side: a secret (however its separators stretch it)
+            # may straddle that cut and escape the mask
+            return "<withheld>"
+        return _redact(shown, secret)[: DIAG_LIMITS[key]]
+
+    def mask(text: object) -> str:
+        return _redact(str(text), secret)
+
+    try:
+        port = f":{parts.port}" if parts.port else ""
+    except ValueError:
+        port = ""
+    host = mask(urllib.parse.unquote(parts.hostname or "")) + port
+    path = mask(urllib.parse.unquote(parts.path))
     return {
-        "url": f"{parts.scheme}://{parts.netloc}{parts.path}",
-        "title": _redact(str(page.title() or "")[:120], secret),
-        "inputs": [str(x) for x in raw.get("inputs", [])],
-        "messages": [_redact(str(x), secret) for x in raw.get("messages", [])],
-        "buttons": [_redact(str(x), secret) for x in raw.get("buttons", [])],
-        "frames": [str(x) for x in raw.get("frames", [])],
+        "url": f"{parts.scheme}://{host}{path}",
+        "title": clean(page.title() or "", "title"),
+        "inputs": [mask(x) for x in raw.get("inputs", [])],
+        "messages": [clean(x, "messages") for x in raw.get("messages", [])],
+        "buttons": [clean(x, "buttons") for x in raw.get("buttons", [])],
+        "frames": [mask(x) for x in raw.get("frames", [])],
         "challenge": challenge_reason(page) or "",
     }
 

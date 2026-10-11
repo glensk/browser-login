@@ -53,6 +53,11 @@ CODE_TEXT = {
     "refused": "the Bitwarden item is refused",
     "needs_sentinel": "the item has no logged-in sentinel — cannot prove a login",
     "vault_error": "the broker cannot read Bitwarden",
+    "no_password": (
+        "the item has no password — an account-number login needs "
+        "agent_login_mode=username-only"
+    ),
+    "no_username": "the username-only item has no username (account number)",
     "needs_human": "the site wants a human (captcha / bot check / second factor)",
     "submit_disabled": "the broker never submits a password here — Albert's session only",
     # The identity provider's own answer to the password (allowlisted enum of
@@ -102,6 +107,8 @@ CODE_TEXT = {
 _ERROR_PHASE = {
     "rate_limited": "limiter",
     "vault_error": "vault",
+    "no_password": "vault",
+    "no_username": "vault",
     "unknown_site": "vault",
     "refused": "vault",
     "needs_sentinel": "vault",

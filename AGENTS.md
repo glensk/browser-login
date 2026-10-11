@@ -251,6 +251,18 @@ framework. It is a **provider**: other repos depend on it, not the reverse. See
   first check, never "due"; one claimed attempt per 20 h), gated like any
   login; a failed renewal of a working session is exit 0 with
   `renewal: failed`.
+  `agent_login_mode=username-only` (Mullvad's account number): the item's
+  username is the credential and travels as `Secret.password` (`username`
+  empty, `mode` set), so every masking path treats it as the secret;
+  `generic_login` hands it to `_credential_login` (the form's ONLY text-like
+  field, `OTHER_FIELDS_JS` = 0, else nothing typed) with the same tripwire /
+  fail-closed submit / marker. The tripwire marks the attempt submitted
+  before ANY request carrying the whole secret leaves (`secret_fields`, a
+  page that submits by itself); a marker it cannot write stops the request.
+  Diagnostics mask every string (longest secret first, URL without userinfo)
+  and withhold a text the page side had to cut. Never screenshot such a login
+  (`screenshot_withheld`), never expose such an item through the secret ops,
+  never put the mode's name in the `sites` view (`username_only` flag).
 - **`security` (keychain) calls go through `_security_run` only**: new session, no
   timeout, never `kill`/`terminate` — killing a client mid-dialog crashed
   `securityd` (tp#504). Writes are delete-then-add pinned to the default keychain,

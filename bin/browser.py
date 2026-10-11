@@ -9580,6 +9580,8 @@ BROKER_ERRORS = {
     "unknown_site": "not whitelisted in Bitwarden agent-logins",
     "refused": "the agent-logins item is refused",
     "vault_error": "the broker cannot read Bitwarden",
+    "no_password": "the Bitwarden item has no password",
+    "no_username": "the username-only Bitwarden item has no username",
     "forbidden": "the broker does not serve this uid",
     "bad_request": "the broker rejected the request",
     "internal": "internal broker error",
@@ -9725,6 +9727,7 @@ def _print_broker_diag(diag: object) -> None:
         ("frames", "frames"),
         ("password_check", "password used (compare with your vault copy)"),
         ("screenshot", "screenshot"),
+        ("screenshot_withheld", "no screenshot"),
         ("before_check", "page before the final check"),
         ("proof_reason", "logged-in proof"),
     ):

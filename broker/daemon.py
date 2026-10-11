@@ -139,6 +139,7 @@ from broker.secret_ops import (  # noqa: E402
 from broker.useragent import CHROME_UA_TEMPLATE, engine_user_agent  # noqa: E402
 from broker.vault import (  # noqa: E402
     SITE_ID_RE,
+    USERNAME_ONLY,
     BwBootstrap,
     BwVault,
     FixtureVault,
@@ -610,7 +611,16 @@ class PlaywrightRunner:
             diag: dict[str, Any] = diagnose(page, secret)
         except Exception:  # pylint: disable=broad-exception-caught
             diag = {"error": "page could not be inspected"}
-        diag["password_check"] = password_fingerprint(secret.password)
+        diag["password_check"] = secret_check(secret)
+        if secret.mode == USERNAME_ONLY:
+            # The credential is an account number the site may show anywhere
+            # (a field, an error text, the account page): no picture at all,
+            # and none of an earlier run's left behind under this site's name.
+            diag["screenshot_withheld"] = "username-only login: the page may show it"
+            with contextlib.suppress(OSError):
+                (self.diag_dir / f"last-failure-{item.site}.png").unlink()
+            self.last_diag[item.site] = diag
+            return
         try:
             page.evaluate(_BLANK_PASSWORDS_JS)
             shot = self.diag_dir / f"last-failure-{item.site}.png"
@@ -1186,6 +1196,16 @@ class _LazyBwVault:
         return self._vault().fingerprint_secret(site)
 
 
+def secret_check(secret: Secret) -> str:
+    """What the reports show of a login secret: the password's fingerprint
+    (``password_fingerprint``); for a username-only login only the length —
+    a 4-hex hash of a 16-digit account number is a stable verifier of a short
+    secret, not a 20+-char random password's."""
+    if secret.mode == USERNAME_ONLY:
+        return f"len={len(secret.password)} (username-only: no hash)"
+    return password_fingerprint(secret.password)
+
+
 def password_fingerprint(password: str) -> str:
     """``len=<n> sha256:<first 4 hex>`` — lets Albert check the broker used the SAME
     password as his vault (``printf %s "$PW" | shasum -a 256 | cut -c1-4``)
@@ -1368,8 +1388,8 @@ class Broker(SecretOps):  # pylint: disable=too-many-instance-attributes  # deps
         try:
             secret = self.vault.fingerprint_secret(site)
         except VaultError as exc:
-            return _err("vault_error", str(exc))
-        return {"ok": True, "password_check": password_fingerprint(secret.password)}
+            return _err(exc.code, str(exc))
+        return {"ok": True, "password_check": secret_check(secret)}
 
     def _logout(self, site: str) -> dict[str, Any]:
         with self._site_lock(site):
@@ -1568,7 +1588,9 @@ class Broker(SecretOps):  # pylint: disable=too-many-instance-attributes  # deps
                 **({"diag": diag} if diag else {}),
             }
         except VaultError as exc:
-            return _phase_err("vault_error", str(exc), "vault")
+            # `vault_error` (Bitwarden unreadable) or the item's own gap
+            # (`no_password`, `no_username`: ``vault.MissingSecret``)
+            return _phase_err(exc.code, str(exc), "vault")
         except Exception:  # pylint: disable=broad-exception-caught
             typed = gate.attempt.submitted or gate.attempt.was_entered
             outcome = "unknown" if typed else "not_submitted"
