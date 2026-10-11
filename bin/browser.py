@@ -10024,18 +10024,44 @@ def _identity_needed(site: str) -> bool:
 
 
 def _broker_cookie_in_scope(
-    domain: str, name: str, hosts: Sequence[str], names: Sequence[str] | None
+    domain: str,
+    name: str,
+    hosts: Sequence[str],
+    names: Sequence[str] | None,
+    *,
+    path: str = "/",
+    scopes: Sequence[Any] | None = None,
+    delete: bool = False,
 ) -> bool:
     """Client copy of broker/bundle.py ``cookie_in_scope``: host (or subdomain)
-    allowlist, identity-provider hosts only when named exactly, name allowlist."""
+    allowlist — with `scopes` (WS5 S4c, ``identity.CookieScope``) also the
+    cookie's `path` inside the scope's path —, identity-provider hosts only
+    when named exactly, name allowlist. Without `scopes`: every host of
+    `hosts` at path "/" (as before). `delete`: the rule of a DELETE
+    (``CookieScope.clears``) — also a cookie on the host or a subdomain
+    whose path is an ancestor of the scope path (``/``, ``/realms/``: sent
+    into the realm, it may carry a foreign session's state); never a parent
+    domain, never a sibling path. Injection stays exact."""
     d = (domain or "").strip().lstrip(".").lower()
-    norm = [h.strip().lstrip(".").lower() for h in hosts if h and h.strip()]
-    if not d or not any(d == h or d.endswith("." + h) for h in norm):
+    if scopes is None:
+        scopes = [
+            _identity.CookieScope(h) for h in hosts if isinstance(h, str) and h.strip()
+        ]
+    rule = _identity.scopes_clear if delete else _identity.scopes_hold
+    if not d or not rule(scopes, d, path):
         return False
     idp = d in BROKER_IDP_HOSTS or d.split(".", 1)[0] in BROKER_IDP_LABELS
-    if idp and d not in norm:
+    if idp and d not in {s.host for s in scopes}:
         return False
     return names is None or name in names
+
+
+def _cookie_scopes_of(entry: Mapping[str, Any]) -> tuple[Any, ...]:
+    """The cookie scopes of a ``sites`` entry or a session bundle
+    (``identity.entry_cookie_scopes``: its versioned ``cookie_scopes``, else
+    its ``cookie_hosts`` at path "/" — host-wide, the fail-closed reading of
+    a pre-S4c broker or a malformed entry)."""
+    return _identity.entry_cookie_scopes(entry)
 
 
 def _url_origin(url: str) -> str:
@@ -11641,6 +11667,7 @@ _IDENTITY_WHY = frozenset(
         "no token",
         "token",
         "claim",
+        "expired",
     }
 )
 # A challenge the broker refused → the client's code (default: indeterminate).
@@ -11744,7 +11771,14 @@ def _client_identity_proof(  # pylint: disable=too-many-return-statements,too-ma
     ``identity_indeterminate`` or one of the broker's refusals
     (``_IDENTITY_REFUSALS``). Only ``match`` ever passes."""
     _deadline_step("bg:identity")
-    recipe = _identity.usable_recipe(entry.get("identity"))
+    # usable, allowed for THIS site and its check origin, covering its
+    # privilege (`identity.item_recipe`, the broker's own rule)
+    recipe = _identity.item_recipe(
+        entry.get("identity"),
+        site=site,
+        check_url=entry.get("check_url") or entry.get("login_url"),
+        privilege=entry.get("privilege"),
+    )
     privilege = str(entry.get("privilege") or "")
     if recipe is None or privilege not in _identity.PRIVILEGES:
         return _identity_note("identity_unproven")
@@ -11914,14 +11948,24 @@ def _broker_check_entry(  # pylint: disable=too-many-return-statements
 
 
 def _broker_replace_cookies(browser, bundle: dict) -> int:
-    """Delete the shared browser's in-scope cookies, add the bundle's; return count."""
+    """Delete the shared browser's in-scope cookies, add the bundle's; return
+    count. In scope = the bundle's cookie scopes (`_cookie_scopes_of`: on a
+    path-scoped host only inside its paths and, for the delete, on their
+    ancestor paths — a sibling Keycloak realm's cookies stay)."""
     ctx = browser.contexts[0] if browser.contexts else browser.new_context()
     hosts = [str(h) for h in bundle.get("cookie_hosts") or []]
+    scopes = _cookie_scopes_of(bundle)
     raw_names = bundle.get("cookie_names")
     names = [str(n) for n in raw_names] if isinstance(raw_names, list) else None
     for ck in ctx.cookies():
         if _broker_cookie_in_scope(
-            str(ck.get("domain")), str(ck.get("name")), hosts, names
+            str(ck.get("domain")),
+            str(ck.get("name")),
+            hosts,
+            names,
+            path=str(ck.get("path") or "/"),
+            scopes=scopes,
+            delete=True,
         ):
             ctx.clear_cookies(name=ck["name"], domain=ck["domain"], path=ck["path"])
     # Defence in depth: never inject a cookie outside the declared scope.
@@ -11930,7 +11974,12 @@ def _broker_replace_cookies(browser, bundle: dict) -> int:
         for c in bundle.get("cookies") or []
         if isinstance(c, dict)
         and _broker_cookie_in_scope(
-            str(c.get("domain")), str(c.get("name")), hosts, names
+            str(c.get("domain")),
+            str(c.get("name")),
+            hosts,
+            names,
+            path=str(c.get("path") or "/"),
+            scopes=scopes,
         )
     ]
     if cookies:
@@ -12224,6 +12273,7 @@ def _broker_drop_cookies(port: int, bundle: dict) -> int:
     """Delete the bundle's in-scope cookies from the shared browser again (a
     storage write failed after they were injected); the count deleted."""
     hosts = [str(h) for h in bundle.get("cookie_hosts") or []]
+    scopes = _cookie_scopes_of(bundle)
     raw_names = bundle.get("cookie_names")
     names = [str(n) for n in raw_names] if isinstance(raw_names, list) else None
     gone = 0
@@ -12234,7 +12284,13 @@ def _broker_drop_cookies(port: int, bundle: dict) -> int:
         ctx = browser.contexts[0]
         for ck in ctx.cookies():
             if _broker_cookie_in_scope(
-                str(ck.get("domain")), str(ck.get("name")), hosts, names
+                str(ck.get("domain")),
+                str(ck.get("name")),
+                hosts,
+                names,
+                path=str(ck.get("path") or "/"),
+                scopes=scopes,
+                delete=True,
             ):
                 ctx.clear_cookies(name=ck["name"], domain=ck["domain"], path=ck["path"])
                 gone += 1
@@ -12881,15 +12937,17 @@ def cmd_broker_logout(port: int, site_name: str) -> int:
 def _broker_clear_cookies(
     port: int, site: str, entry: dict, names: list[str] | None, *, why: str
 ) -> int:
-    """Delete `site`'s cookies (its cookie hosts; only `names` when given)
-    from THIS browser under the interaction lease; how many went. Nothing
-    else: no storage, never the broker's profile."""
+    """Delete `site`'s cookies (its cookie scopes — on a path-scoped host
+    only inside its paths; only `names` when given) from THIS browser under
+    the interaction lease; how many went. Nothing else: no storage, never
+    the broker's profile."""
     hosts = [str(h) for h in entry.get("cookie_hosts") or []]
+    scopes = _cookie_scopes_of(entry)
     pw, browser = _connect(port)
     try:
         with _interaction_lease(f"{why} {site}"):
             ctx = browser.contexts[0] if browser.contexts else browser.new_context()
-            doomed = _scope_cookies(ctx.cookies(), hosts, names)
+            doomed = _scope_cookies(ctx.cookies(), hosts, names, scopes)
             for ck in doomed:
                 ctx.clear_cookies(name=ck["name"], domain=ck["domain"], path=ck["path"])
     finally:
@@ -12899,16 +12957,27 @@ def _broker_clear_cookies(
 
 
 def _scope_cookies(
-    cookies: Sequence[Mapping[str, Any]], hosts: Sequence[str], names: list[str] | None
+    cookies: Sequence[Mapping[str, Any]],
+    hosts: Sequence[str],
+    names: list[str] | None,
+    scopes: Sequence[Any] | None = None,
 ) -> list[Mapping[str, Any]]:
-    """The cookies of a site's scope: on its cookie hosts or their
-    subdomains (never a parent domain), identity-provider hosts only when
-    named exactly, only `names` when given (`_broker_cookie_in_scope`)."""
+    """The cookies a delete of a site's scope takes (logout, the foreign
+    clear): on its cookie hosts or their subdomains (never a parent domain)
+    — with `scopes`, inside their paths or on an ancestor path of them —,
+    identity-provider hosts only when named exactly, only `names` when given
+    (`_broker_cookie_in_scope`, ``delete``)."""
     return [
         ck
         for ck in cookies
         if _broker_cookie_in_scope(
-            str(ck.get("domain")), str(ck.get("name")), hosts, names
+            str(ck.get("domain")),
+            str(ck.get("name")),
+            hosts,
+            names,
+            path=str(ck.get("path") or "/"),
+            scopes=scopes,
+            delete=True,
         )
     ]
 

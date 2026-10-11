@@ -14,9 +14,13 @@ known without reading values, so they conflict unless BOTH declare each other
 the same account (the broker refuses a one-sided declaration, WS5 S1).
 
 Over-inclusion only costs a refusal, never a wrong account: hosts match at the
-host level (parent domains included, cookie names and paths ignored), and every
-listed item takes part, refused ones included (their cookies may still be in
-the browser).
+host level (parent domains included, cookie names ignored), and every listed
+item takes part, refused ones included (their cookies may still be in the
+browser). Since S4c a cookie scope may carry a path (``CookieScope``: Keycloak
+keeps each realm's session cookies under ``/realms/<realm>/``): two scopes
+overlap only when their domains are related AND their paths overlap (RFC 6265
+path-match). Fill and storage origins stay host-wide: origin state cannot be
+split by path.
 
 WS5 S1 adds what the broker and the client share for the server identity
 proof: the item-field vocabularies (instances, privileges, the static site
@@ -30,10 +34,16 @@ Pure: no I/O, no imports beyond the standard library. Imported by
 and the broker (``vault``, ``identity_ops``, ``daemon``).
 """
 
+# too-many-lines: the one shared module of the identity protocol (the in-page
+# RECIPE_JS and the reviewed recipe table are long, and must stay in ONE
+# place for the broker and the client).
+# pylint: disable=too-many-lines
+
 from __future__ import annotations
 
 import hashlib
 import hmac
+import json
 import re
 import unicodedata
 import urllib.parse
@@ -60,6 +70,19 @@ def _norm_host(value: object) -> str:
     return raw.strip().lstrip(".").rstrip(".").lower()
 
 
+def _https_origin(value: object) -> str:
+    """``https://host[:port]`` of a URL or an origin (lower-case, the default
+    port dropped); '' for anything that is not https."""
+    try:
+        parts = urllib.parse.urlsplit(str(value or ""))
+        host, port = parts.hostname, parts.port
+    except ValueError:
+        return ""
+    if parts.scheme != "https" or not host:
+        return ""
+    return f"https://{host.lower()}" + ("" if port in (None, 443) else f":{port}")
+
+
 def _list(value: object) -> list[str]:
     """A field that holds one string or a list of strings, as a list."""
     if isinstance(value, str):
@@ -79,16 +102,253 @@ def scope_hosts(entry: Mapping[str, object]) -> frozenset[str]:
     return frozenset(hosts)
 
 
+def domains_related(a: str, b: str) -> bool:
+    """`a` equals, or is a parent or a subdomain of, `b` (cookie domain
+    matching in both directions)."""
+    return a == b or a.endswith("." + b) or b.endswith("." + a)
+
+
 def hosts_overlap(a: Iterable[str], b: Iterable[str]) -> bool:
     """Any host of `a` equals, or is a parent or a subdomain of, a host of
     `b` (cookie domain matching in both directions: ``docker.com`` covers
     ``app.docker.com``)."""
     bs = list(b)
-    for x in a:
-        for y in bs:
-            if x == y or x.endswith("." + y) or y.endswith("." + x):
-                return True
-    return False
+    return any(domains_related(x, y) for x in a for y in bs)
+
+
+# ---------------------------------------------------------------------------
+# WS5 S4c: cookie scopes with a path (Keycloak scopes its session cookies to
+# /realms/<realm>/: two realms on one host are two cookie scopes)
+# ---------------------------------------------------------------------------
+# The `sites` view's (and the bundle's) cookie-scope protocol version: an
+# entry with ``scope_v`` >= 1 carries ``cookie_scopes`` ([{host, path}]). A
+# reader that does not know it (an old client) uses ``cookie_hosts``, which
+# the broker keeps as the scopes' hosts: host-wide, so over-inclusive — more
+# conflicts, a wider clear — never a narrower scope (fail closed).
+SCOPE_V = 1
+MAX_COOKIE_SCOPES = 16
+_SCOPE_HOST = re.compile(
+    r"^(?=.{1,253}$)[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?"
+    r"(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)*$"
+)
+# A cookie path: printable ASCII without whitespace, the characters that
+# end a path or a cookie attribute, and `%` (no percent-encoding at all:
+# `%2e%2e` would be a dot segment the checks below cannot see — the paths
+# are vault-authored, so they stay plain).
+_SCOPE_PATH = re.compile(r"^/[!$&'()*+\-./0-9:=@A-Z\[\]^_`a-z{|}~]{0,255}$")
+
+
+def _scope_path(path: str) -> str:
+    """The canonical form of a scope path: '/' stays, any other path loses
+    its trailing slashes (``/realms/sdsc/`` → ``/realms/sdsc``) — so the
+    RFC 6265 path-match below covers the exact path without its slash too."""
+    trimmed = path.rstrip("/")
+    return trimmed or "/"
+
+
+def path_match(request_path: str, cookie_path: str) -> bool:
+    """RFC 6265 §5.1.4: `request_path` path-matches `cookie_path` — equal,
+    or `cookie_path` is a prefix ending in '/', or a prefix followed by '/'
+    in `request_path` (``/realms/sdscx`` does not match ``/realms/sdsc``)."""
+    if request_path == cookie_path:
+        return True
+    if not request_path.startswith(cookie_path):
+        return False
+    return cookie_path.endswith("/") or request_path[len(cookie_path)] == "/"
+
+
+def paths_overlap(a: str, b: str) -> bool:
+    """Two cookie paths (canonical or not) share a request path: one
+    path-matches the other (``/`` overlaps everything; sibling realms
+    ``/realms/a`` and ``/realms/b`` do not)."""
+    pa, pb = _scope_path(a or "/"), _scope_path(b or "/")
+    return path_match(pa, pb) or path_match(pb, pa)
+
+
+@dataclass(frozen=True, order=True)
+class CookieScope:
+    """Where one item's cookies live: a host (its subdomains included, as
+    for every cookie host) and a path (RFC 6265 path-match; ``/`` = the
+    whole host). The ONE implementation behind every scope decision: the
+    multi-account and in-instance conflicts (`overlaps`), and every cookie
+    operation — the broker's export, fresh-login wipe and reset, the
+    client's replace, rollback, logout and foreign clear (`holds`,
+    `reaches`). A host-only scope (path ``/``) decides exactly as the
+    host lists did before."""
+
+    host: str
+    path: str = "/"
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "host", _norm_host(self.host))
+        object.__setattr__(self, "path", _scope_path(str(self.path or "/")))
+
+    def holds(self, domain: object, path: object = "/") -> bool:
+        """A cookie of `domain` and `path` LIES IN this scope: its domain is
+        the host or a subdomain of it (never a parent), and its path is the
+        scope path (with or without its trailing slash) or below it."""
+        d = _norm_host(domain)
+        if (
+            not self.host
+            or not d
+            or not (d == self.host or d.endswith("." + self.host))
+        ):
+            return False
+        if self.path == "/":
+            return True
+        return path_match(str(path or "/"), self.path)
+
+    def clears(self, domain: object, path: object = "/") -> bool:
+        """A DELETE in the shared browser takes this cookie: one the scope
+        `holds`, or one on the host or a subdomain (never a parent domain)
+        whose path is an ANCESTOR of the scope path — ``/`` and
+        ``/realms/`` of a ``/realms/sdsc/`` scope: such a cookie is sent to
+        the realm and may carry a foreign session's state into it. Never a
+        sibling path (``/realms/master/``). Safe for the sibling realm: an
+        item of it can never share the instance — the fill origin (the
+        Keycloak host) keeps the two in conflict (O11). Export and
+        injection stay exact (`holds`)."""
+        if self.holds(domain, path):
+            return True
+        d = _norm_host(domain)
+        if (
+            not self.host
+            or not d
+            or not (d == self.host or d.endswith("." + self.host))
+        ):
+            return False
+        return path_match(self.path, _scope_path(str(path or "/")))
+
+    def reaches(self, domain: object, path: object = "/") -> bool:
+        """A cookie of `domain` and `path` lies in this scope OR is sent
+        into it: the domains are related either way (a parent domain's
+        cookie reaches the host) and the paths overlap (a ``/`` cookie
+        reaches every path)."""
+        d = _norm_host(domain)
+        if not self.host or not d or not domains_related(d, self.host):
+            return False
+        return self.path == "/" or paths_overlap(str(path or "/"), self.path)
+
+    def overlaps(self, other: CookieScope) -> bool:
+        """Joint overlap: related domains AND overlapping paths."""
+        if not self.host or not other.host:
+            return False
+        return domains_related(self.host, other.host) and paths_overlap(
+            self.path, other.path
+        )
+
+    def view(self) -> dict[str, str]:
+        """``{host, path}`` for the `sites` view and the bundle."""
+        return {"host": self.host, "path": self.path}
+
+
+def scope_problem(raw: object) -> str:
+    """Why one ``{host, path}`` object is not a valid cookie scope ('' =
+    it is): exactly the keys host (a plain lower-case DNS name or IPv4,
+    no scheme, port or path) and optionally path (absolute, printable
+    ASCII, no ``//``, no ``.``/``..`` segment, ≤ 256 characters)."""
+    if not isinstance(raw, Mapping):
+        return "each scope is an object {host, path}"
+    if not set(raw) <= {"host", "path"} or "host" not in raw:
+        return "each scope has exactly the keys host and path"
+    host, path = raw.get("host"), raw.get("path", "/")
+    if not isinstance(host, str) or not _SCOPE_HOST.match(host.strip().lower()):
+        return "bad host (a plain host name, no scheme, port or path)"
+    if not isinstance(path, str) or not _SCOPE_PATH.match(path):
+        return "bad path (absolute, plain printable ASCII, no %, ≤ 256 characters)"
+    segments = path.split("/")[1:]
+    if "//" in path or any(seg in (".", "..") for seg in segments):
+        return "bad path (no // and no . or .. segment)"
+    return ""
+
+
+def parse_cookie_scopes(raw: object) -> tuple[tuple[CookieScope, ...], str]:
+    """(scopes, '') from the vault field ``agent_cookie_scopes`` (a JSON
+    list of ``{host, path}``, as text or already parsed), or ((), why not).
+    Duplicates fold; at most ``MAX_COOKIE_SCOPES``."""
+    value = raw
+    if isinstance(raw, str):
+        try:
+            value = json.loads(raw)
+        except ValueError:
+            return (), "not JSON"
+    if not isinstance(value, list) or not value:
+        return (), "a non-empty JSON list of {host, path}"
+    if len(value) > MAX_COOKIE_SCOPES:
+        return (), f"at most {MAX_COOKIE_SCOPES} scopes"
+    out: list[CookieScope] = []
+    for one in value:
+        problem = scope_problem(one)
+        if problem:
+            return (), problem
+        scope = CookieScope(str(one["host"]), str(one.get("path", "/")))
+        if scope not in out:
+            out.append(scope)
+    return tuple(out), ""
+
+
+def _versioned(entry: Mapping[str, object]) -> bool:
+    version = entry.get("scope_v")
+    return not isinstance(version, bool) and isinstance(version, int) and version >= 1
+
+
+def entry_cookie_scopes(entry: Mapping[str, object]) -> tuple[CookieScope, ...]:
+    """The cookie scopes of a ``sites`` entry or a session bundle: its
+    ``cookie_scopes`` when it speaks ``scope_v`` >= 1 AND they are valid AND
+    name exactly its ``cookie_hosts``; otherwise its ``cookie_hosts`` at
+    path ``/`` (a pre-S4c broker or a malformed entry: host-wide, the
+    over-inclusive reading — fail closed)."""
+    hosts = tuple(
+        CookieScope(h) for h in dict.fromkeys(_list(entry.get("cookie_hosts"))) if h
+    )
+    hosts = tuple(s for s in hosts if s.host)
+    if not _versioned(entry):
+        return hosts
+    scopes, problem = parse_cookie_scopes(entry.get("cookie_scopes"))
+    if problem or {s.host for s in scopes} != {s.host for s in hosts}:
+        return hosts
+    return scopes
+
+
+def item_scopes(entry: Mapping[str, object]) -> frozenset[CookieScope]:
+    """Every scope an item's session lives in or is typed into: its cookie
+    scopes (`entry_cookie_scopes`), and its fill and storage origins'
+    hosts at path ``/`` — origin-scoped state (localStorage, a login form)
+    cannot be split by path, so an origin overlap stays a conflict."""
+    scopes = set(entry_cookie_scopes(entry))
+    for key in ("fill_origins", "storage_origins"):
+        scopes |= {CookieScope(o) for o in _list(entry.get(key))}
+    return frozenset(s for s in scopes if s.host)
+
+
+def scopes_overlap(a: Iterable[CookieScope], b: Iterable[CookieScope]) -> bool:
+    """Any scope of `a` overlaps (domain AND path) a scope of `b`."""
+    bs = list(b)
+    return any(x.overlaps(y) for x in a for y in bs)
+
+
+def scopes_hold(
+    scopes: Iterable[CookieScope], domain: object, path: object = "/"
+) -> bool:
+    """A cookie of `domain` / `path` lies in one of `scopes`
+    (`CookieScope.holds`)."""
+    return any(s.holds(domain, path) for s in scopes)
+
+
+def scopes_clear(
+    scopes: Iterable[CookieScope], domain: object, path: object = "/"
+) -> bool:
+    """A delete in the shared browser takes this cookie
+    (`CookieScope.clears`: held, or an ancestor path of a scope)."""
+    return any(s.clears(domain, path) for s in scopes)
+
+
+def scopes_reach(
+    scopes: Iterable[CookieScope], domain: object, path: object = "/"
+) -> bool:
+    """A cookie of `domain` / `path` lies in or is sent into one of `scopes`
+    (`CookieScope.reaches`)."""
+    return any(s.reaches(domain, path) for s in scopes)
 
 
 def instance_of(entry: Mapping[str, object]) -> str:
@@ -113,7 +373,7 @@ def scope_conflicts(
     is multi-account wherever its siblings live). Items without a conflict
     are absent."""
     items = [
-        (str(e.get("site")), e, scope_hosts(e))
+        (str(e.get("site")), e, item_scopes(e))
         for e in sites
         if isinstance(e, Mapping) and isinstance(e.get("site"), str) and e.get("site")
     ]
@@ -122,7 +382,7 @@ def scope_conflicts(
         for sb, eb, hb in items[i + 1 :]:
             if sa == sb or not ha or not hb:
                 continue
-            if hosts_overlap(ha, hb) and not _same_account(ea, eb):
+            if scopes_overlap(ha, hb) and not _same_account(ea, eb):
                 out.setdefault(sa, set()).add(sb)
                 out.setdefault(sb, set()).add(sa)
     return {site: tuple(sorted(sib)) for site, sib in sorted(out.items())}
@@ -358,6 +618,36 @@ class IdentityRecipe:  # pylint: disable=too-many-instance-attributes  # one rev
     # compared with (`identity_form`): a vault holding another form can never
     # match, so the item is refused at validation instead of failing later.
     forms: tuple[str, ...] = ("username",)
+    # --- WS5 S4c: who may use the recipe (enforced by the broker's
+    # validation, its own proof and the challenge gate, and by the client's
+    # proof): only these site ids ("" = any) and only on this exact https
+    # origin ("" = the check URL's).
+    allowed_sites: tuple[str, ...] = ()
+    origin: str = ""
+    # "token-endpoint" (Run:ai): `path` is a same-origin POST of the fixed
+    # JSON `token_body`; the response's `token_field` holds a JWT whose
+    # claims are the identity source (`id_field` is a claim path), pinned
+    # by `claim_pins` (claim == value), `issuer` (the `iss` claim, exactly)
+    # and an `exp` in the future.
+    token_body: tuple[tuple[str, str], ...] = ()
+    token_field: tuple[str, ...] | None = None
+    claim_pins: tuple[tuple[str, str], ...] = ()
+    issuer: str = ""
+    # The admin bit from a fixed same-origin GET with the token as bearer:
+    # a status in `admin_probe_true` = admin, in `admin_probe_false` = not;
+    # anything else = no admin bit (indeterminate).
+    admin_probe: str = ""
+    admin_probe_true: tuple[int, ...] = (200,)
+    admin_probe_false: tuple[int, ...] = (403,)
+    # The admin bit's "admin" answer was seen live. While False an item
+    # with `agent_privilege admin` may not use the recipe (it stays
+    # unproven); a `user` / `readonly` item may (its "not admin" side is
+    # confirmed).
+    admin_true_confirmed: bool = True
+    # localStorage keys the page keeps its OWN claim of the account in
+    # (forgeable, seen stale: Run:ai B1): an item using the recipe may not
+    # list them in `agent_storage_keys` — never exported, never injected.
+    identity_storage_keys: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         problem = recipe_problem(self)
@@ -366,7 +656,13 @@ class IdentityRecipe:  # pylint: disable=too-many-instance-attributes  # one rev
 
 
 # How a recipe authenticates its request (`IdentityRecipe.auth`).
-AUTHS = ("cookie", "bearer-local-storage", "jwt-local-storage", "syno-token")
+AUTHS = (
+    "cookie",
+    "bearer-local-storage",
+    "jwt-local-storage",
+    "syno-token",
+    "token-endpoint",
+)
 # The ones that read a token from the origin's localStorage: a foreign
 # session of such a site lives there, not (only) in cookies.
 LOCAL_STORAGE_AUTHS = frozenset({"bearer-local-storage", "jwt-local-storage"})
@@ -457,12 +753,101 @@ def recipe_problem(  # pylint: disable=too-many-return-statements,too-many-branc
             return "path_claim takes no base_segments"
     elif recipe.auth == "jwt-local-storage":
         return "jwt-local-storage needs path_claim"
+    return _token_recipe_problem(recipe) or _scope_rule_problem(recipe)
+
+
+_SITE_SLUG = re.compile(r"^[a-z0-9][a-z0-9._-]{0,63}$")
+_PIN_VALUE = re.compile(r"^[!-~]{1,128}$")
+_ISSUER = re.compile(r"^https://[a-z0-9.-]+(?::[0-9]{1,5})?/[!-\"$-/0-9:;=@-~]{0,200}$")
+
+
+def _fixed_path_problem(path: str) -> str:
+    """'' for an absolute same-origin path without a fragment."""
+    if not path.startswith("/") or path.startswith("//"):
+        return "must be an absolute path on the check origin"
+    if "\\" in path or "#" in path or any(c.isspace() for c in path):
+        return "bad path"
     return ""
 
 
-# Reviewed recipes only. Run:ai is absent on purpose: no server-bound
-# endpoint is confirmed yet, so its items stay unproven (an `agent_identity`
-# naming it is refused).
+def _scope_rule_problem(recipe: IdentityRecipe) -> str:
+    """WS5 S4c: `allowed_sites` are site ids, `origin` an exact https
+    origin, `identity_storage_keys` plain names."""
+    if not all(
+        isinstance(s, str) and _SITE_SLUG.match(s) for s in recipe.allowed_sites
+    ):
+        return "bad allowed_sites"
+    if recipe.origin and _https_origin(recipe.origin) != recipe.origin:
+        return "origin must be an exact https origin"
+    if not all(isinstance(k, str) and k for k in recipe.identity_storage_keys):
+        return "bad identity_storage_keys"
+    return ""
+
+
+# One return per rule of the token-endpoint spec, in the order they are checked.
+def _token_recipe_problem(  # pylint: disable=too-many-return-statements,too-many-branches
+    recipe: IdentityRecipe,
+) -> str:
+    """The token-endpoint rules: a fixed JSON body of plain keys and
+    printable values, the token's response field, claim pins, an issuer
+    path suffix, a fixed admin probe with disjoint status sets, and a
+    recipe pinned to its sites AND its origin (a fixed source). Any other
+    auth carries none of these fields."""
+    token_fields = (
+        recipe.token_body,
+        recipe.token_field,
+        recipe.claim_pins,
+        recipe.issuer,
+        recipe.admin_probe,
+    )
+    if recipe.auth != "token-endpoint":
+        return "token fields need auth token-endpoint" if any(token_fields) else ""
+    if not recipe.token_body or not all(
+        isinstance(k, str)
+        and _FIELD_KEY.match(k)
+        and isinstance(v, str)
+        and _PIN_VALUE.match(v)
+        for k, v in recipe.token_body
+    ):
+        return "token-endpoint needs a token_body of plain keys and values"
+    if not recipe.token_field or not all(
+        isinstance(k, str) and _FIELD_KEY.match(k) for k in recipe.token_field
+    ):
+        return "token-endpoint needs a token_field"
+    if not all(
+        isinstance(k, str)
+        and _CLAIM_NAME.match(k)
+        and isinstance(v, str)
+        and _PIN_VALUE.match(v)
+        for k, v in recipe.claim_pins
+    ):
+        return "bad claim_pins"
+    if not _ISSUER.match(recipe.issuer):
+        return "token-endpoint needs an issuer (an https URL, no query)"
+    if recipe.admin_field is not None:
+        return "token-endpoint takes its admin bit from admin_probe"
+    problem = _fixed_path_problem(recipe.admin_probe)
+    if problem:
+        return f"admin_probe {problem}"
+    statuses = (*recipe.admin_probe_true, *recipe.admin_probe_false)
+    if (
+        not recipe.admin_probe_true
+        or not recipe.admin_probe_false
+        or not all(
+            isinstance(c, int) and not isinstance(c, bool) and 100 <= c <= 599
+            for c in statuses
+        )
+        or set(recipe.admin_probe_true) & set(recipe.admin_probe_false)
+    ):
+        return "admin_probe statuses must be disjoint HTTP codes"
+    if recipe.base_segments or "?" in recipe.path:
+        return "token-endpoint takes one fixed path"
+    if not recipe.allowed_sites or not recipe.origin:
+        return "token-endpoint needs allowed_sites and an origin (a fixed source)"
+    return ""
+
+
+# Reviewed recipes only.
 IDENTITIES: dict[str, IdentityRecipe] = {
     # live 2026-10-11: 200, keys username / email / is_admin (as an admin)
     # It compares the GitLab `username` only. A vault holding the e-mail is
@@ -535,6 +920,56 @@ IDENTITIES: dict[str, IdentityRecipe] = {
         admin_field=("user", "is_superuser"),
         must_be_null=("original",),
     ),
+    # Run:ai (S4c B1, live 2026-10-11 as runai-test3, value-free): the SPA
+    # keeps its bearer in page memory only; it renews it with ITS OWN
+    # same-origin `POST /api/v1/token` (JSON grantType refresh_token,
+    # clientID runai-admin-ui; the HttpOnly `refresh-token` cookie, path
+    # /api/v1/token, authenticates it) → 200 {accessToken, idToken}. The
+    # access token is a JWT of Run:ai's Keycloak (`iss` path
+    # /auth/realms/sdsc, `azp` runai-admin-ui) whose `preferred_username`
+    # (= `email` = `sub`) is the vault username, an e-mail address. Its
+    # Keycloak lives on app1.run.ai, which serves EVERY Run:ai tenant: the
+    # items' cookie scope there is the realm path /auth/realms/sdsc/ only.
+    #
+    # Why the claims count as a SERVER proof without a JWKS check: the
+    # recipe fetches the token itself, from the fixed same-origin endpoint,
+    # in a CDP isolated world (the page cannot hook that world's fetch,
+    # JSON, atob or Date), with no redirect allowed — the claims are what
+    # Run:ai's server said about the session cookie it was sent, exactly
+    # like gitlab's /api/v4/user record. Nothing of the page (a token in
+    # memory, localStorage `logged-in-user-email`: seen stale in B1) is
+    # read. The pins (azp, the exact issuer, a future exp) reject a token
+    # minted for another client, realm or host, or an old one.
+    #
+    # Side effect: the POST is a refresh, the same request the SPA sends
+    # every few minutes — the server may rotate the `refresh-token` cookie
+    # (the browser stores the new one). Each check runs the recipe once.
+    #
+    # The admin bit: `GET /api/v1/authorization/access-rules?subjectType=user`
+    # with the access token as bearer, a JSON answer only (an HTML 200/403 —
+    # an SPA fallback, a WAF page — is no bit) → 403 for a non-admin (test3, live);
+    # 200 is expected for an admin but NOT yet seen (`admin_true_confirmed`
+    # False: an `agent_privilege admin` item stays unproven until the main
+    # session confirms it with runai-admin).
+    "runai": IdentityRecipe(
+        name="runai",
+        path="/api/v1/token",
+        auth="token-endpoint",
+        token_body=(("grantType", "refresh_token"), ("clientID", "runai-admin-ui")),
+        token_field=("accessToken",),
+        id_field=("preferred_username",),
+        claim_pins=(("azp", "runai-admin-ui"),),
+        issuer="https://app1.run.ai/auth/realms/sdsc",
+        admin_probe="/api/v1/authorization/access-rules?subjectType=user",
+        admin_probe_true=(200,),
+        admin_probe_false=(403,),
+        admin_true_confirmed=False,
+        allowed_sites=("runai-admin", "runai-test3"),
+        origin="https://sdsc.run.ai",
+        identity_storage_keys=("logged-in-user-email",),
+        live_confirmed=True,
+        forms=("email",),
+    ),
 }
 
 
@@ -553,12 +988,75 @@ def identity_form(value: object) -> str | None:
 
 def usable_recipe(name: object) -> IdentityRecipe | None:
     """The recipe an item may use: reviewed, live-confirmed, WITH an admin
-    bit (the privilege check needs one). None for anything else — dsm and
-    authentik until S4 confirms them live; their items stay unproven."""
+    bit (the privilege check needs one: a response field or an admin
+    probe). None for anything else — dsm and authentik until S4 confirms
+    them live; their items stay unproven. Whether ONE item may use it is
+    `item_recipe`."""
     recipe = IDENTITIES.get(name) if isinstance(name, str) else None
-    if recipe is None or not recipe.live_confirmed or recipe.admin_field is None:
+    if recipe is None or not recipe.live_confirmed:
+        return None
+    if recipe.admin_field is None and not recipe.admin_probe:
         return None
     return recipe
+
+
+def recipe_config_problem(name: object, *, site: object, check_url: object) -> str:
+    """Why the item `site` (its check URL) is not configured for recipe
+    `name` ('' = it is): not usable at all, another site than the recipe's
+    `allowed_sites`, or a check page off the recipe's `origin`. The vault
+    refuses such an item."""
+    recipe = usable_recipe(name)
+    if recipe is None:
+        return f"agent_identity {name} is not live-confirmed with an admin bit yet"
+    if recipe.allowed_sites and site not in recipe.allowed_sites:
+        return (
+            f"the {recipe.name} identity proof is reviewed for "
+            + ", ".join(recipe.allowed_sites)
+            + " only"
+        )
+    if recipe.origin and _https_origin(check_url) != recipe.origin:
+        return f"the {recipe.name} identity proof runs on {recipe.origin} only"
+    return ""
+
+
+def recipe_refusal(
+    name: object, *, site: object, check_url: object, privilege: object
+) -> str:
+    """Why the item `site` (its check URL, its `agent_privilege`) may not
+    use recipe `name` ('' = it may): `recipe_config_problem`, or an admin
+    item while the recipe's "admin" answer is unconfirmed — a valid item
+    that stays unproven (``identity_unproven``) until the flag flips. One
+    rule for the broker's own proof, its login precheck and challenge gate,
+    and the client's proof."""
+    problem = recipe_config_problem(name, site=site, check_url=check_url)
+    if problem:
+        return problem
+    recipe = IDENTITIES[str(name)]
+    if privilege == "admin" and not recipe.admin_true_confirmed:
+        return (
+            f"the {recipe.name} identity proof's admin answer is not live-confirmed yet"
+        )
+    return ""
+
+
+def item_recipe(
+    name: object, *, site: object, check_url: object, privilege: object
+) -> IdentityRecipe | None:
+    """The recipe the item may use (`recipe_refusal` is ''), else None."""
+    if recipe_refusal(name, site=site, check_url=check_url, privilege=privilege):
+        return None
+    return usable_recipe(name)
+
+
+def entry_recipe(entry: Mapping[str, object]) -> IdentityRecipe | None:
+    """`item_recipe` of a ``sites`` entry (its check URL, else its login
+    URL — where the check looks)."""
+    return item_recipe(
+        entry.get("identity"),
+        site=entry.get("site"),
+        check_url=entry.get("check_url") or entry.get("login_url"),
+        privilege=entry.get("privilege"),
+    )
 
 
 def proof_ready(entry: Mapping[str, object]) -> bool:
@@ -572,10 +1070,7 @@ def proof_ready(entry: Mapping[str, object]) -> bool:
         return False
     if entry.get("refused"):
         return False
-    return (
-        usable_recipe(entry.get("identity")) is not None
-        and entry.get("privilege") in PRIVILEGES
-    )
+    return entry_recipe(entry) is not None and entry.get("privilege") in PRIVILEGES
 
 
 FETCH_MS = 8000
@@ -617,12 +1112,86 @@ RECIPE_JS = r"""async (a) => {
       return v !== null && typeof v === 'object' && !Array.isArray(v) ? v : null;
     } catch (e) { return null; }
   };
+  // sha256(nonce || id) in hex: the only form a name ever leaves the page in.
+  const digestOf = async (id) => {
+    const data = new Uint8Array(32 + id.length);
+    for (let i = 0; i < 32; i++) data[i] = parseInt(a.nonce.substr(2 * i, 2), 16);
+    for (let i = 0; i < id.length; i++) data[32 + i] = id.charCodeAt(i);
+    const d = new Uint8Array(await crypto.subtle.digest('SHA-256', data));
+    return Array.from(d, x => x.toString(16).padStart(2, '0')).join('');
+  };
+  // One same-origin request: {r} or {err} (a redirect of any kind, another
+  // final URL, a network error or the time limit is indeterminate).
+  const call = async (origin, path, init) => {
+    const url = new URL(path, origin);
+    if (url.origin !== origin) return {err: out('indeterminate', {why: 'origin'})};
+    const ctl = new AbortController();
+    const timer = setTimeout(() => ctl.abort(), a.fetch_ms);
+    let r;
+    try {
+      r = await fetch(url.href, Object.assign({credentials: 'same-origin',
+        cache: 'no-store', redirect: 'manual', signal: ctl.signal}, init));
+    } catch (e) {
+      return {err: out('indeterminate',
+        {why: e && e.name === 'AbortError' ? 'timeout' : 'network'})};
+    } finally { clearTimeout(timer); }
+    if (r.type === 'opaqueredirect') return {err: out('indeterminate', {why: 'redirect'})};
+    let final = null;
+    try { final = new URL(r.url); } catch (e) { final = null; }
+    if (r.redirected || !final || final.origin !== origin
+        || final.pathname !== url.pathname || final.search !== url.search)
+      return {err: out('indeterminate', {why: 'redirect', status: r.status})};
+    return {r: r};
+  };
+  // token-endpoint (Run:ai): POST the fixed body, read the JWT the server
+  // returns, pin its claims, read the identity claim; the admin bit from
+  // a fixed GET with that token as bearer. The token never leaves here.
+  const tokenWork = async (origin) => {
+    const tok = await call(origin, a.path, {method: 'POST',
+      headers: {Accept: 'application/json', 'Content-Type': 'application/json'},
+      body: JSON.stringify(a.token_body)});
+    if (tok.err) return tok.err;
+    const r = tok.r;
+    if (r.status === 401 || r.status === 403) return out('logged_out', {status: r.status});
+    if (r.status !== 200) return out('indeterminate', {why: 'status', status: r.status});
+    const ct = (r.headers.get('content-type') || '').toLowerCase();
+    if (!/^application\/json\s*(;|$)/.test(ct))
+      return out('indeterminate', {why: 'content-type', status: r.status});
+    let body;
+    try { body = await r.json(); } catch (e) { return out('indeterminate', {why: 'body'}); }
+    if (body === null || typeof body !== 'object' || Array.isArray(body))
+      return out('indeterminate', {why: 'schema'});
+    const t = get(body, a.token_field);
+    if (typeof t !== 'string' || !t) return out('indeterminate', {why: 'token'});
+    const claims = jwt(t);
+    if (claims === null) return out('indeterminate', {why: 'token'});
+    for (const pin of a.claim_pins)
+      if (get(claims, [pin[0]]) !== pin[1]) return out('indeterminate', {why: 'claim'});
+    if (get(claims, ['iss']) !== a.issuer) return out('indeterminate', {why: 'claim'});
+    const exp = get(claims, ['exp']);
+    if (typeof exp !== 'number' || !isFinite(exp) || exp * 1000 <= Date.now())
+      return out('indeterminate', {why: 'expired'});
+    const id = norm(get(claims, a.id_field));
+    if (id === null) return out('indeterminate', {why: 'identity'});
+    let admin = null;
+    const probe = await call(origin, a.admin_probe, {method: 'GET',
+      headers: {Accept: 'application/json', Authorization: 'Bearer ' + t}});
+    // the bit only from a JSON answer: an HTML 200/403 (an SPA fallback,
+    // a WAF page) says nothing about the account's rights
+    const pct = probe.err ? '' : (probe.r.headers.get('content-type') || '').toLowerCase();
+    if (!probe.err && /^application\/json\s*(;|$)/.test(pct)) {
+      if (a.admin_probe_true.indexOf(probe.r.status) >= 0) admin = true;
+      else if (a.admin_probe_false.indexOf(probe.r.status) >= 0) admin = false;
+    }
+    return out('found', {digest: await digestOf(id), admin: admin});
+  };
   const work = async () => {
     const origin = location.origin;
     if (!origin || origin === 'null' || origin !== a.origin)
       return out('indeterminate', {why: 'origin'});
     if (!/^[0-9a-f]{64}$/.test(a.nonce)) return out('indeterminate', {why: 'nonce'});
     if (!window.crypto || !crypto.subtle) return out('indeterminate', {why: 'crypto'});
+    if (a.auth === 'token-endpoint') return await tokenWork(origin);
     const headers = {Accept: 'application/json'};
     let path = a.path, claim = null;
     if (a.auth === 'bearer-local-storage' || a.auth === 'jwt-local-storage') {
@@ -690,12 +1259,7 @@ RECIPE_JS = r"""async (a) => {
       else if (a.admin_true.indexOf(v) >= 0) admin = true;
       else if (a.admin_false.indexOf(v) >= 0) admin = false;
     }
-    const data = new Uint8Array(32 + id.length);
-    for (let i = 0; i < 32; i++) data[i] = parseInt(a.nonce.substr(2 * i, 2), 16);
-    for (let i = 0; i < id.length; i++) data[32 + i] = id.charCodeAt(i);
-    const d = new Uint8Array(await crypto.subtle.digest('SHA-256', data));
-    const digest = Array.from(d, x => x.toString(16).padStart(2, '0')).join('');
-    return out('found', {digest: digest, admin: admin});
+    return out('found', {digest: await digestOf(id), admin: admin});
   };
   let timer;
   const cap = new Promise(res => {
@@ -740,7 +1304,7 @@ def recipe_args(
         return list(path) if path else None
 
     return {
-        "origin": check_origin(check_url),
+        "origin": recipe.origin or check_origin(check_url),
         "path": recipe_path(recipe, check_url),
         "nonce": nonce_hex,
         "auth": recipe.auth,
@@ -758,22 +1322,16 @@ def recipe_args(
         "error_code_field": opt(recipe.error_code_field),
         "logged_out_codes": list(recipe.logged_out_codes),
         "must_be_null": opt(recipe.must_be_null),
+        "token_body": dict(recipe.token_body),
+        "token_field": opt(recipe.token_field),
+        "claim_pins": [list(pin) for pin in recipe.claim_pins],
+        "issuer": recipe.issuer,
+        "admin_probe": recipe.admin_probe,
+        "admin_probe_true": list(recipe.admin_probe_true),
+        "admin_probe_false": list(recipe.admin_probe_false),
         "fetch_ms": FETCH_MS,
         "total_ms": TOTAL_MS,
     }
-
-
-def _https_origin(value: object) -> str:
-    """``https://host[:port]`` of a URL or an origin (lower-case, the default
-    port dropped); '' for anything that is not https."""
-    try:
-        parts = urllib.parse.urlsplit(str(value or ""))
-        host, port = parts.hostname, parts.port
-    except ValueError:
-        return ""
-    if parts.scheme != "https" or not host:
-        return ""
-    return f"https://{host.lower()}" + ("" if port in (None, 443) else f":{port}")
 
 
 def foreign_storage_keys(entry: Mapping[str, object]) -> dict[str, list[str]]:
@@ -786,11 +1344,21 @@ def foreign_storage_keys(entry: Mapping[str, object]) -> dict[str, list[str]]:
     origin — where the recipe reads it — also the recipe's own token key. A
     fill origin may be an SSO provider other sites share: it never loses an
     undeclared key. ``{origin: sorted keys}`` (an origin without a key is
-    left out); {} for any other item."""
+    left out); {} for any other item.
+
+    S4c: a recipe's `identity_storage_keys` (the page's own account claim,
+    Run:ai's `logged-in-user-email`) go too, on the check origin — for a
+    token-endpoint recipe only there and only when it is the recipe's
+    `origin` — so a foreign account's e-mail does not linger in the UI."""
     recipe = usable_recipe(entry.get("identity"))
-    if recipe is None or recipe.auth not in LOCAL_STORAGE_AUTHS:
+    if recipe is None:
         return {}
     check = _https_origin(entry.get("check_url") or entry.get("login_url"))
+    if recipe.auth not in LOCAL_STORAGE_AUTHS:
+        claim = sorted({k for k in recipe.identity_storage_keys if k})
+        if claim and recipe.origin and check == recipe.origin:
+            return {check: claim}
+        return {}
     origins = [check, *(_https_origin(o) for o in _list(entry.get("fill_origins")))]
     declared: dict[str, set[str]] = {}
     raw = entry.get("storage_keys")
@@ -804,5 +1372,6 @@ def foreign_storage_keys(entry: Mapping[str, object]) -> dict[str, list[str]]:
             names = set(declared.get(origin, ()))
             if origin == check:
                 names.add(recipe.token_key)
+                names.update(recipe.identity_storage_keys)
             out[origin] = sorted(k for k in names if k)
     return {origin: names for origin, names in out.items() if names}

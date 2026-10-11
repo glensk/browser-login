@@ -186,6 +186,10 @@ class SiteItem:  # pylint: disable=too-many-instance-attributes
     cookie_hosts: list[str] = field(default_factory=list)
     cookie_names: list[str] | None = None
     storage_keys: dict[str, list[str]] = field(default_factory=dict)
+    # `agent_cookie_scopes` (WS5 S4c): the cookie scopes WITH a path (a
+    # Keycloak realm); () = every cookie host at path "/". `cookie_hosts`
+    # then holds their hosts, for readers that predate `scope_v`.
+    cookie_scopes: tuple[_identity.CookieScope, ...] = ()
     login_url: str = ""
     check_url: str = ""
     logged_in_selector: str | None = None
@@ -265,6 +269,27 @@ class SiteItem:  # pylint: disable=too-many-instance-attributes
         }
 
     @property
+    def scopes(self) -> tuple[_identity.CookieScope, ...]:
+        """The item's cookie scopes: `cookie_scopes`, else every cookie host
+        at path "/" (the whole host)."""
+        if self.cookie_scopes:
+            return tuple(self.cookie_scopes)
+        return tuple(
+            s for s in (_identity.CookieScope(h) for h in self.cookie_hosts) if s.host
+        )
+
+    @property
+    def identity_recipe(self) -> _identity.IdentityRecipe | None:
+        """The recipe this item may use (`identity.item_recipe`: usable, its
+        site and check origin allowed, its privilege covered), else None."""
+        return _identity.item_recipe(
+            self.identity,
+            site=self.site,
+            check_url=self.check_url or self.login_url,
+            privilege=self.privilege,
+        )
+
+    @property
     def has_proof(self) -> bool:
         """The STRICT proof is possible: an authenticated DOM sentinel exists,
         or the site has a registered server proof (``recipes.PROOFS``: CSCS
@@ -287,6 +312,7 @@ class SiteItem:  # pylint: disable=too-many-instance-attributes
             cookie_hosts=list(self.cookie_hosts),
             cookie_names=list(self.cookie_names) if self.cookie_names else None,
             storage_keys={k: list(v) for k, v in self.storage_keys.items()},
+            cookie_scopes=self.scopes,
         )
 
     def public(self) -> dict[str, Any]:
@@ -296,6 +322,10 @@ class SiteItem:  # pylint: disable=too-many-instance-attributes
             "name": self.name,
             "fill_origins": list(self.fill_origins),
             "cookie_hosts": list(self.cookie_hosts),
+            # WS5 S4c: the scopes with their paths; a reader that predates
+            # `scope_v` uses `cookie_hosts` (host-wide: fail closed)
+            "cookie_scopes": [s.view() for s in self.scopes],
+            "scope_v": _identity.SCOPE_V,
             "cookie_names": list(self.cookie_names) if self.cookie_names else None,
             "storage_origins": sorted(self.storage_keys),
             "login_url": self.login_url,
@@ -877,7 +907,14 @@ def site_item_from_json(item: Mapping[str, Any], *, dev: bool = False) -> SiteIt
             "chars; no Playwright text=/xpath=/>>)"
         )
     hosts_raw = fields.get("agent_cookie_hosts", "").strip()
-    if hosts_raw:
+    cookie_scopes, problem = _cookie_scopes(
+        fields.get("agent_cookie_scopes", ""), hosts_raw
+    )
+    if problem:
+        return refused(problem)
+    if cookie_scopes:
+        cookie_hosts = list(dict.fromkeys(s.host for s in cookie_scopes))
+    elif hosts_raw:
         cookie_hosts = [h.lstrip(".").lower() for h in _split_list(hosts_raw)]
     else:
         cookie_hosts = _default_cookie_hosts(fill_origins, check_url)
@@ -928,6 +965,7 @@ def site_item_from_json(item: Mapping[str, Any], *, dev: bool = False) -> SiteIt
     built = SiteItem(
         fill_origins=fill_origins,
         cookie_hosts=cookie_hosts,
+        cookie_scopes=cookie_scopes,
         cookie_names=cookie_names,
         storage_keys=storage_keys,
         login_url=login_url,
@@ -949,6 +987,29 @@ def site_item_from_json(item: Mapping[str, Any], *, dev: bool = False) -> SiteIt
         item_id=item_id,
     )
     return _with_identity_fields(built, item, fields)
+
+
+def _cookie_scopes(
+    raw: str, hosts_raw: str
+) -> tuple[tuple[_identity.CookieScope, ...], str]:
+    """(scopes, '') of `agent_cookie_scopes` — a JSON list of ``{host,
+    path}`` (`identity.parse_cookie_scopes`) — or ((), why it is refused).
+    Next to `agent_cookie_hosts` the two must name the same hosts (one
+    field narrows the other's hosts to paths, never adds a host)."""
+    text = raw.strip()
+    if not text:
+        return (), ""
+    scopes, problem = _identity.parse_cookie_scopes(text)
+    if problem:
+        return (), f"bad agent_cookie_scopes: {problem}"
+    if hosts_raw:
+        named = {h.strip().lstrip(".").lower() for h in _split_list(hosts_raw)}
+        if named != {s.host for s in scopes}:
+            return (), (
+                "agent_cookie_scopes and agent_cookie_hosts name different hosts "
+                "(set the same hosts, or only agent_cookie_scopes)"
+            )
+    return scopes, ""
 
 
 MAX_SESSION_DAYS_RANGE = (1, 365)
@@ -1078,10 +1139,37 @@ def _with_identity_fields(
         alias=fields.get("agent_alias", "").strip().lower(),
         account_name=_login_username(item),
     )
-    problem = _identity_problem(built.site, fields, item)
+    problem = _identity_problem(built.site, fields, item) or _recipe_item_problem(
+        filled
+    )
     if problem:
         return replace(filled, refused=problem, same_account_as="", alias="")
     return filled
+
+
+def _recipe_item_problem(item: SiteItem) -> str:
+    """WS5 S4c: '' when the item is configured for its `agent_identity`
+    recipe — its site id and check origin allowed by the recipe
+    (`identity.recipe_config_problem`) — and lists none of the page's own
+    identity claim keys (`identity_storage_keys`) in `agent_storage_keys`:
+    those are never exported or injected. (An admin item of a recipe whose
+    "admin" answer is unconfirmed is NOT refused: it stays unproven —
+    `identity_recipe` is None — until the recipe's flag flips.)"""
+    if not item.identity:
+        return ""
+    why = _identity.recipe_config_problem(
+        item.identity, site=item.site, check_url=item.check_url or item.login_url
+    )
+    if why:
+        return f"agent_identity {item.identity}: {why} (the item stays unproven)"
+    recipe = _identity.IDENTITIES[item.identity]
+    listed = {k for keys in item.storage_keys.values() for k in keys}
+    if listed & set(recipe.identity_storage_keys):
+        return (
+            f"agent_identity {item.identity}: agent_storage_keys may not list the "
+            "page's own account claim (an identity-source key)"
+        )
+    return ""
 
 
 def _raw_scope_hosts(raw: Mapping[str, Any]) -> list[str]:
@@ -1092,6 +1180,7 @@ def _raw_scope_hosts(raw: Mapping[str, Any]) -> list[str]:
     generic login URIs."""
     fields = _fields(raw)
     hosts = list(_split_list(fields.get("agent_cookie_hosts", "")))
+    hosts += _raw_scope_field_hosts(fields.get("agent_cookie_scopes", ""))
     for key in ("agent_fill_origins",):
         for value in _split_list(fields.get(key, "")):
             url = value if "://" in value else "https://" + value
@@ -1101,6 +1190,23 @@ def _raw_scope_hosts(raw: Mapping[str, Any]) -> list[str]:
                 continue
             hosts.append(host)
     return sorted({h.strip().lstrip(".").lower() for h in hosts if h.strip()})
+
+
+def _raw_scope_field_hosts(raw: str) -> list[str]:
+    """Best effort: every host string in a (possibly malformed)
+    `agent_cookie_scopes` — at path "/" in a refused item's scope, the
+    over-inclusive reading."""
+    try:
+        value = json.loads(raw) if raw.strip() else []
+    except ValueError:
+        return []
+    if not isinstance(value, list):
+        return []
+    return [
+        str(one["host"])
+        for one in value
+        if isinstance(one, Mapping) and isinstance(one.get("host"), str)
+    ]
 
 
 def _refuse(it: SiteItem, reason: str) -> SiteItem:
@@ -1167,12 +1273,12 @@ def identity_rules(  # pylint: disable=too-many-branches
         it = out[i]
         if it.refused:
             continue
-        mine = _identity.scope_hosts(it.public())
+        mine = _identity.item_scopes(it.public())
         clash = next(
             (
                 other
                 for other in kept.get(it.instance, [])
-                if _identity.hosts_overlap(mine, _identity.scope_hosts(other.public()))
+                if _identity.scopes_overlap(mine, _identity.item_scopes(other.public()))
                 and not (
                     other.same_account_as == it.site
                     and it.same_account_as == other.site

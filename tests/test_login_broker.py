@@ -43,6 +43,7 @@ from broker import (  # noqa: E402
     bootstrap_switch,
     bundle,
     daemon,
+    identity,
     limiter,
     origins,
     page_state,
@@ -2369,15 +2370,21 @@ def test_fresh_login_hosts_cover_cookie_hosts_fill_origins_and_parents() -> None
             },
         )
     )
-    hosts = daemon.fresh_login_hosts(it)
-    assert hosts == ["www.x.example", "login.x.example"]
-    reach = daemon.cookie_reaches_hosts
-    assert reach(".x.example", hosts)  # parent domain: sent to both hosts
-    assert reach("login.x.example", hosts)
-    assert reach("a.www.x.example", hosts)  # set below a cookie host
-    assert not reach("other.x.example", hosts)
-    assert not reach("x.example.evil", hosts)
-    assert not reach("", hosts)
+    scopes = daemon.fresh_login_scopes(it)
+    assert [(s.host, s.path) for s in scopes] == [
+        ("www.x.example", "/"),
+        ("login.x.example", "/"),
+    ]
+
+    def reach(domain: str) -> bool:
+        return identity.scopes_reach(scopes, domain, "/any/path")
+
+    assert reach(".x.example")  # parent domain: sent to both hosts
+    assert reach("login.x.example")
+    assert reach("a.www.x.example")  # set below a cookie host
+    assert not reach("other.x.example")
+    assert not reach("x.example.evil")
+    assert not reach("")
 
 
 def test_eduid_idp_session_cookie_exported_only_when_named() -> None:

@@ -1,10 +1,13 @@
 """Session bundle: which cookies and storage keys of a site leave the broker.
 
 Never the whole cookie jar: a cookie is exported only when its domain is one of
-the site's ``cookie_hosts`` (or a subdomain of one) and, when the item lists
-``cookie_names``, its name is listed. Identity-provider hosts are always
-excluded unless the site names that exact host — an IdP session cookie would
-let the agent log into every other site behind that IdP.
+the site's ``cookie_hosts`` (or a subdomain of one) — with ``cookie_scopes``
+(WS5 S4c), also only when its path lies in the scope's path
+(``identity.CookieScope.holds``: one realm of a Keycloak host, not its sibling)
+— and, when the item lists ``cookie_names``, its name is listed.
+Identity-provider hosts are always excluded unless the site names that exact
+host — an IdP session cookie would let the agent log into every other site
+behind that IdP.
 """
 
 from __future__ import annotations
@@ -12,6 +15,8 @@ from __future__ import annotations
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
 from typing import Any
+
+from broker.identity import CookieScope, scopes_hold
 
 # Exact IdP hosts, plus first-label wildcards (``idp.*``, ``sso.*``, ``keycloak.*``).
 # browser.py mirrors this list for the client-side cookie delete (a test pins
@@ -35,6 +40,17 @@ class SiteBundleSpec:
     cookie_hosts: list[str]
     cookie_names: list[str] | None = None
     storage_keys: dict[str, list[str]] = field(default_factory=dict)
+    # WS5 S4c: the item's cookie scopes with their paths; None = its
+    # cookie hosts, each at path "/" (the whole host).
+    cookie_scopes: tuple[CookieScope, ...] | None = None
+
+    @property
+    def scopes(self) -> tuple[CookieScope, ...]:
+        """The scopes a cookie must lie in (`cookie_scopes`, else every
+        cookie host at path "/")."""
+        if self.cookie_scopes is not None:
+            return tuple(self.cookie_scopes)
+        return tuple(CookieScope(h) for h in self.cookie_hosts if _norm_host(h))
 
 
 def _norm_host(domain: str) -> str:
@@ -47,15 +63,18 @@ def is_idp_host(host: str) -> bool:
     return h in IDP_HOSTS or h.split(".", 1)[0] in IDP_LABELS
 
 
-def cookie_in_scope(domain: str, name: str, spec: SiteBundleSpec) -> bool:
-    """The export rule for one cookie (see the module docstring)."""
+def cookie_in_scope(
+    domain: str, name: str, spec: SiteBundleSpec, path: str = "/"
+) -> bool:
+    """The export rule for one cookie of `domain`, `name` and `path` (see
+    the module docstring)."""
     d = _norm_host(domain)
     if not d:
         return False
-    hosts = [_norm_host(h) for h in spec.cookie_hosts if _norm_host(h)]
-    if not any(d == h or d.endswith("." + h) for h in hosts):
+    scopes = spec.scopes
+    if not scopes_hold(scopes, d, path):
         return False
-    if is_idp_host(d) and d not in hosts:
+    if is_idp_host(d) and d not in {s.host for s in scopes}:
         return False
     return spec.cookie_names is None or name in spec.cookie_names
 
@@ -71,7 +90,9 @@ def filter_cookies(
     for c in cookies:
         domain = str(c.get("domain") or "")
         name = str(c.get("name") or "")
-        if not name or not cookie_in_scope(domain, name, spec):
+        if not name or not cookie_in_scope(
+            domain, name, spec, str(c.get("path") or "/")
+        ):
             continue
         item: dict[str, Any] = {
             "name": name,

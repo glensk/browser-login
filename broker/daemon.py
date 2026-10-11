@@ -737,7 +737,9 @@ class PlaywrightRunner:
         an item naming one that is not usable is ``indeterminate``."""
         if not item.identity:
             return _identity.MATCH
-        recipe = _identity.usable_recipe(item.identity)
+        # (`identity.item_recipe`: usable, this site and check origin, this
+        # privilege — the same rule as the validation and the client)
+        recipe = item.identity_recipe
         if recipe is None:
             return _identity.INDETERMINATE
         nonce = secrets.token_hex(_identity.NONCE_BYTES)
@@ -896,6 +898,10 @@ class PlaywrightRunner:
             "cookies": cookies,
             "storage": filter_storage(raw, spec),
             "cookie_hosts": list(spec.cookie_hosts),
+            # WS5 S4c: the scopes with their paths (the client clears and
+            # injects only inside them; an older client reads the hosts)
+            "cookie_scopes": [s.view() for s in spec.scopes],
+            "scope_v": _identity.SCOPE_V,
             "cookie_names": spec.cookie_names,
             # The key NAMES the bundle must carry (the client checks the
             # bundle is complete before it touches the shared browser).
@@ -905,16 +911,17 @@ class PlaywrightRunner:
     def clear_site_cookies(self, ctx: Any, item: SiteItem) -> int:
         """``agent_fresh_login``: delete every cookie of the broker's OWN profile
         that the browser would send to one of the site's cookie hosts or fill
-        origin hosts (the host itself, a subdomain or a parent domain of it).
+        origin hosts (the host itself, a subdomain or a parent domain of it),
+        every path (`fresh_login_scopes`).
 
         Afterwards neither the site's long-lived account cookie nor a stale IdP
         cookie can short-circuit the login. Returns the number deleted.
         """
-        hosts = fresh_login_hosts(item)
+        scopes = fresh_login_scopes(item)
         cleared = 0
         for ck in ctx.cookies():
             domain = str(ck.get("domain") or "")
-            if cookie_reaches_hosts(domain, hosts):
+            if _identity.scopes_reach(scopes, domain, str(ck.get("path") or "/")):
                 ctx.clear_cookies(
                     name=ck.get("name"), domain=domain, path=ck.get("path") or "/"
                 )
@@ -933,7 +940,9 @@ class PlaywrightRunner:
         (``Storage.clearDataForOrigin``); finally a FRESH tab replaces the
         old one (its sessionStorage dies with it). Raises ``LoginFailed``
         (nothing typed yet) when any step fails: a fresh login on a
-        half-cleared profile proves nothing."""
+        half-cleared profile proves nothing. Host-wide on purpose, also
+        for an item with path scopes (WS5 S4c): the broker's profile is the
+        item's own — no sibling account lives in it to spare."""
         check = _identity.check_origin(check_page_url(item))
         origins = list(
             dict.fromkeys(
@@ -1381,29 +1390,23 @@ def exception_site(exc: BaseException) -> str:
     return f"{name} in {frame.name} ({Path(frame.filename).name}:{frame.lineno})"
 
 
-def fresh_login_hosts(item: SiteItem) -> list[str]:
-    """The hosts an ``agent_fresh_login`` wipe covers: the cookie hosts plus the
-    hosts of the fill origins (lower-case, no leading dot, no port)."""
-    hosts: list[str] = []
+def fresh_login_scopes(item: SiteItem) -> list[_identity.CookieScope]:
+    """The scopes an ``agent_fresh_login`` wipe (and the WS5 reset) covers,
+    HOST-WIDE: every cookie host and every fill origin's host at path "/"
+    — a cookie of the host, a subdomain or a parent domain of it, any
+    path (``CookieScope.reaches``). The broker's profile is the item's own,
+    so its path scopes (WS5 S4c) spare nothing here."""
+    scopes: list[_identity.CookieScope] = []
     for host in [*item.cookie_hosts, *(url_host(o) for o in item.fill_origins)]:
-        h = host.strip().lstrip(".").lower()
-        if h and h not in hosts:
-            hosts.append(h)
-    return hosts
+        scope = _identity.CookieScope(host)
+        if scope.host and scope not in scopes:
+            scopes.append(scope)
+    return scopes
 
 
 def url_host(origin: str) -> str:
     """``https://login.eduid.ch:8443`` -> ``login.eduid.ch``."""
     return (urllib.parse.urlsplit(origin).hostname or "").lower()
-
-
-def cookie_reaches_hosts(domain: str, hosts: list[str]) -> bool:
-    """True iff a cookie of `domain` is sent to (or set below) one of `hosts`:
-    the same host, a subdomain of it, or a parent domain of it."""
-    d = domain.strip().lstrip(".").lower()
-    if not d:
-        return False
-    return any(d == h or d.endswith("." + h) or h.endswith("." + d) for h in hosts)
 
 
 # ---------------------------------------------------------------------------
@@ -1711,7 +1714,7 @@ class Broker(SecretOps):  # pylint: disable=too-many-instance-attributes  # deps
             return _err("refused", item.refused)
         if not item.has_proof:
             return _err("needs_sentinel", "the item has no logged-in proof")
-        if _identity.usable_recipe(item.identity) is None:
+        if item.identity_recipe is None:
             return _err("identity_unproven", f"{site}: no usable identity recipe")
         if not isinstance(instance, str) or instance != item.instance:
             return _err(
@@ -1874,9 +1877,7 @@ class Broker(SecretOps):  # pylint: disable=too-many-instance-attributes  # deps
             )
         if item.refused:
             return _phase_err("refused", item.refused, "vault")
-        if (item.multi_account or item.identity) and _identity.usable_recipe(
-            item.identity
-        ) is None:
+        if (item.multi_account or item.identity) and item.identity_recipe is None:
             # WS5: its session could be any of the scope's accounts and no
             # usable recipe (reviewed, live-confirmed, with an admin bit) can
             # tell which: no bundle, nothing reserved.

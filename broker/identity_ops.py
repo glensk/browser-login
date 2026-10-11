@@ -379,7 +379,7 @@ class IdentityOps:
         """``identity_challenge`` for an item the daemon already admitted
         (`Broker._challenge_gates`) → ``{ok, challenge_id, nonce, ...}``."""
         site = item.site
-        if identity.usable_recipe(item.identity) is None:
+        if item.identity_recipe is None:
             return _err("identity_unproven", f"{site}: no usable identity recipe")
         if not isinstance(pid, int) or pid <= 0:
             return _err("bad_request", "the peer process is unknown")

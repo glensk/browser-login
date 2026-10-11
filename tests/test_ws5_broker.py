@@ -140,6 +140,7 @@ def test_recipes_are_reviewed_and_unconfirmed_ones_absent() -> None:
         "navidrome",
         "dsm",
         "authentik",
+        "runai",
     }
     for name, recipe in identity.IDENTITIES.items():
         assert recipe.name == name and recipe.path.startswith("/")
@@ -155,7 +156,9 @@ def test_recipes_are_reviewed_and_unconfirmed_ones_absent() -> None:
     assert identity.usable_recipe("gitlab") is identity.IDENTITIES["gitlab"]
     assert identity.usable_recipe("audiobookshelf") is not None
     assert identity.usable_recipe("navidrome") is identity.IDENTITIES["navidrome"]
-    for name in ("dsm", "authentik", "runai", None):
+    # runai (S4c): usable; who may use it is `identity.item_recipe`
+    assert identity.usable_recipe("runai") is identity.IDENTITIES["runai"]
+    for name in ("dsm", "authentik", "nope", None):
         assert identity.usable_recipe(name) is None
 
 
@@ -169,7 +172,7 @@ def test_recipes_are_reviewed_and_unconfirmed_ones_absent() -> None:
     [
         ({"instance": "private"}, "bad agent_instance"),
         ({"instance": "admin", "privilege": "root"}, "bad agent_privilege"),
-        ({"identity": "runai", "privilege": "user"}, "bad agent_identity"),
+        ({"identity": "nope", "privilege": "user"}, "bad agent_identity"),
         ({"identity": "gitlab"}, "agent_identity needs agent_privilege"),
         ({"identity": "dsm", "privilege": "readonly"}, "not live-confirmed"),
         ({"identity": "authentik", "privilege": "user"}, "not live-confirmed"),

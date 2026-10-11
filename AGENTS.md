@@ -286,10 +286,14 @@ framework. It is a **provider**: other repos depend on it, not the reverse. See
   ANY `--cdp-port`, or a port that is not the instance's); `logout` and
   `assisted-login` refuse the same way. A `logged-in` that finds a foreign
   account's session in an item's instance (`wrong_account`) clears it at once —
-  the item's cookies (its cookie hosts and subdomains, its `cookie_names`) and,
+  the item's cookies (its cookie hosts and subdomains, its `cookie_names`; with
+  path scopes — `agent_cookie_scopes`, `identity.CookieScope` — only inside
+  the scope paths and on their ancestor paths, never a sibling realm's) and,
   when its recipe reads its token from localStorage (ABS, Navidrome), its
   declared storage keys on its check / fill origins plus the recipe's token
-  key on the check origin only (`identity.foreign_storage_keys`; registered,
+  key on the check origin only — and, for a recipe that names the page's own
+  account claim (Run:ai `logged-in-user-email`), that key on the recipe's
+  origin (`identity.foreign_storage_keys`; registered,
   then the lease; a fresh owned tab with the service-worker bypass applied,
   served a nonce-marked blank document by its own route, so the app never
   runs there — keys are removed only after the isolated world sees that nonce
