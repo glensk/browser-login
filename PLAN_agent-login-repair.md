@@ -288,7 +288,12 @@ manual acceptance steps under the attempt policy below.
             identity fields + recipes (gitlab, audiobookshelf live-confirmed; dsm/authentik refused
             until confirmed), one-use pid-bound challenges, IdentityGuard lockouts, per-instance
             conflicts; three security review rounds before release.
-      - [ ] S2+S3 client identity check, admin/alt instances, agent views (builder running).
+      - [x] S2+S3 released 2026-10-11 (859c785, broker 859c785bf996): client proof in an isolated
+            CDP world, admin 9224 / alt 9225 instances with port+instance gate, aliases, a
+            `wrong_account` check clears the foreign cookies in that instance (no lockout spiral),
+            identity verdict in checks.json, grouped agents.md. Two review rounds (2 blockers,
+            port exemption + `-W` removed). Known gap for S4: audiobookshelf keeps its session in
+            localStorage, cookie clearing does not remove a foreign abs session.
       - [ ] S4 vault fields (Albert's Touch ID), live confirmations, admin MCP config, then log in
             the held-back group members.
       Original line: account identity (tp#833, hit 2026-10-10): 8 same-scope groups report ✅ for
