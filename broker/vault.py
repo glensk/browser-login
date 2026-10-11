@@ -161,6 +161,13 @@ class SiteItem:  # pylint: disable=too-many-instance-attributes
     # reusable broker profile is still exported. (The `fingerprint` op still
     # hashes the password: it never logs in.)
     no_submit: bool = False
+    # `agent_max_session_days`: the server ends a session this many days after
+    # its login, however much it is used (Calibre-Web Automated: 31 days, the
+    # row's expiry is set at login and never extended). The client then asks
+    # for a fresh login once its last proven fresh authentication is this old,
+    # while the session still works. Only with `agent_fresh_login` (a reused
+    # broker profile would hand back the same ageing session). None = no limit.
+    max_session_days: int | None = None
     refused: str | None = None
     item_id: str = ""
 
@@ -212,6 +219,7 @@ class SiteItem:  # pylint: disable=too-many-instance-attributes
             "storage_keys": {o: list(k) for o, k in self.storage_keys.items()},
             "session_refresh": session_refresh_name(self),
             "no_submit": self.no_submit or self.site in NO_SUBMIT_SITES,
+            "max_session_days": self.max_session_days,
             "refused": self.refused is not None,
             "reason": self.refused or "",
         }
@@ -787,6 +795,11 @@ def site_item_from_json(item: Mapping[str, Any], *, dev: bool = False) -> SiteIt
     no_submit = _parse_flag(fields.get("agent_no_submit", ""))
     if no_submit is None:
         return refused("bad agent_no_submit (true or false)")
+    max_days, problem = _max_session_days(
+        fields.get("agent_max_session_days", ""), fresh_login=bool(fresh_login)
+    )
+    if problem:
+        return refused(problem)
     return SiteItem(
         fill_origins=fill_origins,
         cookie_hosts=cookie_hosts,
@@ -804,10 +817,28 @@ def site_item_from_json(item: Mapping[str, Any], *, dev: bool = False) -> SiteIt
         no_submit=no_submit
         or site in NO_SUBMIT_SITES
         or no_submit_by_origin(fill_origins),
+        max_session_days=max_days,
         site=site,
         name=name,
         item_id=item_id,
     )
+
+
+MAX_SESSION_DAYS_RANGE = (1, 365)
+
+
+def _max_session_days(raw: str, *, fresh_login: bool) -> tuple[int | None, str]:
+    """(days or None, refusal reason or ''): a whole number of days in
+    ``MAX_SESSION_DAYS_RANGE``, and only on an `agent_fresh_login` item."""
+    text = raw.strip()
+    if not text:
+        return None, ""
+    low, high = MAX_SESSION_DAYS_RANGE
+    if not re.fullmatch(r"[0-9]{1,3}", text) or not low <= int(text) <= high:
+        return None, f"bad agent_max_session_days (whole days, {low}-{high})"
+    if not fresh_login:
+        return None, "agent_max_session_days needs agent_fresh_login true"
+    return int(text), ""
 
 
 def _attempt_group(raw: str, item: Mapping[str, Any]) -> tuple[str | None, str]:

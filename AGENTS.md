@@ -216,6 +216,41 @@ framework. It is a **provider**: other repos depend on it, not the reverse. See
   < 12 h left `browser.py login` asks for a `refresh_only` re-export
   (`login -F/--refresh-only` never logs in; `agent-login.py -c` runs it for
   every refreshable ✅, pending sites included). A refresh never quarantines.
+- **A submit is never a guess (WS2-calibre)**: `_submit_password` /
+  `_submit_identifier` read the form's submit buttons first
+  (`login_form.read_submit_buttons`) and raise `SubmitUnidentified` (pre-submit,
+  no marker) when they cannot — never fall back to Enter, which fires whatever
+  the default button is (CWA's `forgot` reset a password, 2026-10-08). The OTP
+  step submits through `_submit_password` too; Keycloak's generic fallback
+  button (visible, non-secondary, guarded with `allowed`) and Smartsheet's
+  sign-in are a known primary or nothing; destructive labels (delete, log out
+  …) are secondary. Fill-origin checks compare parsed origins, never
+  substrings (`_on_cscs_auth`).
+  `generic_login` runs every submit under `recipes.SubmitTripwire` (a CONTEXT
+  route on the fill origins; it screens form navigations until the login
+  went out and every request carrying a shielded field, matches a secondary
+  button by its (name, value) pair per step — never a name a login button
+  shares — and aborts one naming a secondary action:
+  `secondary_action_blocked`, client-quarantined; the
+  attempt is `not_submitted` only when the context saw nothing else that could
+  carry the password since it was armed, before typing — by request
+  identity — and no service worker of a fill origin ran; the OTP step runs
+  under it too, and a self-submitting OTP page is marked, never re-pressed)
+  and ticks a SESSION "remember me" (never a trusted
+  device / browser / choice) before typing. A new recipe that submits a form
+  uses the same helpers. A Cloudflare Access page (`origins.access_gated`:
+  `*.cloudflareaccess.com` or `/cdn-cgi/access/`) is `precheck` ·
+  `access_gated` on both sides, before any reservation — agent-login shows it
+  as "unreachable off-LAN", never ❌; a login page answering 401/403 is
+  `precheck` · `login_blocked` (the broker loads it before reserving), a
+  bot challenge there (`recipes.raise_if_blocked`) `needs_human`.
+  `agent_max_session_days` (with `agent_fresh_login`): the client renews a
+  session that old since its last proven fresh login
+  (`SESSION_AGE_DIR/<site>.json` under a per-site flock, `fresh_auth_at`
+  written only after a verified injection; none on record → counted from the
+  first check, never "due"; one claimed attempt per 20 h), gated like any
+  login; a failed renewal of a working session is exit 0 with
+  `renewal: failed`.
 - **`security` (keychain) calls go through `_security_run` only**: new session, no
   timeout, never `kill`/`terminate` — killing a client mid-dialog crashed
   `securityd` (tp#504). Writes are delete-then-add pinned to the default keychain,

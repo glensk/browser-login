@@ -29,6 +29,7 @@ from __future__ import annotations
 
 # every recipe and its proof share the guarded helpers.
 # pylint: disable=too-many-lines
+import contextlib
 import math
 import re
 import time
@@ -37,17 +38,30 @@ from collections.abc import Callable
 from typing import TYPE_CHECKING, Any
 
 from broker.login_form import (
-    BUTTON_DESCRIBE_JS,
     FORM_ACTION_JS,
+    REMEMBER_BOX_HANDLES_JS,
+    REMEMBER_BOXES_JS,
     SUBMIT_BUTTON_JS,
     USERNAME_JS,
-    form_submit_buttons,
+    body_pairs,
+    describe_buttons,
     pick_login_password,
     pick_login_username,
+    pick_remember_me,
     pick_submit_button,
     pick_visible,
+    read_submit_buttons,
+    secondary_button_like,
+    secondary_hit,
+    secondary_pairs,
 )
-from broker.origins import form_action_allowed, origin_allowed, origin_hint, url_origin
+from broker.origins import (
+    access_gated,
+    form_action_allowed,
+    origin_allowed,
+    origin_hint,
+    url_origin,
+)
 from broker.otp_detect import OTP_CANDIDATE_SELECTOR, OTP_DESCRIBE_JS, otp_field_like
 from broker.page_state import (
     await_sentinel,
@@ -175,10 +189,57 @@ class RecipeError(Exception):
         # password still sits in its field on a fill origin: the form was not
         # submitted, although the password was entered.
         self.unsent = unsent
+        # Set only by the POST tripwire (``SubmitTripwire``): the submit WAS
+        # triggered, but its request was aborted inside the browser and no
+        # other request with a body reached a fill origin after the password
+        # was typed — the password never left the machine.
+        self.never_sent = False
 
 
 class LoginFailed(RecipeError):
     """The login did not reach a logged-in state."""
+
+
+class SubmitUnidentified(LoginFailed):
+    """The form's submit buttons could not be read, or only secondary ones
+    (forgot password, register …) show: nothing is submitted. Pressing Enter
+    then would fire the form's default button — a guess, and on Calibre-Web
+    Automated (2026-10-08) the guess reset the admin password."""
+
+    code = "submit_unidentified"
+
+
+class SecondaryActionBlocked(RecipeError):
+    """The POST tripwire aborted a request that named a secondary form action
+    (``login_form.secondary_post``): the broker's own submit would have run
+    "forgot password", reset, register or resend instead of the login."""
+
+    code = "secondary_action_blocked"
+
+    def __init__(self, detail: str, *, never_sent: bool) -> None:
+        super().__init__(detail, phase="submit", submitted=not never_sent)
+        self.never_sent = never_sent
+
+
+# A login page that answers one of these has no login form of the site's (an
+# Access block page, an IP or country gate): nothing is typed there.
+BLOCKED_STATUSES = frozenset({401, 403})
+
+
+class AccessGated(RecipeError):
+    """The site's page is a Cloudflare Access login (``origins.access_gated``):
+    off-LAN, the app is behind Access and unreachable from here. Nothing is
+    reserved, typed or submitted."""
+
+    code = "access_gated"
+
+    def __init__(self, detail: str = "") -> None:
+        super().__init__(
+            detail
+            or "the site redirects to its Cloudflare Access login — unreachable "
+            "off-LAN, nothing typed",
+            phase="precheck",
+        )
 
 
 class OriginViolation(RecipeError):
@@ -208,6 +269,36 @@ class BundleExportError(ExportFailed):
 
     def __init__(self, detail: str) -> None:
         super().__init__(detail, phase="bundle-export")
+
+
+class LoginBlocked(AccessGated):
+    """The login page answered HTTP 401/403 (``BLOCKED_STATUSES``): blocked
+    from here — nothing is reserved (precheck) or typed."""
+
+    code = "login_blocked"
+
+    def __init__(self, status: int) -> None:
+        super().__init__(
+            f"the login page answers HTTP {status} — blocked from here, nothing typed"
+        )
+
+
+def raise_if_blocked(page: Any, resp: Any) -> None:
+    """The login page answered 401/403 (``BLOCKED_STATUSES``): a bot
+    challenge (Cloudflare's ``cf-mitigated: challenge``, "Just a moment", a
+    captcha — ``challenge_reason``) is ``NeedsHuman`` (exit 4), anything else
+    ``LoginBlocked``. Phase ``precheck``: nothing typed."""
+    status = getattr(resp, "status", None)
+    if status not in BLOCKED_STATUSES:
+        return
+    try:
+        mitigated = str((resp.headers or {}).get("cf-mitigated") or "").lower()
+    except Exception:  # pylint: disable=broad-exception-caught
+        mitigated = ""
+    reason = "captcha" if mitigated == "challenge" else challenge_reason(page)
+    if reason:
+        raise NeedsHuman(reason, phase="precheck")
+    raise LoginBlocked(int(status))
 
 
 class AttemptController:
@@ -835,7 +926,15 @@ def _fill_otp(  # pylint: disable=too-many-arguments
     dev: bool,
     otp_label: str | None = None,
     attempt: AttemptController | None = None,
+    tripwire: SubmitTripwire | None = None,
 ) -> None:
+    """Type the TOTP code and submit it like the password
+    (``_submit_password``: Enter only on a login default button, else the
+    identified button — "Verify", never a "Resend code" default — under the
+    tripwire with the OTP form's own button pairs). A page that submits
+    itself once the code is complete (GitHub) is not pressed again: when the
+    field is gone or the URL changed after the fill, the submit is marked and
+    the caller's settle loop decides."""
     if not secret.totp_seed:
         raise NeedsHuman("otp required but the item has no TOTP seed", submitted=True)
     code = fresh_totp(secret.totp_seed)
@@ -850,10 +949,34 @@ def _fill_otp(  # pylint: disable=too-many-arguments
     except OriginViolation as exc:
         exc.submitted = True
         raise
+    before = page.url
     otp_field.fill(code)
-    _guard(page, otp_field, allowed, dev=dev)
-    (attempt or NO_ATTEMPT).mark_submitted()
-    otp_field.press("Enter")
+    page.wait_for_timeout(OTP_SELF_SUBMIT_MS)
+    if _submitted_itself(page, otp_field, before):
+        (attempt or NO_ATTEMPT).mark_submitted()
+        return
+    try:
+        _submit_password(
+            page, otp_field, allowed, dev=dev, attempt=attempt, tripwire=tripwire
+        )
+    except RecipeError as exc:
+        if isinstance(exc, SubmitUnidentified) and _submitted_itself(
+            page, otp_field, before
+        ):  # it went on its own while the buttons were read
+            (attempt or NO_ATTEMPT).mark_submitted()
+            return
+        exc.submitted = True  # the password went before the code
+        raise
+
+
+# How long a page may take to submit a complete OTP code by itself.
+OTP_SELF_SUBMIT_MS = 400
+
+
+def _submitted_itself(page: Any, field: Any, url_before: str) -> bool:
+    """The page moved on after the fill without a submit of ours: the URL
+    changed or the field is gone."""
+    return page.url != url_before or not _still_there(field)
 
 
 def _wait_login_fields(page: Any, timeout_s: float) -> tuple[Any, Any]:
@@ -969,19 +1092,287 @@ def _still_there(field: Any) -> bool:
         return False  # detached: the page moved on
 
 
+def _field_name(field: Any) -> str:
+    """The `name` attribute of a field ("" when unreadable)."""
+    try:
+        return str(field.get_attribute("name") or "")
+    except Exception:  # pylint: disable=broad-exception-caught
+        return ""
+
+
+class SubmitTripwire:  # pylint: disable=too-many-instance-attributes  # screen + proof state
+    """Screens the requests of a login while the broker submits it (installed
+    by ``generic_login`` before its first submit). A request to a fill origin
+    that names a secondary form action (``login_form.secondary_hit``: a
+    "forgot password" button's (name, value), ``forgot_password=``,
+    ``action=reset``, a ``/register`` URL …) is aborted inside the browser;
+    ``check`` then raises ``SecondaryActionBlocked``.
+
+    What is screened (the route matches only fill-origin URLs; the browser
+    CONTEXT is routed, so a form posting into a popup counts too):
+    * a FORM NAVIGATION (a navigation with a body, or a GET navigation with a
+      query — its URL path only on the first hop), until the login went out;
+    * any request that CARRIES a shielded key (the username / password /
+      OTP field's name) — the login itself, whatever transport.
+    Once a request carrying a shielded key went through, only such requests
+    are screened: the app's own traffic after the login (``POST
+    /api/push/register``, ``{"e": {"recovery": …}}``) is none of the
+    tripwire's business. Requests a service worker makes itself are not
+    routable — hence the worker rule of ``never_sent``. A tripped tripwire
+    stays installed until the context closes.
+
+    The broker's button choice (``pick_submit_button``) is the first line of
+    defence; this one holds when a page's buttons fool it. A body that cannot
+    be read passes. ``never_sent`` — the attempt may count as not submitted —
+    needs PROOF that nothing left: armed before the password is typed
+    (``arm``), no service worker of a fill origin running then, and every
+    request that could carry it (a body, post data, a query or an
+    ``Authorization`` header) the whole context issued since then — any
+    origin, popups included — is one this tripwire PROVABLY aborted (by
+    request identity)."""
+
+    def __init__(self, page: Any, allowed: list[str], *, dev: bool) -> None:
+        self.page = page
+        self.allowed = list(allowed)
+        self.dev = dev
+        self.protect: set[str] = set()
+        # (name, value) of the CURRENT step's secondary submit buttons
+        self.button_pairs: set[tuple[str, str]] = set()
+        self.tripped: str | None = None
+        # identities of the requests that could carry the password since
+        # `arm`: seen by the context / provably aborted here
+        self.ids: dict[str, set[Any]] = {"seen": set(), "aborted": set()}
+        self.proof = {"armed": False, "workers": False, "login_sent": False}
+
+    def _match(self, url: str) -> bool:
+        return origin_allowed(url, self.allowed, dev=self.dev)
+
+    @staticmethod
+    def _identity(req: Any) -> Any:
+        return getattr(req, "_guid", None) or id(req)
+
+    @staticmethod
+    def _header(req: Any, name: str) -> str:
+        try:
+            return str((req.headers or {}).get(name) or "")
+        except Exception:  # pylint: disable=broad-exception-caught
+            return ""
+
+    @classmethod
+    def _carrier(cls, req: Any) -> bool:
+        """`req` could carry a typed secret: any method but GET/HEAD, post
+        data, a query, or an ``Authorization`` header (HTTP Basic logins)."""
+        if str(req.method).upper() not in ("GET", "HEAD"):
+            return True
+        try:
+            if req.post_data_buffer:
+                return True
+        except Exception:  # pylint: disable=broad-exception-caught
+            return True
+        if cls._header(req, "authorization"):
+            return True
+        return bool(urllib.parse.urlsplit(str(req.url)).query)
+
+    @staticmethod
+    def _navigation(req: Any) -> bool:
+        try:
+            return bool(req.is_navigation_request())
+        except Exception:  # pylint: disable=broad-exception-caught
+            return True  # cannot tell: screen it
+
+    def _seen(self, req: Any) -> None:
+        with contextlib.suppress(Exception):
+            if self.proof["armed"] and self._carrier(req):
+                self.ids["seen"].add(self._identity(req))
+
+    def _verdict(self, req: Any) -> tuple[str | None, bool]:
+        """(what makes `req` a secondary action or None, whether it carries
+        a shielded key) — see the class docstring for what is screened."""
+        method = str(req.method).upper()
+        nav = self._navigation(req)
+        query = urllib.parse.urlsplit(str(req.url)).query
+        if method in ("GET", "HEAD"):
+            pairs = urllib.parse.parse_qsl(query, keep_blank_values=True)
+            every = pairs
+            form_nav = nav and bool(query)
+            first = getattr(req, "redirected_from", None) is None
+            path_url = str(req.url) if first else ""
+        else:
+            raw = req.post_data_buffer
+            body = raw.decode("utf-8", "replace") if raw else ""
+            ctype = self._header(req, "content-type")
+            pairs = body_pairs(body, ctype)
+            every = body_pairs(body, ctype, nested=True)
+            form_nav = nav
+            path_url = str(req.url)
+        shield = {p.lower() for p in self.protect}
+        shielded = any(k.lower() in shield for k, _v in every)
+        if not shielded and (self.proof["login_sent"] or not form_nav):
+            return None, False
+        hit = secondary_hit(
+            path_url, pairs, protect=self.protect, button_pairs=self.button_pairs
+        )
+        return hit, shielded
+
+    def _handle(self, route: Any) -> None:
+        try:
+            hit, shielded = self._verdict(route.request)
+        except Exception:  # pylint: disable=broad-exception-caught
+            hit, shielded = None, False  # unreadable: let it pass (counted as seen)
+        if not hit:
+            with contextlib.suppress(Exception):
+                route.continue_()
+            if shielded:
+                self.proof["login_sent"] = True
+            return
+        self.tripped = self.tripped or hit
+        try:
+            route.abort("blockedbyclient")
+        except Exception:  # pylint: disable=broad-exception-caught
+            return  # not provably stopped: never counted as aborted
+        if self.proof["armed"]:
+            self.ids["aborted"].add(self._identity(route.request))
+
+    def __enter__(self) -> SubmitTripwire:
+        # Context scope: popups (a form with target=_blank) are screened too;
+        # the URL predicate keeps every other origin off the route.
+        context = self.page.context
+        context.on("request", self._seen)
+        context.route(self._match, self._handle)
+        return self
+
+    def __exit__(self, *_exc: object) -> None:
+        if self.tripped:
+            return  # keeps screening until the context closes
+        context = self.page.context
+        with contextlib.suppress(Exception):  # the context may be gone
+            context.unroute(self._match, self._handle)
+        with contextlib.suppress(Exception):
+            context.remove_listener("request", self._seen)
+
+    def shield(self, *fields: Any) -> None:
+        """Never read the values of these fields' keys (username, password,
+        OTP); a request carrying one of them is the login itself."""
+        self.protect.update(n for f in fields if f is not None if (n := _field_name(f)))
+
+    def step(self, descs: list[dict[str, Any]], *fields: Any) -> None:
+        """A new submit step: ITS form's secondary (name, value) pairs replace
+        the last step's (page 1's names must not judge page 2), and its
+        fields are shielded."""
+        self.button_pairs = secondary_pairs(descs)
+        self.shield(*fields)
+
+    def arm(self) -> None:
+        """The password is about to be typed: from now on every request that
+        could carry it is recorded, and a running service worker of a fill
+        origin (unscreened) rules out ``never_sent``."""
+        self.ids = {"seen": set(), "aborted": set()}
+        self.proof["armed"] = True
+        try:
+            workers = list(self.page.context.service_workers)
+            self.proof["workers"] = any(self._match(str(w.url)) for w in workers)
+        except Exception:  # pylint: disable=broad-exception-caught
+            self.proof["workers"] = True  # cannot tell: no proof
+
+    @property
+    def never_sent(self) -> bool:
+        """Provably nothing that could carry the password left the browser."""
+        return (
+            bool(self.proof["armed"])
+            and not self.proof["workers"]
+            and self.ids["seen"] <= self.ids["aborted"]
+        )
+
+    def check(self) -> None:
+        """Raise ``SecondaryActionBlocked`` once a request was aborted."""
+        if self.tripped:
+            raise SecondaryActionBlocked(
+                f"a submit named a secondary form action ({self.tripped}) — "
+                "aborted in the browser before it reached the site",
+                never_sent=self.never_sent,
+            )
+
+
+def _guarded_button(page: Any, button: Any, allowed: list[str], *, dev: bool) -> str:
+    """Why `button` may not be clicked to submit (its frame, its own
+    ``formaction`` or the page off the fill origins), or ""."""
+    frame_url = _frame_url(button)
+    if not origin_allowed(frame_url, allowed, dev=dev):
+        return "the submit button is not on a fill origin"
+    own_action = button.get_attribute("formaction")
+    if own_action and not form_action_allowed(frame_url, own_action, allowed, dev=dev):
+        return "submit button posts off the fill origins"
+    if not origin_allowed(page.url, allowed, dev=dev):
+        return "page is not on a fill origin"
+    return ""
+
+
+def _primary_index(descs: list[dict[str, Any]]) -> int | None:
+    """The first visible, enabled submit button that is not secondary."""
+    for i, desc in enumerate(descs):
+        if desc.get("visible") and not desc.get("disabled"):
+            if not secondary_button_like(desc):
+                return i
+    return None
+
+
+def _formless_fallback(field: Any) -> Any:
+    """The first visible submit button of the field's form (no form: its
+    document), only when it can be read and is not secondary; else None."""
+    try:
+        handle = field.evaluate_handle(SUBMIT_BUTTON_JS)
+        button = handle.as_element() if handle is not None else None
+    except Exception:  # pylint: disable=broad-exception-caught
+        return None
+    descs = describe_buttons([button]) if button is not None else None
+    if not descs or secondary_button_like(descs[0]):
+        return None
+    return button
+
+
 def _submit_identifier(
-    page: Any, user_field: Any, allowed: list[str], *, dev: bool
+    page: Any,
+    user_field: Any,
+    allowed: list[str],
+    *,
+    dev: bool,
+    tripwire: SubmitTripwire | None = None,
 ) -> None:
-    """Submit the username step: Enter in the field; if neither the URL nor the
-    DOM changes within ``SUBMIT_CHANGE_S``, click the form's visible submit
-    button (re-guarded: the button's own ``formaction`` must stay on a fill
-    origin too).
+    """Submit the username step — like the password, never by a guess: the
+    form's submit buttons are read first (``read_submit_buttons``); unreadable
+    → ``SubmitUnidentified`` (nothing submitted). A secondary default button
+    (``pick_submit_button``) → the login button is clicked instead of Enter,
+    or, with none showing, ``SubmitUnidentified``. Otherwise Enter; if neither
+    the URL nor the DOM changes within ``SUBMIT_CHANGE_S``, click the form's
+    first visible login button (re-guarded: the button's own ``formaction``
+    must stay on a fill origin too; a form-less field only a readable,
+    non-secondary one).
 
     The click is a fallback only. A disabled button means the page is still
     busy with the Enter (Zoho turns "Next" into a disabled spinner during its
     lookup) and is left alone; a click that cannot happen within
     ``FALLBACK_CLICK_TIMEOUT_S`` is given up. Either way the caller's wait
     for the password field decides."""
+    read = read_submit_buttons(user_field)
+    if read is None:
+        raise SubmitUnidentified(
+            "the username step's submit buttons could not be read — nothing submitted"
+        )
+    buttons, descs = read
+    if tripwire is not None:
+        tripwire.step(descs, user_field)
+    choice = pick_submit_button(descs)
+    if choice is not None and choice < 0:
+        raise SubmitUnidentified(
+            "Enter would press the username form's non-login default button and "
+            "no login button is showing"
+        )
+    if choice is not None:
+        problem = _guarded_button(page, buttons[choice], allowed, dev=dev)
+        if problem:
+            raise OriginViolation(problem)
+        _click_on_fill_origin(page, buttons[choice], allowed, dev=dev)
+        return
     before = page.url
     user_field.press("Enter")
     deadline = time.monotonic() + SUBMIT_CHANGE_S
@@ -993,8 +1384,11 @@ def _submit_identifier(
             or _login_password(page) is not None
         ):
             return
-    handle = user_field.evaluate_handle(SUBMIT_BUTTON_JS)
-    button = handle.as_element() if handle is not None else None
+    primary = _primary_index(descs)
+    if descs:
+        button = buttons[primary] if primary is not None else None
+    else:
+        button = _formless_fallback(user_field)
     if button is None or not _enabled(button):
         return
     _guard(page, user_field, allowed, dev=dev)
@@ -1033,52 +1427,103 @@ def _submit_password(  # pylint: disable=too-many-arguments
     dev: bool,
     attempt: AttemptController | None = None,
     secret: Secret | None = None,
+    tripwire: SubmitTripwire | None = None,
 ) -> None:
-    """Submit the typed password: Enter in the field, unless Enter would fire
-    a form button that does something else (``pick_submit_button``: a
-    "forgot password" default button, Calibre-Web Automated 2026-10-08) — then
-    click the form's login button instead. Guarded like every submit: the
-    field, the button's own frame and its ``formaction`` stay on a fill
-    origin. Raises before anything is submitted when no login button shows."""
+    """Submit the typed password — never by a guess. The form's submit
+    buttons are read first (``read_submit_buttons``): when they cannot be
+    read, nothing is submitted (``SubmitUnidentified``, before the submit
+    marker). Enter in the field only when the form has no submit button (a
+    form-less field: the page's script handles Enter) or its default button
+    is a login button; when Enter would fire a button that does something
+    else (``pick_submit_button``: a "forgot password" default button,
+    Calibre-Web Automated 2026-10-08) the form's login button is clicked
+    instead; with none showing, ``SubmitUnidentified``. Guarded like every
+    submit: the field, the button's own frame and its ``formaction`` stay on
+    a fill origin. ``attempt.mark_submitted()`` runs only right before the
+    Enter or the click on the identified button."""
     _guard(page, pw_field, allowed, dev=dev)
-    buttons = form_submit_buttons(pw_field)
-    descs: list[dict[str, Any]] = []
-    for button in buttons:
-        try:
-            desc = button.evaluate(BUTTON_DESCRIBE_JS)
-        except Exception:  # pylint: disable=broad-exception-caught
-            desc = None
-        descs.append(desc if isinstance(desc, dict) else {})
+    read = read_submit_buttons(pw_field)
+    if read is None:
+        raise SubmitUnidentified(
+            "the login form's submit buttons could not be read — nothing submitted",
+            unsent=_unsent(page, pw_field, secret, allowed, dev=dev),
+        )
+    buttons, descs = read
+    if tripwire is not None:
+        tripwire.step(descs, pw_field)
     choice = pick_submit_button(descs)
     if choice is None:
         (attempt or NO_ATTEMPT).mark_submitted()
         pw_field.press("Enter")
         return
     if choice < 0:
-        raise LoginFailed(
+        raise SubmitUnidentified(
             "Enter would press the form's non-login default button and no login"
             " button is showing",
             unsent=_unsent(page, pw_field, secret, allowed, dev=dev),
         )
     button = buttons[choice]
-    frame_url = _frame_url(button)
-    problem = ""
-    if not origin_allowed(frame_url, allowed, dev=dev):
-        problem = "the submit button is not on a fill origin"
-    else:
-        own_action = button.get_attribute("formaction")
-        if own_action and not form_action_allowed(
-            frame_url, own_action, allowed, dev=dev
-        ):
-            problem = "submit button posts off the fill origins"
-        elif not origin_allowed(page.url, allowed, dev=dev):
-            problem = "page is not on a fill origin"
+    problem = _guarded_button(page, button, allowed, dev=dev)
     if problem:
         raise OriginViolation(
             problem, unsent=_unsent(page, pw_field, secret, allowed, dev=dev)
         )
     (attempt or NO_ATTEMPT).mark_submitted()
     _click_on_fill_origin(page, button, allowed, dev=dev)
+
+
+# The visible label of a checkbox (its first `labels` entry, else the label
+# around it), or null.
+_BOX_LABEL_JS = """b => {
+  const vis = el => !!(el.offsetWidth || el.offsetHeight || el.getClientRects().length);
+  const all = Array.from(b.labels || []);
+  const wrap = b.closest('label');
+  if (wrap && !all.includes(wrap)) all.push(wrap);
+  return all.find(vis) || null;
+}"""
+
+
+def _tick_remember_me(
+    page: Any, pw_field: Any, allowed: list[str], *, dev: bool
+) -> bool:
+    """Tick the login form's "remember me" checkbox when it has one
+    (``login_form.pick_remember_me``), before the password is typed: apps
+    that bind a session to IP + User-Agent keep an injected session only
+    through their remember-me cookie. Best effort — only on a fill origin
+    (an ``OriginViolation`` propagates); True iff the box ends up ticked."""
+    try:
+        descs = pw_field.evaluate(REMEMBER_BOXES_JS)
+        handle = pw_field.evaluate_handle(REMEMBER_BOX_HANDLES_JS)
+        props = handle.get_properties()
+        boxes = [
+            v.as_element()
+            for _, v in sorted(
+                ((int(k), v) for k, v in props.items() if str(k).isdigit()),
+                key=lambda kv: kv[0],
+            )
+        ]
+    except Exception:  # pylint: disable=broad-exception-caught
+        return False
+    if not isinstance(descs, list) or len(descs) != len(boxes):
+        return False
+    idx = pick_remember_me([d if isinstance(d, dict) else {} for d in descs])
+    if idx is None or boxes[idx] is None:
+        return False
+    box = boxes[idx]
+    _guard(page, box, allowed, dev=dev)
+    try:
+        if not box.is_checked():
+            if descs[idx].get("visible"):
+                box.check(timeout=3000)
+            else:  # a styled box: click its visible label, like a human
+                label = box.evaluate_handle(_BOX_LABEL_JS).as_element()
+                if label is None or not label.is_visible():
+                    return False
+                _guard(page, label, allowed, dev=dev)
+                label.click(timeout=3000)
+        return bool(box.is_checked())
+    except Exception:  # pylint: disable=broad-exception-caught
+        return False
 
 
 def _needs_fill(field: Any, username: str) -> bool:
@@ -1112,22 +1557,65 @@ def generic_login(
     Returns once the page left the login (sentinel visible / off the fill
     origins) or `settle_s` passed; the caller then runs the POSITIVE check
     ``check_logged_in`` — this function's return alone proves nothing.
+
+    A login page that is a Cloudflare Access login (off-LAN) ends it at once
+    (``AccessGated``, nothing typed). A "remember me" box is ticked before the
+    password is typed. From the first submit on, ``SubmitTripwire`` aborts
+    any request that names a secondary form action.
     """
     allowed = list(item.fill_origins)
-    page.goto(item.login_url, wait_until="domcontentloaded")
+    resp = page.goto(item.login_url, wait_until="domcontentloaded")
+    if access_gated(page.url):
+        raise AccessGated()
+    raise_if_blocked(page, resp)
     _check_challenge(page, submitted=False)
     if item.pre_click:
         _pre_click(page, item.pre_click, allowed, dev=dev)
     user_field, pw_field = _wait_login_fields(page, STEP_TIMEOUT_S)
     if user_field is None and pw_field is None:
+        if access_gated(page.url):
+            raise AccessGated()
         _check_challenge(page, submitted=False)
         raise LoginFailed("no visible username or password field on the login page")
+    if access_gated(page.url):
+        raise AccessGated()  # its e-mail field is not the site's
+    with SubmitTripwire(page, allowed, dev=dev) as trip:
+        _login_steps(
+            page,
+            item,
+            secret,
+            (user_field, pw_field),
+            dev=dev,
+            settle_s=settle_s,
+            attempt=attempt,
+            trip=trip,
+        )
+
+
+# One step after the other, as the login page asks for them.
+def _login_steps(  # pylint: disable=too-many-arguments,too-many-locals
+    page: Any,
+    item: SiteItem,
+    secret: Secret,
+    fields: tuple[Any, Any],
+    *,
+    dev: bool,
+    settle_s: float,
+    attempt: AttemptController | None,
+    trip: SubmitTripwire,
+) -> None:
+    """``generic_login`` from the first visible login field on, under its
+    POST tripwire `trip`."""
+    allowed = list(item.fill_origins)
+    user_field, pw_field = fields
     if pw_field is None:  # identifier-first: username page, then password page
         _guard(page, user_field, allowed, dev=dev)
         user_field.fill(secret.username)
         _guard(page, user_field, allowed, dev=dev)
-        _submit_identifier(page, user_field, allowed, dev=dev)
+        _submit_identifier(page, user_field, allowed, dev=dev, tripwire=trip)
+        trip.check()
         pw_field = _password_after_identifier(page, allowed, dev=dev)
+        trip.check()
         if pw_field is None:
             _check_challenge(page, submitted=False)
             raise LoginFailed("no visible password field after the username step")
@@ -1137,14 +1625,26 @@ def generic_login(
         if _needs_fill(user_field, secret.username):
             _guard(page, user_field, allowed, dev=dev)
             user_field.fill(secret.username)
+    trip.shield(user_field, pw_field)
+    _tick_remember_me(page, pw_field, allowed, dev=dev)
+    trip.arm()
     pw_field = _fill_password(page, pw_field, secret, allowed, dev=dev, attempt=attempt)
-    _submit_password(page, pw_field, allowed, dev=dev, attempt=attempt, secret=secret)
+    _submit_password(
+        page,
+        pw_field,
+        allowed,
+        dev=dev,
+        attempt=attempt,
+        secret=secret,
+        tripwire=trip,
+    )
 
     otp_done = False
     prompts_answered = 0
     deadline = time.monotonic() + settle_s
     while time.monotonic() < deadline:
         page.wait_for_timeout(500)
+        trip.check()
         _check_challenge(page, submitted=True)
         otp_field = None if otp_done else _otp_field(page)
         if otp_field is not None:
@@ -1156,10 +1656,12 @@ def generic_login(
                 dev=dev,
                 otp_label=item.otp_label,
                 attempt=attempt,
+                tripwire=trip,
             )
             otp_done = True
             continue
         if _left_login(page, item, dev=dev):
+            trip.check()
             return
         trust = (
             None
@@ -1170,6 +1672,7 @@ def generic_login(
         if trust is not None:
             trust.click(timeout=5000)
             prompts_answered += 1
+    trip.check()
     if _visible(page, PASSWORD_SELECTOR) is None and page_blank(page):
         # A blank page proves nothing either way: an SPA that is reloading or
         # whose bundle failed to load (NPM 2026-10-10: the login had worked).
@@ -1536,21 +2039,49 @@ def _remember_me(page: Any, allowed: list[str], *, dev: bool) -> None:
         pass
 
 
-def click_keycloak_submit(page: Any, attempt: AttemptController | None = None) -> bool:
+# Keycloak's own login button, then (a themed login page) a generic submit
+# button — only one that reads as a login button, never a secondary one.
+KEYCLOAK_SUBMITS = ("#kc-login", "input[name=login]")
+KEYCLOAK_FALLBACK_SUBMITS = "button[type=submit], input[type=submit]"
+
+
+def click_keycloak_submit(
+    page: Any,
+    attempt: AttemptController | None = None,
+    *,
+    allowed: list[str] | None = None,
+    dev: bool = False,
+) -> bool:
     """Click Keycloak's login button; False when none is found (nothing sent).
+    The generic fallback takes the first VISIBLE, enabled submit button whose
+    description can be read and is not ``secondary_button_like`` (a themed
+    page's "forgot password" button is never a guess). With `allowed` (the
+    broker's fill origins) the chosen button is guarded like every submit
+    (``_guarded_button``: its frame, its ``formaction`` and the page on a fill
+    origin — else ``OriginViolation`` before anything is marked).
     `attempt.mark_submitted()` runs right before the click."""
-    for sel in (
-        "#kc-login",
-        "input[name=login]",
-        "button[type=submit]",
-        "input[type=submit]",
-    ):
-        el = page.query_selector(sel)
-        if el:
-            (attempt or NO_ATTEMPT).mark_submitted()
-            el.click()
-            return True
-    return False
+    chosen = None
+    for sel in KEYCLOAK_SUBMITS:
+        chosen = page.query_selector(sel)
+        if chosen:
+            break
+    if not chosen:
+        for el in page.query_selector_all(KEYCLOAK_FALLBACK_SUBMITS):
+            descs = describe_buttons([el])
+            if not descs or secondary_button_like(descs[0]):
+                continue
+            if descs[0].get("visible") and not descs[0].get("disabled"):
+                chosen = el
+                break
+    if not chosen:
+        return False
+    if allowed is not None:
+        problem = _guarded_button(page, chosen, allowed, dev=dev)
+        if problem:
+            raise OriginViolation(problem)
+    (attempt or NO_ATTEMPT).mark_submitted()
+    chosen.click()
+    return True
 
 
 def cscs_login(
@@ -1589,7 +2120,7 @@ def cscs_login(
     # verify the field KEPT the password, retry key by key, fail before submit.
     pw_field = _fill_password(page, pw_field, secret, allowed, dev=dev, attempt=attempt)
     _guard(page, pw_field, allowed, dev=dev)
-    if not click_keycloak_submit(page, attempt):
+    if not click_keycloak_submit(page, attempt, allowed=allowed, dev=dev):
         raise LoginFailed(
             "Keycloak login button not found",
             unsent=_unsent(page, pw_field, secret, allowed, dev=dev),
@@ -1702,13 +2233,15 @@ def smartsheet_login(
     pw_field = _fill_password(page, pw_field, secret, allowed, dev=dev, attempt=attempt)
     _guard(page, pw_field, allowed, dev=dev)
     button = _visible(page, SMARTSHEET_SIGN_IN)
-    if button is not None and not origin_allowed(page.url, allowed, dev=dev):
+    if button is None:  # its known login button, or nothing (never a guess)
+        raise SubmitUnidentified(
+            "the Smartsheet sign-in button is not showing — nothing submitted",
+            unsent=_unsent(page, pw_field, secret, allowed, dev=dev),
+        )
+    if not origin_allowed(page.url, allowed, dev=dev):
         raise OriginViolation("page is not on a fill origin")  # unsent unprovable
     (attempt or NO_ATTEMPT).mark_submitted()
-    if button is not None:
-        _click_on_fill_origin(page, button, allowed, dev=dev)
-    else:
-        pw_field.press("Enter")
+    _click_on_fill_origin(page, button, allowed, dev=dev)
 
     deadline = time.monotonic() + settle_s
     while time.monotonic() < deadline:

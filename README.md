@@ -565,6 +565,61 @@ item, `agent-login.py` shows the reason):
 | `agent_proof_origins`      | Further `https://host` origins (besides the check URL's) where the proof page may end after redirects.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                  |
 | `agent_attempt_group`      | Opaque slug shared by items that log into ONE account (e.g. two shop domains on one identity provider): the broker limiter then enforces interval, cooldown, caps and the hard block on `group:<id>` too. Must not contain the account name. Reset: `sudo install/install.sh -r group:<id>`, or `-r SITE -G`.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                           |
 | `agent_no_submit`          | `true` (default `false`): the broker's login NEVER asks for this item's secret, so it never types or submits its password — a login answers `submit_disabled` (phase `vault`, nothing reserved); a still-valid broker profile is exported as before. For IdPs whose bot check rejects the headless broker (every submit risks a vendor lock): agents use Albert's session there (Safari import, `agent-login.py -g SITE` in the window), and `agent-login.py` shows the site as your login. Built in, and not lifted by `false`: the sites `galaxus` and `galaxus-de` (`vault.NO_SUBMIT_SITES`) and every item with a fill origin on a Digitec Galaxus domain (`vault.NO_SUBMIT_DOMAINS`, whatever the item is called). The secret ops (`secret-run`) never expose such an item either.                                 |
+| `agent_max_session_days`   | Whole days (1–365), only together with `agent_fresh_login = true`: renew the session with a fresh login once the last proven fresh broker login is this many days old, while the session still works. For servers that end a session a fixed time after its login however much it is used — Calibre-Web Automated: 31 days, so set `28` (the daily check then has 3 days to succeed). The age counts from this client's last PROVEN fresh broker login (`~/.cache/claude-browser/session-age/SITE.json`, written once a fresh broker login was injected and verified); with none on record, from the first check that saw the session — a lost or unreadable record means "age unknown", never a renewal loop. One renewal attempt per 20 h at most (claimed under a per-site lock before it starts), whatever its outcome. `browser.py login` and `agent-login.py -c` renew under the usual gates (pending, quarantined, locked … → only a note); a failed renewal keeps the working session (exit 0, `renewal: failed` in the result record). |
+
+### Submit safety: never a guess, never a secondary action (WS2-calibre)
+
+Calibre-Web Automated puts its `Forgot Password?` submit button BEFORE `Login`;
+Enter in the password field fired it and reset the admin password (2026-10-08).
+The generic recipe now:
+
+- **fails closed**: the form's submit buttons are read first; when they cannot
+  be read, or only secondary buttons (forgot, register, show password, delete
+  account, log out …, also by a button's `value` or `formaction`) show,
+  nothing is submitted (`recipe` ·
+  `submit_unidentified`, before the submit marker). Enter is pressed only for a
+  form without submit buttons or when its default button is a login button;
+  otherwise the login button is clicked. The username step of an
+  identifier-first login and the OTP step follow the same rule; Keycloak's
+  generic fallback button and Smartsheet's sign-in are a known login button or
+  nothing (on the broker path guarded like every submit: frame, `formaction`,
+  page origin).
+- **screens every submit** with a tripwire (`recipes.SubmitTripwire`, a
+  Playwright route on the fill origins, context-wide so popups count, from
+  the first submit on). Screened are form navigations (a navigation with a
+  body, or a GET form) until the login went out, and every request that
+  carries the username / password / OTP field — after the login, the app's
+  own traffic is left alone. One that names a secondary action — the
+  (name, value) a secondary button of THIS step posts (a name a login button
+  shares never counts: Rails `commit`, Auth0 `action`),
+  `forgot`/`reset`/`register`/`signup`/`resend` as a top-level key (not when
+  its value says `false`/`0`) or as the value of `action`/`submit`/…, or such
+  a URL path — is aborted inside the browser (`submit` ·
+  `secondary_action_blocked`, and the site is quarantined: the broker
+  misreads its form; the route then stays until the context closes). The
+  attempt counts as `not_submitted` only with proof that nothing left: the
+  tripwire was armed before the password was typed, no service worker of a
+  fill origin ran, and every request of the whole browser context that could
+  carry the password (body, query, `Authorization` header) is one it aborted
+  (by request identity).
+- **the OTP step** submits like the password (a "Resend code" default button
+  is never pressed: Verify is clicked), under the tripwire; a page that posts
+  the code by itself (GitHub) is marked submitted and left to the settle loop.
+- **ticks a session "remember me"** (`Remember me`, `keep me signed in`,
+  `angemeldet bleiben`, `rester connecté` …, or a `remember_me`-like name)
+  before typing the password — never a box about a device, a browser, a choice
+  or the user name (a trusted device is another policy); a hidden styled box
+  through its visible label. Apps that bind a session to IP + User-Agent keep
+  an injected session only through it.
+- **stops at Cloudflare Access**: a check or login page on
+  `*.cloudflareaccess.com` or under `/cdn-cgi/access/` (off-LAN) is
+  `precheck` · `access_gated` — nothing reserved, typed or submitted, and
+  agent-login reports the site as "unreachable off-LAN", never ❌. Before a
+  login the broker loads the login page first (before anything is reserved);
+  one that answers HTTP 401/403 is `precheck` · `login_blocked` (an Access
+  block page or an IP gate has no login form of the site's) — unless it is a
+  bot challenge (`cf-mitigated: challenge`, "Just a moment", a captcha): that
+  is `needs_human` (exit 4).
 
 ### Where a login broke, and why the daily check never burns the limiter (WS1a)
 

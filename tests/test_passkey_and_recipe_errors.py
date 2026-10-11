@@ -53,7 +53,17 @@ E2E = pytest.mark.skipif(
 # ---------------------------------------------------------------------------
 
 
+class _NoButtons:
+    """A form without submit buttons, as ``SUBMIT_BUTTONS_JS`` reads it."""
+
+    def get_properties(self) -> dict[str, Any]:
+        return {}
+
+
 class _ExplodingField:
+    def evaluate_handle(self, _js: str) -> Any:
+        return _NoButtons()  # no submit buttons: the step presses Enter
+
     def press(self, _key: str) -> None:
         raise RuntimeError("page text that must not be reported")
 
@@ -187,6 +197,17 @@ class _Button:
     def get_attribute(self, _name: str) -> None:
         return None
 
+    def evaluate(self, _js: str) -> dict[str, Any]:  # BUTTON_DESCRIBE_JS
+        return {
+            "name": "",
+            "id": "next",
+            "cls": "",
+            "text": "Next",
+            "aria": "",
+            "disabled": not self.enabled,
+            "visible": True,
+        }
+
     def click(self, **kwargs: Any) -> None:
         self.clicks.append(kwargs.get("timeout"))
         if self.click_error:
@@ -194,6 +215,9 @@ class _Button:
 
 
 class _UserField:
+    """A form-less username field: no form buttons, the document's first
+    visible submit button is the fallback."""
+
     def __init__(self, button: _Button) -> None:
         self.button = button
 
@@ -203,8 +227,10 @@ class _UserField:
     def is_visible(self) -> bool:
         return True
 
-    def evaluate_handle(self, _js: str) -> Any:
-        return SimpleNamespace(as_element=lambda: self.button)
+    def evaluate_handle(self, js: str) -> Any:
+        if js == recipes.SUBMIT_BUTTON_JS:
+            return SimpleNamespace(as_element=lambda: self.button)
+        return _NoButtons()
 
 
 @pytest.fixture

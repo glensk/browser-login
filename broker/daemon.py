@@ -102,7 +102,7 @@ from broker.limiter import (  # noqa: E402
     group_key,
     proc_start,
 )
-from broker.origins import origin_allowed  # noqa: E402
+from broker.origins import access_gated, origin_allowed  # noqa: E402
 from broker.page_state import diagnose, sentinel_shown  # noqa: E402
 from broker.peercred import peer_uid  # noqa: E402
 from broker.phases import PHASE_V  # noqa: E402
@@ -113,6 +113,7 @@ from broker.recipes import (  # noqa: E402
     REFRESH_NONE,
     REFRESH_REJECTED,
     VALID,
+    AccessGated,
     AttemptController,
     BundleExportError,
     ExportFailed,
@@ -122,6 +123,7 @@ from broker.recipes import (  # noqa: E402
     RecipeError,
     check_proof,
     cscs_export_storage,
+    raise_if_blocked,
     recipe_for,
     refresh_session,
 )
@@ -734,11 +736,17 @@ class PlaywrightRunner:
         if item.fresh_login:
             # Never "via profile": the login must pass through the IdP in this
             # run so its session-only SSO cookie exists when the bundle is cut.
+            # Off-LAN behind Cloudflare Access: stop before anything is
+            # reserved (the profile proof below does it for the other items).
+            self._access_precheck(page, item, None)
             # Reserve FIRST: a denied reservation leaves the profile untouched.
             secret = get_secret()
             self.clear_site_cookies(ctx, item)
         else:
             proof = self._profile_proof(page, item)
+            # Even after a VALID one: the old proof of a sentinel-less item
+            # passes on an Access page (off the fill origins, no password).
+            self._access_precheck(page, item, proof)
             if proof == VALID:
                 # A storage token near its expiry is renewed first; a token
                 # the server rejects means the profile is not reusable.
@@ -809,6 +817,31 @@ class PlaywrightRunner:
             )
             raise self._note_idp(item, reason, failed)
         return self._export(ctx, item, "login", proven=True)
+
+    @staticmethod
+    def _access_precheck(page: Any, item: SiteItem, proof: str | None) -> None:
+        """Before anything is reserved: raise ``AccessGated`` (phase
+        ``precheck``) when the site's page is a Cloudflare Access login —
+        off-LAN the app is unreachable, and that login is not the site's —
+        and ``LoginBlocked`` when the login page answers HTTP 401/403 (an
+        Access block page, an IP gate: no login form of the site's, nothing
+        may be typed there).
+
+        `proof`: the profile proof's answer (None: no proof ran, a
+        ``fresh_login``). A login is next unless it was ``valid``: then the
+        login URL is loaded first (after a profile proof not for a site with
+        its own preflight, which loads it itself; a ``fresh_login`` always)
+        and judged by URL — even after a failed load — and status; a
+        ``valid`` proof's own page is judged by URL (the old proof of a
+        sentinel-less item passes on an Access page)."""
+        resp = None
+        if proof is None or (proof != VALID and item.site not in PREFLIGHTS):
+            # a failed load may still have ended on the Access page
+            with contextlib.suppress(Exception):
+                resp = page.goto(item.login_url, wait_until="domcontentloaded")
+        if access_gated(str(getattr(page, "url", "") or "")):
+            raise AccessGated()
+        raise_if_blocked(page, resp)
 
     def _before_secret(  # pylint: disable=too-many-arguments
         self,
@@ -1544,6 +1577,10 @@ def _error_outcome(attempt: AttemptController, exc: RecipeError) -> str:
         return "not_submitted"
     if exc.auth_proven:
         return "ok"
+    if exc.never_sent:
+        # The POST tripwire aborted the submit inside the browser and nothing
+        # else with a body reached the site after the password was typed.
+        return "not_submitted"
     if attempt.submitted:
         return "unknown"
     return "not_submitted" if exc.unsent else "unknown"

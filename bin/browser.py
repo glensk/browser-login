@@ -180,6 +180,7 @@ from broker import phases as _phases  # noqa: E402
 from broker import safari_cookies as _safari  # noqa: E402
 from broker.bundle import IDP_HOSTS as BROKER_IDP_HOSTS  # noqa: E402
 from broker.bundle import IDP_LABELS as BROKER_IDP_LABELS  # noqa: E402
+from broker.origins import access_gated as _access_gated  # noqa: E402
 from broker.page_state import await_sentinel as _broker_await_sentinel  # noqa: E402
 from broker.page_state import page_blank as _broker_page_blank  # noqa: E402
 from broker.recipes import CSCS_EXPIRES_KEY as BROKER_CSCS_EXPIRES_KEY  # noqa: E402
@@ -372,6 +373,13 @@ KEYCHAIN_SVC_BIOPOL_PASS = "biopol-wifi: password"
 # when `login <site>` actually had to sign in (never on a warm/already-logged-in
 # run), so `login-log <site>` shows how often you truly re-authenticated.
 LOGIN_LOG_DIR = CACHE_DIR / "login-log"
+# Per broker site with `max_session_days`: when this client last injected a
+# PROVEN fresh broker login, and its last renewal attempt (`<site>.json`).
+SESSION_AGE_DIR = CACHE_DIR / "session-age"
+# At most one renewal attempt per this long (the daily check runs every 24 h).
+SESSION_RENEW_RETRY_S = 20 * 3600.0
+# A recorded time a little in the future (rounding, a clock step) still counts.
+CLOCK_SLACK_S = 60.0
 
 
 # `eval`'s default hard deadline (seconds), attach included — see cmd_eval.
@@ -7341,7 +7349,7 @@ def _fill_keycloak_otp(page, otp: Callable[[], str | None]) -> bool:
         print("⚠ Could not produce a TOTP code — OTP step not submitted.")
         return False
     try:
-        if _on_portal(page) or "auth.cscs.ch" not in page.url:
+        if _on_portal(page) or not _on_cscs_auth(page.url):
             print("⚠ The Keycloak page moved on before the OTP could be filled.")
             return False
         otp_input = _keycloak_otp_field(page)
@@ -7349,7 +7357,9 @@ def _fill_keycloak_otp(page, otp: Callable[[], str | None]) -> bool:
             print("⚠ The Keycloak OTP field disappeared before it could be filled.")
             return False
         otp_input.fill(code)
-        _click_keycloak_submit(page)
+        if not _click_keycloak_submit(page):
+            print("⚠ No Keycloak button to submit the OTP — not submitted.")
+            return False
     except PlaywrightError:
         print("⚠ The Keycloak OTP step changed while filling it — not submitted.")
         return False
@@ -7366,7 +7376,9 @@ def _submit_keycloak_login(page, creds: CscsCreds) -> bool:
     """
     page.fill("#username", creds.user)
     page.fill("#password", creds.password)
-    _click_keycloak_submit(page)
+    if not _click_keycloak_submit(page):
+        print("⚠ No Keycloak login button found — the password was not submitted.")
+        return False
     # Wait for EITHER the OTP step or a direct landing on the portal.
     otp_filled = False
     for _ in range(40):  # ~20s
@@ -7403,13 +7415,19 @@ def cmd_cscs_login(port: int, allow_op: bool = False) -> int:
         return _fail(f"login cscs: {exc}")
 
 
+def _on_cscs_auth(url: str) -> bool:
+    """`url` is on CSCS's Keycloak (exact origin, never a substring:
+    ``https://auth.cscs.ch.evil.example`` is not)."""
+    return _url_origin(str(url or "")) == "https://auth.cscs.ch"
+
+
 def _cscs_login_owned(page, allow_op: bool) -> int:
     """`cmd_cscs_login` in its owned tab, under the lease."""
     page.goto(PORTAL_PROFILE_URL, wait_until="domcontentloaded")
     page.wait_for_timeout(1500)
     if _on_portal(page):
         print("✓ Already logged into CSCS.")
-    elif "auth.cscs.ch" not in page.url:
+    elif not _on_cscs_auth(page.url):
         return _fail(
             f"Unexpected page (not portal, not Keycloak): {_tab_hint(page.url)}"
         )
@@ -7445,7 +7463,7 @@ def _cscs_login_owned(page, allow_op: bool) -> int:
             page.wait_for_timeout(1500)
             if _on_portal(page):
                 break  # the fresh authorization request re-used the SSO session
-            if "auth.cscs.ch" not in page.url:
+            if not _on_cscs_auth(page.url):
                 return _fail(
                     f"Retry did not reach the Keycloak form ({_tab_hint(page.url)})."
                 )
@@ -7638,10 +7656,11 @@ def _claude_fill_email_and_continue(page, email: str) -> bool:
             return False
         field.fill(email)
         btn = page.get_by_role("button", name=cont).first
-        if btn.count():
-            btn.click()
-        else:
-            field.press("Enter")
+        if not btn.count():
+            # Its known button or nothing: Enter would fire whatever the
+            # form's default button is (WS2-calibre) → the assisted fallback.
+            return False
+        btn.click()
         return True
     except PlaywrightError:
         return False
@@ -11013,6 +11032,158 @@ def _broker_wait_sentinel(
 # in this process (`_broker_note_session_left`; only for items with a
 # `session_refresh`). None / missing = unknown.
 _SESSION_LEFT: dict[str, int | None] = {}
+# site -> True when its session is due for a fresh login
+# (`_broker_note_session_age`, on a VALID proof only).
+_SESSION_DUE: dict[str, bool] = {}
+
+
+def _session_age_path(site: str) -> Path:
+    return SESSION_AGE_DIR / f"{site}.json"
+
+
+def _session_age_read(site: str) -> dict | None:
+    """The site's session-age record (``{}`` when there is none yet), or
+    None when it exists but cannot be read — then the age is unknown."""
+    path = _session_age_path(site)
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return {}
+    except (OSError, ValueError):
+        return None
+    return data if isinstance(data, dict) else None
+
+
+@contextlib.contextmanager
+def _session_age_lock(site: str) -> Iterator[None]:
+    """An exclusive per-site ``flock`` (``<site>.lock`` beside the record):
+    every read-modify-write of a session-age record holds it (raises
+    OSError when it cannot be taken)."""
+    SESSION_AGE_DIR.mkdir(parents=True, exist_ok=True)
+    lock_path = SESSION_AGE_DIR / f"{site}.lock"
+    fd = os.open(str(lock_path), os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        yield
+    finally:
+        os.close(fd)  # releases the lock
+
+
+def _session_age_store(site: str, record: dict) -> bool:
+    """Replace the site's record (atomic, 0600) — callers hold the lock."""
+    tmp = ""
+    try:
+        fd, tmp = tempfile.mkstemp(prefix=f".{site}.", dir=str(SESSION_AGE_DIR))
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            json.dump(record, fh)
+        os.replace(tmp, _session_age_path(site))
+        return True
+    except OSError:
+        if tmp:
+            with contextlib.suppress(OSError):
+                Path(tmp).unlink(missing_ok=True)
+        return False
+
+
+def _session_age_write(site: str, **fields: float) -> bool:
+    """Merge `fields` into the site's session-age record under its lock;
+    False when it could not be written (an unreadable record is not
+    overwritten)."""
+    try:
+        with _session_age_lock(site):
+            current = _session_age_read(site)
+            if current is None:
+                return False
+            return _session_age_store(site, {**current, **fields})
+    except OSError:
+        return False
+
+
+def _session_renewal_claim(site: str) -> bool:
+    """Claim the site's next session renewal: under the site's lock, re-read
+    the record and, unless a renewal started within
+    ``SESSION_RENEW_RETRY_S``, write ``renewal_attempt_at``. True only for
+    the winner — two concurrent `browser.py login` runs never both renew.
+    Any error: False (no renewal, never a guess)."""
+    try:
+        with _session_age_lock(site):
+            state = _session_age_read(site)
+            if state is None:
+                return False
+            tried = state.get("renewal_attempt_at")
+            if (
+                isinstance(tried, (int, float))
+                and not isinstance(tried, bool)
+                and -CLOCK_SLACK_S <= time.time() - float(tried) < SESSION_RENEW_RETRY_S
+            ):
+                return False
+            return _session_age_store(
+                site, {**state, "renewal_attempt_at": round(time.time(), 3)}
+            )
+    except OSError:
+        return False
+
+
+def _broker_note_fresh_auth(site: str, entry: dict | None) -> None:
+    """A PROVEN fresh broker login (``fresh_auth``) of an item with
+    ``max_session_days`` was injected and verified: the shared browser's
+    session is new from now. A record that cannot be written is said."""
+    if not isinstance((entry or {}).get("max_session_days"), int):
+        return
+    if not _session_age_write(site, fresh_auth_at=round(time.time(), 3)):
+        _result_set(session_age_record="failed")
+        print(
+            f"⚠️ {site}: could not record this fresh login's time "
+            f"({_session_age_path(site)}) — its session age is unknown from now.",
+            file=sys.stderr,
+        )
+
+
+def _broker_note_session_age(site: str, entry: dict) -> None:
+    """On a VALID proof of an item with ``max_session_days``: how old its
+    session is and whether a fresh login is due — ``session_age_d`` /
+    ``renew_due`` (result file) and `_SESSION_DUE`. Some servers end a
+    session a fixed time after its login, however much it is used
+    (Calibre-Web Automated: 31 days); the item says at which age the client
+    renews it.
+
+    The age counts from the last PROVEN fresh broker login of this client
+    (``fresh_auth_at`` in ``SESSION_AGE_DIR/<site>.json``). With none on
+    record it counts from the first check that saw the session
+    (``first_seen_at``, written now): never "due" for want of a record — a
+    lost or unwritable record means "age unknown", never a submit loop. An
+    unreadable record: unknown, not due. A renewal attempt (recorded before
+    it starts, ``renewal_attempt_at``) holds the next one off for
+    ``SESSION_RENEW_RETRY_S``, however it ended."""
+    _SESSION_DUE.pop(site, None)
+    days = entry.get("max_session_days")
+    if isinstance(days, bool) or not isinstance(days, int) or days <= 0:
+        return
+    state = _session_age_read(site)
+    tried = (state or {}).get("renewal_attempt_at")
+    recent = (
+        isinstance(tried, (int, float))
+        and not isinstance(tried, bool)
+        and -CLOCK_SLACK_S <= time.time() - float(tried) < SESSION_RENEW_RETRY_S
+    )
+    since = None
+    if state is not None:
+        for key in ("fresh_auth_at", "first_seen_at"):
+            value = state.get(key)
+            if isinstance(value, (int, float)) and not isinstance(value, bool):
+                since = float(value)
+                break
+        if since is None and _session_age_write(site, first_seen_at=time.time()):
+            since = time.time()
+    age_d = None if since is None else max(0.0, (time.time() - since) / 86400.0)
+    # one renewal attempt per SESSION_RENEW_RETRY_S, whatever became of it
+    due = age_d is not None and age_d >= days and not recent
+    _SESSION_DUE[site] = due
+    _result_set(
+        session_age_d=None if age_d is None else round(age_d, 2),
+        max_session_days=days,
+        renew_due=due,
+    )
 
 
 def _broker_note_session_left(page, entry: dict) -> None:
@@ -11061,6 +11232,9 @@ def _proof_origins(entry: dict) -> list[str]:
 
 # Tri-state answers of a logged-in proof (broker/recipes.py's VALID & co).
 PROOF_VALID, PROOF_INVALID, PROOF_UNDECIDED = "valid", "invalid", "indeterminate"
+# The check page is a Cloudflare Access login: off-LAN, unreachable — neither
+# logged in nor out, and never a reason to log in.
+PROOF_GATED = "access_gated"
 
 
 def _legacy_probe(page, entry: dict) -> str:
@@ -11088,8 +11262,27 @@ def _broker_password_shown(page) -> bool:
         return False
 
 
+def _broker_probe(page, entry: dict, sentinel: str | None = None) -> str:
+    """`_broker_probe_page`, or ``access_gated`` when the check page is — or
+    ends on, after the proof's waits (a script redirect) — a Cloudflare Access
+    login (off-LAN: unreachable, neither logged in nor out). Checked around
+    the proof because the old proof of a sentinel-less item passes on such a
+    page (off the fill origins, no password field)."""
+
+    def gated() -> bool:
+        return _access_gated(str(getattr(page, "url", "") or ""))
+
+    if not gated():
+        answer = _broker_probe_page(page, entry, sentinel)
+        if not gated():
+            return answer
+    _RESULT["final_origin"] = _url_origin(str(getattr(page, "url", "") or ""))
+    _RESULT["origin_ok"] = False
+    return PROOF_GATED
+
+
 # One return per rule of the proof, in the order they are checked.
-def _broker_probe(  # pylint: disable=too-many-return-statements
+def _broker_probe_page(  # pylint: disable=too-many-return-statements
     page, entry: dict, sentinel: str | None = None
 ) -> str:
     """The broker's positive proof, client side, on the loaded check page:
@@ -11221,8 +11414,17 @@ def _broker_check_entry(
     )
     if proof == PROOF_VALID:
         _result_set(phase="ok", code="ok")
+        _broker_note_session_age(site, entry)
         print(f"✓ Logged into {site} (checked {_tab_hint(url)}).")
         return 0
+    if proof == PROOF_GATED:
+        _result_fail("precheck", "access_gated", "Cloudflare Access login page")
+        print(
+            f"{site}: unreachable off-LAN — {_tab_hint(url)} answers with its "
+            "Cloudflare Access login (not checked, nothing logged in).",
+            file=sys.stderr,
+        )
+        return 2
     code = "logged_out" if proof == PROOF_INVALID else "indeterminate"
     _result_fail("client-proof", code)
     why = (
@@ -11375,7 +11577,9 @@ def _broker_refused(site: str, resp: dict) -> int:
         screenshot=str(diag.get("screenshot") or "") or None,
         stop_origin=_url_origin(str(diag.get("url") or "")),
     )
-    if _phases.post_submit(phase, submitted):
+    # A blocked secondary action means the broker misreads this login form:
+    # quarantined even when the password provably never left (no daily repeat).
+    if _phases.post_submit(phase, submitted) or code == "secondary_action_blocked":
         with contextlib.suppress(Exception):
             _als.quarantine(site, phase, code)
     msg = f"{site}: {BROKER_ERRORS.get(code, code)}"
@@ -11862,12 +12066,33 @@ def _broker_inject_phase(bundle: dict, n_cookies: int, n_keys: int) -> None:
 
 def _broker_already(port: int, site: str) -> int | None:
     """`_broker_login`'s free check: logged in → its token kept fresh
-    (`_broker_keep_fresh`) and the follow-up's exit code; a refresh-only run
-    that is not logged in → 2; None → go on with the gated broker login."""
+    (`_broker_keep_fresh`) and the follow-up's exit code — or, when its
+    session is due for renewal (`_SESSION_DUE`), None with ``renewal: due``;
+    a refresh-only run that is not logged in → 2; a Cloudflare Access login
+    instead of the check page (off-LAN) → 2, phase ``precheck``, code
+    ``access_gated``, never a broker request; None → go on with the gated
+    broker login."""
     _SESSION_LEFT.pop(site, None)
+    _SESSION_DUE.pop(site, None)
     rc = _broker_logged_in(port, site)
+    if rc == 2 and _RESULT.get("code") == "access_gated":
+        return 2  # off-LAN: the broker could not reach it either
     if rc == 0:
         _result_set(route="already")
+        if (
+            _SESSION_DUE.get(site)
+            and not _LOGIN_OPTS.get("refresh_only")
+            and _session_renewal_claim(site)
+        ):
+            age = _RESULT.get("session_age_d")
+            print(
+                f"↻ {site}: the session's last fresh login is "
+                + (f"{age} d old" if age is not None else "not on record")
+                + f" (renew at {_RESULT.get('max_session_days')} d) — renewing "
+                "it with a fresh login while it still works"
+            )
+            _result_set(route="broker", renewal="due")
+            return None
         if _broker_keep_fresh(port, site) is not None:
             _deadline_step("broker:after")
             return _broker_after_login(port, site)
@@ -11881,15 +12106,18 @@ def _broker_already(port: int, site: str) -> int | None:
     return None if rc == 2 else rc
 
 
-# One return per exit code of the broker contract (0 / 2 / 3 / 4) + the cscs follow-up.
-def _broker_login(port: int, site: str) -> int:  # pylint: disable=too-many-return-statements
+def _broker_login(port: int, site: str) -> int:
     """Log the shared browser into broker site `site` via a session bundle.
 
     Gates first (`_broker_gate`: quarantine, scheduled + pending). Already
-    logged in → no broker call. Else: interaction lease (gate first, via
-    `_connect`, then the lease — the documented lock order), request the
-    bundle, replace the site's in-scope cookies, write its storage keys, then
-    verify with `_broker_check_entry`. Every exit records its phase (`-R`).
+    logged in → no broker call — unless the session is due for renewal
+    (``max_session_days``, `_broker_note_session_age`): then a gated fresh
+    login replaces it, and when that fails while the old session still works
+    the answer stays "logged in" (exit 0, ``renewal: failed`` in the result
+    record, a warning). Else: interaction lease (gate first, via `_connect`,
+    then the lease — the documented lock order), request the bundle, replace
+    the site's in-scope cookies, write its storage keys, then verify with
+    `_broker_check_entry`. Every exit records its phase (`-R`).
     """
     _BROKER_REFUSALS.pop(site, None)
     _result_set(broker_site=site, route="broker")
@@ -11899,6 +12127,42 @@ def _broker_login(port: int, site: str) -> int:  # pylint: disable=too-many-retu
         done = _broker_already(port, site)
         if done is not None:
             return done
+    renewing = _RESULT.get("renewal") == "due"
+    rc = _broker_login_gated(port, site, candidate)
+    if renewing:
+        return _broker_renewal_end(port, site, rc)
+    return rc
+
+
+def _broker_renewal_end(port: int, site: str, rc: int) -> int:
+    """After a renewal login (``renewal: due``): done → ``renewed``; failed
+    while the OLD session still passes the check → exit 0 with
+    ``renewal: failed`` and where it stopped (a quarantine after a submit
+    stays); failed and logged out → its own exit code."""
+    if rc == 0:
+        _result_set(renewal="renewed")
+        return 0
+    phase, code = str(_RESULT.get("phase") or ""), str(_RESULT.get("code") or "")
+    detail = _RESULT.get("detail")
+    if _broker_logged_in(port, site) != 0:
+        _result_fail(phase or "unknown", code or "login_failed", detail or "")
+        return rc
+    _result_set(renewal="failed", renewal_phase=phase, renewal_code=code)
+    print(
+        f"⚠️ {site}: renewing the session failed ({_phases.text(phase, code)}); "
+        "the current session still works — it ends at the server's session "
+        "limit unless a renewal succeeds first.",
+        file=sys.stderr,
+    )
+    return 0
+
+
+# One return per exit code of the broker contract (0 / 2 / 3 / 4) + the cscs follow-up.
+def _broker_login_gated(  # pylint: disable=too-many-return-statements
+    port: int, site: str, candidate: Any
+) -> int:
+    """`_broker_login` after the free check: gates, the broker request, the
+    injection and the verify."""
     rc_gate = _broker_gate(site)  # only before a broker login
     if rc_gate is not None:
         return rc_gate
@@ -11932,6 +12196,10 @@ def _broker_login(port: int, site: str) -> int:  # pylint: disable=too-many-retu
             f"✓ candidate sentinel verified for {site} (absent before, present "
             f"after the login): broker-add.py … -L {json.dumps(candidate)}"
         )
+    if _RESULT.get("fresh_auth") is True:  # injected and verified
+        _broker_note_fresh_auth(site, entry)
+        if "renew_due" in _RESULT:  # the verify judged the OLD record
+            _broker_note_session_age(site, entry)
     _record_login_event(site, "broker")
     _deadline_step("broker:after")
     return _broker_after_login(port, site)

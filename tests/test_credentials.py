@@ -838,7 +838,10 @@ def test_click_keycloak_submit_is_a_noop_without_a_button():
         def query_selector(self, sel):
             return None
 
-    browser._click_keycloak_submit(_Blank())  # must not raise
+        def query_selector_all(self, sel):
+            return []
+
+    assert browser._click_keycloak_submit(_Blank()) is False  # must not raise
 
 
 @pytest.mark.parametrize(

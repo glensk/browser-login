@@ -12,8 +12,10 @@ is a secret (attributes and counts only, never a value).
 
 from __future__ import annotations
 
+import json
 import re
-from collections.abc import Callable, Sequence
+import urllib.parse
+from collections.abc import Callable, Collection, Sequence
 from typing import Any
 
 # Attributes of an input and of the <form> around it. ``form_passwords``:
@@ -109,6 +111,9 @@ BUTTON_DESCRIBE_JS = """b => {
     name: a('name'), id: b.id || '', cls: a('class'),
     text: label.replace(/\\s+/g, ' ').trim().slice(0, 60),
     aria: (a('aria-label') + ' ' + a('title')).trim().slice(0, 60),
+    value: (b.tagName === 'BUTTON' ? a('value') : '').slice(0, 60),
+    formaction: a('formaction').slice(0, 200),
+    post_value: String(b.value == null ? '' : b.value).slice(0, 200),
     disabled: !!b.disabled,
     visible: !!(b.offsetWidth || b.offsetHeight || b.getClientRects().length),
   };
@@ -267,7 +272,7 @@ def pick_login_username(descs: Sequence[dict[str, Any]]) -> int | None:
 # Forgot Password?` BEFORE its Login button, so Enter in the password field
 # submitted "forgot password" and never logged in.
 _SECONDARY_JOINED_RE = re.compile(
-    r"forgot|resetpass|recover|lostpass|register|signup|createaccount|passkey"
+    r"forgot|resetpass|recover|lostpass|register|signup|createaccount|passkey|logout|signout|resend"
     r"|webauthn|securitykey|showpassword|hidepassword|togglepassword|revealpassword"
     r"|passwortanzeigen|passwortverbergen|afficherlemotdepasse|masquerlemotdepasse"
 )
@@ -284,6 +289,13 @@ _SECONDARY_TOKENS = frozenset(
         "reveal",
         "show",
         "hide",
+        # destructive account actions: never the login, whatever the layout
+        "delete",
+        "remove",
+        "deactivate",
+        "unsubscribe",
+        "logout",
+        "resend",
     }
 )
 
@@ -292,9 +304,15 @@ def secondary_button_like(desc: dict[str, Any]) -> bool:
     """The submit button names another action than the login (forgot
     password, register, cancel, show password, passkey ...) and not also the
     login itself. In the class only a password toggle counts — words like
-    ``show``, ``back`` or ``signup`` there are layout noise."""
-    named = [str(desc.get(k) or "") for k in ("name", "id", "text", "aria")]
+    ``show``, ``back`` or ``signup`` there are layout noise. A ``<button>``'s
+    ``value`` counts like its name (``name=op value=forgot`` posts
+    ``op=forgot``), and a ``formaction`` whose last path segment is a
+    secondary action (``/forgot-password``) makes it secondary whatever its
+    label says."""
+    named = [str(desc.get(k) or "") for k in ("name", "id", "text", "aria", "value")]
     cls = str(desc.get("cls") or "")
+    if _action_path(str(desc.get("formaction") or "")) in SECONDARY_ACTIONS:
+        return True
     if _login_words(named):
         return False
     for text in named:
@@ -323,9 +341,12 @@ def pick_submit_button(descs: Sequence[dict[str, Any]]) -> int | None:
     return -1
 
 
-def form_submit_buttons(field: Any) -> list[Any]:
+def form_submit_buttons(field: Any) -> list[Any] | None:
     """The submit buttons of `field`'s form in tree order (``SUBMIT_BUTTONS_JS``);
-    [] when there is no form or they cannot be read."""
+    [] when there is no form or it has none; None when they cannot be read
+    (the field detached, the script failed, an entry is no element) — the
+    caller must then refuse to submit: Enter fires whatever the form's
+    default button is, and nobody knows which one that is."""
     try:
         handle = field.evaluate_handle(SUBMIT_BUTTONS_JS)
         props = handle.get_properties()
@@ -333,9 +354,313 @@ def form_submit_buttons(field: Any) -> list[Any]:
             ((int(k), v) for k, v in props.items() if str(k).isdigit()),
             key=lambda kv: kv[0],
         )
-        return [el for _, v in ordered if (el := v.as_element()) is not None]
+        out = [v.as_element() for _, v in ordered]
     except Exception:  # pylint: disable=broad-exception-caught
+        return None
+    if any(el is None for el in out):
+        return None
+    return out
+
+
+# The keys `BUTTON_DESCRIBE_JS` returns; a descriptor without them was not
+# read (a detached button, a script error) and cannot be judged.
+BUTTON_DESC_KEYS = ("name", "id", "cls", "text", "aria", "disabled", "visible")
+
+
+def describe_buttons(buttons: Sequence[Any]) -> list[dict[str, Any]] | None:
+    """``BUTTON_DESCRIBE_JS`` of every button, or None when ANY of them cannot
+    be read: one unreadable button could be the form's default (secondary)
+    one, so a partial picture is no picture."""
+    descs: list[dict[str, Any]] = []
+    for button in buttons:
+        try:
+            desc = button.evaluate(BUTTON_DESCRIBE_JS)
+        except Exception:  # pylint: disable=broad-exception-caught
+            return None
+        if not isinstance(desc, dict) or any(k not in desc for k in BUTTON_DESC_KEYS):
+            return None
+        descs.append(desc)
+    return descs
+
+
+def read_submit_buttons(field: Any) -> tuple[list[Any], list[dict[str, Any]]] | None:
+    """(buttons, descriptors) of `field`'s form — both empty without a form
+    or without submit buttons — or None when they cannot be read
+    (``form_submit_buttons`` / ``describe_buttons``)."""
+    buttons = form_submit_buttons(field)
+    if buttons is None:
+        return None
+    descs = describe_buttons(buttons)
+    if descs is None:
+        return None
+    return buttons, descs
+
+
+def secondary_pairs(descs: Sequence[dict[str, Any]]) -> set[tuple[str, str]]:
+    """The (name, posted value) of every NAMED secondary submit button
+    (``secondary_button_like``) — a request that carries exactly that pair
+    was submitted by that button. A name that a non-secondary button of the
+    form also uses is dropped (Rails: ``commit=Sign in`` next to
+    ``commit=Cancel``; Auth0: ``action=default`` next to another action):
+    the name alone says nothing, and the value check is ``ACTION_KEYS``'
+    business. Names compare case-insensitively."""
+    login_names = {
+        str(d.get("name") or "").lower()
+        for d in descs
+        if d.get("name") and not secondary_button_like(d)
+    }
+    return {
+        (name, str(d.get("post_value") or ""))
+        for d in descs
+        if (name := str(d.get("name") or "").lower())
+        and name not in login_names
+        and secondary_button_like(d)
+    }
+
+
+# --- "Remember me" ---------------------------------------------------------
+# Apps that tie a session to IP + User-Agent (Flask-Login "strong" session
+# protection: Calibre-Web Automated) keep a session injected into another
+# browser only through their remember-me cookie, so the broker ticks the box
+# when the login form has one. Judged on the checkbox's name / id /
+# aria-label and its label text.
+REMEMBER_ME_RE = re.compile(
+    r"\bremember\s*me\b|keep\s*me\s*(?:signed|logged)\s*in"
+    r"|stay\s*(?:signed|logged)\s*in|angemeldet\s*bleiben|eingeloggt\s*bleiben"
+    r"|rester\s*connect|se\s*souvenir\s*de\s*moi",
+    re.IGNORECASE,
+)
+# The same choice as a field name / id (separators and camelCase dropped).
+REMEMBER_ME_NAMES = frozenset(
+    {
+        "remember",
+        "rememberme",
+        "rememberlogin",
+        "keepmeloggedin",
+        "keepmesignedin",
+        "staysignedin",
+        "stayloggedin",
+    }
+)
+# Never ticked: a box about a device, a browser, a choice or the user name is
+# another policy (a trusted device skips the second factor) — not a session.
+REMEMBER_NOT_RE = re.compile(
+    r"device|browser|computer|choice|trust|ger[aä]t|appareil|navigateur"
+    r"|user\s*name|e-?mail|benutzer"
+    r"|don[\u2019']?t|do\s*not|nicht|ne\s*pas",
+    re.IGNORECASE,
+)
+
+# The checkboxes of the password's form (no form: its document), each with
+# what `remember_me_like` judges — attribute names and label text, never a
+# value.
+REMEMBER_BOXES_JS = """pw => {
+  const scope = pw.form || pw.ownerDocument;
+  const vis = el => !!(el.offsetWidth || el.offsetHeight || el.getClientRects().length);
+  const a = (el, n) => ((el && el.getAttribute(n)) || '');
+  return Array.from(scope.querySelectorAll('input[type=checkbox]')).map(b => {
+    const labels = Array.from(b.labels || []);
+    const wrap = b.closest('label');
+    if (wrap && !labels.includes(wrap)) labels.push(wrap);
+    const text = labels.map(l => (l.innerText || l.textContent || '')).join(' ');
+    return {
+      name: a(b, 'name'), id: b.id || '',
+      aria: (a(b, 'aria-label') + ' ' + a(b, 'title')).trim().slice(0, 80),
+      label: text.replace(/\\s+/g, ' ').trim().slice(0, 80),
+      checked: !!b.checked, disabled: !!b.disabled, visible: vis(b),
+      label_visible: labels.some(vis),
+    };
+  });
+}"""
+
+# The same checkboxes as element handles, index-aligned with REMEMBER_BOXES_JS.
+REMEMBER_BOX_HANDLES_JS = """pw => Array.from(
+  (pw.form || pw.ownerDocument).querySelectorAll('input[type=checkbox]'))"""
+
+
+def remember_me_like(desc: dict[str, Any]) -> bool:
+    """The checkbox is a "remember me" / "keep me signed in" choice for the
+    SESSION: its label or aria-label says so (``REMEMBER_ME_RE``), or its
+    name / id is one (``REMEMBER_ME_NAMES``) — and nothing about it names a
+    device, a browser, a choice or the user name (``REMEMBER_NOT_RE``)."""
+    names = [str(desc.get(k) or "") for k in ("name", "id")]
+    texts = [str(desc.get("aria") or ""), str(desc.get("label") or "")]
+    if any(REMEMBER_NOT_RE.search(t) for t in [*names, *texts]):
+        return False
+    if any(_joined(n) in REMEMBER_ME_NAMES for n in names):
+        return True
+    return any(REMEMBER_ME_RE.search(t) for t in texts)
+
+
+def pick_remember_me(descs: Sequence[dict[str, Any]]) -> int | None:
+    """Index of the first enabled "remember me" checkbox a human could tick
+    (it or its label is visible), or None."""
+    for i, desc in enumerate(descs):
+        if desc.get("disabled"):
+            continue
+        if not (desc.get("visible") or desc.get("label_visible")):
+            continue
+        if remember_me_like(desc):
+            return i
+    return None
+
+
+# --- POST tripwire ---------------------------------------------------------
+# While the broker submits a login form, every request to a fill origin that
+# carries a body is screened (``recipes.SubmitTripwire``): one that names a
+# secondary action — forgot password, reset, register, sign-up, resend — is
+# aborted before it leaves the browser. Calibre-Web Automated (2026-10-08):
+# Enter fired its `forgot` button and the server reset the admin password,
+# twice. Whole names only: GitHub's login form carries a hidden `allow_signup`
+# field, which names no action of its own.
+SECONDARY_ACTIONS = frozenset(
+    {
+        "forgot",
+        "forgotten",
+        "forgotpassword",
+        "forgotpwd",
+        "forgotusername",
+        "lostpassword",
+        "reset",
+        "resetpassword",
+        "passwordreset",
+        "resetpwd",
+        "recover",
+        "recovery",
+        "recoverpassword",
+        "register",
+        "registration",
+        "signup",
+        "createaccount",
+        "resend",
+        "resendcode",
+        "resendemail",
+        "resendverification",
+    }
+)
+# A body key that names an action with one of these values does not ask for it
+# (``signup=false``).
+_FALSEY = frozenset({"false", "0", "no", "off", "null"})
+# Body keys whose VALUE names the action (``action=forgot``, ``submit=Register``).
+ACTION_KEYS = frozenset(
+    {"action", "_action", "op", "submit", "commit", "button", "btn", "intent", "do"}
+)
+_MAX_ACTION_VALUE = 64
+
+
+def _joined(text: str) -> str:
+    return "".join(_tokens(text))
+
+
+def _action_path(url: str) -> str:
+    """The last path segment of `url`, normalised (``/forgot-password`` →
+    ``forgotpassword``); "" when there is none."""
+    try:
+        path = urllib.parse.urlsplit(url).path
+    except ValueError:
+        return ""
+    segments = [seg for seg in path.split("/") if seg]
+    return _joined(urllib.parse.unquote(segments[-1])) if segments else ""
+
+
+def _json_pairs(body: str, *, nested: bool = False) -> list[tuple[str, str]]:
+    """Keys of a JSON object body with their scalar values — the top level
+    only, nested objects too with `nested`."""
+    try:
+        data = json.loads(body or "null")
+    except ValueError:
         return []
+    out: list[tuple[str, str]] = []
+    stack = [data] if isinstance(data, dict) else []
+    while stack:
+        obj = stack.pop()
+        for key, value in obj.items():
+            if isinstance(value, dict) and nested:
+                stack.append(value)
+            scalar = isinstance(value, (str, int, float)) and not isinstance(
+                value, bool
+            )
+            out.append((str(key), str(value) if scalar else ""))
+    return out
+
+
+def _multipart_pairs(body: str) -> list[tuple[str, str]]:
+    out: list[tuple[str, str]] = []
+    for part in re.split(r"\r?\n?--[^\r\n]*\r?\n", body or ""):
+        head, _, value = part.partition("\r\n\r\n")
+        match = re.search(r'\bname="([^"]*)"', head)
+        if match:
+            out.append((match.group(1), value.rstrip("\r\n")))
+    return out
+
+
+def body_pairs(
+    body: str, content_type: str, *, nested: bool = False
+) -> list[tuple[str, str]]:
+    """(key, value) pairs of a form-urlencoded, JSON or multipart body (JSON:
+    top-level keys, nested objects too with `nested`); unknown types: none."""
+    ctype = (content_type or "").split(";", 1)[0].strip().lower()
+    if ctype == "application/json" or ctype.endswith("+json"):
+        return _json_pairs(body, nested=nested)
+    if ctype == "multipart/form-data":
+        return _multipart_pairs(body)
+    if ctype in ("", "application/x-www-form-urlencoded", "text/plain"):
+        return urllib.parse.parse_qsl(body or "", keep_blank_values=True)
+    return []
+
+
+def secondary_hit(
+    url: str,
+    pairs: Sequence[tuple[str, str]],
+    *,
+    protect: Collection[str] = (),
+    button_pairs: Collection[tuple[str, str]] = (),
+) -> str | None:
+    """What makes a request with these body/query `pairs` a secondary form
+    action, or None.
+
+    Tripped by: a (key, value) pair that one of the form's secondary submit
+    buttons posts (`button_pairs`, ``secondary_pairs``), a key — or the value
+    of an ``ACTION_KEYS`` key — that IS a secondary action word
+    (``SECONDARY_ACTIONS``, the whole name after separators and camelCase are
+    dropped; a key whose value says no — ``signup=false`` — does not trip),
+    or a `url` whose last path segment is one ("" = no path check). Keys in
+    `protect` (the password and username fields) are skipped and their values
+    never read. The answer names the key (or ``path``) and the action word
+    only — never a value."""
+    shield = {p.lower() for p in protect if p}
+    named = {(n.lower(), v) for n, v in button_pairs if n}
+    for key, value in pairs:
+        low = key.lower()
+        if low in shield:
+            continue
+        if (low, value) in named:
+            return f"button {key[:40]}"
+        if _joined(key) in SECONDARY_ACTIONS and value.strip().lower() not in _FALSEY:
+            return f"field {key[:40]}"
+        if low in ACTION_KEYS and len(value) <= _MAX_ACTION_VALUE:
+            word = _joined(value)
+            if word in SECONDARY_ACTIONS:
+                return f"{key}={word}"
+    last = _action_path(url) if url else ""
+    return f"path {last}" if last in SECONDARY_ACTIONS else None
+
+
+def secondary_post(
+    url: str,
+    body: str,
+    content_type: str,
+    *,
+    protect: Collection[str] = (),
+    button_pairs: Collection[tuple[str, str]] = (),
+) -> str | None:
+    """``secondary_hit`` over a request body (top-level keys)."""
+    return secondary_hit(
+        url,
+        body_pairs(body, content_type),
+        protect=protect,
+        button_pairs=button_pairs,
+    )
 
 
 def _visible_all(page: Any, selector: str) -> list[Any]:

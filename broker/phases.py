@@ -61,6 +61,12 @@ CODE_TEXT = {
     "idp_unknown": "the identity provider refused without a reason (often a bot check)",
     "captcha_required": "the identity provider wants a captcha",
     "origin_violation": "the login page left the fill origins",
+    "access_gated": "unreachable off-LAN (Cloudflare Access) — not checked",
+    "login_blocked": "the login page is blocked from here (HTTP 401/403) — nothing typed",
+    "submit_unidentified": "the login button could not be identified — nothing submitted",
+    "secondary_action_blocked": (
+        "the submit would have run forgot/reset/register — blocked in the browser"
+    ),
     "login_failed": "the login did not reach a logged-in state",
     "export_failed": "the session could not be exported",
     "empty_bundle": "the exported session holds no cookie and no storage key",
@@ -98,6 +104,8 @@ _ERROR_PHASE = {
     "submit_disabled": "vault",
     "forbidden": "precheck",
     "bad_request": "precheck",
+    "access_gated": "precheck",
+    "login_blocked": "precheck",
 }
 
 # Phases after which a password may have been typed and submitted — used only

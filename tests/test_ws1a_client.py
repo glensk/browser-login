@@ -509,6 +509,9 @@ class _Page:
     def query_selector(self, _sel: str) -> Any:
         return self.button
 
+    def query_selector_all(self, _sel: str) -> list[Any]:
+        return []  # Keycloak's generic fallback buttons: none
+
 
 class _Button:
     def __init__(self) -> None:

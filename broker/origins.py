@@ -116,3 +116,31 @@ def origin_hint(url: str, *, dev: bool) -> str:
         return origin
     scheme = urllib.parse.urlsplit(url).scheme
     return f"{scheme}: URL" if scheme else "unparsable URL"
+
+
+# Cloudflare Access puts its login (GitHub / e-mail PIN) on the team domain
+# ``<team>.cloudflareaccess.com``. Off-LAN, an app behind an Access policy
+# (calibre.dom42.space: public DNS is Cloudflare, the LAN's split-DNS skips
+# Access) redirects there before the app ever answers: the site is
+# unreachable from here, not logged out — never a reason to type a secret.
+ACCESS_GATE_SUFFIX = ".cloudflareaccess.com"
+# The same login served on the app's own host (Access's path on every
+# proxied hostname).
+ACCESS_GATE_PATH = "/cdn-cgi/access/"
+
+
+def access_gated(url: str) -> bool:
+    """True iff `url` is a Cloudflare Access login page: https on a
+    ``*.cloudflareaccess.com`` host (exact suffix on the parsed host, never a
+    substring of the URL), or any https URL whose path is under
+    ``/cdn-cgi/access/``."""
+    try:
+        parts = urllib.parse.urlsplit(str(url or "").strip())
+        host = (parts.hostname or "").lower()
+    except ValueError:
+        return False
+    if parts.scheme.lower() != "https" or not host:
+        return False
+    if parts.path.startswith(ACCESS_GATE_PATH):
+        return True
+    return host.endswith(ACCESS_GATE_SUFFIX) and len(host) > len(ACCESS_GATE_SUFFIX)

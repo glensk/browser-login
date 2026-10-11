@@ -586,6 +586,7 @@ _CHECK_FIRST = {
     "stale": "its last success is older than the status age",
     "unknown": "its last check could not tell",
     "unchecked": "not checked yet",
+    "unreachable": "unreachable off-LAN (Cloudflare Access)",
 }
 
 
@@ -757,8 +758,9 @@ def _setup_problem(row: dict) -> str | None:
 def row_state(row: dict, checks: dict[str, dict]) -> tuple[str, str]:
     """(state, why) of one login: ``ok`` (setup complete AND the latest real
     check passed, fresh), ``stale`` (that ✅ is older than the max status
-    age), ``unknown`` (the latest check could not tell), ``unchecked``,
-    ``failed``, or ``setup`` (cannot work whatever a check says)."""
+    age), ``unknown`` (the latest check could not tell), ``unreachable``
+    (it met a Cloudflare Access login: off-LAN), ``unchecked``, ``failed``,
+    or ``setup`` (cannot work whatever a check says)."""
     problem = _setup_problem(row)
     if problem:
         return "setup", problem
@@ -775,10 +777,13 @@ def row_state(row: dict, checks: dict[str, dict]) -> tuple[str, str]:
             f"last success {when} is older than {hours:g} h — verify: "
             f"browser.py logged-in {browser_site(site)}"
         )
-    if fresh == "unknown":
-        return "unknown", f"last check {when} could not tell — {reason}"
+    if fresh in ("unknown", "failed") and rec.get("code") == "access_gated":
+        # Off-LAN behind Cloudflare Access: neither logged in nor out.
+        fresh = "unreachable"
     if fresh != "ok":
-        return "failed", f"last check {when}: {reason}"
+        state = fresh if fresh in ("unknown", "unreachable") else "failed"
+        told = " could not tell —" if state == "unknown" else ":"
+        return state, f"last check {when}{told} {reason}"
     how = f"checked {when}"
     if row["status"] == "safari" and row.get("safari"):
         how += f", Safari session until {row.get('safari_expires')}"
@@ -848,11 +853,17 @@ def print_overview(data: dict) -> None:
     print(f"  broker: {'🟢' if ok else '🔴'} {data['broker']}\n")
     checks = last_checks()
     judged = [(r, *row_state(r, checks)) for r in rows]
-    order = {"ok": 0, "stale": 1, "unknown": 1, "unchecked": 1}
+    order = {"ok": 0, "stale": 1, "unknown": 1, "unreachable": 1, "unchecked": 1}
     judged.sort(key=lambda x: (order.get(x[1], 2), x[0]["name"].lower()))
     width = max(len(r["name"]) for r in rows)
     col = "agent_fill_origins"
-    icons = {"ok": "✅", "stale": "❓", "unknown": "❓", "unchecked": "❓"}
+    icons = {
+        "ok": "✅",
+        "stale": "❓",
+        "unknown": "❓",
+        "unreachable": "❓",
+        "unchecked": "❓",
+    }
     print(_c("2", f"     {'login'.ljust(width)}  {col}  status"))
     for r, state, why in judged:
         bw = str(bool(r.get("in_bitwarden"))).ljust(len(col))
@@ -1224,6 +1235,7 @@ def assisted_login(site: str, force: bool = False) -> int:
 
 
 BUSY_HOW = "busy: guided login in progress — skipped, re-check later"
+UNREACHABLE_HOW = "unreachable off-LAN (Cloudflare Access) — not checked"
 
 
 Outcome = tuple[bool | None, str, dict | None]
@@ -1256,6 +1268,9 @@ def ensure_logged_in(site: str, gate: tuple[str, str] | None = None) -> Outcome:
     rc, check = probe(site)
     if rc == BUSY_RC:
         return None, BUSY_HOW, {"phase": "precheck", "code": "busy"}
+    if rc != 0 and (check or {}).get("code") == "access_gated":
+        # Off-LAN behind Cloudflare Access: unreachable, never a login.
+        return None, UNREACHABLE_HOW, {**(check or {}), "phase": "precheck"}
     if rc == 0:
         weak = gate is not None and gate[0] == "needs_sentinel"
         how = "needs sentinel (old proof)" if weak else "logged in"
@@ -1481,6 +1496,51 @@ def refresh_step(site: str, check: dict | None, how: str) -> str:
     return f"{how} (token refresh failed, exit {run.rc})"
 
 
+# One return per outcome of the renewal, in the order they are decided.
+def renew_step(  # pylint: disable=too-many-return-statements
+    site: str, row: dict, check: dict | None, how: str
+) -> Outcome:
+    """A fresh ✅ whose session is due for renewal (``renew_due``: the item's
+    ``agent_max_session_days`` reached since the last proven fresh login —
+    servers like Calibre-Web Automated end a session a fixed time after its
+    login, however much it is used): ONE scheduled `browser.py login SITE -s`,
+    which logs in fresh while the old session still works. The scheduled
+    gates apply (`schedule_gate`: pending, quarantined, locked … → no login,
+    only a note). A failed renewal with the old session still working stays
+    ✅ with the reason in `how`."""
+    res: dict = check or {}
+    if not res.get("renew_due"):
+        return True, how, res
+    gate = schedule_gate(row)
+    if gate is not None:
+        return True, f"{how} (session renewal due — {gate[1]})", res
+    run = run_browser(
+        "login",
+        site,
+        "-s",
+        timeout_s=browser_timeout("login"),
+        capture=True,
+        result=True,
+    )
+    out = derived_result(run)
+    failed = login_run_failure(run)
+    if failed is not None:
+        _quarantine_after_kill(site, run)
+        return False, failed, out
+    if run.rc != 0:
+        return False, failure_how(out, run.rc), out
+    renewal = out.get("renewal")
+    if renewal == "renewed":
+        return True, f"{how} (session renewed with a fresh login)", out
+    if renewal == "failed":
+        text = phases.text(
+            str(out.get("renewal_phase") or ""), str(out.get("renewal_code") or "")
+        )
+        print(f"⚠️ {site}: session renewal failed — {text}")
+        return True, f"{how} (session renewal FAILED — {text})", out
+    return True, f"{how} (session renewal: {renewal or 'not needed'})", out
+
+
 def _record_unchecked(data: dict | None, code: str, why: str) -> None:
     """A run that could not check anything records `unknown` for every
     checkable row (never success, never "logged out")."""
@@ -1550,6 +1610,8 @@ def check_all(*, mail: bool = False) -> int:  # pylint: disable=too-many-branche
             continue
         if ok and row.get("session_refresh"):
             how = refresh_step(site, res, how)
+        if ok and (res or {}).get("renew_due"):
+            ok, how, res = renew_step(site, row, res, how)
         print(f"{'✅' if ok else '❌'} {site}: {how}")
         record_check(site, ok, how, res)
         if not ok:
