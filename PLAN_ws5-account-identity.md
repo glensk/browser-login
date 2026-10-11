@@ -468,6 +468,22 @@ value.
       only with the server identity proof; values never leave page or broker) and the
       parent plan's WS5 box. Close tp#833 through the review flow.
 
+- Live findings 2026-10-11 (main session, Albert's Safari, schema only, no values printed):
+  - `install.sh -S docker docker-hub` → different; `-S custos-admin runai-admin` → different.
+  - navidrome: `GET /api/user/<jwt.uid>` with `x-nd-authorization: Bearer <localStorage token>` →
+    200 JSON `userName`, `isAdmin` (navidrome-albert: not admin). Recipe → S4b builder.
+  - audiobookshelf albert: `type` = user.
+  - Run:ai (sdsc.run.ai) and the Keycloak admin console keep their bearer token in page memory
+    (no JS-readable cookie, no storage token; `/api/v1/*` answers 401 with cookies alone): no
+    in-page server identity recipe is possible with RECIPE_JS. Decision for Albert: drop one
+    member per group, or accept these groups as unproven.
+  - runai-test3's vault password was stale (Keycloak "Invalid username or password"; the user
+    exists, enabled, no required actions). Rotated 2026-10-11 (test fixture): new password set
+    via the Keycloak admin API (keycloak-client-secret) and saved into the vault item through
+    Safari; the Safari login with the vault item then reached the Run:ai dashboard.
+  - dsm (two-step login, SynoToken page global), authentik (shadow-DOM flow), docker (two-step):
+    not live-probed yet.
+
 ### S5 — onboarding rule (with WS3)
 
 - [ ] WS3's static validation uses `scope_conflicts`: a new item that conflicts with an
