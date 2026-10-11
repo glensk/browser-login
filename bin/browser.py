@@ -9718,6 +9718,13 @@ def _print_broker_diag(diag: object) -> None:
     if not isinstance(diag, dict):
         return
     print("  broker stopped at:", diag.get("url", "?"), f"— {diag.get('title', '')!r}")
+    seen = diag.get("challenge_at_detection")
+    if isinstance(seen, dict) and seen:
+        # Where the bot check showed — the page above may be a later one.
+        print(
+            f"  bot check seen at: {seen.get('url', '?')} ({seen.get('frame', '?')})"
+            f" — {str(seen.get('title') or '')!r}"
+        )
     for key, label in (
         ("challenge", "bot check"),
         ("idp_reason", "identity provider answered"),

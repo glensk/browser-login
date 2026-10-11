@@ -46,47 +46,213 @@ BLOCKED_TEXT_RE = re.compile(
 # hidden (Infomaniak keeps an idle reCAPTCHA in a ``<div hidden>`` on every
 # login step, verified from its bundle 2026-10-07) is no challenge; once the
 # site reveals it, the next check sees it.
-_SHOWN_IFRAME_SRCS_JS = """els => els.filter(e => e.getClientRects().length > 0
-    && getComputedStyle(e).visibility !== 'hidden')
-  .map(e => e.getAttribute('src') || '')"""
+# Shown also means ON SCREEN and not transparent: Google parks its reCAPTCHA
+# challenge popup (``bframe``) at ``top: -10000px`` / ``opacity: 0`` until it
+# is needed, and Playwright's ``is_visible`` counts both as visible.
+_ON_SCREEN_JS = """e => {
+  const r = e.getBoundingClientRect();
+  if (r.width <= 0 || r.height <= 0) return false;
+  if (r.right <= 0 || r.bottom <= 0 || r.left >= innerWidth || r.top >= innerHeight)
+    return false;
+  for (let n = e; n && n.nodeType === 1; n = n.parentElement)
+    if (parseFloat(getComputedStyle(n).opacity) === 0) return false;
+  return true;
+}"""
+_SHOWN_IFRAME_SRCS_JS = (
+    "els => els.filter(e => e.getClientRects().length > 0"
+    " && getComputedStyle(e).visibility !== 'hidden' && ("
+    + _ON_SCREEN_JS
+    + ")(e)).map(e => e.getAttribute('src') || '')"
+)
 
 
 def _frame_shown(frame: Any) -> bool:
-    """False only for a child frame whose <iframe> element is provably hidden
-    (no box / ``visibility: hidden``, e.g. inside ``display: none``). The main
-    frame and any frame that cannot be inspected count as shown (fail closed:
-    a challenge there still means "needs a human")."""
+    """False only for a child frame whose <iframe> element — or the element
+    of any frame it is nested in — is provably hidden (no box /
+    ``visibility: hidden``, e.g. inside ``display: none``; off screen;
+    ``opacity: 0``). The main frame and any frame that cannot be inspected
+    count as shown (fail closed: a challenge there still means "needs a
+    human")."""
     try:
-        if getattr(frame, "parent_frame", None) is None:
-            return True
-        element = frame.frame_element()
-        return bool(element.is_visible())
+        while getattr(frame, "parent_frame", None) is not None:
+            element = frame.frame_element()
+            if not element.is_visible():
+                return False
+            try:
+                if element.evaluate(_ON_SCREEN_JS) is False:
+                    return False
+            except Exception:  # pylint: disable=broad-exception-caught
+                pass  # not inspectable: counts as on screen
+            frame = frame.parent_frame
+        return True
     except Exception:  # pylint: disable=broad-exception-caught
         return True
 
 
-def challenge_reason(page: Any) -> str | None:
-    """``"captcha"`` when a captcha / bot-challenge is on the page, else None."""
+# What a challenge-provider frame is, by its URL. Only the INVISIBLE widgets
+# are passive: an invisible / score-based reCAPTCHA (its ``anchor`` frame
+# carries ``size=invisible``; it sits in the ``.grecaptcha-badge`` corner box)
+# and an invisible hCaptcha (``frame=checkbox-invisible``) ask a human nothing
+# until the provider decides to pop up a challenge, and that popup is its own
+# frame (reCAPTCHA ``bframe``, hCaptcha ``frame=challenge``), which counts
+# once it is shown. Evidence: MyFRITZ (sso.myfritz.net, Keycloak) shows an
+# invisible reCAPTCHA page between password and OTP that submits itself after
+# 2-4 s (its theme's recaptcha-page.js, 2026-10-10); reporting its badge as a
+# captcha made those logins a false ``needs_human``.
+PASSIVE_CHALLENGE_KINDS = frozenset(
+    {"recaptcha-invisible", "recaptcha-helper", "hcaptcha-invisible"}
+)
+_RECAPTCHA_FRAME_RE = re.compile(
+    r"/recaptcha/(?:api2|enterprise)/(anchor|bframe|aframe|webworker)\b",
+    re.IGNORECASE,
+)
+_TURNSTILE_RE = re.compile(r"turnstile|challenges\.cloudflare", re.IGNORECASE)
+# Which kind a report names when a page shows several (most specific first).
+_KIND_ORDER = (
+    "recaptcha-challenge",
+    "hcaptcha-challenge",
+    "recaptcha-checkbox",
+    "hcaptcha-checkbox",
+    "turnstile",
+    "captcha-other",
+)
+
+
+def _url_params(parts: urllib.parse.SplitResult) -> dict[str, list[str]]:
+    """Query and fragment parameters of a URL (hCaptcha keeps its own in the
+    fragment); values lower-cased."""
+    out: dict[str, list[str]] = {}
+    for raw in (parts.query, parts.fragment):
+        for key, values in urllib.parse.parse_qs(raw).items():
+            out.setdefault(key.lower(), []).extend(v.lower() for v in values)
+    return out
+
+
+def challenge_kind(url: str) -> str | None:
+    """The kind of challenge widget a frame at `url` is; None for a frame of
+    no challenge provider. ``PASSIVE_CHALLENGE_KINDS`` ask a human nothing;
+    anything unrecognised from a provider is ``captcha-other`` (fail closed)."""
+    text = str(url or "")
+    if not CHALLENGE_SRC_RE.search(text):
+        return None
+    try:
+        parts = urllib.parse.urlsplit(text)
+    except ValueError:
+        return "captcha-other"
+    params = _url_params(parts)
+    invisible = "invisible" in params.get("size", [])
+    match = _RECAPTCHA_FRAME_RE.search(parts.path)
+    host = (parts.hostname or "").lower()
+    if match:
+        kind = {
+            "anchor": "recaptcha-invisible" if invisible else "recaptcha-checkbox",
+            "bframe": "recaptcha-challenge",
+        }.get(match.group(1).lower(), "recaptcha-helper")
+    elif host == "hcaptcha.com" or host.endswith(".hcaptcha.com"):
+        frame = (params.get("frame") or [""])[0]
+        kind = {
+            "checkbox-invisible": "hcaptcha-invisible",
+            "checkbox": "hcaptcha-invisible" if invisible else "hcaptcha-checkbox",
+            "challenge": "hcaptcha-challenge",
+        }.get(frame, "captcha-other")
+    else:
+        kind = "turnstile" if _TURNSTILE_RE.search(text) else "captcha-other"
+    return kind
+
+
+# Kinds that may still clear by themselves (a managed Turnstile that passes on
+# its own, a Cloudflare "Just a moment" JS check, an unrecognised provider
+# frame): the login waits a bounded time before it calls them a challenge,
+# touching nothing meanwhile. ``unknown`` = the page could not be inspected
+# (mid-navigation): never a challenge by itself, but no action is taken on it.
+PROCESSING_CHALLENGE_KINDS = frozenset(
+    {"interstitial", "turnstile", "captcha-other", "unknown"}
+)
+# A Turnstile widget whose response token is set has passed (the widget puts a
+# hidden ``cf-turnstile-response`` input into the page); only the presence of
+# a value is read, never the value.
+_TURNSTILE_SOLVED_JS = """() => {
+  const els = [...document.querySelectorAll('input[name="cf-turnstile-response"]')];
+  return els.length > 0 && els.every(i => (i.value || '').length > 0);
+}"""
+_UNKNOWN = {"reason": "", "kind": "unknown"}
+
+
+def _turnstile_solved(page: Any) -> bool:
+    try:
+        return page.evaluate(_TURNSTILE_SOLVED_JS) is True
+    except Exception:  # pylint: disable=broad-exception-caught
+        return False
+
+
+def challenge_detail(page: Any) -> dict[str, str] | None:
+    """The challenge a human would have to answer on `page`, or None.
+
+    ``{"reason": ..., "kind": ...}``: ``reason`` is what ``challenge_reason``
+    answers; ``kind`` is ``interstitial`` (a "Just a moment" page), a frame
+    kind of ``challenge_kind`` (passive kinds never count; a Turnstile whose
+    token is set neither), ``blocked`` (a fraud-protection text) or
+    ``unknown`` (the page could not be inspected; ``reason`` empty). Shown
+    frames only: a widget rendered but hidden (Infomaniak's idle reCAPTCHA in
+    a ``<div hidden>``, a reCAPTCHA ``bframe`` parked off screen) is no
+    challenge; once the site reveals it, the next check sees it. Never clicks
+    or types anything."""
     if interstitial_title(page):
-        return "captcha"
+        return {"reason": "captcha", "kind": "interstitial"}
     try:
         frames = [f.url for f in page.frames if _frame_shown(f)]
         srcs = page.eval_on_selector_all("iframe", _SHOWN_IFRAME_SRCS_JS)
     except Exception:  # pylint: disable=broad-exception-caught
-        return None
-    if any(CHALLENGE_SRC_RE.search(str(u or "")) for u in [*frames, *srcs]):
-        return "captcha"
+        return dict(_UNKNOWN)
+    kinds = {challenge_kind(str(u or "")) for u in [*frames, *srcs]}
+    if "turnstile" in kinds and _turnstile_solved(page):
+        kinds.discard("turnstile")
+    for kind in _KIND_ORDER:
+        if kind in kinds:
+            return {"reason": "captcha", "kind": kind}
     try:
         text = str(
             page.evaluate("() => (document.body?.innerText || '').slice(0, 4000)")
         )
     except Exception:  # pylint: disable=broad-exception-caught
-        return None
+        return dict(_UNKNOWN)
     if BLOCKED_TEXT_RE.search(text):
-        return (
-            "the site blocked this IP range / too many attempts — stop and retry later"
-        )
+        return {
+            "reason": "the site blocked this IP range / too many attempts"
+            " — stop and retry later",
+            "kind": "blocked",
+        }
     return None
+
+
+def challenge_reason(page: Any) -> str | None:
+    """``"captcha"`` when a captcha / bot challenge a human must answer is on
+    the page (an invisible widget is none — ``challenge_detail``), the
+    block-page text on a fraud-protection page, else None (also when the page
+    could not be inspected)."""
+    detail = challenge_detail(page)
+    return detail["reason"] if detail and detail["kind"] != "unknown" else None
+
+
+def page_origin_path(url: str) -> str:
+    """``scheme://host[:port]/path`` of `url` — no query, no fragment."""
+    try:
+        parts = urllib.parse.urlsplit(str(url or ""))
+    except ValueError:
+        return ""
+    return f"{parts.scheme}://{parts.netloc}{parts.path}"
+
+
+def challenge_snapshot(page: Any, kind: str) -> dict[str, str]:
+    """Where a challenge was SEEN, taken at detection time (the page may
+    submit itself away before the failure report runs): the page URL without
+    query/fragment, the challenge kind and the page title (cut to 120
+    characters; the daemon masks username/password in it). No page text."""
+    try:
+        title = str(page.title() or "")[:120]
+    except Exception:  # pylint: disable=broad-exception-caught
+        title = ""
+    return {"url": page_origin_path(page.url), "frame": kind, "title": title}
 
 
 # A sentinel may render without a box of its own: Kavita's `app-side-nav`
@@ -318,6 +484,16 @@ def _redact(text: str, secret: Secret) -> str:
         if loose is not None:
             text = loose.sub("***", text)
     return text
+
+
+def redacted_snapshot(snapshot: dict[str, Any], secret: Secret) -> dict[str, str]:
+    """A ``challenge_snapshot`` for the failure report: the three known keys
+    only, username/password masked in the title."""
+    return {
+        "url": str(snapshot.get("url") or ""),
+        "frame": str(snapshot.get("frame") or ""),
+        "title": _redact(str(snapshot.get("title") or "")[:120], secret),
+    }
 
 
 def diagnose(page: Any, secret: Secret) -> dict[str, Any]:

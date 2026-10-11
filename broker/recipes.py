@@ -67,8 +67,11 @@ from broker.origins import (
 )
 from broker.otp_detect import OTP_CANDIDATE_SELECTOR, OTP_DESCRIBE_JS, otp_field_like
 from broker.page_state import (
+    PROCESSING_CHALLENGE_KINDS,
     await_sentinel,
+    challenge_detail,
     challenge_reason,
+    challenge_snapshot,
     interstitial_title,
     page_blank,
     password_shown,
@@ -162,6 +165,11 @@ NO_PASSKEY_JS = """(() => {
   }
 })();"""
 SETTLE_TIMEOUT_S = 30.0
+# A challenge seen AFTER the submit counts only once it has stayed this long
+# on ONE document (``ChallengeWatch``): an interstitial that clears itself
+# (MyFRITZ's invisible reCAPTCHA page submits after 2-4 s) moves on before
+# that. Must stay well inside SETTLE_TIMEOUT_S.
+CHALLENGE_GRACE_S = 8.0
 # agent_pre_click: re-click while the element stays and no login field shows.
 PRE_CLICK_RETRY_S = 3.0
 
@@ -283,9 +291,18 @@ class OriginViolation(RecipeError):
 
 
 class NeedsHuman(RecipeError):
-    """A captcha / bot challenge or a missing second factor."""
+    """A captcha / bot challenge or a missing second factor.
+
+    ``challenge``: for a challenge, ``page_state.challenge_snapshot`` of the
+    page it was SEEN on (the page may move on before the failure report)."""
 
     code = "needs_human"
+
+    def __init__(
+        self, detail: str, *, challenge: dict[str, str] | None = None, **kw: Any
+    ) -> None:
+        super().__init__(detail, **kw)
+        self.challenge = challenge
 
 
 class ExportFailed(RecipeError):
@@ -963,10 +980,129 @@ def _field_value(field: Any) -> str | None:
         return None
 
 
+def _challenge_error(
+    detail: dict[str, str], snapshot: dict[str, str], *, submitted: bool
+) -> NeedsHuman:
+    """``NeedsHuman`` naming the challenge kind and the page it was seen on
+    (origin + path only, never page text or a query)."""
+    text = detail["reason"]
+    if detail["kind"] != "blocked":
+        text += f" ({detail['kind']} on {snapshot.get('url') or '?'})"
+    return NeedsHuman(text, submitted=submitted, challenge=snapshot)
+
+
 def _check_challenge(page: Any, *, submitted: bool) -> None:
-    reason = challenge_reason(page)
-    if reason:
-        raise NeedsHuman(reason, submitted=submitted)
+    """Raise ``NeedsHuman`` when a challenge shows. A confirmed one (checkbox,
+    challenge popup, block page) raises at once; one that may clear by itself
+    (``PROCESSING_CHALLENGE_KINDS``: Turnstile, "Just a moment", an
+    unrecognised provider frame) is watched up to ``CHALLENGE_GRACE_S`` first,
+    touching nothing. A page that cannot be inspected (``unknown``, e.g.
+    mid-navigation) is looked at again for as long; still uninspectable, the
+    login ends here (``LoginFailed``) — the caller types and clicks only
+    after a definite "no challenge". The post-submit settle loops use
+    ``ChallengeWatch``."""
+    detail = challenge_detail(page)
+    if detail and detail["kind"] in PROCESSING_CHALLENGE_KINDS:
+        deadline = time.monotonic() + CHALLENGE_GRACE_S
+        while (
+            detail
+            and detail["kind"] in PROCESSING_CHALLENGE_KINDS
+            and time.monotonic() < deadline
+        ):
+            page.wait_for_timeout(500)
+            detail = challenge_detail(page)
+    if detail and detail["kind"] == "unknown":
+        raise LoginFailed(
+            "the page could not be checked for a bot challenge — nothing typed",
+            submitted=submitted,
+        )
+    if detail:
+        snapshot = challenge_snapshot(page, detail["kind"])
+        raise _challenge_error(detail, snapshot, submitted=submitted)
+
+
+def _document_key(page: Any) -> tuple[str, Any]:
+    """Identifies the page's current document: its URL plus the document's
+    ``performance.timeOrigin`` (a form POST that answers on the same URL is a
+    new document too). Unreadable (mid-navigation) → None for the second."""
+    try:
+        origin = page.evaluate("() => performance.timeOrigin")
+    except Exception:  # pylint: disable=broad-exception-caught
+        origin = None
+    return (str(page.url), origin)
+
+
+class ChallengeWatch:
+    """The post-submit challenge check of a settle loop, with a grace.
+
+    A challenge (``page_state.challenge_detail``; invisible widgets never
+    count) must stay ``grace_s`` on ONE document before it is ``NeedsHuman``;
+    every navigation, and every check that sees none, starts over. A
+    fraud-protection page (kind ``blocked``) needs no grace. A page that
+    cannot be inspected (``unknown``) keeps the state as it is and counts as
+    ``pending`` for that check: the loop acts on nothing it could not see.
+    Where the challenge was seen is snapshotted at first sight on that
+    document (``challenge_snapshot``) and travels with the error. Nothing is
+    ever clicked: the page either clears it by itself or a human must."""
+
+    def __init__(
+        self,
+        *,
+        grace_s: float | None = None,
+        clock: Callable[[], float] = time.monotonic,
+    ) -> None:
+        self.grace_s = CHALLENGE_GRACE_S if grace_s is None else grace_s
+        self._clock = clock
+        self._doc: tuple[str, Any] | None = None
+        self._since: float | None = None
+        self._detail: dict[str, str] | None = None
+        self._unknown = False
+        self.snapshot: dict[str, str] | None = None
+
+    def check(self, page: Any, *, submitted: bool = True) -> None:
+        """One look at `page`; raises ``NeedsHuman`` once the grace is over."""
+        detail = challenge_detail(page)
+        self._unknown = detail is not None and detail["kind"] == "unknown"
+        if self._unknown:
+            return
+        if detail is None:
+            self._since = self._doc = self._detail = None
+            return
+        if detail["kind"] == "blocked":
+            snapshot = challenge_snapshot(page, detail["kind"])
+            raise _challenge_error(detail, snapshot, submitted=submitted)
+        doc = _document_key(page)
+        now = self._clock()
+        # A new document or another kind of challenge starts over (timer and
+        # snapshot): the report names what was seen, where.
+        kind_changed = (self._detail or {}).get("kind") != detail["kind"]
+        if self._since is None or doc != self._doc or kind_changed:
+            self._doc, self._since = doc, now
+            self.snapshot = challenge_snapshot(page, detail["kind"])
+        self._detail = detail
+        if now - self._since >= self.grace_s and self.snapshot:
+            raise _challenge_error(detail, self.snapshot, submitted=submitted)
+
+    def clear(self, page: Any) -> bool:
+        """``check`` and True when nothing is pending: safe to act now."""
+        self.check(page)
+        return not self.pending
+
+    @property
+    def pending(self) -> bool:
+        """The latest check saw a challenge (still within its grace) or could
+        not inspect the page: act on nothing this round."""
+        return self._unknown or self._since is not None
+
+    def final(self, page: Any, *, submitted: bool = True) -> None:
+        """For the end of a settle loop: ONE fresh look at `page` (never the
+        cached state); a challenge that shows now needs a human, whatever is
+        left of its grace. Nothing showing (or not inspectable): returns."""
+        grace, self.grace_s = self.grace_s, 0.0
+        try:
+            self.check(page, submitted=submitted)
+        finally:
+            self.grace_s = grace
 
 
 def _wait_visible(page: Any, selector: str, timeout_s: float) -> Any:
@@ -1048,19 +1184,27 @@ def _fill_otp(  # pylint: disable=too-many-arguments
     otp_label: str | None = None,
     attempt: AttemptController | None = None,
     tripwire: SubmitTripwire | None = None,
-) -> None:
+    watch: ChallengeWatch | None = None,
+) -> bool:
     """Type the TOTP code and submit it like the password
     (``_submit_password``: Enter only on a login default button, else the
     identified button — "Verify", never a "Resend code" default — under the
     tripwire with the OTP form's own button pairs). A page that submits
     itself once the code is complete (GitHub) is not pressed again: when the
     field is gone or the URL changed after the fill, the submit is marked and
-    the caller's settle loop decides."""
+    the caller's settle loop decides.
+
+    With a `watch`, the page is checked for a challenge right before the
+    first click/keystroke (after the code wait): one showing → False,
+    nothing selected or typed, the caller's loop comes back. True = the code
+    went in."""
     if not secret.totp_seed:
         raise NeedsHuman("otp required but the item has no TOTP seed", submitted=True)
     code = fresh_totp(secret.totp_seed)
     if not code:
         raise LoginFailed("could not produce a TOTP code", submitted=True)
+    if watch is not None and not watch.clear(page):
+        return False
     otp_field = _otp_field(page)  # re-query: the wait may have taken s
     if otp_field is None:
         raise LoginFailed("the OTP field disappeared", submitted=True)
@@ -1075,7 +1219,7 @@ def _fill_otp(  # pylint: disable=too-many-arguments
     page.wait_for_timeout(OTP_SELF_SUBMIT_MS)
     if _submitted_itself(page, otp_field, before):
         (attempt or NO_ATTEMPT).mark_submitted()
-        return
+        return True
     try:
         _submit_password(
             page, otp_field, allowed, dev=dev, attempt=attempt, tripwire=tripwire
@@ -1085,9 +1229,10 @@ def _fill_otp(  # pylint: disable=too-many-arguments
             page, otp_field, before
         ):  # it went on its own while the buttons were read
             (attempt or NO_ATTEMPT).mark_submitted()
-            return
+            return True
         exc.submitted = True  # the password went before the code
         raise
+    return True
 
 
 # How long a page may take to submit a complete OTP code by itself.
@@ -2027,15 +2172,23 @@ def _settle(  # pylint: disable=too-many-arguments
     """After the (password / username-only) submit: answer an OTP step and
     known post-login prompts until the page left the login (`settle_s`).
     `credential`: a username-only login's field — never taken for an OTP
-    field (an account-number field looks numeric)."""
+    field (an account-number field looks numeric). A challenge on the way is
+    watched (``ChallengeWatch``): while one shows nothing is typed or clicked."""
     allowed = list(item.fill_origins)
     otp_done = False
     prompts_answered = 0
+    watch = ChallengeWatch()
     deadline = time.monotonic() + settle_s
     while time.monotonic() < deadline:
         page.wait_for_timeout(500)
         trip.check()
-        _check_challenge(page, submitted=True)
+        # The item's own sentinel first: a widget left on the logged-in page
+        # never holds up a login it shows (the positive proof decides).
+        if _sentinel_up(page, item):
+            trip.check()
+            return
+        if not watch.clear(page):
+            continue  # nothing typed or clicked while one shows
         otp_field = None if otp_done else _otp_field(page)
         if (
             otp_field is not None
@@ -2044,7 +2197,7 @@ def _settle(  # pylint: disable=too-many-arguments
         ):
             otp_field = None
         if otp_field is not None:
-            _fill_otp(
+            otp_done = _fill_otp(
                 page,
                 otp_field,
                 secret,
@@ -2053,8 +2206,8 @@ def _settle(  # pylint: disable=too-many-arguments
                 otp_label=item.otp_label,
                 attempt=attempt,
                 tripwire=trip,
+                watch=watch,  # checked again right before typing
             )
-            otp_done = True
             continue
         if _left_login(page, item, dev=dev):
             trip.check()
@@ -2065,10 +2218,13 @@ def _settle(  # pylint: disable=too-many-arguments
             or off_fill_origins(page.url, allowed, dev=dev)
             else trust_prompt_button(page)
         )
-        if trust is not None:
+        if trust is not None and watch.clear(page):  # right before clicking
             trust.click(timeout=5000)
             prompts_answered += 1
     trip.check()
+    if _sentinel_up(page, item):
+        return
+    watch.final(page)
     if _visible(page, PASSWORD_SELECTOR) is None and page_blank(page):
         # A blank page proves nothing either way: an SPA that is reloading or
         # whose bundle failed to load (NPM 2026-10-10: the login had worked).
@@ -2085,6 +2241,12 @@ def _settle(  # pylint: disable=too-many-arguments
     raise LoginFailed(
         f"still on the login page after submitting {what}", submitted=True
     )
+
+
+def _sentinel_up(page: Any, item: SiteItem) -> bool:
+    """The item's own logged-in sentinel shows (False without one)."""
+    selector = item.logged_in_selector
+    return bool(selector) and sentinel_shown(page, str(selector))
 
 
 def _left_login(page: Any, item: SiteItem, *, dev: bool) -> bool:
@@ -2528,16 +2690,18 @@ def cscs_login(
         )
 
     otp_done = False
+    watch = ChallengeWatch()
     deadline = time.monotonic() + settle_s
     while time.monotonic() < deadline:
         page.wait_for_timeout(500)
         if cscs_on_portal(page.url):
             return
-        _check_challenge(page, submitted=True)
+        if not watch.clear(page):
+            continue
         if not otp_done:
             otp_field = _visible(page, OTP_SELECTOR)
             if otp_field is not None:
-                _fill_otp(
+                otp_done = _fill_otp(
                     page,
                     otp_field,
                     secret,
@@ -2545,8 +2709,11 @@ def cscs_login(
                     dev=dev,
                     otp_label=item.otp_label,
                     attempt=attempt,
+                    watch=watch,  # checked again right before typing
                 )
-                otp_done = True
+    if cscs_on_portal(page.url):
+        return
+    watch.final(page)
     raise LoginFailed("login did not reach the CSCS portal", submitted=True)
 
 
@@ -2644,16 +2811,21 @@ def smartsheet_login(
     (attempt or NO_ATTEMPT).mark_submitted()
     _click_on_fill_origin(page, button, allowed, dev=dev)
 
+    watch = ChallengeWatch()
     deadline = time.monotonic() + settle_s
     while time.monotonic() < deadline:
         page.wait_for_timeout(500)
-        _check_challenge(page, submitted=True)
         if _visible(page, sentinel) is not None:
-            return
+            return  # the sentinel first: the positive proof decides
+        if not watch.clear(page):
+            continue
         if off_fill_origins(page.url, allowed, dev=dev) and (
             _visible(page, PASSWORD_SELECTOR) is None
         ):
             return
+    if _visible(page, sentinel) is not None:
+        return
+    watch.final(page)
     raise LoginFailed(
         "still on the Smartsheet login after submitting the password", submitted=True
     )

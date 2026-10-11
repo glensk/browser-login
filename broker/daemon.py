@@ -103,7 +103,11 @@ from broker.limiter import (  # noqa: E402
     proc_start,
 )
 from broker.origins import access_gated, origin_allowed  # noqa: E402
-from broker.page_state import diagnose, sentinel_shown  # noqa: E402
+from broker.page_state import (  # noqa: E402
+    diagnose,
+    redacted_snapshot,
+    sentinel_shown,
+)
 from broker.peercred import peer_uid  # noqa: E402
 from broker.phases import PHASE_V  # noqa: E402
 from broker.recipes import (  # noqa: E402
@@ -635,6 +639,17 @@ class PlaywrightRunner:
                 diag["script_as_html"] = sorted(set(seen))[:3]
         self.last_diag[item.site] = diag
 
+    def _note_challenge(self, item: SiteItem, exc: RecipeError, secret: Secret) -> None:
+        """The page a challenge was SEEN on (``NeedsHuman.challenge``, taken
+        at detection) as ``challenge_at_detection`` in the failure report: the
+        screenshot and page picture show the page at failure time, which an
+        interstitial that submits itself may already have left."""
+        snapshot = getattr(exc, "challenge", None)
+        if isinstance(snapshot, dict) and snapshot:
+            self.last_diag.setdefault(item.site, {})["challenge_at_detection"] = (
+                redacted_snapshot(snapshot, secret)
+            )
+
     def _note_idp(
         self, item: SiteItem, reason: str | None, exc: RecipeError
     ) -> RecipeError:
@@ -809,6 +824,7 @@ class PlaywrightRunner:
         except RecipeError as exc:
             reason = idp_reason(ctx)  # before anything navigates away
             self._record_failure(page, item, secret)
+            self._note_challenge(item, exc, secret)
             self._note_idp(item, reason, exc)
             exc.submitted = exc.submitted or attempt.submitted
             exc.detail += html_script_hint(page)
