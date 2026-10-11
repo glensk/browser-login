@@ -129,7 +129,7 @@ manual acceptance steps under the attempt policy below.
 - [ ] WS2 — per-site root-cause fixes, serial, each from the previous accepted + deployed
       base. Acceptance per site: logged-in probe ✅ in the shared Chromium, plus its consumer
       where one exists:
-  - [ ] cscs: token discovery proven, exported storage keys > 0, injection read back before
+  - [x] cscs: token discovery proven, exported storage keys > 0, injection read back before
         the SPA redirect, stable portal probe, `cscs-api.py` (Waldur) call succeeds.
     - [x] Root cause found (read-only, Codex diagnose debate converged in 3 rounds):
           `cscs_portal_ready` (recipes.py:791) passes on ANY 40-hex localStorage value, even
@@ -139,7 +139,8 @@ manual acceptance steps under the attempt policy below.
           silently returns 0 keys. The audit still says `ok`.
           Second issue: a fresh login (188 s) exceeds the client's `BROKER_TIMEOUT_S` 180 s.
           `cscs-api.py:773` also kills the login after 180 s.
-    - [ ] Fix (after WS1a deploys):
+    - [x] ✅ 2026-10-11: release f942dd0, broker f942dd0004dd. One login: 3 storage keys, token validated (aglensk); `cscs-api.py -lp` live data (22 projects); promoted (`-p cscs`). The server proof counts as strict, so no DOM sentinel is needed (this overrides the WS1a rule). Timeouts: broker 255 s < client 285 s < LOGIN_TIMEOUT 480 s < runner 570 s; cscs-api / user-management / smartsheet raised to 540 / 600 / 540 s. The cscs item's cookie hosts exclude auth.cscs.ch, so no Keycloak session reaches the shared browser.
+    - [x] Fix delivered:
       - the check asks the server: `/api/users/me/` 200 + identity, returning
             valid/invalid/indeterminate;
       - export allowlist `waldur/auth/token` (+ expires_at, method), read on `/profile/`;
