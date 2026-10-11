@@ -819,3 +819,41 @@ def test_a_killed_reap_is_not_reaped_again(monkeypatch):
 def test_runner_budgets_for_the_new_commands():
     assert jobs.browser_timeout("eval-fresh") == 60
     assert jobs.browser_timeout("reap-owned") == 60
+
+
+def test_gog_bin_falls_back_to_local_bin(tmp_path, monkeypatch):
+    """GOG_BIN -> PATH -> ~/.local/bin/gog (from HOME at runtime); no Homebrew path."""
+    home = tmp_path / "home"
+    stub = home / ".local" / "bin" / "gog"
+    stub.parent.mkdir(parents=True)
+    stub.write_text("#!/bin/sh\nexit 0\n")
+    stub.chmod(0o755)
+    empty = tmp_path / "empty-path"
+    empty.mkdir()
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("PATH", str(empty))
+    monkeypatch.delenv("GOG_BIN", raising=False)
+    assert jobs.gog_bin() == str(Path.home() / ".local" / "bin" / "gog")
+    stub.unlink()
+    assert jobs.gog_bin() is None
+    assert jobs.__file__ is not None
+    assert "/opt/homebrew/bin/gog" not in Path(jobs.__file__).read_text(
+        encoding="utf-8"
+    )
+
+
+def test_gog_bin_prefers_env_then_path(tmp_path, monkeypatch):
+    """An explicit GOG_BIN wins; otherwise a gog on PATH beats the fallback."""
+    on_path = tmp_path / "path"
+    on_path.mkdir()
+    path_gog = on_path / "gog"
+    path_gog.write_text("#!/bin/sh\nexit 0\n")
+    path_gog.chmod(0o755)
+    env_gog = tmp_path / "env-gog"
+    env_gog.write_text("#!/bin/sh\nexit 0\n")
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    monkeypatch.setenv("PATH", str(on_path))
+    monkeypatch.delenv("GOG_BIN", raising=False)
+    assert jobs.gog_bin() == str(path_gog)
+    monkeypatch.setenv("GOG_BIN", str(env_gog))
+    assert jobs.gog_bin() == str(env_gog)

@@ -154,11 +154,11 @@ def uninstall_daily() -> int:
 
 
 def gog_bin() -> str | None:
-    """gog: $GOG_BIN, then PATH, then the Homebrew default; None when absent."""
+    """gog: $GOG_BIN, then PATH, then ~/.local/bin/gog; None when absent."""
     for cand in (
         os.environ.get("GOG_BIN"),
         shutil.which("gog"),
-        "/opt/homebrew/bin/gog",
+        str(Path.home() / ".local" / "bin" / "gog"),
     ):
         if cand and Path(cand).is_file():
             return cand
@@ -169,7 +169,10 @@ def send_mail(subject: str, body: str) -> bool:
     """Mail Albert through gog's Gmail API; False (after a message) on failure."""
     gog = gog_bin()
     if gog is None:
-        print("❌ gog (gogcli) not found — set GOG_BIN or install gogcli; no mail sent")
+        print(
+            "❌ gog not found — set GOG_BIN or install with mydotfiles "
+            "bin/gog-install.py -u; no mail sent"
+        )
         return False
     res = subprocess.run(
         [
