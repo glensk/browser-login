@@ -284,7 +284,13 @@ manual acceptance steps under the attempt policy below.
         gitlab-sdsc-test, docker-hub, custos-admin in `alt`);
       - admin browser ALSO reachable via MCP (Albert chose this over browser.py-only).
       - [x] S0 guard released 2026-10-11 (919da8f): 8 groups / 20 items read "⚠ account unproven"; logged-in/login exit 2 `identity_unproven`; -p/-c skip them.
-      - [ ] S1 broker identity (builder running).
+      - [x] S1 broker identity released 2026-10-11 (bea6b32, broker release bea6b327b2ed):
+            identity fields + recipes (gitlab, audiobookshelf live-confirmed; dsm/authentik refused
+            until confirmed), one-use pid-bound challenges, IdentityGuard lockouts, per-instance
+            conflicts; three security review rounds before release.
+      - [ ] S2+S3 client identity check, admin/alt instances, agent views (builder running).
+      - [ ] S4 vault fields (Albert's Touch ID), live confirmations, admin MCP config, then log in
+            the held-back group members.
       Original line: account identity (tp#833, hit 2026-10-10): 8 same-scope groups report ✅ for
       the wrong account; gitlab-sdsc-test passed while the browser was `albertadmin`.
       Plan → codex-debate → implement:
