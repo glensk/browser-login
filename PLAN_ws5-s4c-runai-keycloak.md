@@ -106,6 +106,20 @@ Verification is not strict-eligible on purpose: it needs the test suite, mypy an
       Also find a server-authenticated role artifact: a role claim in the token, or a
       fixed authenticated Run:ai roles endpoint. Write down why each approach that fails
       does so.
+- B1 findings 2026-10-11 (main session, Albert's Safari as runai-test3, value-free):
+  - The SPA's own refresh: `POST /api/v1/token` (same origin, JSON
+    `{"grantType":"refresh_token","clientID":"runai-admin-ui"}`; the HttpOnly
+    `refresh-token` cookie is path `/api/v1/token`) → 200 `{accessToken, idToken}`. The
+    access token is a JWT issued by Run:ai's own Keycloak (`iss` path `/auth/realms/sdsc` on
+    `app1.run.ai`, `azp` runai-admin-ui, `aud` [runai-dummy, runai]). Its `email`,
+    `preferred_username` and `sub` all equal the vault username. Fetched fresh from the
+    server in the isolated world, this is server-bound, like gitlab's `/api/v4/user`.
+  - With that bearer: `/api/v1/authorization/permissions` → 200 (44 entries: resourceType,
+    displayName, groupId, actions); `/api/v1/users/me` → 403; `/api/v1/authorization/access-rules`
+    → 403 for test3. Admin-bit candidate: a fixed admin-only endpoint (200 vs 403), or a
+    permission entry. Compare against runai-admin before fixing it.
+  - localStorage `logged-in-user-email` did NOT equal test3: it was left over from an earlier
+    login. This is live proof of Codex O3: the page claim was stale.
 - [ ] **Rules for any resulting recipe:**
       - **Who may use it:** it declares `allowed_sites`, an exact https origin and a fixed
         source, enforced by both the broker validation and the client proof.
