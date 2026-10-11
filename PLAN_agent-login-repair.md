@@ -249,7 +249,12 @@ manual acceptance steps under the attempt policy below.
             a grace period that resets on navigation; never click);
       - snapshot the challenge page at detection time;
       - no `fresh_login` for myfritz (it would drop CLOUD_SSO_DEVICE).
-    - [ ] Albert: merge the Alzenau box into the gmail MyFRITZ account? (asked 2026-10-10)
+    - [ ] Albert decided 2026-10-11: MERGE the Alzenau box into the gmail MyFRITZ account,
+          then remove `myfritz-alzenau` and keep one `myfritz` site. Waits on the box
+          re-registration (FRITZ!Box UI → Internet → MyFRITZ!-Konto) plus the confirmation
+          mail in Gmail, which the main session can click.
+    - [x] Albert decided 2026-10-11: MyFRITZ is on-demand (10 h Keycloak session). The
+          scheduled check shows it as "on demand", not ❌; agents log in when they need it.
 - [ ] WS5 — account identity (tp#833, hit 2026-10-10): 8 same-scope groups report ✅ for
       the wrong account; gitlab-sdsc-test passed while the browser was `albertadmin`.
       Plan → codex-debate → implement:
