@@ -365,9 +365,9 @@ value.
     "logged out" and logs in normally (its verify is the second challenge, blocked by the
     guard's cooldown right after a mismatch → recorded as unknown).
     `privilege_mismatch`, `identity_indeterminate`, `identity_blocked`, `rate_limited`
-    stop a login before any broker request (`IDENTITY_STOP_CODES`). Known gap: a foreign
-    session held in localStorage (the audiobookshelf bearer token) is NOT cleared by
-    cookies alone — its next check re-mismatches until a login overwrites the token.
+    stop a login before any broker request (`IDENTITY_STOP_CODES`). The former gap (a
+    foreign session held in localStorage, the audiobookshelf bearer token, survived the
+    cookie clear) is closed by S4a below.
   - **Pinned runs** (review rounds 1–2, B1/SF3): ANY `--cdp-port` on the command line
     pins the run (`_self_run` always passes one); a routed re-run refuses a port that is
     not its instance's; `_instance_gate` compares the PORT too: a port of ANOTHER known
@@ -461,8 +461,58 @@ value.
 - [ ] Per pair: one positive proof in the item's own instance, and one wrong-sibling proof
       (the recipe in instance A against item B's challenge must answer `mismatch`). Free
       probes otherwise; a login only under the attempt policy.
-- [ ] navidrome / runai / custos-admin endpoints: confirm at their WS2 candidate logins.
-      Until then those groups stay `identity_unproven`.
+- [ ] runai / custos-admin endpoints: confirm at their WS2 candidate logins. Until then
+      those groups stay `identity_unproven`. (navidrome: confirmed live 2026-10-11, S4a.)
+- [x] **S4a** built 2026-10-11 (worktree, not yet released; BROKER + client:
+      `broker/identity.py` changes what the broker accepts and proves, so `install.sh`):
+  - **`navidrome` recipe** (`live_confirmed`): auth `jwt-local-storage` — localStorage
+    `token` is a JWT; its payload (base64url, no signature check, the server validates)
+    gives `uid`, which must be 1–128 of `[A-Za-z0-9_-]` (else indeterminate, nothing
+    sent); `GET /api/user/<uid>` at the origin root with `x-nd-authorization: Bearer
+    <token>`; the record's `id` must equal `uid` (an admin token reads any user →
+    `why: claim`, indeterminate); `userName` compared, `isAdmin` boolean (any other
+    type: no admin bit → indeterminate); no token / 401 / 403 → `logged_out`; a
+    malformed token → `why: token`. Forms: username.
+  - **RECIPE_JS generalised minimally**: `auth_header` + `auth_scheme` (ABS keeps
+    `Authorization: Bearer …`), `path_claim` (one JWT claim as the last path segment),
+    `claim_field` (the record's own id). The broker (`daemon.evaluate_isolated`) and the
+    client (`browser._evaluate_isolated`) run the same function; the new test file runs
+    every case through both.
+  - **Reviewed-spec validation**: `IdentityRecipe.__post_init__` → `recipe_problem`
+    (known auth, one absolute path, plain field keys, a token key and a settable header
+    — not a forbidden / `Sec-` / `Proxy-` / Accept header — for localStorage auths, a
+    claim only with jwt auth + `claim_field` + a path ending in `/`). A malformed
+    table entry fails at import.
+  - **Foreign clear covers storage** (`_broker_clear_foreign`): for an item whose
+    recipe reads from localStorage (`identity.LOCAL_STORAGE_AUTHS`), also the item's
+    declared `storage_keys` on its check / fill origins, and the recipe's `token_key`
+    on the CHECK origin only (a fill origin may be a shared SSO provider;
+    `identity.foreign_storage_keys`); registered first, then the interaction lease
+    (gate before lease, as `reap-owned`); one fresh owned background tab per origin
+    whose SW / cache bypass must apply (`_broker_bypass_cache` now returns whether it
+    did; False → nothing loaded, not cleared) and whose own route serves a blank
+    document of that origin carrying a per-call nonce (the app never runs, nothing
+    reaches the site, every other request aborted); in an isolated world, removal by
+    name only when the nonce is there and `navigator.serviceWorker.controller` is
+    null (else nothing: a PWA worker answered — `not our document` / `a service worker
+    controls the page`), confirmed by read-back. `_RESULT.foreign_storage_cleared`
+    (count, None on failure), message "foreign session cleared (N cookie(s) and K
+    storage key(s) in this browser; the broker's profile untouched)"; an unconfirmed
+    origin → "could NOT be cleared (storage: … : <reason>)". Another open tab of the
+    app may write its token back later: "cleared" holds at read-back time (fail
+    safe). Cookie-auth items keep the old message and behaviour. (Review S4b fixes.)
+  - Tests: `tests/test_ws5_navidrome.py` (spec validation, `foreign_storage_keys`,
+    RECIPE_JS in a throwaway Chromium through both evaluators: match / mismatch / admin
+    true-false-other / id≠uid / missing + garbage tokens and claims / 401 / 403 / 5xx /
+    non-JSON / a page hooking fetch, Response.json, JSON.parse, atob, crypto.subtle /
+    another origin) and `tests/test_ws5_client_s2.py` (ABS + Navidrome proven end to end
+    through the real broker; a foreign session cleared by one check — cookies, declared
+    keys, token — with an undeclared key and another origin's storage untouched, the
+    clear tab never loading the site; the next check sends no challenge; a registered
+    PWA service worker answering the clear tab → nothing cleared, reported; the real
+    `_broker_clear_foreign_storage` against a disposable Chromium attached with
+    `connect_over_cdp` (default context, owned tabs, registry, lease), with and
+    without an installed worker).
 - [ ] Update README (item fields, "Accounts that share a site", instances), AGENTS.md
       (invariant: one account per conflict group per instance; a multi-account item passes
       only with the server identity proof; values never leave page or broker) and the

@@ -10353,7 +10353,7 @@ def _with_background_page(port: int, url: str, fn: Callable[[Any], Any]) -> Any:
 def _with_prepared_background_page(
     port: int,
     url: str,
-    prepare: Callable[[Any], None],
+    prepare: Callable[[Any], object],
     fn: Callable[[Any], Any],
 ) -> Any:
     """`_with_background_page`, but ``prepare(page)`` runs BEFORE `url` loads.
@@ -10379,7 +10379,7 @@ def _probe_status(page: Any) -> object:
 def _background_page_run(
     port: int,
     url: str,
-    prepare: Callable[[Any], None] | None,
+    prepare: Callable[[Any], object] | None,
     fn: Callable[[Any], Any],
 ) -> Any:
     """Shared body of the background-page helpers (None on any failure).
@@ -10804,7 +10804,7 @@ def _marker_target(port: int, marker: str) -> str | None:
 
 @contextlib.contextmanager
 def _owned_background_page(
-    port: int, *, prepare: Callable[[Any], None] | None = None
+    port: int, *, prepare: Callable[[Any], object] | None = None
 ) -> Iterator[Any]:
     """A fresh BACKGROUND tab this process owns, adopted by Playwright (tp#845).
 
@@ -11426,17 +11426,22 @@ def _broker_note_session_left(page, entry: dict) -> None:
 _BG_NOCACHE: dict[int, Any] = {}
 
 
-def _broker_bypass_cache(page) -> None:
+def _broker_bypass_cache(page) -> bool:
     """Make `page` ignore the HTTP cache and any service worker
     (``Network.setCacheDisabled`` / ``setBypassServiceWorker`` need
     ``Network.enable`` on the same session): a worker can serve a stale app
-    shell too. Best effort: without it the tab still works, only cached."""
-    with contextlib.suppress(Exception):
+    shell too. Best effort: without it the tab still works, only cached —
+    True when every setting was applied (a caller that must not meet a
+    service worker fails closed on False)."""
+    try:
         session = page.context.new_cdp_session(page)
         _BG_NOCACHE[id(page)] = session
         session.send("Network.enable")
         session.send("Network.setCacheDisabled", {"cacheDisabled": True})
         session.send("Network.setBypassServiceWorker", {"bypass": True})
+    except Exception:  # pylint: disable=broad-exception-caught
+        return False
+    return True
 
 
 def _proof_origins(entry: dict) -> list[str]:
@@ -11634,6 +11639,8 @@ _IDENTITY_WHY = frozenset(
         "deadline",
         "error",
         "no token",
+        "token",
+        "claim",
     }
 )
 # A challenge the broker refused → the client's code (default: indeterminate).
@@ -12916,24 +12923,178 @@ def _broker_clear_foreign(port: int, site: str, entry: dict) -> str:
     """The identity proof found ANOTHER account's session in THIS browser:
     delete it here at once — the item's cookies on its cookie hosts and
     their subdomains, its `cookie_names` only when it has them (as `logout`
-    does); never storage, never the broker's profile (that holds the RIGHT
+    does); for an item whose recipe authenticates from localStorage (ABS,
+    Navidrome) also its storage keys on its check / fill origins
+    (`identity.foreign_storage_keys`, `_broker_clear_foreign_storage`);
+    never anything else, never the broker's profile (that holds the RIGHT
     account). No sibling may live in this instance (the broker refuses two
     accounts of one site per instance), so such a session is always
     foreign. The next check then sees no sentinel: no further challenge, no
     further mismatch for the broker's guard. Not a login: no gate applies.
-    Returns the message suffix (fixed words and a count)."""
+    Returns the message suffix (fixed words and counts)."""
+    plan = _identity.foreign_storage_keys(entry)
+    failed: list[str] = []
+    gone: int | None = None
     try:
         gone = _broker_clear_cookies(
             port, site, entry, _item_cookie_names(entry), why="clear-foreign"
         )
     except Exception as exc:  # pylint: disable=broad-exception-caught
-        _result_set(foreign_cleared=None)
-        return f" — the foreign session could NOT be cleared ({type(exc).__name__})"
+        failed.append(type(exc).__name__)
     _result_set(foreign_cleared=gone)
+    if not plan:
+        if failed:
+            return f" — the foreign session could NOT be cleared ({failed[0]})"
+        return (
+            f" — foreign session cleared ({gone} cookie(s) in this browser; storage "
+            "and the broker's profile untouched)"
+        )
+    keys: int | None = None
+    try:
+        keys = _broker_clear_foreign_storage(port, site, plan)
+    except Exception as exc:  # pylint: disable=broad-exception-caught
+        why = exc if isinstance(exc, ForeignStorageError) else type(exc).__name__
+        failed.append(f"storage: {why}")
+    _result_set(foreign_storage_cleared=keys)
+    if failed:
+        return f" — the foreign session could NOT be cleared ({'; '.join(failed)})"
     return (
-        f" — foreign session cleared ({gone} cookie(s) in this browser; storage "
-        "and the broker's profile untouched)"
+        f" — foreign session cleared ({gone} cookie(s) and {keys} storage key(s) "
+        "in this browser; the broker's profile untouched)"
     )
+
+
+class ForeignStorageError(RuntimeError):
+    """A foreign session's storage keys could not be confirmed gone (the
+    message is fixed words and counts)."""
+
+
+# The clear tab's document: served by the tab's own route (no request reaches
+# the site, no app code runs that could write its token back). It carries a
+# fresh nonce per call: the clear runs only in a document that proves it is
+# this one — never in an app shell a service worker answered instead.
+FOREIGN_CLEAR_META = "agent-login-clear"
+
+
+def _foreign_clear_doc(nonce: str) -> str:
+    """The clear tab's blank document, marked with `nonce` (hex)."""
+    return (
+        f'<!doctype html><meta name="{FOREIGN_CLEAR_META}" content="{nonce}">'
+        "<title>clear</title>"
+    )
+
+
+# Run in an isolated world of the clear tab (`_evaluate_isolated`): only in
+# OUR document (the nonce) with no service worker controlling it, remove
+# `keys` from the origin's localStorage. How many were there; -2 not our
+# document, -3 a controlling service worker, -1 a key still present after.
+# Names and the nonce in, a count out.
+_FOREIGN_CLEAR_JS = (
+    "([nonce, keys]) => {"
+    f" const m = document.querySelector('meta[name=\"{FOREIGN_CLEAR_META}\"]');"
+    " if (!m || m.getAttribute('content') !== nonce) return -2;"
+    " if (navigator.serviceWorker && navigator.serviceWorker.controller) return -3;"
+    " let n = 0;"
+    " for (const k of keys) if (localStorage.getItem(k) !== null)"
+    " { localStorage.removeItem(k); n++; }"
+    " return keys.every(k => localStorage.getItem(k) === null) ? n : -1; }"
+)
+# Why an origin was not cleared (fixed words for the message).
+_FOREIGN_CLEAR_WHY = {
+    -1: "keys remain",
+    -2: "not our document",
+    -3: "a service worker controls the page",
+}
+
+
+def _foreign_clear_route(route: Any, url: str, nonce: str) -> None:
+    """The clear tab's route: its own navigation to `url` gets the blank
+    document of that origin marked with `nonce`, every other request is
+    aborted."""
+    req = route.request
+    if req.url == url and req.is_navigation_request():
+        route.fulfill(
+            status=200, content_type="text/html", body=_foreign_clear_doc(nonce)
+        )
+    else:
+        route.abort()
+
+
+def _foreign_clear_origin(port: int, origin: str, keys: Sequence[str]) -> int | str:
+    """`_broker_clear_foreign_storage` for ONE origin: the count of keys
+    removed, or why nothing was (fixed words). Fails closed: no service
+    worker bypass for this tab, a page that is not our nonce-marked
+    document (a worker or anything else answered the navigation), or a
+    controlling worker → nothing is removed."""
+    url = f"{origin}/"
+    nonce = secrets.token_hex(16)
+    why: dict[str, str] = {}
+
+    def prepare(page: Any) -> None:
+        if not _broker_bypass_cache(page):
+            why["why"] = "service worker bypass not applied"
+            raise ForeignStorageError(why["why"])
+
+        def handle(route: Any) -> None:  # one parameter: no request arg
+            _foreign_clear_route(route, url, nonce)
+
+        page.route("**/*", handle)
+
+    def drop(page: Any) -> int | None:
+        if _url_origin(page.url) != origin:
+            why["why"] = "the tab left the origin"
+            return None
+        n = _evaluate_isolated(page, _FOREIGN_CLEAR_JS, [nonce, list(keys)])
+        if isinstance(n, int) and not isinstance(n, bool) and n >= 0:
+            return n
+        why["why"] = (
+            _FOREIGN_CLEAR_WHY.get(n, "no answer")
+            if isinstance(n, int)
+            else "no answer"
+        )
+        return None
+
+    got = _with_prepared_background_page(port, url, prepare, drop)
+    if isinstance(got, int) and not isinstance(got, bool):
+        return got
+    return why.get("why", "the clear tab failed")
+
+
+def _broker_clear_foreign_storage(
+    port: int, site: str, plan: Mapping[str, Sequence[str]]
+) -> int:
+    """Delete a foreign session's localStorage keys (`plan`: ``{origin:
+    keys}``, from `identity.foreign_storage_keys`) in THIS browser —
+    registered first (the gate), then under the interaction lease (gate
+    before lease, as `reap-owned`): per origin one fresh owned background
+    tab that bypasses the service worker and cache and is served a blank,
+    nonce-marked document of that origin by its own route — the site's app
+    never runs there, so it cannot write its token back, and nothing is sent
+    to the site (`_foreign_clear_origin`). Only the named keys go (no
+    `Storage.clearDataForOrigin`: other keys, IndexedDB and other origins
+    stay). Another open tab of the same app may still write its token back
+    later: "cleared" holds at read-back time. Returns how many keys were
+    present and removed; raises `ForeignStorageError` when an origin could
+    not be confirmed clean."""
+    removed = 0
+    failed: list[str] = []
+    release = _registry_register("browser.py", _purpose(), port)
+    try:
+        with _interaction_lease(f"clear-foreign {site}"):
+            for origin, keys in plan.items():
+                got = _foreign_clear_origin(port, origin, keys)
+                if isinstance(got, int):
+                    removed += got
+                else:
+                    failed.append(got)
+    finally:
+        release()
+    if failed:
+        raise ForeignStorageError(
+            f"{len(failed)} of {len(plan)} origin(s) not confirmed clean: "
+            + ", ".join(sorted(set(failed)))
+        )
+    return removed
 
 
 # ---------------------------------------------------------------------------

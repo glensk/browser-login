@@ -15,16 +15,20 @@ from __future__ import annotations
 # pylint: disable=import-error,wrong-import-position,redefined-outer-name
 # pylint: disable=too-many-lines  # one file: the client proof end to end
 import argparse
+import base64
 import contextlib
 import importlib.util
 import json
 import os
 import secrets
 import shutil
+import socket
+import subprocess
 import sys
 import tempfile
 import threading
 import time
+import urllib.request
 from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
@@ -1060,3 +1064,510 @@ def test_a_guided_login_never_runs_ungated(
     down = browser.GuidedRequest("gl-glensk")
     assert browser._assisted_precheck(None, 9222, down) == 2
     assert "cannot confirm its browser instance" in capsys.readouterr().err
+
+
+# ---------------------------------------------------------------------------
+# Storage-token sites (audiobookshelf, navidrome): the proof end to end, and a
+# foreign session's localStorage token cleared by the check
+# ---------------------------------------------------------------------------
+
+ABS = "https://abs.ws5c.example"
+ND = "https://music.ws5c.example"
+ELSEWHERE = "https://elsewhere.ws5c.example"
+# Per recipe: origin, check URL, the item's declared storage keys (Navidrome
+# stores eight, see tests/test_storage_inject_rewrite.py; three suffice here).
+_STORAGE_SITES = {
+    "audiobookshelf": (ABS, f"{ABS}/audiobookshelf/library", ["token"]),
+    "navidrome": (ND, f"{ND}/app/", ["token", "userId", "subsonic-token"]),
+}
+# The app shell shows the sentinel while it holds a token, its login form
+# otherwise.
+_APP_DOC = (
+    "<div id=app></div><script>document.getElementById('app').innerHTML ="
+    " localStorage.getItem('token') ? '<p id=me>hi</p>' : '<p>log in</p>';"
+    "</script>"
+)
+
+
+# A PWA's service worker: it answers every navigation of its origin with the
+# app shell (which would run the app, send the token and write it back).
+_APP_SW = """
+self.addEventListener('install', e => self.skipWaiting());
+self.addEventListener('activate', e => e.waitUntil(clients.claim()));
+self.addEventListener('fetch', e => {
+  if (e.request.mode === 'navigate')
+    e.respondWith(new Response('<p id=shell>app shell</p>',
+      {headers: {'content-type': 'text/html'}}));
+});
+"""
+
+
+def _register_sw(ctx: Any, origin: str) -> None:
+    """Install `_APP_SW` on `origin`; it controls every later page there."""
+    page = ctx.new_page()
+    try:
+        page.goto(f"{origin}/elsewhere")
+        page.evaluate(
+            "async () => { await navigator.serviceWorker.register('/sw.js');"
+            " await navigator.serviceWorker.ready; }"
+        )
+    finally:
+        page.close()
+    check = ctx.new_page()
+    try:
+        check.goto(f"{origin}/elsewhere")
+        assert check.evaluate("() => !!navigator.serviceWorker.controller")
+    finally:
+        check.close()
+
+
+def _b64url(raw: bytes) -> str:
+    return base64.urlsafe_b64encode(raw).rstrip(b"=").decode("ascii")
+
+
+def _storage_pair(recipe: str, user: str, root: str) -> list[dict]:
+    """The default member and the admin of one storage-token site."""
+    origin, check, keys = _STORAGE_SITES[recipe]
+    common = {
+        "fill_origins": origin,
+        "check_url": check,
+        "cookie_hosts": origin.split("://", 1)[1],
+        "storage_keys": json.dumps({origin: keys}),
+        "identity": recipe,
+    }
+    return [
+        _raw(f"{recipe}-user", user, privilege="user", **common),
+        _raw(f"{recipe}-root", root, instance="admin", privilege="admin", **common),
+    ]
+
+
+class _StorageApp:
+    """The fixture apps: session tokens → (account name, admin, uid); ABS
+    answers /audiobookshelf/api/me for its Bearer token, Navidrome
+    /api/user/<uid> for its x-nd-authorization header (the token is a JWT
+    built at run time)."""
+
+    def __init__(self) -> None:
+        self.accounts: dict[str, tuple[str, bool, str]] = {}
+        self.api_calls = 0
+        self.docs: list[str] = []
+
+    def session(self, name: str, admin: bool, recipe: str) -> str:
+        uid = secrets.token_hex(8)
+        if recipe == "navidrome":
+            parts = [{"alg": "HS256"}, {"uid": uid, "sub": "x", "iss": "ND"}]
+            token = ".".join(
+                [*(_b64url(json.dumps(p).encode()) for p in parts)]
+                + [_b64url(secrets.token_bytes(16))]
+            )
+        else:
+            token = secrets.token_hex(16)
+        self.accounts[token] = (name, admin, uid)
+        return token
+
+    def handle(self, route: Any) -> None:
+        req = route.request
+        if req.resource_type == "document":
+            self.docs.append(req.url)
+            body = "<p>elsewhere</p>" if req.url.startswith(ELSEWHERE) else _APP_DOC
+            route.fulfill(status=200, content_type="text/html", body=body)
+            return
+        if req.url.endswith("/sw.js"):
+            route.fulfill(status=200, content_type="text/javascript", body=_APP_SW)
+            return
+        self.api_calls += 1
+        sent = req.headers.get("authorization") or req.headers.get("x-nd-authorization")
+        token = (sent or "").removeprefix("Bearer ")
+        if token not in self.accounts:
+            route.fulfill(status=401, content_type="application/json", body="{}")
+            return
+        name, admin, uid = self.accounts[token]
+        if req.url.startswith(ND):
+            record: dict = {"id": uid, "userName": name, "isAdmin": admin}
+        else:
+            record = {"username": name, "type": "root" if admin else "user"}
+        route.fulfill(
+            status=200, content_type="application/json", body=json.dumps(record)
+        )
+
+
+@pytest.fixture
+def storage_chrome(
+    monkeypatch: pytest.MonkeyPatch,
+) -> Iterator[tuple[Any, _StorageApp]]:
+    """A throwaway headless Chromium standing in for THIS browser: every
+    background tab (`_with_prepared_background_page`) is a fresh page of its
+    one context — `prepare` first, then the URL, then `fn`, None on any
+    failure like the real helper — and the cookie clear's `_connect` reaches
+    the same context."""
+    from playwright.sync_api import (  # pylint: disable=import-outside-toplevel
+        sync_playwright,
+    )
+
+    app = _StorageApp()
+    with sync_playwright() as pw:
+        chromium = pw.chromium.launch(headless=True)
+        try:
+            ctx = chromium.new_context()
+            ctx.route("**/*", app.handle)
+
+            def tab(_port: int, url: str, prepare: Any, fn: Any) -> Any:
+                page = ctx.new_page()
+                try:
+                    if prepare is not None:
+                        prepare(page)
+                    resp = page.goto(url)
+                    browser._BG_STATUS[id(page)] = getattr(resp, "status", None)
+                    return fn(page)
+                except Exception:  # pylint: disable=broad-exception-caught
+                    return None
+                finally:
+                    browser._BG_STATUS.pop(id(page), None)
+                    browser._BG_NOCACHE.pop(id(page), None)
+                    page.close()
+
+            class _Browser:
+                contexts = [ctx]
+
+                def close(self) -> None:
+                    pass
+
+            class _Pw:
+                def stop(self) -> None:
+                    pass
+
+            monkeypatch.setattr(browser, "_with_prepared_background_page", tab)
+            monkeypatch.setattr(browser, "_broker_note_session_age", lambda *_a: None)
+            monkeypatch.setattr(browser, "_connect", lambda _port: (_Pw(), _Browser()))
+            yield ctx, app
+        finally:
+            chromium.close()
+
+
+def _set_storage(ctx: Any, origin: str, kv: dict[str, str]) -> None:
+    page = ctx.new_page()
+    try:
+        page.goto(f"{origin}/elsewhere")
+        page.evaluate(
+            "kv => { for (const [k, v] of Object.entries(kv))"
+            " localStorage.setItem(k, v); }",
+            kv,
+        )
+    finally:
+        page.close()
+
+
+def _storage(ctx: Any, origin: str) -> dict[str, str]:
+    page = ctx.new_page()
+    try:
+        page.goto(f"{origin}/elsewhere")
+        return dict(page.evaluate("() => Object.assign({}, localStorage)"))
+    finally:
+        page.close()
+
+
+@pytest.mark.launches_chrome
+@CHROME
+@pytest.mark.parametrize("recipe", sorted(_STORAGE_SITES))
+def test_a_storage_token_session_is_proven(
+    storage_chrome: tuple[Any, _StorageApp],
+    make_broker: Any,
+    result_file: Path,
+    recipe: str,
+) -> None:
+    ctx, app = storage_chrome
+    user, root = _user(), _user()
+    make_broker(_storage_pair(recipe, user, root))
+    _set_storage(
+        ctx, _STORAGE_SITES[recipe][0], {"token": app.session(user, False, recipe)}
+    )
+    assert browser._broker_logged_in(9222, f"{recipe}-user") == 0
+    rec = _record(result_file, 0)
+    assert rec["identity"] == "match" and app.api_calls == 1
+
+
+@pytest.mark.launches_chrome
+@CHROME
+@pytest.mark.parametrize("recipe", sorted(_STORAGE_SITES))
+def test_a_foreign_storage_token_session_is_cleared_by_one_check(
+    storage_chrome: tuple[Any, _StorageApp],
+    make_broker: Any,
+    result_file: Path,
+    capsys: pytest.CaptureFixture[str],
+    recipe: str,
+) -> None:
+    """The admin's session (its token in localStorage) sits in the default
+    browser: the check says wrong_account and clears the item's declared
+    keys + the recipe's token key on its origins, and its cookies; another
+    origin's storage and an undeclared key stay. The next check sees no
+    sentinel: no challenge, no further mismatch."""
+    ctx, app = storage_chrome
+    user, root = _user(), _user()
+    fake = make_broker(_storage_pair(recipe, user, root))
+    origin, _check, keys = _STORAGE_SITES[recipe]
+    host = origin.split("://", 1)[1]
+    foreign = {k: secrets.token_hex(6) for k in keys}
+    foreign["token"] = app.session(root, True, recipe)
+    keep = secrets.token_hex(6)
+    _set_storage(ctx, origin, {**foreign, "keep": keep})
+    _set_storage(ctx, ELSEWHERE, {"token": keep})
+    ctx.add_cookies(
+        [{"name": "sid", "value": secrets.token_hex(8), "domain": host, "path": "/"}]
+    )
+    site = f"{recipe}-user"
+    assert browser._broker_logged_in(9222, site) == 2
+    rec = _record(result_file, 2)
+    assert (rec["phase"], rec["code"]) == ("client-proof", "wrong_account")
+    assert rec["foreign_cleared"] == 1
+    assert rec["foreign_storage_cleared"] == len(keys)
+    err = capsys.readouterr().err
+    assert f"cleared (1 cookie(s) and {len(keys)} storage key(s)" in err
+    assert root not in err and user not in err and foreign["token"] not in err
+    assert _storage(ctx, origin) == {"keep": keep}  # an undeclared key stays
+    assert _storage(ctx, ELSEWHERE) == {"token": keep}  # another origin: untouched
+    assert not [c for c in ctx.cookies() if c["domain"].endswith(host)]
+    # the clear tab's blank document never came from the site, no API call
+    assert f"{origin}/" not in app.docs and app.api_calls == 1
+    assert _guard_mismatches(fake, site) == 1
+    # the next check: logged out, no challenge
+    browser._result_begin("logged-in", site, str(result_file))
+    assert browser._broker_logged_in(9222, site) == 2
+    assert _record(result_file, 2)["code"] == "logged_out"
+    assert fake.op_names().count("identity_challenge") == 1
+    assert _guard_mismatches(fake, site) == 1 and app.api_calls == 1
+
+
+def test_a_storage_clear_that_cannot_be_confirmed_says_so(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A clear tab that did not end on the origin (or failed) is no clear."""
+    monkeypatch.setattr(browser, "_broker_clear_cookies", lambda *_a, **_k: 0)
+    monkeypatch.setattr(
+        browser, "_with_prepared_background_page", lambda *_a, **_k: None
+    )
+    origin, check, keys = _STORAGE_SITES["navidrome"]
+    entry = {
+        "site": "navidrome-user",
+        "identity": "navidrome",
+        "check_url": check,
+        "fill_origins": [origin],
+        "storage_keys": {origin: keys},
+    }
+    said = browser._broker_clear_foreign(9222, "navidrome-user", entry)
+    assert "could NOT be cleared (storage: 1 of 1 origin(s) not confirmed" in said
+    assert browser._RESULT["foreign_storage_cleared"] is None
+    assert browser._RESULT["foreign_cleared"] == 0
+
+
+def _nd_entry() -> dict:
+    origin, check, keys = _STORAGE_SITES["navidrome"]
+    return {
+        "site": "navidrome-user",
+        "identity": "navidrome",
+        "check_url": check,
+        "fill_origins": [origin],
+        "cookie_hosts": [origin.split("://", 1)[1]],
+        "storage_keys": {origin: keys},
+    }
+
+
+@pytest.mark.launches_chrome
+@CHROME
+@pytest.mark.parametrize(
+    ("bypass", "why"),
+    [
+        # the setting "applied" but a worker still answers: not our document
+        ("ineffective", "not our document"),
+        # the setting could not be applied for this tab: nothing is loaded
+        ("failed", "service worker bypass not applied"),
+    ],
+)
+def test_a_service_worker_answering_the_clear_tab_clears_nothing(
+    storage_chrome: tuple[Any, _StorageApp],
+    monkeypatch: pytest.MonkeyPatch,
+    bypass: str,
+    why: str,
+) -> None:
+    """A PWA worker serves the app shell instead of the clear tab's own
+    document: the app would run, send the foreign token and write it back.
+    The clear proves its nonce-marked document (and no controlling worker)
+    before removing anything — else it clears nothing and says so."""
+    ctx, _app = storage_chrome
+    _register_sw(ctx, ND)
+    token = secrets.token_hex(12)
+    _set_storage(ctx, ND, {"token": token, "userId": "u1"})
+    monkeypatch.setattr(browser, "_broker_bypass_cache", lambda _p: bypass != "failed")
+    said = browser._broker_clear_foreign(9222, "navidrome-user", _nd_entry())
+    assert "could NOT be cleared (storage: 1 of 1 origin(s)" in said and why in said
+    assert browser._RESULT["foreign_storage_cleared"] is None
+    assert _storage(ctx, ND) == {"token": token, "userId": "u1"}
+
+
+@pytest.mark.launches_chrome
+@CHROME
+def test_the_bypass_keeps_a_service_worker_out_of_the_clear_tab(
+    storage_chrome: tuple[Any, _StorageApp],
+) -> None:
+    """With the real bypass the clear tab gets its own document despite a
+    registered worker, and clears."""
+    ctx, _app = storage_chrome
+    _register_sw(ctx, ND)
+    _set_storage(ctx, ND, {"token": secrets.token_hex(12), "keep": "k"})
+    said = browser._broker_clear_foreign(9222, "navidrome-user", _nd_entry())
+    assert "and 1 storage key(s)" in said
+    assert _storage(ctx, ND) == {"keep": "k"}
+
+
+# ---------------------------------------------------------------------------
+# The clear in production shape: a disposable Chromium attached over CDP
+# (connect_over_cdp, its default context), real owned tabs, registry, lease
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def cdp_chromium(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> Iterator[tuple[int, Any]]:
+    """A throwaway headless Chromium with a DevTools port (never 9222-9225)
+    and every coordination file of browser.py in `tmp_path`; yields
+    (port, a seeding helper that runs `fn(page)` on a routed page of the
+    default context)."""
+    from playwright.sync_api import (  # pylint: disable=import-outside-toplevel
+        sync_playwright,
+    )
+
+    files = {
+        "CACHE_DIR": "",
+        "LIFECYCLE_FILE": ".browser-lifecycle.json",
+        "CLIENTS_DIR": "clients",
+        "REGISTRY_GATE": "clients/.registry.lock",
+        "INTERACTION_LOCK": "interaction.lock",
+        "MAINTENANCE_FILE": "maintenance.json",
+        "MAINTENANCE_LOCK": ".maintenance.lock",
+    }
+    for name, rel in files.items():
+        monkeypatch.setattr(browser, name, tmp_path / rel if rel else tmp_path)
+    monkeypatch.setenv("CLAUDE_BROWSER_CACHE_DIR", str(tmp_path))
+    monkeypatch.delenv("CLAUDE_BROWSER_LEASE_HELD", raising=False)
+    with socket.socket() as s:
+        s.bind(("127.0.0.1", 0))
+        port = int(s.getsockname()[1])
+    assert port not in browser.INSTANCE_PORTS.values()
+    with sync_playwright() as pw:
+        exe = pw.chromium.executable_path
+    proc = subprocess.Popen(  # pylint: disable=consider-using-with
+        [
+            exe,
+            "--headless=new",
+            f"--remote-debugging-port={port}",
+            f"--user-data-dir={tmp_path / 'profile'}",
+            "--no-first-run",
+            "--no-default-browser-check",
+            "about:blank",
+        ],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    try:
+        deadline = time.monotonic() + 20
+        while True:
+            try:
+                with urllib.request.urlopen(
+                    f"http://127.0.0.1:{port}/json/version", timeout=1
+                ):
+                    break
+            except OSError:
+                assert time.monotonic() < deadline, "disposable Chromium did not start"
+                time.sleep(0.1)
+
+        def seed_doc(route: Any) -> None:
+            if route.request.url.endswith("/sw.js"):
+                route.fulfill(status=200, content_type="text/javascript", body=_APP_SW)
+            else:
+                route.fulfill(status=200, content_type="text/html", body="<p>seed</p>")
+
+        def on_page(url: str, fn: Any) -> Any:
+            with sync_playwright() as pw2:
+                attached = pw2.chromium.connect_over_cdp(f"http://127.0.0.1:{port}")
+                try:
+                    ctx = attached.contexts[0]
+                    ctx.route("**/*", seed_doc)
+                    page = ctx.new_page()
+                    page.goto(url)
+                    try:
+                        return fn(page)
+                    finally:
+                        page.close()
+                finally:
+                    attached.close()  # disconnects; the browser keeps running
+
+        yield port, on_page
+    finally:
+        proc.terminate()
+        try:
+            proc.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait(timeout=10)
+
+
+@pytest.mark.launches_chrome
+@CHROME
+def test_the_clear_route_works_over_connect_over_cdp(
+    cdp_chromium: tuple[int, Any],
+) -> None:
+    """The real `_broker_clear_foreign_storage` against a Chromium attached
+    the way production attaches (connect_over_cdp, default context): it
+    removes only the planned keys of the planned origin, through an owned
+    tab that is gone afterwards."""
+    port, on_page = cdp_chromium
+    seed = (
+        "kv => { for (const [k, v] of Object.entries(kv)) localStorage.setItem(k, v); }"
+    )
+    read = "() => Object.assign({}, localStorage)"
+    token = secrets.token_hex(12)
+    on_page(
+        f"{ND}/x",
+        lambda p: p.evaluate(seed, {"token": token, "userId": "u", "keep": "k"}),
+    )
+    on_page(f"{ELSEWHERE}/x", lambda p: p.evaluate(seed, {"token": token}))
+    plan = {ND: ["token", "userId", "subsonic-token"]}
+    assert browser._broker_clear_foreign_storage(port, "navidrome-user", plan) == 2
+    assert on_page(f"{ND}/x", lambda p: p.evaluate(read)) == {"keep": "k"}
+    assert on_page(f"{ELSEWHERE}/x", lambda p: p.evaluate(read)) == {"token": token}
+    assert not [
+        t
+        for t in browser._page_targets(port)
+        if str(t.get("url", "")).startswith(browser.OWNED_MARKER_PREFIX)
+        or str(t.get("url", "")).startswith(ND)
+    ]
+
+
+@pytest.mark.launches_chrome
+@CHROME
+def test_over_cdp_a_service_worker_is_bypassed_or_nothing_is_cleared(
+    cdp_chromium: tuple[int, Any], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Production attach, a PWA worker installed on the origin: the real
+    bypass keeps it out of the clear tab (cleared); a bypass that does not
+    take effect lets the worker answer — the nonce is missing, nothing is
+    cleared, and the clear says so."""
+    port, on_page = cdp_chromium
+    seed = (
+        "kv => { for (const [k, v] of Object.entries(kv)) localStorage.setItem(k, v); }"
+    )
+    register = (
+        "async () => { await navigator.serviceWorker.register('/sw.js');"
+        " await navigator.serviceWorker.ready; }"
+    )
+    read = "() => Object.assign({}, localStorage)"
+    on_page(f"{ND}/x", lambda p: p.evaluate(register))
+    assert "app shell" in on_page(f"{ND}/x", lambda p: p.content())
+    plan = {ND: ["token"]}
+    on_page(f"{ND}/x", lambda p: p.evaluate(seed, {"token": "a"}))
+    assert browser._broker_clear_foreign_storage(port, "navidrome-user", plan) == 1
+    on_page(f"{ND}/x", lambda p: p.evaluate(seed, {"token": "b"}))
+    monkeypatch.setattr(browser, "_broker_bypass_cache", lambda _p: True)
+    with pytest.raises(browser.ForeignStorageError, match="not our document"):
+        browser._broker_clear_foreign_storage(port, "navidrome-user", plan)
+    assert on_page(f"{ND}/x", lambda p: p.evaluate(read)) == {"token": "b"}

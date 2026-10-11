@@ -286,8 +286,19 @@ framework. It is a **provider**: other repos depend on it, not the reverse. See
   ANY `--cdp-port`, or a port that is not the instance's); `logout` and
   `assisted-login` refuse the same way. A `logged-in` that finds a foreign
   account's session in an item's instance (`wrong_account`) clears it at once —
-  the item's cookies only (its cookie hosts and subdomains, its `cookie_names`),
-  never storage or the broker's profile; the next login then starts logged out. A multi-account item
+  the item's cookies (its cookie hosts and subdomains, its `cookie_names`) and,
+  when its recipe reads its token from localStorage (ABS, Navidrome), its
+  declared storage keys on its check / fill origins plus the recipe's token
+  key on the check origin only (`identity.foreign_storage_keys`; registered,
+  then the lease; a fresh owned tab with the service-worker bypass applied,
+  served a nonce-marked blank document by its own route, so the app never
+  runs there — keys are removed only after the isolated world sees that nonce
+  and no controlling worker, else nothing and "could NOT be cleared"; never
+  `Storage.clearDataForOrigin`), never anything else and never the broker's
+  profile; the next login then starts logged out. Another open tab of the
+  same app may write its token back later: "cleared" holds at read-back time
+  (fail-safe — such a session is still never proven as the item's account: the
+  next proof mismatches, or the broker's guard gives no verdict). A multi-account item
   passes `logged-in` only with the server identity proof (the reviewed recipe in
   an isolated world of the probe tab + the broker's one-use challenge); only a
   digest ever crosses CDP or the socket. `agent-login.py -c` starts a role

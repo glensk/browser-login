@@ -323,9 +323,21 @@ class IdentityRecipe:  # pylint: disable=too-many-instance-attributes  # one rev
     path: str
     id_field: tuple[str, ...]
     # "cookie" (the session cookie), "bearer-local-storage" (`token_key` of
-    # the origin's localStorage) or "syno-token" (DSM's in-page SynoToken).
+    # the origin's localStorage), "jwt-local-storage" (the same, a JWT whose
+    # `path_claim` names the endpoint's last path segment) or "syno-token"
+    # (DSM's in-page SynoToken).
     auth: str = "cookie"
     token_key: str = ""
+    # The request header a localStorage token travels in: `auth_header:
+    # <auth_scheme><token>`.
+    auth_header: str = "Authorization"
+    auth_scheme: str = "Bearer "
+    # jwt-local-storage: the JWT payload claim appended to `path` (which ends
+    # in "/") as ONE path segment of safe characters, and the response field
+    # that must equal it (the record is the token's own user, never another
+    # one an admin token may read).
+    path_claim: str = ""
+    claim_field: tuple[str, ...] | None = None
     base_segments: tuple[str, ...] = ()
     admin_field: tuple[str, ...] | None = None
     admin_true: tuple[object, ...] = (True,)
@@ -347,10 +359,110 @@ class IdentityRecipe:  # pylint: disable=too-many-instance-attributes  # one rev
     # match, so the item is refused at validation instead of failing later.
     forms: tuple[str, ...] = ("username",)
 
+    def __post_init__(self) -> None:
+        problem = recipe_problem(self)
+        if problem:
+            raise ValueError(f"identity recipe {self.name or '?'}: {problem}")
 
-# Reviewed recipes only. navidrome and Run:ai are absent on purpose: no
-# server-bound endpoint is confirmed yet, so their items stay unproven (an
-# `agent_identity` naming them is refused).
+
+# How a recipe authenticates its request (`IdentityRecipe.auth`).
+AUTHS = ("cookie", "bearer-local-storage", "jwt-local-storage", "syno-token")
+# The ones that read a token from the origin's localStorage: a foreign
+# session of such a site lives there, not (only) in cookies.
+LOCAL_STORAGE_AUTHS = frozenset({"bearer-local-storage", "jwt-local-storage"})
+_RECIPE_NAME = re.compile(r"^[a-z][a-z0-9-]{0,31}$")
+_HEADER_NAME = re.compile(r"^[A-Za-z][A-Za-z0-9-]{0,63}$")
+# Headers a recipe may not send its token in: the fetch spec's forbidden
+# ones (names and prefixes), and the recipe's own Accept.
+_RESERVED_HEADER_PREFIXES = ("proxy-", "sec-", "access-control-request-")
+_RESERVED_HEADERS = frozenset(
+    {
+        "accept",
+        "accept-charset",
+        "access-control-request-headers",
+        "access-control-request-method",
+        "access-control-request-private-network",
+        "accept-encoding",
+        "connection",
+        "content-length",
+        "content-type",
+        "cookie",
+        "cookie2",
+        "date",
+        "dnt",
+        "expect",
+        "host",
+        "keep-alive",
+        "origin",
+        "referer",
+        "te",
+        "trailer",
+        "transfer-encoding",
+        "upgrade",
+        "via",
+    }
+)
+_AUTH_SCHEME = re.compile(r"^(?:[A-Za-z]{1,16} )?$")
+_CLAIM_NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_]{0,31}$")
+_FIELD_KEY = re.compile(r"^[A-Za-z_][A-Za-z0-9_]{0,63}$")
+
+
+# One return per rule of the reviewed spec, in the order they are checked.
+def recipe_problem(  # pylint: disable=too-many-return-statements,too-many-branches
+    recipe: IdentityRecipe,
+) -> str:
+    """Why `recipe` is not a well-formed reviewed spec ('' = it is): a
+    known auth, ONE fixed same-origin path, field paths of plain keys, a
+    token key and a settable header where the token is read from
+    localStorage, and a JWT claim only as the last path segment of a
+    jwt-local-storage recipe that also checks the record's own id
+    against it."""
+    if not _RECIPE_NAME.match(recipe.name):
+        return "bad name"
+    if recipe.auth not in AUTHS:
+        return f"bad auth {recipe.auth!r}"
+    if not recipe.path.startswith("/") or recipe.path.startswith("//"):
+        return "path must be an absolute path on the check origin"
+    if "\\" in recipe.path or "#" in recipe.path:
+        return "bad path"
+    if not recipe.id_field:
+        return "no identity field"
+    for field_path in (recipe.id_field, recipe.admin_field, recipe.claim_field):
+        if field_path is not None and not all(
+            isinstance(k, str) and _FIELD_KEY.match(k) for k in field_path
+        ):
+            return "bad field path"
+    if recipe.auth in LOCAL_STORAGE_AUTHS:
+        if not recipe.token_key:
+            return f"{recipe.auth} needs token_key"
+        header = recipe.auth_header.lower()
+        if (
+            not _HEADER_NAME.match(recipe.auth_header)
+            or header in _RESERVED_HEADERS
+            or header.startswith(_RESERVED_HEADER_PREFIXES)
+        ):
+            return f"bad auth_header {recipe.auth_header!r}"
+        if not _AUTH_SCHEME.match(recipe.auth_scheme):
+            return "bad auth_scheme"
+    if recipe.path_claim or recipe.claim_field:
+        if recipe.auth != "jwt-local-storage":
+            return "path_claim needs jwt-local-storage"
+        if not _CLAIM_NAME.match(recipe.path_claim):
+            return "bad path_claim"
+        if not recipe.claim_field:
+            return "path_claim needs claim_field (the record's own id)"
+        if not recipe.path.endswith("/") or "?" in recipe.path:
+            return "path_claim needs a path ending in '/'"
+        if recipe.base_segments:
+            return "path_claim takes no base_segments"
+    elif recipe.auth == "jwt-local-storage":
+        return "jwt-local-storage needs path_claim"
+    return ""
+
+
+# Reviewed recipes only. Run:ai is absent on purpose: no server-bound
+# endpoint is confirmed yet, so its items stay unproven (an `agent_identity`
+# naming it is refused).
 IDENTITIES: dict[str, IdentityRecipe] = {
     # live 2026-10-11: 200, keys username / email / is_admin (as an admin)
     # It compares the GitLab `username` only. A vault holding the e-mail is
@@ -378,6 +490,29 @@ IDENTITIES: dict[str, IdentityRecipe] = {
         admin_true=("root", "admin"),
         admin_false=("user", "guest"),
         live_confirmed=True,
+    ),
+    # live 2026-10-11: Navidrome keeps its session in localStorage `token`, a
+    # JWT whose payload claims are exp, iat, iss, sub and uid (uid = the
+    # localStorage `userId`). GET /api/user/<uid> with `x-nd-authorization:
+    # Bearer <token>` (no cookie needed) answers 200 application/json with
+    # id, userName, name, email, isAdmin (a boolean), lastLoginAt,
+    # lastAccessAt, createdAt, updatedAt, scrobbleFilter, libraries; without
+    # the header 401 JSON {"error": …}. The web app lives under /app/, the API
+    # at the origin root. The record must be the token's own user (`id` ==
+    # uid): an admin token can read other users.
+    "navidrome": IdentityRecipe(
+        name="navidrome",
+        path="/api/user/",
+        id_field=("userName",),
+        auth="jwt-local-storage",
+        token_key="token",
+        auth_header="x-nd-authorization",
+        auth_scheme="Bearer ",
+        path_claim="uid",
+        claim_field=("id",),
+        admin_field=("isAdmin",),
+        live_confirmed=True,
+        forms=("username",),
     ),
     # DSM Web API (logged out it answers success:false, code 119). This
     # answer has no admin bit: an item using it stays indeterminate until S4
@@ -470,20 +605,39 @@ RECIPE_JS = r"""async (a) => {
     t = t.toLowerCase().replace(/^[ \t\n\r\v\f]+|[ \t\n\r\v\f]+$/g, '');
     return t ? t : null;
   };
+  // A JWT's payload claims (base64url; no signature check: the server
+  // validates the token); null for anything that is not one.
+  const jwt = (t) => {
+    const parts = t.split('.');
+    if (parts.length !== 3 || !parts.every(p => /^[A-Za-z0-9_-]+$/.test(p))) return null;
+    try {
+      let b = parts[1].replace(/-/g, '+').replace(/_/g, '/');
+      while (b.length % 4) b += '=';
+      const v = JSON.parse(atob(b));
+      return v !== null && typeof v === 'object' && !Array.isArray(v) ? v : null;
+    } catch (e) { return null; }
+  };
   const work = async () => {
     const origin = location.origin;
     if (!origin || origin === 'null' || origin !== a.origin)
       return out('indeterminate', {why: 'origin'});
     if (!/^[0-9a-f]{64}$/.test(a.nonce)) return out('indeterminate', {why: 'nonce'});
     if (!window.crypto || !crypto.subtle) return out('indeterminate', {why: 'crypto'});
-    const url = new URL(a.path, origin);
-    if (url.origin !== origin) return out('indeterminate', {why: 'origin'});
     const headers = {Accept: 'application/json'};
-    if (a.auth === 'bearer-local-storage') {
+    let path = a.path, claim = null;
+    if (a.auth === 'bearer-local-storage' || a.auth === 'jwt-local-storage') {
       let t = null;
       try { t = localStorage.getItem(a.token_key); } catch (e) { t = null; }
       if (typeof t !== 'string' || !t) return out('logged_out', {why: 'no token'});
-      headers.Authorization = 'Bearer ' + t;
+      if (a.auth === 'jwt-local-storage') {
+        const claims = jwt(t);
+        if (claims === null) return out('indeterminate', {why: 'token'});
+        claim = get(claims, [a.path_claim]);
+        if (typeof claim !== 'string' || !/^[A-Za-z0-9_-]{1,128}$/.test(claim))
+          return out('indeterminate', {why: 'claim'});
+        path = a.path + claim;
+      }
+      headers[a.auth_header] = a.auth_scheme + t;
     } else if (a.auth === 'syno-token') {
       let t = null;
       try { t = window.SYNO.SDS.Session.SynoToken; } catch (e) { t = null; }
@@ -492,6 +646,8 @@ RECIPE_JS = r"""async (a) => {
     } else if (a.auth !== 'cookie') {
       return out('indeterminate', {why: 'auth'});
     }
+    const url = new URL(path, origin);
+    if (url.origin !== origin) return out('indeterminate', {why: 'origin'});
     const ctl = new AbortController();
     const timer = setTimeout(() => ctl.abort(), a.fetch_ms);
     let r;
@@ -523,6 +679,8 @@ RECIPE_JS = r"""async (a) => {
     }
     if (a.must_be_null && get(body, a.must_be_null) !== null)
       return out('indeterminate', {why: 'impersonation'});
+    if (a.claim_field && (claim === null || get(body, a.claim_field) !== claim))
+      return out('indeterminate', {why: 'claim'});
     const id = norm(get(body, a.id_field));
     if (id === null) return out('indeterminate', {why: 'identity'});
     let admin = null;
@@ -587,6 +745,10 @@ def recipe_args(
         "nonce": nonce_hex,
         "auth": recipe.auth,
         "token_key": recipe.token_key,
+        "auth_header": recipe.auth_header,
+        "auth_scheme": recipe.auth_scheme,
+        "path_claim": recipe.path_claim,
+        "claim_field": opt(recipe.claim_field),
         "id_field": list(recipe.id_field),
         "admin_field": opt(recipe.admin_field),
         "admin_true": list(recipe.admin_true),
@@ -599,3 +761,48 @@ def recipe_args(
         "fetch_ms": FETCH_MS,
         "total_ms": TOTAL_MS,
     }
+
+
+def _https_origin(value: object) -> str:
+    """``https://host[:port]`` of a URL or an origin (lower-case, the default
+    port dropped); '' for anything that is not https."""
+    try:
+        parts = urllib.parse.urlsplit(str(value or ""))
+        host, port = parts.hostname, parts.port
+    except ValueError:
+        return ""
+    if parts.scheme != "https" or not host:
+        return ""
+    return f"https://{host.lower()}" + ("" if port in (None, 443) else f":{port}")
+
+
+def foreign_storage_keys(entry: Mapping[str, object]) -> dict[str, list[str]]:
+    """The localStorage keys a check clears, besides the cookies, when it
+    finds ANOTHER account's session of a multi-account item: only for an
+    item whose recipe authenticates from localStorage (`LOCAL_STORAGE_AUTHS`;
+    a cookie session has nothing there), and only on its check and fill
+    origins (https): on each, the item's declared keys of that origin
+    (``storage_keys``, the keys its session bundle injects); on the CHECK
+    origin — where the recipe reads it — also the recipe's own token key. A
+    fill origin may be an SSO provider other sites share: it never loses an
+    undeclared key. ``{origin: sorted keys}`` (an origin without a key is
+    left out); {} for any other item."""
+    recipe = usable_recipe(entry.get("identity"))
+    if recipe is None or recipe.auth not in LOCAL_STORAGE_AUTHS:
+        return {}
+    check = _https_origin(entry.get("check_url") or entry.get("login_url"))
+    origins = [check, *(_https_origin(o) for o in _list(entry.get("fill_origins")))]
+    declared: dict[str, set[str]] = {}
+    raw = entry.get("storage_keys")
+    for origin, keys in raw.items() if isinstance(raw, Mapping) else []:
+        norm = _https_origin(origin)
+        if norm:
+            declared.setdefault(norm, set()).update(_list(keys))
+    out: dict[str, list[str]] = {}
+    for origin in origins:
+        if origin and origin not in out:
+            names = set(declared.get(origin, ()))
+            if origin == check:
+                names.add(recipe.token_key)
+            out[origin] = sorted(k for k in names if k)
+    return {origin: names for origin, names in out.items() if names}

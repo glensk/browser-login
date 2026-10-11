@@ -134,10 +134,17 @@ def test_static_site_names_match_browser_registry() -> None:
 
 
 def test_recipes_are_reviewed_and_unconfirmed_ones_absent() -> None:
-    assert set(identity.IDENTITIES) == {"gitlab", "audiobookshelf", "dsm", "authentik"}
+    assert set(identity.IDENTITIES) == {
+        "gitlab",
+        "audiobookshelf",
+        "navidrome",
+        "dsm",
+        "authentik",
+    }
     for name, recipe in identity.IDENTITIES.items():
         assert recipe.name == name and recipe.path.startswith("/")
-        assert recipe.auth in ("cookie", "bearer-local-storage", "syno-token")
+        assert recipe.auth in identity.AUTHS
+        assert identity.recipe_problem(recipe) == ""
     abs_ = identity.IDENTITIES["audiobookshelf"]
     assert (
         identity.recipe_path(abs_, "https://a.example/audiobookshelf/library")
@@ -147,7 +154,8 @@ def test_recipes_are_reviewed_and_unconfirmed_ones_absent() -> None:
     # usable = live-confirmed AND an admin bit: dsm / authentik wait for S4
     assert identity.usable_recipe("gitlab") is identity.IDENTITIES["gitlab"]
     assert identity.usable_recipe("audiobookshelf") is not None
-    for name in ("dsm", "authentik", "navidrome", None):
+    assert identity.usable_recipe("navidrome") is identity.IDENTITIES["navidrome"]
+    for name in ("dsm", "authentik", "runai", None):
         assert identity.usable_recipe(name) is None
 
 
@@ -161,7 +169,7 @@ def test_recipes_are_reviewed_and_unconfirmed_ones_absent() -> None:
     [
         ({"instance": "private"}, "bad agent_instance"),
         ({"instance": "admin", "privilege": "root"}, "bad agent_privilege"),
-        ({"identity": "navidrome", "privilege": "user"}, "bad agent_identity"),
+        ({"identity": "runai", "privilege": "user"}, "bad agent_identity"),
         ({"identity": "gitlab"}, "agent_identity needs agent_privilege"),
         ({"identity": "dsm", "privilege": "readonly"}, "not live-confirmed"),
         ({"identity": "authentik", "privilege": "user"}, "not live-confirmed"),
