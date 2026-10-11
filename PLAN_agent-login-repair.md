@@ -183,7 +183,7 @@ manual acceptance steps under the attempt policy below.
         protection mode blocks docker), so one approved submit after the vault update is
         the test. Separate realm, so no shared attempt group. Off-LAN it must report
         `unreachable` (precheck), never submit.
-  - [ ] calibre (Calibre-Web Automated v4.0.8, container `calibre-web` on nixos)
+  - [ ] calibre (Calibre-Web Automated v4.0.8, container `calibre-web` on nixos). Generic fix released 2026-10-11 (175ccd2, broker 175ccd25130a): fail-closed submits, a (name,value) secondary-action tripwire that only screens credential carriers / form navigations, remember-me, Access gate, `agent_max_session_days`. Canary logins running.
     - [x] Root cause (read-only; Opus critique, since every Codex seat was above its cap):
           the vault had the factory default `admin123`. On 2026-10-08 the broker's
           pre-tp#835 Enter-submit pressed CWA's `forgot` button twice, which reset the admin
