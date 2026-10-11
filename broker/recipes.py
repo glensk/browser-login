@@ -301,6 +301,28 @@ def raise_if_blocked(page: Any, resp: Any) -> None:
     raise LoginBlocked(int(status))
 
 
+def load_document(page: Any, url: str, *, wait_until: str = "domcontentloaded") -> Any:
+    """``page.goto(url)`` that loads a DOCUMENT and returns its Response.
+
+    Playwright answers None (no Response, status unknown) for a same-document
+    navigation: a target that differs from the page's URL only after ``#`` —
+    an SPA's hash route (``/#!/home`` after ``/#!/auth``, ``/web/#/home``
+    twice). Then a 401/403 (``raise_if_blocked``) or a 5xx goes unseen. So on
+    a None, unless the target is an ``about:`` page itself, the page goes to
+    ``about:blank`` and loads `url` once more: a real document load with its
+    own Response. A None on that second load stays None (status unknown).
+
+    No URL comparison (a redirect or a router's rewrite would defeat it) and
+    no ``page.reload()``: a reload repeats the page's own last request, which
+    may be the login form's POST — outside the submit tripwire. Exceptions
+    propagate."""
+    resp = page.goto(url, wait_until=wait_until)
+    if resp is not None or str(url).startswith("about:"):
+        return resp
+    page.goto("about:blank", wait_until=wait_until)
+    return page.goto(url, wait_until=wait_until)
+
+
 class AttemptController:
     """What a recipe tells the broker's limiter about its attempt.
 
@@ -573,24 +595,46 @@ def strict_proof(item: SiteItem) -> bool:
     return bool(item.logged_in_selector) or has_server_proof(item.site)
 
 
-# One return per answer of the proof, in the order they are decided.
-def check_proof(  # pylint: disable=too-many-return-statements
-    page: Any, item: SiteItem, *, dev: bool = False, wait_s: float = 8.0
-) -> str:
-    """Navigate to the check page and prove the login: ``valid``, ``invalid``
-    or ``indeterminate``.
+# Why a proof answered what it did (``check_proof_reason``): the code goes
+# into the failure detail and ``last_diag[site]["proof_reason"]``, so an
+# overview tells the undecided cases apart. "" for a valid proof.
+PROOF_REASONS: dict[str, str] = {
+    # indeterminate
+    "raised": "loading or reading the check page raised",
+    "second-load-none": "the check page gave no HTTP response, even on a fresh load",
+    "status-unknown": "the check page's HTTP status is unknown",
+    "5xx": "the check page answered 5xx",
+    "blank": "the check page stayed blank",
+    "server-proof": "the site's server proof could not decide",
+    # invalid
+    "no-check-page": "the item has no check page",
+    "4xx": "the check page answered 4xx",
+    "not-logged-in": "the check page does not show a logged-in state",
+}
 
-    Indeterminate: the page did not load, answered 5xx, the proof raised, or —
-    for the strict proof — the status is unknown (no Response, status 0).
-    HTTP 4xx → invalid. No check page → invalid.
-    """
+
+def proof_reason_text(reason: str | None) -> str:
+    """`reason` (a ``PROOF_REASONS`` code) for a failure detail:
+    ``"<text> [<code>]"``; "" for no or an unknown code."""
+    text = PROOF_REASONS.get(reason or "")
+    return f"{text} [{reason}]" if text else ""
+
+
+# One return per answer of the proof, in the order they are decided.
+def check_proof_reason(  # pylint: disable=too-many-return-statements
+    page: Any, item: SiteItem, *, dev: bool = False, wait_s: float = 8.0
+) -> tuple[str, str]:
+    """``check_proof`` with its reason: ``(answer, PROOF_REASONS code)``,
+    the code "" for ``valid``."""
     url = check_page_url(item)
     if not url:
-        return INVALID
+        return INVALID, "no-check-page"
     try:
-        resp = page.goto(url, wait_until="domcontentloaded")
+        # a fresh document load: after an SPA login the page sits on the
+        # same document, and a hash-only goto has no Response
+        resp = load_document(page, url)
     except Exception:  # pylint: disable=broad-exception-caught
-        return INDETERMINATE
+        return INDETERMINATE, "raised"
     try:
         page.wait_for_load_state("load", timeout=10_000)
     except Exception:  # pylint: disable=broad-exception-caught
@@ -598,17 +642,37 @@ def check_proof(  # pylint: disable=too-many-return-statements
     raw = getattr(resp, "status", None) if resp is not None else None
     status = raw if isinstance(raw, int) and not isinstance(raw, bool) else 0
     if status <= 0 and strict_proof(item):
-        return INDETERMINATE
+        return INDETERMINATE, "second-load-none" if resp is None else "status-unknown"
     if status >= 500:
-        return INDETERMINATE
+        return INDETERMINATE, "5xx"
     if status >= 400:
-        return INVALID
+        return INVALID, "4xx"
     try:
         page.wait_for_timeout(1000)
         answer = proof_for(item.site)(page, item, dev=dev, wait_s=wait_s)
     except Exception:  # pylint: disable=broad-exception-caught
-        return INDETERMINATE
-    return answer if answer in (VALID, INVALID, INDETERMINATE) else INDETERMINATE
+        return INDETERMINATE, "raised"
+    if answer == VALID:
+        return VALID, ""
+    if answer == INVALID:
+        return INVALID, "not-logged-in"
+    # the generic proof is undecided only on a blank page (`sentinel_proof`)
+    return INDETERMINATE, "server-proof" if has_server_proof(item.site) else "blank"
+
+
+def check_proof(
+    page: Any, item: SiteItem, *, dev: bool = False, wait_s: float = 8.0
+) -> str:
+    """Navigate to the check page and prove the login: ``valid``, ``invalid``
+    or ``indeterminate``.
+
+    The check page is loaded as a fresh document (``load_document``).
+    Indeterminate: the page did not load, answered 5xx, the proof raised, or —
+    for the strict proof — the status is unknown (no Response even on the
+    fresh load, status 0). HTTP 4xx → invalid. No check page → invalid.
+    ``check_proof_reason`` says why.
+    """
+    return check_proof_reason(page, item, dev=dev, wait_s=wait_s)[0]
 
 
 def check_logged_in(
@@ -1564,7 +1628,9 @@ def generic_login(
     any request that names a secondary form action.
     """
     allowed = list(item.fill_origins)
-    resp = page.goto(item.login_url, wait_until="domcontentloaded")
+    # a fresh document load: a hash-only goto has no Response, and
+    # raise_if_blocked would be blind to a 401/403
+    resp = load_document(page, item.login_url)
     if access_gated(page.url):
         raise AccessGated()
     raise_if_blocked(page, resp)

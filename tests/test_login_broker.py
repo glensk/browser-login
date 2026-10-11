@@ -22,6 +22,7 @@ import importlib.util
 import json
 import os
 import re
+import secrets
 import shutil
 import socket
 import struct
@@ -856,17 +857,46 @@ class _Resp:
 
 
 class _ProofPage(_CheckPage):
-    """A page whose goto answers `status` (or raises) and lands on `url`."""
+    """A page whose goto answers `status` (or raises) and lands on `url`.
 
-    def __init__(self, url, *, status=200, raises=False, **kw):
+    `same_doc`: the goto tracks the URL like Chromium — a target that differs
+    from the current URL only after ``#`` (and any ``about:`` page) is a
+    same-document navigation answered None; a real document load answers
+    `status`, or None with `fresh_none`, or raises with `fresh_raises`."""
+
+    def __init__(  # pylint: disable=too-many-arguments
+        self,
+        url,
+        *,
+        status=200,
+        raises=False,
+        same_doc=False,
+        fresh_none=False,
+        fresh_raises=False,
+        **kw,
+    ):
         super().__init__(url, **kw)
         self._status = status
         self._raises = raises
+        self._same_doc = same_doc
+        self._fresh_none = fresh_none
+        self._fresh_raises = fresh_raises
+        self.gotos: list[str] = []
 
-    def goto(self, _url, **_kw):
+    def goto(self, target, **_kw):
         if self._raises:
             raise TimeoutError("navigation timeout")
-        return _Resp(self._status)
+        self.gotos.append(target)
+        if not self._same_doc:
+            return _Resp(self._status)
+        before, self.url = self.url, target
+        if target.startswith("about:"):
+            return None
+        if "#" in target and before.split("#")[0] == target.split("#")[0]:
+            return None  # same document: no Response
+        if self._fresh_raises:
+            raise TimeoutError("navigation timeout")
+        return None if self._fresh_none else _Resp(self._status)
 
     def wait_for_load_state(self, *_a, **_kw):
         return None
@@ -899,6 +929,82 @@ def test_check_proof_without_sentinel_keeps_the_old_rules():
     for status in (None, 0):
         page = _ProofPage(SHOP_CHECK, status=status, sentinel=True)
         assert recipes.check_proof(page, strict, wait_s=0) == recipes.INDETERMINATE
+        answer = recipes.check_proof_reason(page, strict, wait_s=0)
+        assert answer == (recipes.INDETERMINATE, "status-unknown")
+
+
+# An SPA with hash routes (Portainer `#!/home`, Jellyfin `/web/#/home`): after
+# the login the page sits on the check page's document, so a goto to the
+# check URL changes only the fragment and Playwright answers None.
+HASH_LOGIN = "https://www.shop.example/#!/auth"
+HASH_CHECK = "https://www.shop.example/#!/home"
+
+
+@pytest.mark.parametrize(
+    "fresh, sentinel, strict, want",
+    [
+        # the fresh load answers 200 and the sentinel shows: proven
+        ({}, True, True, (recipes.VALID, "")),
+        # the fresh load has no Response either: still undecided
+        ({"fresh_none": True}, True, True, (recipes.INDETERMINATE, "second-load-none")),
+        # no sentinel (the old proof): valid as before
+        ({}, False, False, (recipes.VALID, "")),
+        # the fresh load raises: undecided
+        ({"fresh_raises": True}, True, True, (recipes.INDETERMINATE, "raised")),
+        # the fresh load answers, the page shows logged out
+        ({}, False, True, (recipes.INVALID, "not-logged-in")),
+    ],
+)
+def test_check_proof_reloads_a_same_document_check_page(fresh, sentinel, strict, want):
+    fields = {"agent_check_url": HASH_CHECK}
+    if strict:
+        fields["agent_logged_in_selector"] = "#me"
+    item = _shop_item(**fields)
+    page = _ProofPage(HASH_LOGIN, same_doc=True, sentinel=sentinel, **fresh)
+    assert recipes.check_proof_reason(page, item, wait_s=0) == want
+    # one same-document goto, then about:blank and ONE fresh load
+    assert page.gotos == [HASH_CHECK, "about:blank", HASH_CHECK]
+
+
+def test_load_document_keeps_a_response_and_never_retries_about_blank():
+    page = _ProofPage(SHOP_CHECK, status=200, same_doc=True)
+    assert recipes.load_document(page, HASH_CHECK).status == 200
+    assert page.gotos == [HASH_CHECK]  # a cross-document load: no retry
+    assert recipes.load_document(page, "about:blank") is None
+    assert page.gotos == [HASH_CHECK, "about:blank"]
+
+
+def test_same_document_login_page_403_is_seen_by_precheck_and_recipe():
+    """`raise_if_blocked` must see the 401/403 of a hash-route login page the
+    page already sits on (no Response from the same-document goto)."""
+    item = _shop_item(
+        agent_check_url=HASH_CHECK,
+        agent_login_url=HASH_LOGIN,
+        agent_logged_in_selector="#me",
+    )
+    page = _ProofPage(HASH_CHECK, status=403, same_doc=True)
+    with pytest.raises(recipes.LoginBlocked):
+        daemon.PlaywrightRunner._access_precheck(page, item, recipes.INVALID)
+    assert page.gotos == [HASH_LOGIN, "about:blank", HASH_LOGIN]
+    page = _ProofPage(HASH_CHECK, status=403, same_doc=True)
+    secret = vault.Secret(
+        username="u", password=secrets.token_hex(4)
+    )  # nothing is typed
+    with pytest.raises(recipes.LoginBlocked):
+        recipes.generic_login(page, item, secret)
+    assert page.gotos == [HASH_LOGIN, "about:blank", HASH_LOGIN]
+
+
+def test_profile_proof_reason_reaches_the_failure_report(tmp_path):
+    runner = daemon.PlaywrightRunner(tmp_path / "home", dev=False)
+    item = _shop_item(agent_check_url=HASH_CHECK, agent_logged_in_selector="#me")
+    page = _ProofPage(HASH_LOGIN, same_doc=True, fresh_none=True, sentinel=True)
+    assert runner._profile_proof(page, item) == recipes.INDETERMINATE
+    assert runner._proof_reason(item) == "second-load-none"
+    assert runner.last_diag["shop"]["proof_reason"] == "second-load-none"
+    text = recipes.proof_reason_text("second-load-none")
+    assert text.endswith("[second-load-none]") and "fresh load" in text
+    assert not recipes.proof_reason_text("") and not recipes.proof_reason_text("x")
 
 
 def test_client_broker_logged_in_uses_check_url(monkeypatch, capsys):

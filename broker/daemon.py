@@ -121,8 +121,10 @@ from broker.recipes import (  # noqa: E402
     NeedsHuman,
     OriginViolation,
     RecipeError,
-    check_proof,
+    check_proof_reason,
     cscs_export_storage,
+    load_document,
+    proof_reason_text,
     raise_if_blocked,
     recipe_for,
     refresh_session,
@@ -547,6 +549,9 @@ class PlaywrightRunner:
         # dir); the broker home stays closed.
         self.diag_dir = diag_dir or (home if dev else Path(DEFAULT_SOCKET).parent)
         self.last_diag: dict[str, dict[str, Any]] = {}
+        # site -> the reason code of its latest `_profile_proof`
+        # (``recipes.PROOF_REASONS``; "" valid)
+        self.proof_reasons: dict[str, str] = {}
 
     def profile_dir(self, site: str) -> Path:
         """The broker's own profile for `site`."""
@@ -580,11 +585,24 @@ class PlaywrightRunner:
 
     def _profile_proof(self, page: Any, item: SiteItem) -> str:
         """The tri-state proof (``recipes.check_proof``) on the broker's own
-        profile; an exception is ``indeterminate``."""
+        profile; an exception is ``indeterminate``. Its reason code is kept
+        in ``proof_reasons[site]`` (``_proof_reason``)."""
         try:
-            return check_proof(page, item, dev=self.dev, wait_s=PROFILE_PROOF_WAIT_S)
+            answer, reason = check_proof_reason(
+                page, item, dev=self.dev, wait_s=PROFILE_PROOF_WAIT_S
+            )
         except Exception:  # pylint: disable=broad-exception-caught
-            return INDETERMINATE
+            answer, reason = INDETERMINATE, "raised"
+        self.proof_reasons[item.site] = reason
+        return answer
+
+    def _proof_reason(self, item: SiteItem) -> str:
+        """The latest proof's reason code of `item`, also recorded as
+        ``last_diag[site]["proof_reason"]``; "" when none is known."""
+        reason = self.proof_reasons.get(item.site, "")
+        if reason:
+            self.last_diag.setdefault(item.site, {})["proof_reason"] = reason
+        return reason
 
     def _record_failure(self, page: Any, item: SiteItem, secret: Secret) -> None:
         """Secret-free failure report + screenshot (password fields emptied first)."""
@@ -761,9 +779,11 @@ class PlaywrightRunner:
                 # refresh-only request ends here, as `refresh_unavailable`.
                 get_secret()
             if proof == INDETERMINATE:
+                why = proof_reason_text(self._proof_reason(item))
                 raise LoginFailed(
-                    "could not tell whether the broker profile is logged in "
-                    "(check page did not load, answered 5xx or stayed blank)"
+                    "could not tell whether the broker profile is logged in ("
+                    + (why or "check page did not load, answered 5xx or stayed blank")
+                    + ")"
                     + html_script_hint(page),
                     phase="profile-proof",
                 )
@@ -804,12 +824,16 @@ class PlaywrightRunner:
         if proof != VALID:
             self._record_failure(page, item, secret)
             self.last_diag.setdefault(item.site, {})["before_check"] = before
+            why = proof_reason_text(self._proof_reason(item))
             failed = LoginFailed(
                 (
-                    "login did not reach a logged-in state (status / origin / sentinel)"
+                    "login did not reach a logged-in state ("
+                    + (why or "status / origin / sentinel")
+                    + ")"
                     if proof != INDETERMINATE
-                    else "the logged-in proof could not decide (check page did not "
-                    "load, answered 5xx or stayed blank)"
+                    else "the logged-in proof could not decide ("
+                    + (why or "check page did not load, answered 5xx or stayed blank")
+                    + ")"
                 )
                 + html_script_hint(page),
                 submitted=attempt.submitted,
@@ -838,7 +862,9 @@ class PlaywrightRunner:
         if proof is None or (proof != VALID and item.site not in PREFLIGHTS):
             # a failed load may still have ended on the Access page
             with contextlib.suppress(Exception):
-                resp = page.goto(item.login_url, wait_until="domcontentloaded")
+                # a fresh document load: a hash-only goto (an SPA's check
+                # page -> its login route) has no Response to judge
+                resp = load_document(page, item.login_url)
         if access_gated(str(getattr(page, "url", "") or "")):
             raise AccessGated()
         raise_if_blocked(page, resp)

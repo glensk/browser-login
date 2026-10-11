@@ -9726,6 +9726,7 @@ def _print_broker_diag(diag: object) -> None:
         ("password_check", "password used (compare with your vault copy)"),
         ("screenshot", "screenshot"),
         ("before_check", "page before the final check"),
+        ("proof_reason", "logged-in proof"),
     ):
         value = diag.get(key)
         if value:
