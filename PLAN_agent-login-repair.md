@@ -275,6 +275,8 @@ manual acceptance steps under the attempt policy below.
         dsm→readonly, authentik→glensk, runai→test3; admins in the `admin` browser;
         gitlab-sdsc-test, docker-hub, custos-admin in `alt`);
       - admin browser ALSO reachable via MCP (Albert chose this over browser.py-only).
+      - [x] S0 guard released 2026-10-11 (919da8f): 8 groups / 20 items read "⚠ account unproven"; logged-in/login exit 2 `identity_unproven`; -p/-c skip them.
+      - [ ] S1 broker identity (builder running).
       Original line: account identity (tp#833, hit 2026-10-10): 8 same-scope groups report ✅ for
       the wrong account; gitlab-sdsc-test passed while the browser was `albertadmin`.
       Plan → codex-debate → implement:
