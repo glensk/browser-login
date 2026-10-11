@@ -13952,14 +13952,16 @@ def _assisted_precheck(tty: Any, port: int, req: GuidedRequest) -> int | None:
             f"✅ {req.site}: the shared Chromium is already logged in — nothing to do"
         )
         return 0
+    # The human gate is the controlling terminal itself (agents have none);
+    # the prompt only confirms intent: Enter (or the site name) starts,
+    # anything else cancels.
     answer = _tty_ask(
-        tty, f"Guided login for {req.site}: type the site name to start: "
+        tty,
+        f"Guided login for {req.site}: press Enter to start "
+        "(type anything else to cancel): ",
     )
-    if answer.lower() != req.site.strip().lower():
-        print(
-            f"❌ not confirmed (expected {req.site!r}) — nothing started",
-            file=sys.stderr,
-        )
+    if answer.strip() and answer.strip().lower() != req.site.strip().lower():
+        print("❌ not confirmed — nothing started", file=sys.stderr)
         return 2
     return None
 

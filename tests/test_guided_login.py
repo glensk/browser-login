@@ -545,6 +545,17 @@ def test_fallback_window_flag_goes_straight_to_a(flow):
     assert len(tty.prompts) == 1  # only the confirmation
 
 
+def test_enter_alone_confirms(flow):
+    tty = _FakeTty("")
+    assert (
+        browser._assisted_login_tty(
+            tty, PORT, browser.GuidedRequest("testsite", window=True)
+        )
+        == 0
+    )
+    assert flow == ["A A"]
+
+
 def test_wrong_confirmation_starts_nothing(flow, capsys):
     tty = _FakeTty("slack")
     assert (
@@ -1505,8 +1516,8 @@ def _guided(disposable: dict, site: str) -> Iterator[tuple[_Pty, Any]]:
     argv = [PY, str(BROWSER_PY), "--cdp-port", str(port), "assisted-login", site]
     run = _Pty(argv, env)
     try:
-        assert run.expect("type the site name to start", 90), run.out
-        run.send(site + "\n")
+        assert run.expect("press Enter to start", 90), run.out
+        run.send("\n")
         url_file = disposable["viewer_url"]
         assert _wait(url_file.exists, 60), run.out
         url = url_file.read_text(encoding="utf-8").strip()

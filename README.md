@@ -296,8 +296,8 @@ bin/browser.py assisted-login anibis -u https://www.anibis.ch/fr/user/searches
 bin/browser.py assisted-login slack -a    # skip the remote view: the window (A)
 ```
 
-`assisted-login SITE` opens `/dev/tty` and asks you to **type the site name** to
-start. Without a controlling terminal (an agent, launchd, a pipe) it exits **2**
+`assisted-login SITE` opens `/dev/tty` and asks you to **press Enter** to start
+(the site name is accepted too; anything else cancels). Without a controlling terminal (an agent, launchd, a pipe) it exits **2**
 before touching anything — agents cannot start a guided login; they get
 `needs Albert: agent-login.py -g SITE` from `login` instead. Already logged in →
 ✅ and exit 0 without asking. `agent-login.py -g` routes the plain human logins
