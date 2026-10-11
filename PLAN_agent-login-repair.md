@@ -299,8 +299,11 @@ manual acceptance steps under the attempt policy below.
             (1d54bd3, broker 1d54bd358b31); playwright-admin MCP config + `cba` alias.
             runai-test3 vault password was stale → rotated (test fixture). Docker/docker-hub:
             Albert: neither → leave the broker (the Safari collection removal did not persist; redo).
-      - [ ] S4c (PLAN_ws5-s4c-runai-keycloak.md, tp#931, debated): Keycloak realm-path scopes +
-            server-bound Run:ai token recipe — builder running.
+      - [x] S4c built + reviewed (2 rounds), committed locally b5f21ec (mydotfiles 5c83fd9f):
+            path-scoped `agent_cookie_scopes`, server-bound `runai` recipe (token endpoint +
+            JSON admin probe, admin side unconfirmed). Push + install wait on the YubiKey.
+            Live gates: A0 logged-in cookie inventory, runai-admin admin probe, refresh-token
+            rotation (broker reuse → client check → broker reuse).
       - [ ] S4 vault fields via `broker-add.py -I/-p/-i/-A` (Albert's Touch ID; -25308 when he is
             away), live proofs, then log in the held-back group members.
       Original line: account identity (tp#833, hit 2026-10-10): 8 same-scope groups report ✅ for
@@ -384,7 +387,7 @@ manual acceptance steps under the attempt policy below.
   - Real renewals on nixos and the raspi; nixos nginx reloaded. The raspi add-on was
     restarted with Albert's go, and serves the cert until 2027-01-08; all 7 hosts answer.
   - Records committed in macbook2014-nixos, credplane and tp.
-- [ ] WS3 — onboarding guard (plan → codex-debate → implement): static validation of a new
+- [ ] WS3 — onboarding guard (plan → codex-debate → implement; subagent running 2026-10-12): static validation of a new
       item (sentinel present, fill origins, cookie scope, attempt group), a budgeted
       promotion test (`pending` → `usable`), and a removal path (`broker-add.py` remove or
       documented) that also prunes agent-login state
