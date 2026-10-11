@@ -266,7 +266,7 @@ def safari_sessions(sites: list[str]) -> dict[str, dict]:
 # interpreter start, venv bootstrap and the inner 15 s tab cleanup.
 
 LOGIN_TIMEOUT_ENV = "CLAUDE_BROWSER_LOGIN_TIMEOUT_S"
-LOGIN_TIMEOUT_DEFAULT_S = 300.0
+LOGIN_TIMEOUT_DEFAULT_S = 480.0  # browser.py's own default (pinned equal)
 RUNNER_MARGIN_S = 90.0
 # browser.py's exit codes of a fired LoginDeadline: tabs closed / unconfirmed.
 LOGIN_TIMEOUT_RC = 124

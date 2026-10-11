@@ -86,7 +86,7 @@ currently ``cscs``, ``anthropic``/``claude``, ``openai``/``chatgpt``, ``slack``,
                     lease); anywhere else `login` exits 4 and prints
                     `needs Albert: agent-login.py -g SITE`. Outside a guided
                     login it is bounded by $CLAUDE_BROWSER_LOGIN_TIMEOUT_S
-                    (default 300): exit 124 when it timed out and its tabs are
+                    (default 480): exit 124 when it timed out and its tabs are
                     closed, 125 when that cleanup is unconfirmed.
   logged-in SITE    Exit 0 if SITE is logged in, 2 if not (no login attempted;
                     bounded to 120 s, exit 124/125 like `login`).
@@ -181,10 +181,13 @@ from broker.bundle import IDP_HOSTS as BROKER_IDP_HOSTS  # noqa: E402
 from broker.bundle import IDP_LABELS as BROKER_IDP_LABELS  # noqa: E402
 from broker.page_state import await_sentinel as _broker_await_sentinel  # noqa: E402
 from broker.page_state import page_blank as _broker_page_blank  # noqa: E402
+from broker.recipes import CSCS_EXPIRES_KEY as BROKER_CSCS_EXPIRES_KEY  # noqa: E402
+from broker.recipes import CSCS_TOKEN_KEY as BROKER_CSCS_TOKEN_KEY  # noqa: E402
 from broker.recipes import REFRESH_MIN_LEFT_S as BROKER_REFRESH_MIN_LEFT_S  # noqa: E402
 from broker.recipes import click_keycloak_submit as _click_keycloak_submit  # noqa: E402
-from broker.recipes import cscs_portal_ready as _broker_cscs_portal_ready  # noqa: E402
+from broker.recipes import cscs_token_proof as _broker_cscs_token_proof  # noqa: E402
 from broker.recipes import fresh_totp as _broker_fresh_totp  # noqa: E402
+from broker.recipes import has_server_proof as _broker_has_server_proof  # noqa: E402
 from broker.recipes import interstitial_title as _broker_interstitial  # noqa: E402
 from broker.recipes import off_fill_origins as _broker_off_fill_origins  # noqa: E402
 from broker.recipes import parse_totp as _parse_totp  # noqa: E402
@@ -231,12 +234,15 @@ CONNECT_TIMEOUT_S = _env_seconds(os.environ.get("CLAUDE_BROWSER_CONNECT_TIMEOUT_
 # Hard deadline of one unattended `login` (tp#843), enforced by `LoginDeadline`:
 # sync Playwright calls take no timeout, so one page that never settles would
 # hang the login — and the interaction lease and gate it holds — without limit.
-# The longest legitimate single wait is the broker's BROKER_TIMEOUT_S (180 s);
-# a slow but healthy CSCS login takes ~65 s. agent-login's runner kills
-# browser.py at this value + 90 s (agent_login_jobs.browser_timeout). Never
-# applied to a guided login.
+# The longest legitimate single wait is the broker request (BROKER_TIMEOUT_S,
+# 285 s: the broker's own run deadline is 255 s, and a fresh CSCS login took
+# 188 s); the free check before it and the injection + verify + token
+# follow-up after it need the rest. Order (tests pin it): broker run deadline
+# < BROKER_TIMEOUT_S < this < agent-login's runner (this + 90 s,
+# agent_login_jobs.browser_timeout) and consumers' subprocess timeouts
+# (cscs-api.py). Never applied to a guided login.
 LOGIN_TIMEOUT_ENV = "CLAUDE_BROWSER_LOGIN_TIMEOUT_S"
-LOGIN_TIMEOUT_DEFAULT_S = 300.0
+LOGIN_TIMEOUT_DEFAULT_S = 480.0
 LOGIN_TIMEOUT_S = _env_seconds(
     os.environ.get(LOGIN_TIMEOUT_ENV), LOGIN_TIMEOUT_DEFAULT_S
 )
@@ -6335,123 +6341,267 @@ def cmd_doctor(port: int) -> int:
     return 0
 
 
-def _scan_token(ctx, page) -> str | None:
-    """Find the 40-hex Waldur DRF token in the portal tab's storage, or None.
+# The portal tab's token candidates: `waldur/auth/token` (the key the app
+# reads) alone when present; only without it, up to 3 distinct 40-hex values
+# found anywhere in localStorage. Plus the auth method (for the scheme).
+_TOKEN_CANDIDATES_JS = (
+    "() => { const re=/\\b[0-9a-f]{40}\\b/; const out=[];"
+    " const method=localStorage.getItem('waldur/auth/method');"
+    " const main=(localStorage.getItem('waldur/auth/token')||'').trim();"
+    " if (main) return {tokens:[main], method};"
+    " for (let i=0;i<localStorage.length && out.length<3;i++)"
+    " {const v=localStorage.getItem(localStorage.key(i)); const m=v&&v.match(re);"
+    " if (m && !out.includes(m[0])) out.push(m[0]);}"
+    " return {tokens:out, method}; }"
+)
+PORTAL_API_CONFIG = "https://portal.cscs.ch/api/configuration/"
 
-    Scans ``localStorage`` (where Waldur HomePort keeps it) first, then the
-    cookies sent to the portal (incl. httpOnly ones invisible to
-    ``document.cookie``) — never the whole profile's: a 40-hex cookie from
-    another site must not be cached and sent to CSCS as a token. Returns ``None``
-    rather than raising if the page navigates mid-scan — the SPA periodically
-    re-renders/redirects, destroying the JS execution context — so the caller can
-    just retry.
-    """
+
+def _token_candidates(ctx, page) -> tuple[list[str], str | None]:
+    """(token candidates, auth method) from the portal tab — ``waldur/auth/
+    token`` first; without it 40-hex localStorage values, then the cookies
+    sent to the portal (incl. httpOnly ones) — never the whole profile's: a
+    40-hex cookie of another site must never be sent to CSCS. ([], None)
+    when the page navigates mid-scan (the SPA re-renders): retry."""
     from playwright.sync_api import Error as PlaywrightError
 
     try:
-        token = page.evaluate(
-            "() => { const re=/\\b[0-9a-f]{40}\\b/;"
-            "for (let i=0;i<localStorage.length;i++)"
-            "{const v=localStorage.getItem(localStorage.key(i));"
-            "const m=v&&v.match(re); if(m) return m[0];} return null; }"
-        )
-        if token:
-            return str(token)
-        for ck in ctx.cookies(PORTAL_PROFILE_URL):
-            m = HEX40.search(str(ck.get("value", "")))
-            if m:
-                return m.group(0)
+        got = page.evaluate(_TOKEN_CANDIDATES_JS)
+        if isinstance(got, str):  # a single value (older callers' fakes)
+            got = {"tokens": [got], "method": None}
+        got = got if isinstance(got, dict) else {}
+        tokens = [str(t) for t in got.get("tokens") or [] if t]
+        raw_method = got.get("method")
+        method = raw_method if isinstance(raw_method, str) else None
+        if not tokens:
+            for ck in ctx.cookies(PORTAL_PROFILE_URL):
+                m = HEX40.search(str(ck.get("value", "")))
+                if m and m.group(0) not in tokens:
+                    tokens.append(m.group(0))
+        return tokens, method
     except PlaywrightError:
-        return None
-    return None
+        return [], None
+
+
+def _scan_token(ctx, page) -> str | None:
+    """The first token candidate of the portal tab (`_token_candidates`), or
+    None — a CANDIDATE only: `_capture_and_cache_token` validates it."""
+    tokens, _method = _token_candidates(ctx, page)
+    return tokens[0] if tokens else None
+
+
+# The whole token capture (`_capture_and_cache_token`: scans + every API
+# call) stays well inside LOGGED_IN_TIMEOUT_S: a network stall exits 1, never
+# the deadline's 124.
+TOKEN_CAPTURE_BUDGET_S = 60.0
+# One portal API call at most.
+PORTAL_API_TIMEOUT_S = 15.0
+
+
+def _api_timeout(deadline: float | None) -> float | None:
+    """The timeout of one portal API call: ``PORTAL_API_TIMEOUT_S``, cut to
+    what is left before `deadline`; None when nothing is left."""
+    if deadline is None:
+        return PORTAL_API_TIMEOUT_S
+    left = deadline - time.monotonic()
+    return min(PORTAL_API_TIMEOUT_S, left) if left > 0.5 else None
+
+
+def _portal_auth_scheme(method: str | None, deadline: float | None = None) -> list[str]:
+    """The Authorization scheme(s) to try, the portal app's own rule:
+    ``Token`` for a local/passkey login; else ``Bearer`` only when the
+    portal's configuration enables OIDC access tokens
+    (``OIDC_ACCESS_TOKEN_ENABLED``), ``Token`` when it says not. A
+    configuration that cannot be read decides nothing: both are tried, and a
+    token is rejected only when every one is."""
+    import requests
+
+    if method in ("local", "passkey"):
+        return ["Token"]
+    timeout = _api_timeout(deadline)
+    if timeout is None:
+        return ["Token", "Bearer"]
+    try:
+        resp = requests.get(
+            PORTAL_API_CONFIG,
+            headers={"Accept": "application/json"},
+            timeout=timeout,
+            allow_redirects=False,
+        )
+        cfg = resp.json() if resp.status_code == 200 else None
+    except (requests.RequestException, ValueError):
+        cfg = None
+    core = cfg.get("WALDUR_CORE") if isinstance(cfg, dict) else None
+    if not isinstance(core, dict):
+        return ["Token", "Bearer"]
+    return ["Bearer"] if core.get("OIDC_ACCESS_TOKEN_ENABLED") is True else ["Token"]
+
+
+def _validate_portal_token(
+    token: str, schemes: list[str], deadline: float | None = None
+) -> tuple[str, dict | None, str]:
+    """Ask the portal's API whether `token` is live, under each of `schemes`
+    in turn: (``valid``, its /users/me/ object, the scheme) on 200 with an
+    identity (``uuid``/``username``); (``invalid``, None, "") only when every
+    scheme got 401/403; else (``indeterminate``, None, "") — network,
+    timeout, 5xx, a redirect, a malformed answer. Never logs the token or a
+    response body."""
+    undecided = False
+    for scheme in schemes:
+        state, me = _validate_portal_token_once(token, scheme, deadline)
+        if state == PROOF_VALID:
+            return state, me, scheme
+        undecided = undecided or state == PROOF_UNDECIDED
+    return (PROOF_UNDECIDED if undecided else PROOF_INVALID), None, ""
+
+
+def _validate_portal_token_once(
+    token: str, scheme: str, deadline: float | None = None
+) -> tuple[str, dict | None]:
+    """`_validate_portal_token` for one scheme: valid / invalid (401/403) /
+    indeterminate (also when no time is left before `deadline`)."""
+    import requests
+
+    timeout = _api_timeout(deadline)
+    if timeout is None:
+        return PROOF_UNDECIDED, None
+    try:
+        resp = requests.get(
+            PORTAL_API_ME,
+            headers={
+                "Authorization": f"{scheme} {token}",
+                "Accept": "application/json",
+            },
+            timeout=timeout,
+            allow_redirects=False,
+        )
+    except requests.RequestException:
+        return PROOF_UNDECIDED, None
+    return _portal_me_answer(resp)
+
+
+def _portal_me_answer(resp: Any) -> tuple[str, dict | None]:
+    """A /users/me/ response: (valid, object) for 200 + identity, (invalid,
+    None) for 401/403, (indeterminate, None) for anything else."""
+    if resp.status_code in (401, 403):
+        return PROOF_INVALID, None
+    if resp.status_code != 200:
+        return PROOF_UNDECIDED, None
+    try:
+        data = resp.json()
+    except ValueError:
+        return PROOF_UNDECIDED, None
+    if isinstance(data, dict) and any(
+        isinstance(data.get(f), str) and data.get(f) for f in ("uuid", "username")
+    ):
+        return PROOF_VALID, data
+    return PROOF_UNDECIDED, None
+
+
+def _write_token_cache(token: str) -> None:
+    """Cache `token` 0600 — created and tightened BEFORE the write (a
+    pre-existing file keeps its old mode through O_CREAT): never
+    write-then-chmod, which leaves the token readable by others in between."""
+    CSCS_TOKEN_CACHE.parent.mkdir(parents=True, exist_ok=True)
+    fd = os.open(CSCS_TOKEN_CACHE, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as fh:
+        os.fchmod(fh.fileno(), 0o600)
+        fh.write(token)
 
 
 def _capture_and_cache_token(ctx, page) -> int:
-    """Capture the DRF token from a portal ``page`` and cache it.
+    """Find the portal tab's DRF token, VALIDATE it against the portal's API
+    and cache only a validated one: 0 cached, 2 the server rejects every
+    candidate (log in again), 1 no candidate / could not tell.
 
     Shared by ``cmd_token`` and ``cmd_cscs_login`` so a login flow can grab the
     token from its existing connection instead of reconnecting over CDP (each
     ``connect_over_cdp`` re-attaches to every open tab and costs seconds).
-
     Resilient to the Waldur SPA navigating/repopulating: scans a few times with
-    short waits, then falls back to an explicit reload of the portal profile to
-    force a settled state before giving up.
+    short waits, then reloads the portal profile once before giving up.
+    Error lines name only states and status classes — never a token or body.
     """
-    import requests
     from playwright.sync_api import Error as PlaywrightError
 
-    token = None
+    deadline = time.monotonic() + TOKEN_CAPTURE_BUDGET_S
+    tokens: list[str] = []
+    method: str | None = None
     for _ in range(4):  # SPA may be mid-navigation / still populating storage
-        token = _scan_token(ctx, page)
-        if token:
+        tokens, method = _token_candidates(ctx, page)
+        if tokens:
             break
         page.wait_for_timeout(800)
-    if not token:  # deterministic fallback: reload to a known-settled state
+    if not tokens:  # deterministic fallback: reload to a known-settled state
         try:
             page.goto(PORTAL_PROFILE_URL, wait_until="domcontentloaded")
             page.wait_for_timeout(1500)
         except PlaywrightError:
             pass
-        token = _scan_token(ctx, page)
-    if not token:
+        tokens, method = _token_candidates(ctx, page)
+    if not tokens:
         return _fail(
-            "Logged in, but no 40-hex token found in storage. The portal may have "
-            "changed where it stores the token — open DevTools → Network → an /api/ "
+            "Logged in, but no portal token found in storage "
+            f"({BROKER_CSCS_TOKEN_KEY} is empty). The portal may have changed "
+            "where it stores the token — open DevTools → Network → an /api/ "
             "request → Authorization header to find it."
         )
-    CSCS_TOKEN_CACHE.parent.mkdir(parents=True, exist_ok=True)
-    # Created 0600 and tightened BEFORE the write (a pre-existing file keeps its
-    # old mode through O_CREAT) — never write-then-chmod, which leaves the token
-    # readable by other users in between.
-    fd = os.open(CSCS_TOKEN_CACHE, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-    with os.fdopen(fd, "w", encoding="utf-8") as fh:
-        os.fchmod(fh.fileno(), 0o600)
-        fh.write(token)
-    print(f"✓ Token cached at {CSCS_TOKEN_CACHE} (mode 0600).")
-    # Cached BEFORE the check on purpose: a token scanned from the logged-in
-    # portal is almost always valid, and cscs-api.py self-heals on a 401. A
-    # failed check exits 1 (cscs-api.py maps 2 to "needs login", which it isn't).
-    # Error lines name only the exception TYPE and the status code — a response
-    # body or exception text may echo the token.
-    try:
-        resp = requests.get(
-            PORTAL_API_ME, headers={"Authorization": f"Token {token}"}, timeout=15
-        )
-        data = resp.json() if resp.status_code == 200 else None
-    except (requests.RequestException, ValueError) as exc:
+    schemes = _portal_auth_scheme(method, deadline)
+    undecided = False
+    for token in tokens:
+        state, me, scheme = _validate_portal_token(token, schemes, deadline)
+        if state == PROOF_VALID and me is not None:
+            _write_token_cache(token)
+            print(f"✓ Token validated and cached at {CSCS_TOKEN_CACHE} (mode 0600).")
+            if scheme != "Token":
+                print(
+                    f"⚠️ the portal wants '{scheme}' auth — cscs-api.py sends 'Token'.",
+                    file=sys.stderr,
+                )
+            user, email = _printable(me.get("username")), _printable(me.get("email"))
+            print(f"✓ Authenticated as: {user} ({email})")
+            return 0
+        undecided = undecided or state == PROOF_UNDECIDED
+    if undecided:
         return _fail(
-            f"Token cached at {CSCS_TOKEN_CACHE}, but verifying it against the "
-            f"portal failed ({type(exc).__name__}) — check the network, then "
-            "re-run: browser.py token"
+            "could not verify the portal token (network, timeout or a 5xx) — "
+            "nothing cached; check the network, then re-run: browser.py token"
         )
-    if resp.status_code != 200:
-        return _fail(
-            f"Portal rejected the cached token (HTTP {resp.status_code}) — "
-            "log into CSCS again (browser.py cscs-login)."
-        )
-    if not isinstance(data, dict):
-        return _fail(
-            f"Token cached at {CSCS_TOKEN_CACHE}, but the portal's /api/me/ "
-            "answer was not a JSON object — cannot confirm the token."
-        )
-    user, email = _printable(data.get("username")), _printable(data.get("email"))
-    print(f"✓ Authenticated as: {user} ({email})")
-    return 0
+    _fail(
+        "the portal's API rejects its stored token — nothing cached; log into "
+        "CSCS again (browser.py login cscs)."
+    )
+    return 2
 
 
 def _token_in_page(page) -> int:
-    """`cmd_token`'s check, in its own fresh tab: portal → token, Keycloak → 2."""
+    """`cmd_token`'s check, in its own fresh tab: the server proof on the
+    portal (`cscs_token_proof`), then the validated token cache. 0 cached, 2
+    not logged in (the portal's API rejects its token / it sent us to
+    Keycloak), 1 cannot tell (network, 5xx, timeout)."""
     _deadline_step("token:goto")
     page.goto(PORTAL_PROFILE_URL, wait_until="domcontentloaded")
-    page.wait_for_timeout(1500)
-    if "auth.cscs.ch" in page.url:  # portal bounced us to Keycloak → not logged in
+    _deadline_step("token:proof")
+    proof = str(_broker_cscs_token_proof(page, wait_s=CSCS_PROBE_WAIT_S))
+    _result_set(proof_v=PROOF_V)
+    if proof == PROOF_INVALID:
+        _result_fail("client-proof", "logged_out")
         _fail(
-            "Not logged in — the portal redirected to Keycloak.\n"
+            "Not logged in — the portal's API rejects its token (or the portal "
+            "redirected to Keycloak).\n"
             "Run: browser.py login cscs   (then re-run: browser.py token)"
         )
         return 2  # distinct code: caller maps this to a 'needs login' hint
+    if proof != PROOF_VALID:
+        _result_fail("client-proof", "indeterminate")
+        return _fail(
+            "could not tell whether CSCS is logged in (the portal's API did not "
+            "answer, answered 5xx or timed out) — retry: browser.py token"
+        )
     _deadline_step("token:scan")
-    return _capture_and_cache_token(page.context, page)
+    rc = _capture_and_cache_token(page.context, page)
+    if rc != 0:
+        _result_fail("consumer-followup", "followup_failed", f"token exit {rc}")
+    return rc
 
 
 def cmd_token(port: int) -> int:
@@ -9374,11 +9524,24 @@ def cmd_login_log(site_name: str | None) -> int:
 # LoginDeadline fired (tabs closed / cleanup unconfirmed — LOGIN_TIMEOUT_RC).
 
 BROKER_SOCKET_DEFAULT = "/var/db/login-broker-run/broker.sock"
-BROKER_TIMEOUT_S = 180.0
+# Longer than the broker's own run deadline (daemon.RUN_DEADLINE_S, 255 s), so
+# the reply of a slow login still arrives (see LOGIN_TIMEOUT_S for the order).
+BROKER_TIMEOUT_S = 285.0
 BROKER_MAX_RESPONSE = 16 * 1024 * 1024
-# How long the cscs check polls the portal for its token (broker/recipes.py
-# ``cscs_portal_ready``, the broker's own positive check, uses the same 8 s).
+# How long the cscs check polls the portal while its app lands (broker/recipes.py
+# ``cscs_token_proof``, the broker's own server proof, uses the same 8 s).
 CSCS_PROBE_WAIT_S = 8.0
+# The portal origin and the page a CSCS session is written and read back on:
+# /profile/, never `/` (the portal's boot-redirect.js sends a session it thinks
+# expired to the IdP there before the app runs).
+CSCS_PORTAL_ORIGIN = "https://portal.cscs.ch"
+STORAGE_PAGE_PATHS = {CSCS_PORTAL_ORIGIN: "/profile/"}
+# Keys a site's bundle MUST carry before anything in the shared browser is
+# touched (a CSCS session without its token logs nobody in).
+REQUIRED_STORAGE_KEYS = {"cscs": {CSCS_PORTAL_ORIGIN: [BROKER_CSCS_TOKEN_KEY]}}
+# Keys the APP rewrites on its own after the injection (the portal records the
+# expiry /users/me/ reports): written, but never compared on read-back.
+VOLATILE_STORAGE_KEYS = {CSCS_PORTAL_ORIGIN: frozenset({BROKER_CSCS_EXPIRES_KEY})}
 BROKER_ERRORS = {
     "needs_human": "the site wants a human (captcha / bot check / second factor)",
     "origin_violation": "the login page left the item's agent_fill_origins — "
@@ -9391,6 +9554,9 @@ BROKER_ERRORS = {
     "forbidden": "the broker does not serve this uid",
     "bad_request": "the broker rejected the request",
     "internal": "internal broker error",
+    "timeout": "the broker run did not finish within its deadline",
+    "bundle_export": "the broker could not export the site's required session token",
+    "bundle_rejected": "the site's API rejects the broker's session",
 }
 _BROKER_SITES_CACHE: list[list[dict]] = []
 # The broker's refusal of this process's latest `login` per site: (error code,
@@ -10881,13 +11047,9 @@ PROOF_VALID, PROOF_INVALID, PROOF_UNDECIDED = "valid", "invalid", "indeterminate
 
 def _legacy_probe(page, entry: dict) -> str:
     """The pre-WS1a proof of an item WITHOUT a sentinel (C2: kept until the
-    item gets one): CSCS — the portal app holds its token; else the page
-    ended off every fill origin (https), with no bot interstitial and no
-    visible password field. Weak (an "Access denied" page passes): never for
-    a scheduled login, never enough to promote a site."""
-    if entry.get("site") == "cscs":
-        ready: bool = _broker_cscs_portal_ready(page, wait_s=CSCS_PROBE_WAIT_S)
-        return PROOF_VALID if ready else PROOF_INVALID
+    item gets one): the page ended off every fill origin (https), with no bot
+    interstitial and no visible password field. Weak (an "Access denied" page
+    passes): never for a scheduled login, never enough to promote a site."""
     page.wait_for_timeout(1000)
     if not entry.get("check_url"):
         return PROOF_INVALID
@@ -10915,18 +11077,22 @@ def _broker_probe(  # pylint: disable=too-many-return-statements
     """The broker's positive proof, client side, on the loaded check page:
     ``valid`` / ``invalid`` / ``indeterminate``.
 
-    With a sentinel (the item's, or the candidate `sentinel`) the STRICT
-    proof: (a) the check page's HTTP status is known and < 400 (absent or 5xx:
-    indeterminate; 4xx: invalid), (b) the page is on a proof origin (the check
-    URL's, or one of the item's ``proof_origins``), (c) the sentinel is
-    visible; CSCS additionally needs its portal token (polled up to
-    ``CSCS_PROBE_WAIT_S``). Without one: the old proof (`_legacy_probe`).
-    Records the page's final origin either way (`-x`'s origin report).
+    The STRICT proof with a sentinel (the item's, or the candidate
+    `sentinel`) or a registered server proof (CSCS): (a) the check page's
+    HTTP status is known and < 400 (absent or 5xx: indeterminate; 4xx:
+    invalid), then CSCS asks the portal's API with the stored token
+    (``cscs_token_proof``: valid / invalid / indeterminate — enough on its
+    own), (b) the page is on a proof origin (the check URL's, or one of the
+    item's ``proof_origins``), (c) the sentinel is visible. Without either:
+    the old proof (`_legacy_probe`). Records the page's final origin either
+    way (`-x`'s origin report).
     """
     sentinel = sentinel or entry.get("logged_in_selector")
     origins = _proof_origins(entry)
+    server = _broker_has_server_proof(str(entry.get("site") or ""))
+    _RESULT.pop("server_proof", None)
     try:
-        if not sentinel:
+        if not sentinel and not server:
             _RESULT["proof_v"] = 0
             return _legacy_probe(page, entry)
         _RESULT["proof_v"] = PROOF_V
@@ -10937,11 +11103,12 @@ def _broker_probe(  # pylint: disable=too-many-return-statements
             return PROOF_UNDECIDED
         if status >= 400:
             return PROOF_INVALID
-        if entry.get("site") == "cscs":
-            # The SPA renders on the portal first and only then sends a
-            # token-less session to Keycloak: poll the token while still there.
-            if not _broker_cscs_portal_ready(page, wait_s=CSCS_PROBE_WAIT_S):
-                return PROOF_INVALID
+        if server:
+            # The portal app lands first, then the server decides.
+            answer = str(_broker_cscs_token_proof(page, wait_s=CSCS_PROBE_WAIT_S))
+            _RESULT["server_proof"] = answer  # the site's API itself said so
+            if answer != PROOF_VALID or not sentinel:
+                return answer
         else:
             page.wait_for_timeout(1000)
 
@@ -11011,7 +11178,9 @@ def _broker_check_entry(
     included): 0 logged in, 2 not (or cannot tell). `sentinel`: a candidate
     instead of the item's (`logged-in -x`)."""
     check_url = str(entry.get("check_url") or "")
-    legacy = not (sentinel or entry.get("logged_in_selector"))
+    legacy = not (
+        sentinel or entry.get("logged_in_selector") or _broker_has_server_proof(site)
+    )
     if legacy:
         _result_set(proof="legacy")
         if site not in _WEAK_PROOF_WARNED and sys.stderr.isatty():
@@ -11106,8 +11275,10 @@ def _broker_write_storage(
     (the CSCS portal sends it to Keycloak), so a post-load ``setItem`` loses the
     race. Instead the tab starts on ``about:blank``, gets an init script that
     sets the keys at document start when ``location.origin`` is the bundle's
-    origin, then navigates there; the keys are read back on that page as the
-    proof. Values never reach a log line — only key counts and origins.
+    origin, then navigates there (``STORAGE_PAGE_PATHS``: the CSCS portal's
+    ``/profile/``, never its `/`); the keys are read back on that page as the
+    proof — all but the ``VOLATILE_STORAGE_KEYS`` the app itself rewrites.
+    Values never reach a log line — only key counts and origins.
     """
     written = 0
     storage = bundle.get("storage") or {}
@@ -11117,20 +11288,23 @@ def _broker_write_storage(
         if not str(origin).startswith("https://"):
             continue
         values = {str(k): str(v) for k, v in kv.items()}
+        volatile = VOLATILE_STORAGE_KEYS.get(str(origin), frozenset())
+        stable = {k: v for k, v in values.items() if k not in volatile}
 
         def prepare(page, origin=origin, values=values) -> None:
             page.add_init_script(script=_broker_storage_init_script(origin, values))
             _broker_bypass_cache(page)
 
-        def verify(page, origin=origin, values=values) -> bool:
+        def verify(page, origin=origin, stable=stable) -> bool:
             if _url_origin(page.url) != origin:  # redirected elsewhere: no proof
                 return False
-            return bool(page.evaluate(_BROKER_STORAGE_CHECK_JS, values))
+            return bool(page.evaluate(_BROKER_STORAGE_CHECK_JS, stable))
 
         if touched_origins is not None:
             touched_origins.append(str(origin))
 
-        if _with_prepared_background_page(port, origin + "/", prepare, verify):
+        url = str(origin) + STORAGE_PAGE_PATHS.get(str(origin), "/")
+        if _with_prepared_background_page(port, url, prepare, verify):
             written += len(values)
         else:
             print(
@@ -11260,6 +11434,23 @@ def _broker_bundle_gap(bundle: dict, entry: dict | None) -> tuple[list[str], int
     return empty, missing, want
 
 
+def _broker_missing_required(site: str, bundle: dict) -> list[str]:
+    """The ``REQUIRED_STORAGE_KEYS`` of `site` the bundle does not carry as a
+    non-empty string (names only, never values) — checked before anything in
+    the shared browser is touched."""
+    raw = bundle.get("storage")
+    storage: dict = raw if isinstance(raw, dict) else {}
+    lacking = []
+    for origin, keys in REQUIRED_STORAGE_KEYS.get(site, {}).items():
+        kv = storage.get(origin)
+        have = kv if isinstance(kv, dict) else {}
+        for key in keys:
+            value = have.get(key)
+            if not isinstance(value, str) or not value.strip():
+                lacking.append(key)
+    return lacking
+
+
 # Removes the named keys and proves they are gone (names in, bool out).
 _BROKER_STORAGE_DROP_JS = (
     "keys => { for (const k of keys) localStorage.removeItem(k);"
@@ -11282,12 +11473,9 @@ def _broker_drop_storage(port: int, bundle: dict, origins: list[str]) -> bool:
                 return False
             return bool(page.evaluate(_BROKER_STORAGE_DROP_JS, keys))
 
+        url = str(origin) + STORAGE_PAGE_PATHS.get(str(origin), "/")
         ok = (
-            bool(
-                _with_prepared_background_page(
-                    port, origin + "/", _broker_bypass_cache, drop
-                )
-            )
+            bool(_with_prepared_background_page(port, url, _broker_bypass_cache, drop))
             and ok
         )
     return ok
@@ -11352,6 +11540,82 @@ def _broker_bundle_keys(bundle: dict) -> int:
     )
 
 
+def _cscs_bundle_rejected(bundle: dict) -> bool:
+    """The bundled CSCS token is REJECTED by the portal's API (every plausible
+    scheme 401/403) — revoked between the broker's export and now, or from an
+    older broker. Undecided (network, 5xx) is not a rejection: the proof after
+    the injection decides then."""
+    raw = bundle.get("storage")
+    storage: dict = raw if isinstance(raw, dict) else {}
+    kv = storage.get(CSCS_PORTAL_ORIGIN)
+    values: dict = kv if isinstance(kv, dict) else {}
+    token = str(values.get(BROKER_CSCS_TOKEN_KEY) or "").strip()
+    method = values.get("waldur/auth/method")
+    # Under the interaction lease: a tight budget (an undecided answer only
+    # means the proof after the injection decides).
+    deadline = time.monotonic() + BUNDLE_CHECK_BUDGET_S
+    schemes = _portal_auth_scheme(method if isinstance(method, str) else None, deadline)
+    state, _me, _scheme = _validate_portal_token(token, schemes, deadline)
+    return state == PROOF_INVALID
+
+
+# The pre-injection API check of a CSCS bundle, all calls together.
+BUNDLE_CHECK_BUDGET_S = 8.0
+
+
+# Server checks of a bundle BEFORE the shared browser is touched: True = the
+# site's server rejects the session (it would log nobody in).
+BUNDLE_REJECTED_CHECKS: dict[str, Callable[[dict], bool]] = {
+    "cscs": _cscs_bundle_rejected
+}
+
+
+def _broker_bundle_refusal(site: str, bundle: dict, entry: dict | None) -> int | None:
+    """The exit code when the bundle may not be injected (nothing touched
+    yet): a required key is missing (``REQUIRED_STORAGE_KEYS``, e.g. CSCS's
+    token), the site's server rejects the session (``BUNDLE_REJECTED_CHECKS``)
+    or an origin holds none of its keys (`_broker_bundle_gap`) — phase
+    ``bundle-export``. None: go on (a partial origin only warns)."""
+    lacking = _broker_missing_required(site, bundle)
+    if lacking:
+        _result_fail(
+            "bundle-export",
+            "incomplete_bundle",
+            f"no {', '.join(lacking)} in the session",
+        )
+        return _broker_fail(
+            2,
+            f"{site}: the broker's session lacks {', '.join(lacking)} — nothing injected.",
+        )
+    rejected = BUNDLE_REJECTED_CHECKS.get(site)
+    if rejected is not None and rejected(bundle):
+        _result_fail("bundle-export", "bundle_rejected", "the site's API rejects it")
+        return _broker_fail(
+            2,
+            f"{site}: the site's API rejects the broker's session — nothing injected.",
+        )
+    empty, missing, want = _broker_bundle_gap(bundle, entry)
+    if empty:
+        _result_fail(
+            "bundle-export",
+            "incomplete_bundle",
+            f"no storage key for {len(empty)} origin(s)",
+        )
+        return _broker_fail(
+            2,
+            f"{site}: the broker's session holds none of the storage "
+            f"keys for {len(empty)} origin(s) — nothing injected.",
+        )
+    if missing:  # some keys of an origin: inject what is there
+        _result_set(warning="partial_bundle", missing_keys=missing)
+        print(
+            f"⚠️ {site}: the broker's session lacks {missing} of {want} "
+            "storage key(s) — injecting the rest.",
+            file=sys.stderr,
+        )
+    return None
+
+
 def _broker_fetch_inject(
     port: int,
     site: str,
@@ -11403,25 +11667,9 @@ def _broker_fetch_inject(
             _result_set(fresh_auth=bool(resp.get("fresh_auth")), submitted=None)
             raw_bundle = resp.get("bundle")
             bundle: dict = raw_bundle if isinstance(raw_bundle, dict) else {}
-            empty, missing, want = _broker_bundle_gap(bundle, entry)
-            if empty:
-                _result_fail(
-                    "bundle-export",
-                    "incomplete_bundle",
-                    f"no storage key for {len(empty)} origin(s)",
-                )
-                msg = (
-                    f"{site}: the broker's session holds none of the storage "
-                    f"keys for {len(empty)} origin(s) — nothing injected."
-                )
-                return _broker_fail(2, msg), bundle, 0, 0
-            if missing:  # some keys of an origin: inject what is there
-                _result_set(warning="partial_bundle", missing_keys=missing)
-                print(
-                    f"⚠️ {site}: the broker's session lacks {missing} of {want} "
-                    "storage key(s) — injecting the rest.",
-                    file=sys.stderr,
-                )
+            refused = _broker_bundle_refusal(site, bundle, entry)
+            if refused is not None:
+                return refused, bundle, 0, 0
             renewal = bundle.get("session_refresh")
             if isinstance(renewal, str):
                 _result_set(session_refresh=renewal)
@@ -11465,6 +11713,121 @@ def _broker_fetch_inject(
         if connected:
             browser.close()
             pw.stop()
+
+
+# Removes each key ONLY while it still holds the bundle's value; true when
+# none of them holds it any more (names and values in, bool out).
+_BROKER_STORAGE_CAS_DROP_JS = (
+    "kv => { for (const [k, v] of Object.entries(kv))"
+    " if (localStorage.getItem(k) === v) localStorage.removeItem(k);"
+    " return Object.entries(kv).every(([k, v]) => localStorage.getItem(k) !== v); }"
+)
+
+
+def _broker_drop_bundle_cookies(port: int, bundle: dict) -> int:
+    """Delete the shared browser's cookies that are still EXACTLY one of the
+    bundle's (name, domain, path and value); the count deleted."""
+    ours = {
+        (str(c.get("name")), str(c.get("domain")), str(c.get("path") or "/")): str(
+            c.get("value")
+        )
+        for c in bundle.get("cookies") or []
+        if isinstance(c, dict)
+    }
+    if not ours:
+        return 0
+    gone = 0
+    pw, browser = _connect(port)
+    try:
+        if not browser.contexts:
+            return 0
+        ctx = browser.contexts[0]
+        for ck in ctx.cookies():
+            key = (str(ck.get("name")), str(ck.get("domain")), str(ck.get("path")))
+            if key in ours and ours[key] == str(ck.get("value")):
+                ctx.clear_cookies(name=ck["name"], domain=ck["domain"], path=ck["path"])
+                gone += 1
+    finally:
+        browser.close()
+        pw.stop()
+    return gone
+
+
+def _broker_undo_injection(port: int, site: str, bundle: dict) -> str:
+    """Compare-and-swap undo of an injection the site rejected, under the
+    interaction lease: only cookies and storage keys that still hold the
+    bundle's exact values are removed. Never raises; ``complete`` /
+    ``partial``."""
+    raw = bundle.get("storage")
+    storage: dict = raw if isinstance(raw, dict) else {}
+    complete = True
+    try:
+        with _interaction_lease(f"undo {site}", wait_s=UNDO_LEASE_WAIT_S):
+            try:
+                _broker_drop_bundle_cookies(port, bundle)
+            except Exception:  # pylint: disable=broad-exception-caught
+                complete = False
+            for origin in _written(bundle):
+                kv = {str(k): str(v) for k, v in storage[origin].items()}
+                complete = _broker_undo_storage(port, origin, kv) and complete
+    except (Exception, SystemExit):  # pylint: disable=broad-exception-caught
+        # The lease or a client registration was not available (a guided
+        # login, BUSY): the login still ends with exit 2 and `rollback`.
+        complete = False
+    return "complete" if complete else "partial"
+
+
+# How long the undo waits for the interaction lease (it never blocks a
+# finished login long; busy -> "partial").
+UNDO_LEASE_WAIT_S = 5.0
+# The undo's compare-and-swap as a document-start script on the bundle's own
+# origin (like the injection): it runs before the app, so a dead-token page
+# that redirects to the IdP right after load cannot outrun it.
+_BROKER_STORAGE_CAS_INIT_JS = (
+    "(() => { const origin = __ORIGIN__; const kv = __KV__;"
+    " if (location.origin !== origin) return;"
+    " try { for (const [k, v] of Object.entries(kv))"
+    " if (localStorage.getItem(k) === v) localStorage.removeItem(k); }"
+    " catch (e) {} })();"
+)
+
+
+def _broker_undo_storage(port: int, origin: str, kv: dict[str, str]) -> bool:
+    """Compare-and-swap removal of `kv` on `origin` (init script at document
+    start, then read back). A page the app already moved off the origin is
+    checked once more on ``/robots.txt`` of the origin (no app runs there;
+    the init script runs again, idempotent). True when none of the bundle's
+    values is left."""
+    script = _BROKER_STORAGE_CAS_INIT_JS.replace(
+        "__ORIGIN__", json.dumps(origin)
+    ).replace("__KV__", json.dumps(kv))
+
+    def prepare(page) -> None:
+        page.add_init_script(script=script)
+        _broker_bypass_cache(page)
+
+    def gone(page) -> bool:
+        if _url_origin(page.url) != origin:
+            page.goto(origin + "/robots.txt", wait_until="domcontentloaded")
+            if _url_origin(page.url) != origin:
+                return False
+        return bool(page.evaluate(_BROKER_STORAGE_CAS_DROP_JS, kv))
+
+    url = origin + STORAGE_PAGE_PATHS.get(origin, "/")
+    return bool(_with_prepared_background_page(port, url, prepare, gone))
+
+
+def _written(bundle: dict) -> list[str]:
+    """The origins `_broker_write_storage` writes for `bundle` (same filter)."""
+    raw = bundle.get("storage")
+    storage: dict = raw if isinstance(raw, dict) else {}
+    return [
+        str(o)
+        for o, kv in storage.items()
+        if isinstance(kv, dict)
+        and _url_origin(str(o)) == o
+        and str(o).startswith("https://")
+    ]
 
 
 def _broker_inject_phase(bundle: dict, n_cookies: int, n_keys: int) -> None:
@@ -11534,7 +11897,15 @@ def _broker_login(port: int, site: str) -> int:  # pylint: disable=too-many-retu
         return failed
     _deadline_step("broker:verify")
     if _broker_check_entry(port, site, entry, sentinel=candidate or None) != 0:
+        # Only when the site's API itself rejected the injected session (a
+        # server proof said `invalid`) — never on a missing sentinel, a 4xx or
+        # a slow SPA, which may still hold a working session. Only values that
+        # are still exactly the bundle's go (a session another login installed
+        # meanwhile stays); a candidate check never undoes.
+        dead = _RESULT.get("server_proof") == PROOF_INVALID and not candidate
         _broker_inject_phase(bundle, n_cookies, n_keys)
+        if dead:
+            _result_set(rollback=_broker_undo_injection(port, site, bundle))
         return _broker_fail(
             2, f"{site}: session injected but the site is not logged in."
         )

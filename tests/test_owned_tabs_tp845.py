@@ -258,6 +258,9 @@ def _stub_checks(monkeypatch) -> None:
         browser, "_slack_session_from_page", lambda ctx, page: {"token": "x"}
     )
     monkeypatch.setattr(browser, "_capture_and_cache_token", lambda ctx, page: 0)
+    monkeypatch.setattr(
+        browser, "_broker_cscs_token_proof", lambda page, wait_s: "valid"
+    )
     monkeypatch.setattr(browser, "_switch_page_verdict", lambda page: "logged-in")
 
 

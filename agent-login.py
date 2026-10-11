@@ -340,8 +340,15 @@ def classify(
 
 
 def has_sentinel(entry: dict) -> bool:
-    """The broker item has an authenticated sentinel (`sentinel` from a WS1a
-    broker, else derived from its `logged_in_selector`)."""
+    """The broker item has an authenticated proof — a DOM sentinel, or a
+    registered server proof (CSCS: its API answers the stored token;
+    ``recipes.PROOFS``) — AS THE BROKER ADVERTISES IT: `strict_proof` from a
+    WS2-cscs broker, else `sentinel` (WS1a), else `logged_in_selector`. An
+    older broker without `strict_proof` still runs its old proof, so its
+    CSCS is never assumed strict from this (newer) code."""
+    strict = entry.get("strict_proof")
+    if isinstance(strict, bool):
+        return strict
     flag = entry.get("sentinel")
     if isinstance(flag, bool):
         return flag

@@ -59,6 +59,8 @@ CODE_TEXT = {
     "export_failed": "the session could not be exported",
     "empty_bundle": "the exported session holds no cookie and no storage key",
     "incomplete_bundle": "the exported session lacks a configured storage key",
+    "bundle_export": "the session's required token could not be exported",
+    "bundle_rejected": "the site's API rejects the exported session",
     "refresh_unavailable": "the broker profile cannot be reused — a refresh never logs in",
     "no_cookies": "no cookie could be injected",
     "storage_failed": "localStorage could not be written",

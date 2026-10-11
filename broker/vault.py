@@ -46,6 +46,7 @@ from broker.recipes import (
     DEFAULT_CHECK_URLS,
     DEFAULT_LOGGED_IN_SELECTORS,
     SESSION_REFRESHERS,
+    has_server_proof,
     session_refresh_name,
 )
 from broker.vault_cache import (
@@ -126,10 +127,11 @@ class SiteItem:  # pylint: disable=too-many-instance-attributes
 
     @property
     def has_proof(self) -> bool:
-        """The STRICT proof is possible: an authenticated DOM sentinel exists
-        (or CSCS's portal-token rule, kept until WS2-cscs). Without one only
-        the old, weaker proof is left: never for a scheduled login."""
-        return bool(self.logged_in_selector) or self.site == "cscs"
+        """The STRICT proof is possible: an authenticated DOM sentinel exists,
+        or the site has a registered server proof (``recipes.PROOFS``: CSCS
+        asks its API with the stored token). Without one only the old, weaker
+        proof is left: never for a scheduled login."""
+        return bool(self.logged_in_selector) or has_server_proof(self.site)
 
     @property
     def limiter_keys(self) -> list[str]:
@@ -164,6 +166,9 @@ class SiteItem:  # pylint: disable=too-many-instance-attributes
             "pre_click": self.pre_click,
             "attempt_group": self.attempt_group,
             "sentinel": bool(self.logged_in_selector),
+            # the strict proof is possible (sentinel OR a server proof): what
+            # agent-login's needs-sentinel / promotion gates read
+            "strict_proof": self.has_proof,
             "proof_origins": list(self.proof_origins),
             "storage_keys": {o: list(k) for o, k in self.storage_keys.items()},
             "session_refresh": session_refresh_name(self),

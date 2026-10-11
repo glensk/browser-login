@@ -624,9 +624,9 @@ def test_runner_budgets(monkeypatch):
     monkeypatch.setenv("CLAUDE_BROWSER_LOGIN_TIMEOUT_S", "600")
     assert jobs.browser_timeout("login") == 690
     monkeypatch.delenv("CLAUDE_BROWSER_LOGIN_TIMEOUT_S")
-    assert jobs.browser_timeout("login") == 390
+    assert jobs.browser_timeout("login") == 570
     monkeypatch.setenv("CLAUDE_BROWSER_LOGIN_TIMEOUT_S", "nan")
-    assert jobs.browser_timeout("login") == 390
+    assert jobs.browser_timeout("login") == 570
     assert jobs.browser_timeout("logged-in") == 210
     assert jobs.browser_timeout("status") == 30
 

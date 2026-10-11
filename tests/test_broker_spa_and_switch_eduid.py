@@ -1,10 +1,9 @@
 """tp#821: broker storage write that beats a SPA redirect, the CSCS token probe,
 and the SWITCH Cloud login chained onto the broker's edu-ID session.
 
-Hermetic by default (fake pages, stubbed broker / lease / CDP). The real-browser
-test (`-m browser`, opt-in via LOGIN_BROKER_E2E=1) serves a fake CSCS portal over
-local HTTPS and points a throwaway headless Chromium at it with
-``--host-resolver-rules``; it never touches the shared browser or a real site.
+Hermetic (fake pages, stubbed broker / lease / CDP). The CSCS portal in a real
+headless Chromium (server proof, write on /profile/, read-back) is tested in
+tests/test_ws2_cscs.py against a routed fixture portal.
 
 Run: uv run --no-sync pytest tests/test_broker_spa_and_switch_eduid.py
 """
@@ -15,21 +14,12 @@ from __future__ import annotations
 # pylint: disable=missing-function-docstring,missing-class-docstring,import-error
 # pylint: disable=redefined-outer-name,unused-argument
 import contextlib
-import http.server
 import importlib.util
 import json
-import os
 import re
 import secrets
-import shutil
-import socket
-import ssl
-import subprocess
 import sys
-import tempfile
-import threading
 import time
-import urllib.request
 from pathlib import Path
 
 import pytest
@@ -112,7 +102,7 @@ def test_storage_write_lands_before_the_redirect(monkeypatch, capsys):
     )
     bundle = {"storage": {PORTAL: {"homeport": tok}}}
     assert browser._broker_write_storage(9222, bundle) == 1
-    assert calls == [PORTAL + "/"] and page.url == PORTAL + "/"
+    assert calls == [PORTAL + "/profile/"] and page.url == PORTAL + "/profile/"
     assert page.storage == {"homeport": tok}
     out = capsys.readouterr()
     assert tok not in out.out + out.err
@@ -160,7 +150,7 @@ def test_init_script_guards_the_origin():
 
 
 # ---------------------------------------------------------------------------
-# A. the cscs probe polls for the token
+# A. the cscs probe asks the portal's API (WS2-cscs; real Chromium: test_ws2_cscs)
 # ---------------------------------------------------------------------------
 
 
@@ -172,15 +162,16 @@ class _ShownEl:
 
 
 class _SpaProbePage:
-    """URL/token sequence advanced by each wait (500 ms per poll)."""
+    """URL sequence advanced by each wait (500 ms per poll); the in-page
+    server check (``recipes.cscs_token_state``) answers from `states`."""
 
-    def __init__(self, urls: list[str], tokens: list[bool]) -> None:
-        self._urls, self._tokens = urls, tokens
+    def __init__(self, urls: list[str], states: list[str]) -> None:
+        self._urls, self._states = urls, states
         self.url = urls[0]
         self.waits = 0
 
-    def evaluate(self, _js: str) -> bool:
-        return self._tokens.pop(0) if self._tokens else False
+    def evaluate(self, _js: str, _arg=None) -> dict:
+        return {"state": self._states.pop(0) if self._states else "none"}
 
     def wait_for_timeout(self, _ms: float) -> None:
         self.waits += 1
@@ -192,7 +183,7 @@ class _SpaProbePage:
         return [_ShownEl()]  # the DOM sentinel shows
 
 
-# WS1a: CSCS needs a DOM sentinel too (next to its token) and a known status.
+# An item MAY add a DOM sentinel; the server proof decides first.
 CSCS_ENTRY = {
     "site": "cscs",
     "check_url": PORTAL + "/profile/",
@@ -200,27 +191,31 @@ CSCS_ENTRY = {
 }
 
 
-def _probe(page) -> str:
+def _probe(page, entry=None) -> str:
     browser._BG_STATUS[id(page)] = 200
     try:
-        return str(browser._broker_probe(page, CSCS_ENTRY))
+        return str(browser._broker_probe(page, entry or CSCS_ENTRY))
     finally:
         browser._BG_STATUS.pop(id(page), None)
 
 
-def test_cscs_probe_waits_for_the_token():
-    late = _SpaProbePage([PORTAL + "/profile/"] * 4, [False, False, True])
+def test_cscs_probe_waits_for_the_server_answer():
+    late = _SpaProbePage([PORTAL + "/profile/"] * 4, ["none", "error", "valid"])
     assert _probe(late) == browser.PROOF_VALID
     assert late.waits == 2  # polled, no fixed 1 s sleep first
 
 
-def test_cscs_probe_on_portal_without_token_is_not_logged_in():
-    """Regression: the old probe said "logged in" 1 s after load on the portal;
-    the SPA moves a token-less session to Keycloak after that second."""
-    redirect_after_1s = _SpaProbePage(
-        [PORTAL + "/profile/", PORTAL + "/profile/", KEYCLOAK], []
-    )
-    assert _probe(redirect_after_1s) == browser.PROOF_INVALID
+def test_cscs_probe_on_portal_with_a_dead_token_is_not_logged_in():
+    """Regression (WS2-cscs): the old probe said "logged in" for any 40-hex
+    value on the portal — an expired token too."""
+    assert _probe(_SpaProbePage([PORTAL + "/profile/"], ["invalid"])) == "invalid"
+    moved = _SpaProbePage([PORTAL + "/profile/", KEYCLOAK], ["none"])
+    assert _probe(moved) == browser.PROOF_INVALID
+
+
+def test_cscs_probe_api_trouble_is_undecided():
+    down = _SpaProbePage([PORTAL + "/profile/"], ["indeterminate"])
+    assert _probe(down) == browser.PROOF_UNDECIDED
 
 
 def test_cscs_probe_gives_up_after_the_wait(monkeypatch):
@@ -229,14 +224,15 @@ def test_cscs_probe_gives_up_after_the_wait(monkeypatch):
     assert _probe(never) == browser.PROOF_INVALID
 
 
-def test_cscs_without_a_dom_sentinel_keeps_its_token_proof():
-    """C2: until WS2-cscs, CSCS without a DOM sentinel keeps the old token rule
-    (also without a known status), recorded as the weak proof (proof_v 0)."""
-    page = _SpaProbePage([PORTAL + "/profile/"], [True])
-    assert browser._broker_probe(page, {"site": "cscs"}) == browser.PROOF_VALID
-    assert browser._RESULT["proof_v"] == 0
-    gone = _SpaProbePage([PORTAL + "/profile/", KEYCLOAK], [])
-    assert browser._broker_probe(gone, {"site": "cscs"}) == browser.PROOF_INVALID
+def test_cscs_without_a_dom_sentinel_is_the_strict_server_proof():
+    """WS2-cscs: the server proof is strict on its own (proof_v 1), and like
+    every strict proof it needs a known status."""
+    entry = {"site": "cscs", "check_url": PORTAL + "/profile/"}
+    page = _SpaProbePage([PORTAL + "/profile/"], ["valid"])
+    assert _probe(page, entry) == browser.PROOF_VALID
+    assert browser._RESULT["proof_v"] == browser.PROOF_V
+    no_status = _SpaProbePage([PORTAL + "/profile/"], ["valid"])
+    assert browser._broker_probe(no_status, entry) == browser.PROOF_UNDECIDED
 
 
 # ---------------------------------------------------------------------------
@@ -552,133 +548,3 @@ def test_wait_without_give_up_ignores_the_eduid_form():
 def test_the_eduid_form_check_needs_the_idp_host():
     page = _IdpWaitPage([LOGIN_URL], [True])
     assert not browser._switch_on_idp_login_form(page)
-
-
-# ---------------------------------------------------------------------------
-# A, real browser: fake CSCS portal over local HTTPS (opt-in)
-# ---------------------------------------------------------------------------
-
-_SPA_JS = (
-    "const has = () => { const re=/\\b[0-9a-f]{40}\\b/;"
-    " for (let i=0;i<localStorage.length;i++)"
-    " { const v=localStorage.getItem(localStorage.key(i));"
-    " if (v && re.test(v)) return true; } return false; };"
-    "window.addEventListener('load', () => {"
-    " if (has()) { document.getElementById('app').textContent='portal'; return; }"
-    " setTimeout(() => location.replace('" + KEYCLOAK + "'), __DELAY__); });"
-)
-
-
-class _PortalApp(http.server.BaseHTTPRequestHandler):
-    def log_message(self, *args):
-        return
-
-    def do_GET(self):  # noqa: N802
-        if self.path.startswith("/auth/"):  # "Keycloak" (auth.cscs.ch)
-            body = "<html><body><form><input type=password></form></body></html>"
-        else:
-            # /slow/: redirect 1 s after load; /slower/: 3 s (the old probe's
-            # "on the portal 1 s after load" called that logged in)
-            delays = {"/slow/": "1000", "/slower/": "3000"}
-            delay = next((d for p, d in delays.items() if self.path.startswith(p)), "0")
-            body = (
-                "<html><body><div id=app>loading</div><script>"
-                + _SPA_JS.replace("__DELAY__", delay)
-                + "</script></body></html>"
-            )
-        self.send_response(200)
-        self.send_header("Content-Type", "text/html")
-        self.end_headers()
-        self.wfile.write(body.encode())
-
-
-def _free_port() -> int:
-    with socket.socket() as s:
-        s.bind(("127.0.0.1", 0))
-        return int(s.getsockname()[1])
-
-
-@contextlib.contextmanager
-def _fake_portal_browser():
-    """(cdp port) of a throwaway headless Chromium whose portal.cscs.ch and
-    auth.cscs.ch resolve to a local HTTPS fake; everything torn down after."""
-    openssl = shutil.which("openssl")
-    if not openssl:
-        pytest.skip("openssl not found (needed for the local HTTPS fake)")
-    from playwright.sync_api import sync_playwright
-
-    with sync_playwright() as pw:
-        exe = pw.chromium.executable_path
-    tmp = Path(tempfile.mkdtemp(prefix="tp821-"))
-    proc = None
-    httpd = None
-    try:
-        key, cert = tmp / "k.pem", tmp / "c.pem"
-        subprocess.run(
-            [openssl, "req", "-x509", "-newkey", "rsa:2048", "-nodes", "-days", "1",
-             "-keyout", str(key), "-out", str(cert), "-subj", "/CN=portal.cscs.ch"],
-            check=True,
-            capture_output=True,
-        )  # fmt: skip
-        httpd = http.server.ThreadingHTTPServer(("127.0.0.1", 0), _PortalApp)
-        tls = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
-        tls.load_cert_chain(str(cert), str(key))
-        httpd.socket = tls.wrap_socket(httpd.socket, server_side=True)
-        hp = httpd.server_address[1]
-        threading.Thread(target=httpd.serve_forever, daemon=True).start()
-        cdp = _free_port()
-        rules = f"MAP portal.cscs.ch 127.0.0.1:{hp},MAP auth.cscs.ch 127.0.0.1:{hp}"
-        proc = subprocess.Popen(  # pylint: disable=consider-using-with
-            [exe, "--headless=new", f"--remote-debugging-port={cdp}",
-             f"--user-data-dir={tmp / 'profile'}", "--no-first-run",
-             "--no-default-browser-check", "--ignore-certificate-errors",
-             f"--host-resolver-rules={rules}", "about:blank"],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-        )  # fmt: skip
-        deadline = time.monotonic() + 20
-        while True:
-            try:
-                with urllib.request.urlopen(
-                    f"http://127.0.0.1:{cdp}/json/version", timeout=1
-                ):
-                    break
-            except OSError:
-                if time.monotonic() > deadline:
-                    raise
-                time.sleep(0.2)
-        yield cdp
-    finally:
-        if proc is not None:
-            proc.terminate()
-            with contextlib.suppress(subprocess.TimeoutExpired):
-                proc.wait(timeout=10)
-        if httpd is not None:
-            httpd.shutdown()
-        shutil.rmtree(tmp, ignore_errors=True)
-
-
-@pytest.mark.browser
-@pytest.mark.skipif(
-    os.environ.get("LOGIN_BROKER_E2E") != "1", reason="set LOGIN_BROKER_E2E=1"
-)
-def test_e2e_storage_write_beats_the_spa_redirect(monkeypatch, capsys):
-    # The throwaway browser is not the shared one: no registry, no lifecycle.
-    monkeypatch.setattr(browser, "_is_up", lambda port: True)
-    monkeypatch.setattr(browser, "_ensure_page_target", lambda port, **_k: None)
-    monkeypatch.setattr(browser, "_registry_register", lambda *a, **k: lambda: None)
-    entry = {"site": "cscs", "check_url": PORTAL + "/", "logged_in_selector": None}
-    checks = [
-        {**entry, "check_url": PORTAL + path} for path in ("/", "/slow/", "/slower/")
-    ]
-    tok = _token()
-    with _fake_portal_browser() as port:
-        # no token: redirected right after load / after 1 s / 3 s -> NOT logged in
-        for check in checks:
-            assert browser._broker_check_entry(port, "cscs", check) == 2, check
-        bundle = {"storage": {PORTAL: {"homeport-token": tok}}}
-        assert browser._broker_write_storage(port, bundle) == 1
-        for check in checks:
-            assert browser._broker_check_entry(port, "cscs", check) == 0, check
-    out = capsys.readouterr()
-    assert tok not in out.out + out.err

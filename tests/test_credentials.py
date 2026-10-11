@@ -943,7 +943,8 @@ def token_env(tmp_path, monkeypatch):
 
     cache = tmp_path / "cscs-api" / "portal_token"
     monkeypatch.setattr(browser, "CSCS_TOKEN_CACHE", cache)
-    monkeypatch.setattr(browser, "_scan_token", lambda ctx, page: HEX)
+    monkeypatch.setattr(browser, "_token_candidates", lambda ctx, page: ([HEX], None))
+    monkeypatch.setattr(browser, "_portal_auth_scheme", lambda method, *_a: ["Token"])
     monkeypatch.setattr(requests, "get", lambda *a, **k: _Resp())
     old = os.umask(0o022)
     yield cache

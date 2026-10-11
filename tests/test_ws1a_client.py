@@ -788,16 +788,20 @@ def test_minor_b_old_replies_pre_submit_only_when_proven(
 def test_minor_c_weak_proof_warning_once_and_only_on_a_terminal(
     monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    entry = {"site": "cscs", "check_url": "https://portal.cscs.ch/profile/"}
+    entry = {"site": "weak", "check_url": "https://www.weak.example/me"}
     monkeypatch.setattr(browser, "_with_prepared_background_page", lambda *_a: "valid")
     browser._WEAK_PROOF_WARNED.clear()
     monkeypatch.setattr(sys.stderr, "isatty", lambda: False)
-    browser._broker_check_entry(9222, "cscs", entry)
+    browser._broker_check_entry(9222, "weak", entry)
     assert "weaker proof" not in capsys.readouterr().err  # captured: silent
     monkeypatch.setattr(sys.stderr, "isatty", lambda: True)
     for _ in range(3):
-        browser._broker_check_entry(9222, "cscs", entry)
+        browser._broker_check_entry(9222, "weak", entry)
     assert capsys.readouterr().err.count("weaker proof") == 1
+    # CSCS's server proof is strict without a sentinel (WS2-cscs): no warning
+    cscs = {"site": "cscs", "check_url": "https://portal.cscs.ch/profile/"}
+    browser._broker_check_entry(9222, "cscs", cscs)
+    assert "weaker proof" not in capsys.readouterr().err
 
 
 def test_validate_selectors_lists_what_the_new_broker_refuses(

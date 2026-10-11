@@ -656,14 +656,17 @@ def test_cscs_on_portal_exact():
 
 
 class _SpaPage:
-    """The HomePort SPA: renders on the portal, then (no token) moves to Keycloak."""
+    """The HomePort SPA as the server proof sees it: a URL sequence advanced
+    by each wait, and the in-page check's answers (``cscs_token_state``)."""
 
-    def __init__(self, urls: list[str], tokens: list[bool]) -> None:
-        self._urls, self._tokens = urls, tokens
+    def __init__(self, urls: list[str], states: list[str]) -> None:
+        self._urls, self._states = urls, states
         self.url = urls[0]
+        self.checks = 0
 
-    def evaluate(self, _js: str) -> bool:
-        return self._tokens.pop(0) if self._tokens else False
+    def evaluate(self, _js: str, _arg: object = None) -> dict:
+        self.checks += 1
+        return {"state": self._states.pop(0) if self._states else "none"}
 
     def wait_for_timeout(self, _ms: float) -> None:
         if len(self._urls) > 1:
@@ -671,15 +674,25 @@ class _SpaPage:
         self.url = self._urls[0]
 
 
-def test_cscs_portal_ready_needs_the_token():
-    """On the portal without a token is NOT logged in (the SPA redirects later)."""
+def test_cscs_proof_asks_the_server():
+    """A token's SHAPE proves nothing (an expired one looks the same): the
+    server's answer decides, the first one ends the poll (WS2-cscs)."""
     kc = "https://auth.cscs.ch/auth/realms/cscs/protocol/openid-connect/auth"
-    stale = _SpaPage(["https://portal.cscs.ch/profile/", kc], [False])
-    assert not recipes.cscs_portal_ready(stale, wait_s=5)
-    late = _SpaPage(["https://portal.cscs.ch/profile/"] * 3, [False, False, True])
-    assert recipes.cscs_portal_ready(late, wait_s=5)
-    never = _SpaPage(["https://portal.cscs.ch/profile/"], [])
-    assert not recipes.cscs_portal_ready(never, wait_s=0)
+    profile = "https://portal.cscs.ch/profile/"
+    stale = _SpaPage([profile], ["invalid"])
+    assert recipes.cscs_token_proof(stale, wait_s=5) == recipes.INVALID
+    assert stale.checks == 1
+    late = _SpaPage([profile] * 3, ["none", "error", "valid"])
+    assert recipes.cscs_token_proof(late, wait_s=5) == recipes.VALID
+    down = _SpaPage([profile], ["indeterminate"])
+    assert recipes.cscs_token_proof(down, wait_s=5) == recipes.INDETERMINATE
+    moved = _SpaPage([profile, kc], ["none"])
+    assert recipes.cscs_token_proof(moved, wait_s=5) == recipes.INVALID
+    settled = _SpaPage([profile], [])  # the portal never got a token
+    assert recipes.cscs_token_proof(settled, wait_s=0) == recipes.INVALID
+    landing = _SpaPage(["https://portal.cscs.ch/api-auth/keycloak/x"], [])
+    assert recipes.cscs_token_proof(landing, wait_s=0) == recipes.INDETERMINATE
+    assert landing.checks == 0  # never asked off the settled portal
     assert recipes.recipe_for("cscs") is recipes.cscs_login
     assert recipes.recipe_for("ricardo") is recipes.generic_login
 
@@ -2034,32 +2047,41 @@ def test_item_reads_agent_otp_label() -> None:
 
 
 class _PortalPage:
-    """Fake portal page for the CSCS token-key discovery."""
+    """Fake portal page for the CSCS export (the in-page server check)."""
 
-    url = "https://portal.cscs.ch/"
+    url = "https://portal.cscs.ch/profile/"
 
-    def __init__(self, keys: list) -> None:
-        self.keys = keys
+    def __init__(self, answer: dict) -> None:
+        self.answer = answer
+        self.goto_urls: list[str] = []
+        self.asked: list = []
 
-    def goto(self, *_a, **_k) -> None:
+    def goto(self, url: str, **_k) -> None:
+        self.goto_urls.append(url)
+
+    def wait_for_load_state(self, *_a, **_k) -> None:
         return None
 
     def wait_for_timeout(self, _ms: float) -> None:
         return None
 
-    def evaluate(self, _js: str):
-        return self.keys
+    def evaluate(self, _js: str, arg: object = None):
+        self.asked.append(arg)
+        return self.answer
 
     def close(self) -> None:
         return None
 
 
 class _PortalCtx:
-    def __init__(self, keys: list) -> None:
-        self.keys = keys
+    def __init__(self, answer: dict) -> None:
+        self.page = _PortalPage(answer)
 
     def new_page(self) -> _PortalPage:
-        return _PortalPage(self.keys)
+        return self.page
+
+    def cookies(self) -> list:
+        return []
 
 
 def _cscs_item() -> vault.SiteItem:
@@ -2068,16 +2090,43 @@ def _cscs_item() -> vault.SiteItem:
     )
 
 
-def test_cscs_export_adds_the_portal_token_key(tmp_path) -> None:
+def test_cscs_export_reads_the_validated_token_on_profile(tmp_path) -> None:
     runner = daemon.PlaywrightRunner(tmp_path, dev=False)
-    item = _cscs_item()
-    spec = runner._with_portal_token_keys(
-        _PortalCtx(["waldur/auth/token"]), item, item.bundle_spec
+    values = {
+        "waldur/auth/token": "t" * 40,
+        "waldur/auth/token_expires_at": "2026-10-10T12:00:00Z",
+    }
+    ctx = _PortalCtx({"state": "valid", "key": "waldur/auth/token", "values": values})
+    bundle = runner.export_bundle(ctx, _cscs_item(), "login")
+    portal = "https://portal.cscs.ch"
+    assert ctx.page.goto_urls == [portal + "/profile/"]  # never `/`
+    assert bundle["storage"] == {portal: values}
+    assert bundle["storage_keys"] == {portal: list(values)}
+    mode, _fetch_ms, _total_ms, keys = ctx.page.asked[0]
+    assert mode == "export" and keys[: len(recipes.CSCS_EXPORT_KEYS)] == list(
+        recipes.CSCS_EXPORT_KEYS
     )
-    assert spec.storage_keys == {"https://portal.cscs.ch": ["waldur/auth/token"]}
 
 
-def test_token_key_discovery_only_for_cscs(tmp_path) -> None:
+@pytest.mark.parametrize(
+    "answer",
+    [
+        {"state": "invalid"},
+        {"state": "none"},
+        {"state": "indeterminate", "why": "status 503"},
+        {"state": "wrong_key"},
+        {"state": "valid", "key": "waldur/auth/token", "values": {}},
+    ],
+)
+def test_cscs_export_without_a_validated_token_fails_loudly(tmp_path, answer) -> None:
+    """The old export returned the spec unchanged (0 keys, audit ok)."""
+    runner = daemon.PlaywrightRunner(tmp_path, dev=False)
+    with pytest.raises(recipes.BundleExportError) as err:
+        runner.export_bundle(_PortalCtx(answer), _cscs_item(), "login")
+    assert err.value.code == "bundle_export"
+
+
+def test_only_cscs_reads_the_portal(tmp_path) -> None:
     runner = daemon.PlaywrightRunner(tmp_path, dev=False)
     other = vault.site_item_from_json(
         _item(
@@ -2085,18 +2134,13 @@ def test_token_key_discovery_only_for_cscs(tmp_path) -> None:
             {
                 "agent_fill_origins": "https://login.x.example",
                 "agent_check_url": "https://www.x.example/me",
+                "agent_cookie_hosts": "www.x.example",
             },
         )
     )
-    assert (
-        runner._with_portal_token_keys(_PortalCtx(["k"]), other, other.bundle_spec)
-        == other.bundle_spec
-    )
-    item = _cscs_item()
-    assert (
-        runner._with_portal_token_keys(_PortalCtx([]), item, item.bundle_spec)
-        == item.bundle_spec
-    )
+    ctx = _PortalCtx({"state": "valid"})
+    bundle = runner.export_bundle(ctx, other, "login")
+    assert not bundle["storage"] and not ctx.page.goto_urls
 
 
 def test_password_fingerprint_is_short_and_stable() -> None:

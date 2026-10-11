@@ -190,6 +190,17 @@ framework. It is a **provider**: other repos depend on it, not the reverse. See
   indeterminate: status + origin + sentinel); site-specific proofs plug into
   `recipes.PROOFS`. Never add an automatic retry after phase `submit`/`unknown`;
   `agent-login.py -c` stays scheduled (`browser.py login -s`).
+- **A token's shape proves nothing; the server decides (WS2-cscs)**: a
+  `recipes.PROOFS` entry is a SERVER proof — CSCS asks `/api/users/me/` from
+  the portal page with the stored `waldur/auth/token` (the app's own scheme,
+  no cookies, no redirects, bounded; the token never leaves the page) — and is
+  strict without a DOM sentinel (`has_server_proof`, advertised as
+  `strict_proof`). A site's required storage that cannot be exported validated
+  is `bundle_export`, never a silent empty bundle; the client re-checks a CSCS
+  token against the API before touching cookies and undoes (compare-and-swap,
+  under the lease) an injection the site rejects. Order of the deadlines:
+  broker run (`daemon.RUN_DEADLINE_S`, from request receipt, Chromium killed
+  past it) < `BROKER_TIMEOUT_S` < `LOGIN_TIMEOUT_S` < the runner and consumers.
 - **Sentinel proofs poll, blank is undecided (WS2-npm)**: a proof polls
   `page_state.await_sentinel` (every match, any visible) — never
   `wait_for_selector(state="visible")`, which sees the first match only; a

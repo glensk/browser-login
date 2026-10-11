@@ -8,10 +8,11 @@ because the check runs again right before each one.
 
 Success needs POSITIVE proof (``check_logged_in``): on the site's check page
 (``agent_check_url`` or a built-in default from ``DEFAULT_CHECK_URLS``) the
-item's authenticated sentinel (``agent_logged_in_selector``) is visible; CSCS
-keeps its portal-token rule. "Ended off the fill origins with no password
-field" proves nothing — it also holds on an "Access denied" page — and an item
-without a sentinel is never logged in.
+item's authenticated sentinel (``agent_logged_in_selector``) is visible; a site
+with a registered server proof (``PROOFS``: CSCS asks ``/api/users/me/`` with
+the stored token) needs no sentinel. "Ended off the fill origins with no
+password field" proves nothing — it also holds on an "Access denied" page — and
+an item without either is never logged in.
 
 Every recipe takes an ``attempt`` (``AttemptController``): ``entered()``
 before the password first reaches the page, ``mark_submitted()`` right before
@@ -28,6 +29,7 @@ from __future__ import annotations
 
 # every recipe and its proof share the guarded helpers.
 # pylint: disable=too-many-lines
+import math
 import re
 import time
 import urllib.parse
@@ -195,6 +197,17 @@ class ExportFailed(RecipeError):
     """The login was proven, but the session could not be exported."""
 
     code = "export_failed"
+
+
+class BundleExportError(ExportFailed):
+    """A site's REQUIRED session storage could not be exported (CSCS: no
+    server-validated ``waldur/auth/token`` on the portal): the bundle would not
+    log anybody in, so none is handed out — never a silent empty export."""
+
+    code = "bundle_export"
+
+    def __init__(self, detail: str) -> None:
+        super().__init__(detail, phase="bundle-export")
 
 
 class AttemptController:
@@ -435,17 +448,20 @@ def generic_proof(
 def _cscs_proof(
     page: Any, item: SiteItem, *, dev: bool = False, wait_s: float = 8.0
 ) -> str:
-    """CSCS: the portal app holds its token (its rule until WS2-cscs), AND —
-    once the item has one — the DOM sentinel on a proof origin."""
-    if item.logged_in_selector:
-        answer = generic_proof(page, item, dev=dev, wait_s=wait_s)
-        if answer != VALID:
-            return answer
-    return VALID if cscs_portal_ready(page, wait_s=max(wait_s, 8.0)) else INVALID
+    """CSCS: the SERVER accepts the portal's stored token (``cscs_token_proof``:
+    ``/api/users/me/`` 200 with an identity, asked from the portal page) — and,
+    when the item has one, its DOM sentinel too (optional extra)."""
+    answer = cscs_token_proof(page, wait_s=max(wait_s, 8.0))
+    if answer != VALID or not item.logged_in_selector:
+        return answer
+    return generic_proof(page, item, dev=dev, wait_s=wait_s)
 
 
 # Site-specific proofs (a recipe's own answer on the loaded check page);
-# anything else uses `generic_proof`.
+# anything else uses `generic_proof`. Every entry here is a SERVER proof: it
+# asks the site's API with the stored session (an authenticated call answered
+# with the account's identity) instead of reading page content, so it is the
+# STRICT proof on its own — a DOM sentinel is optional for these sites (WS2-cscs).
 PROOFS: dict[str, Proof] = {"cscs": _cscs_proof}
 
 
@@ -454,10 +470,16 @@ def proof_for(site: str) -> Proof:
     return PROOFS.get(site, generic_proof)
 
 
+def has_server_proof(site: str) -> bool:
+    """`site` has a registered server proof (``PROOFS``): strict without a
+    sentinel."""
+    return site in PROOFS
+
+
 def strict_proof(item: SiteItem) -> bool:
-    """The item is proven by a sentinel (or CSCS's token rule), not the old
-    "off the fill origins" heuristic."""
-    return bool(item.logged_in_selector) or item.site == "cscs"
+    """The item is proven by a sentinel or a registered server proof, not the
+    old "off the fill origins" heuristic."""
+    return bool(item.logged_in_selector) or has_server_proof(item.site)
 
 
 # One return per answer of the proof, in the order they are decided.
@@ -633,7 +655,11 @@ Refresher = Callable[..., str]
 # (validated against this table; "none" switches a default off).
 SESSION_REFRESHERS: dict[str, Refresher] = {"npm-jwt": npm_jwt_refresh}
 # Built-in choices by site id (an item's `agent_session_refresh` overrides).
-DEFAULT_SESSION_REFRESH = {"npm-nixos": "npm-jwt", "npm-raspi": "npm-jwt"}
+DEFAULT_SESSION_REFRESH = {
+    "npm-nixos": "npm-jwt",
+    "npm-raspi": "npm-jwt",
+    "cscs": "waldur-token",  # registered below, next to the CSCS proof
+}
 
 
 def session_refresh_name(item: SiteItem) -> str | None:
@@ -1182,38 +1208,332 @@ def cscs_on_portal(url: str) -> bool:
     )
 
 
-# HomePort keeps its 40-hex DRF token somewhere in localStorage (same regex as
-# browser.py ``_scan_token``: anywhere in the value, not only the whole value).
-CSCS_HAS_TOKEN_JS = (
-    "() => { const re=/\\b[0-9a-f]{40}\\b/;"
-    "for (let i=0;i<localStorage.length;i++)"
-    "{const v=localStorage.getItem(localStorage.key(i));"
-    "if (v && re.test(v)) return true;} return false; }"
-)
+# --- CSCS: the SERVER decides (WS2-cscs) -------------------------------------
+# HomePort (Waldur) keeps its DRF token in localStorage `waldur/auth/token`
+# (StorageManager), next to `waldur/auth/token_expires_at` (the expiry the
+# backend reported on /users/me/; it slides forward with every authenticated
+# call) and `waldur/auth/method`. A token's SHAPE proves nothing — an expired
+# one looks exactly like a live one (the 2026-10-09 failure: a dead broker
+# profile passed, its export then raced the portal's boot-redirect.js on `/`
+# and handed out nothing). So the proof asks the server, FROM the portal page:
+# `GET /api/users/me/` with the stored token, the app's own auth scheme
+# (`Token`, `Bearer` only when the method is not local/passkey and the portal's
+# /api/configuration/ enables OIDC access tokens), no cookies, no redirects,
+# bounded. The token never leaves the page; only a state, the storage key's
+# NAME and (for the export) the allowlisted values come back.
+CSCS_TOKEN_KEY = "waldur/auth/token"
+CSCS_EXPIRES_KEY = "waldur/auth/token_expires_at"
+CSCS_METHOD_KEY = "waldur/auth/method"
+# What a CSCS bundle may carry from the portal origin: the token (required)
+# plus its expiry and method when present (boot-redirect.js treats a missing
+# expiry as live, an expired one as no session).
+CSCS_EXPORT_KEYS = (CSCS_TOKEN_KEY, CSCS_EXPIRES_KEY, CSCS_METHOD_KEY)
+CSCS_FETCH_S = 8.0  # one API call
+CSCS_CHECK_TOTAL_S = 20.0  # the whole in-page check (config + candidates)
+CSCS_POLL_MS = 500
+_CSCS_TOKEN_JS = """async ([mode, fetchMs, totalMs, keys]) => {
+  const TOKEN = 'waldur/auth/token', EXPIRES = 'waldur/auth/token_expires_at';
+  const HEX = /^[0-9a-f]{40}$/;
+  const get = async (path, auth) => {
+    const ctl = new AbortController();
+    const timer = setTimeout(() => ctl.abort(), fetchMs);
+    try {
+      const headers = {Accept: 'application/json'};
+      if (auth) headers.Authorization = auth;
+      const r = await fetch(path, {headers, credentials: 'omit', redirect: 'error',
+                                   cache: 'no-store', signal: ctl.signal});
+      let body;
+      try { body = r.status === 200 ? await r.json() : null; } catch (e) { body = undefined; }
+      return {status: r.status, body};
+    } catch (e) {
+      return {status: 0, why: e && e.name === 'AbortError' ? 'timeout' : 'network'};
+    } finally { clearTimeout(timer); }
+  };
+  // The app's expiry rule (its SC()): the reported expiry, or none at all for
+  // an impersonation / OIDC token / no expiry. True when it stuck.
+  const recordExpiry = (oidc, exp) => {
+    if (localStorage.getItem('waldur/auth/impersonation') || oidc || !exp) {
+      localStorage.removeItem(EXPIRES);
+      return localStorage.getItem(EXPIRES) === null;
+    }
+    localStorage.setItem(EXPIRES, exp);
+    return localStorage.getItem(EXPIRES) === exp;
+  };
+  const check = async () => {
+    // Storage that cannot be read proves nothing either way.
+    let main, method;
+    const cands = [];
+    try {
+      main = (localStorage.getItem(TOKEN) || '').trim();
+      method = localStorage.getItem('waldur/auth/method');
+      if (main) cands.push(TOKEN);
+      else {
+        for (let i = 0; i < localStorage.length && cands.length < 3; i++) {
+          const k = localStorage.key(i);
+          if (k && HEX.test((localStorage.getItem(k) || '').trim())) cands.push(k);
+        }
+      }
+    } catch (e) { return {state: 'storage_error'}; }
+    if (!cands.length) return {state: 'none'};
+    let scheme = 'Token', sure = true, oidc = false;
+    if (method !== 'local' && method !== 'passkey') {
+      const c = await get('/api/configuration/', null);
+      const core = c.body && typeof c.body === 'object' ? c.body.WALDUR_CORE : null;
+      if (c.status === 200 && core && typeof core === 'object') {
+        oidc = core.OIDC_ACCESS_TOKEN_ENABLED === true;
+        if (oidc) scheme = 'Bearer';
+      } else sure = false;
+    }
+    let undecided = null;
+    for (const key of cands) {
+      let tok;
+      try { tok = (localStorage.getItem(key) || '').trim(); }
+      catch (e) { return {state: 'storage_error'}; }
+      if (!tok) continue;
+      const r = await get('/api/users/me/', scheme + ' ' + tok);
+      if (r.status === 200) {
+        const b = r.body;
+        const ident = !!b && typeof b === 'object' && !Array.isArray(b)
+          && ['uuid', 'username'].some(f => typeof b[f] === 'string' && b[f].length > 0);
+        if (!ident) { undecided = undecided || 'malformed'; continue; }
+        // Only the key the app itself reads makes a usable session.
+        if (key !== TOKEN) return {state: 'wrong_key'};
+        const exp = typeof b.token_expires_at === 'string' ? b.token_expires_at : null;
+        return {state: 'valid', key, tok, oidc, exp};
+      }
+      if (r.status === 401 || r.status === 403) {
+        if (!sure) undecided = undecided || 'scheme';
+        continue;
+      }
+      undecided = undecided || (r.status ? 'status ' + r.status : r.why);
+    }
+    return undecided ? {state: 'indeterminate', why: undecided} : {state: 'invalid'};
+  };
+  const finish = async () => {
+    const got = await check();
+    if (got.state !== 'valid') return got;
+    const out = {state: 'valid', key: got.key};
+    if (mode === 'export' || mode === 'refresh') {
+      let wrote;
+      try { wrote = recordExpiry(got.oidc, got.exp); } catch (e) { wrote = false; }
+      const t = got.exp ? Date.parse(got.exp) : NaN;
+      out.left_s = Number.isNaN(t) ? null : Math.round((t - Date.now()) / 1000);
+      if (mode === 'refresh') { out.state = wrote ? 'refreshed' : 'failed'; return out; }
+      if (!wrote) return {state: 'indeterminate', why: 'expiry'};
+      const values = {};
+      try {
+        if ((localStorage.getItem(TOKEN) || '').trim() !== got.tok)
+          return {state: 'indeterminate', why: 'changed'};
+        for (const k of keys) { const v = localStorage.getItem(k); if (v !== null) values[k] = v; }
+      } catch (e) { return {state: 'storage_error'}; }
+      out.values = values;
+    }
+    return out;
+  };
+  let timer;
+  const cap = new Promise(res => {
+    timer = setTimeout(() => res({state: 'indeterminate', why: 'deadline'}), totalMs);
+  });
+  try { return await Promise.race([finish(), cap]); } finally { clearTimeout(timer); }
+}"""
+# One in-page check never gets less than this (a shorter budget cannot even
+# finish one API call).
+CSCS_MIN_CHECK_S = 1.0
 
 
-def cscs_portal_ready(page: Any, *, wait_s: float = 8.0) -> bool:
-    """The CSCS positive check: the portal app holds its Waldur token.
+def cscs_token_state(
+    page: Any,
+    mode: str = "check",
+    keys: tuple[str, ...] = (),
+    *,
+    budget_s: float = CSCS_CHECK_TOTAL_S,
+) -> dict[str, Any]:
+    """ONE in-page server check of the portal's stored token (``_CSCS_TOKEN_JS``)
+    on the CURRENT page, bounded by `budget_s` (clamped to
+    [``CSCS_MIN_CHECK_S``, ``CSCS_CHECK_TOTAL_S``]): ``{"state": "valid" |
+    "invalid" | "indeterminate" | "none" | "wrong_key" | "storage_error" |
+    "error" | …}`` plus the storage key's name — never the token. ``wrong_key``:
+    the only token the server accepts is not under ``waldur/auth/token`` (the
+    app would not use it). ``storage_error``: localStorage could not be read.
+    `mode` ``export`` first records the expiry the server just reported (the
+    app's rule), then adds the allowlisted `keys`' values; ``refresh`` only
+    records the expiry. ``error``: the page navigated mid-check (or the
+    evaluate failed) — ask again."""
+    total = min(max(budget_s, CSCS_MIN_CHECK_S), CSCS_CHECK_TOTAL_S)
+    fetch = min(CSCS_FETCH_S, total)
+    try:
+        got = page.evaluate(
+            _CSCS_TOKEN_JS, [mode, int(fetch * 1000), int(total * 1000), list(keys)]
+        )
+    except Exception:  # pylint: disable=broad-exception-caught
+        return {"state": "error"}
+    if not isinstance(got, dict) or not isinstance(got.get("state"), str):
+        return {"state": "error"}
+    got.pop("tok", None)  # never set by the script's returns; belt and braces
+    return got
 
-    Being on ``portal.cscs.ch`` proves nothing: the SPA renders there first and
-    only then redirects a token-less session to Keycloak. So poll (up to
-    ``wait_s``) until the token is in localStorage while still on the portal;
-    a move to Keycloak or anywhere else is "not logged in".
-    """
+
+def cscs_token_proof(page: Any, *, wait_s: float = 8.0) -> str:
+    """The CSCS logged-in proof on the CURRENT page, tri-state, bounded by
+    about `wait_s` (+ ``CSCS_MIN_CHECK_S``): each in-page check gets only what
+    is left.
+
+    Polls while the portal app lands: off the portal (Keycloak, anywhere
+    else) → ``invalid``; on the portal, the first server answer decides —
+    ``valid`` (``/api/users/me/`` 200 with an identity, token under
+    ``waldur/auth/token``), ``invalid`` (401/403 for every candidate),
+    ``indeterminate`` (timeout, 5xx, a redirect, a malformed answer, unreadable
+    storage, a valid token under another key). No token yet / navigating
+    mid-check → poll again; the portal settled WITHOUT a token (storage read
+    fine) → ``invalid``; never decided → ``indeterminate``."""
+    ticks = max(1, math.ceil(wait_s * 1000 / CSCS_POLL_MS))
     deadline = time.monotonic() + wait_s
-    while True:
-        if not cscs_on_portal(page.url):
-            if not page.url.startswith(CSCS_PORTAL_ORIGIN + "/"):
-                return False  # redirected off the portal (Keycloak login)
-        else:
-            try:
-                if page.evaluate(CSCS_HAS_TOKEN_JS):
-                    return True
-            except Exception:  # pylint: disable=broad-exception-caught
-                pass  # navigating mid-evaluate: try again
-        if time.monotonic() >= deadline:
-            return False
-        page.wait_for_timeout(500)
+    last = None
+    for tick in range(ticks + 1):
+        url = str(page.url or "")
+        if cscs_on_portal(url):
+            left = deadline - time.monotonic()
+            state = cscs_token_state(page, budget_s=left).get("state")
+            if state in (VALID, INVALID, INDETERMINATE):
+                return str(state)
+            if state in ("wrong_key", "storage_error"):
+                return INDETERMINATE
+            last = state  # "none" (no token yet) or "error" (navigating)
+        elif not url.startswith(CSCS_PORTAL_ORIGIN + "/"):
+            return INVALID  # redirected off the portal (Keycloak login)
+        if tick >= ticks or time.monotonic() >= deadline:
+            break
+        page.wait_for_timeout(CSCS_POLL_MS)
+    return INVALID if last == "none" else INDETERMINATE
+
+
+def cscs_export_storage(
+    page: Any, item_keys: list[str] | None = None
+) -> dict[str, str]:
+    """The portal's allowlisted storage, read on the CURRENT page (the
+    ``/profile/`` check page, never `/`) in the SAME in-page step that
+    server-validated ``waldur/auth/token`` and recorded the expiry the server
+    reported (so token and expiry are coherent) — raises ``BundleExportError``
+    when there is no valid token under that key (or it cannot be told).
+    `item_keys`: further portal keys the item itself lists."""
+    keys = tuple(dict.fromkeys([*CSCS_EXPORT_KEYS, *(item_keys or [])]))
+    got: dict[str, Any] = {"state": "error"}
+    for _ in range(3):  # the SPA may navigate mid-check: ask again
+        got = cscs_token_state(page, "export", keys)
+        if got.get("state") != "error":
+            break
+        page.wait_for_timeout(CSCS_POLL_MS)
+    values = got.get("values")
+    if got.get("state") != VALID or not isinstance(values, dict):
+        why = {
+            INVALID: "the server rejected the portal's stored token",
+            "none": "the portal holds no token",
+            "wrong_key": f"the portal's valid token is not under {CSCS_TOKEN_KEY}",
+            "storage_error": "the portal's storage could not be read",
+        }.get(str(got.get("state")), "the portal's token could not be validated")
+        raise BundleExportError(f"cscs: {why} — no session exported")
+    out = {str(k): str(v) for k, v in values.items() if isinstance(v, str)}
+    if not out.get(CSCS_TOKEN_KEY, "").strip():
+        raise BundleExportError(f"cscs: {CSCS_TOKEN_KEY} could not be read back")
+    return out
+
+
+def waldur_token_refresh(page: Any, item: SiteItem, *, dev: bool = False) -> str:
+    """CSCS (Waldur): keep a reused profile's session coherent before export.
+
+    Waldur has no renewal endpoint: its DRF token lives ~1 h and the backend
+    slides the expiry forward with every authenticated call. So the refresher
+    makes one (``/api/users/me/``, which IS the renewal) and writes the expiry
+    the server reports back into ``waldur/auth/token_expires_at`` exactly as
+    the app does (removed for OIDC/impersonation/no expiry) — otherwise
+    boot-redirect.js sends the injected session to Keycloak on `/` while the
+    token still works. (The export repeats that write in its own step, so the
+    exported tuple is coherent even when this one failed.) 401/403 →
+    ``rejected`` (not reusable: log in); undecided → ``failed``."""
+    del item
+    if url_origin(page.url, dev=dev) != CSCS_PORTAL_ORIGIN:
+        return REFRESH_FAILED
+    got = cscs_token_state(page, "refresh")
+    state = got.get("state")
+    if state == "refreshed":
+        return REFRESH_DONE
+    if state == INVALID:
+        return REFRESH_REJECTED
+    return REFRESH_FAILED
+
+
+# No SESSION_LEFT_JS entry on purpose: a ~1 h sliding token is always "due"
+# by the client's 12 h rule, which would make every passing check ask for a
+# refresh-only re-export. The refresher runs on the broker's profile reuse.
+SESSION_REFRESHERS["waldur-token"] = waldur_token_refresh
+
+
+# Keycloak's "Remember me": with it the IdP's SSO cookie survives the broker
+# Chromium's restart, so the next login of a dead portal token is a silent
+# SSO (no password); without it every expired 1 h token costs a submit.
+KEYCLOAK_REMEMBER_ME = "#rememberMe"
+# After the form wait: one last server check before "form not found" (a
+# silent SSO that landed on the portal late).
+CSCS_FINAL_CHECK_S = 8.0
+
+
+def _cscs_form_or_portal(page: Any, timeout_s: float) -> Any:
+    """Wait for Keycloak's username field — or for the portal with a token the
+    server accepts (a silent SSO through the IdP's own session, or a session
+    that still works): then None, nothing to type. Raises ``LoginFailed``
+    ("Keycloak login form not found", pre-submit) when neither shows, after a
+    final server check; a bot challenge raises ``NeedsHuman``. Bounded by about
+    `timeout_s` + ``CSCS_FINAL_CHECK_S`` (+ 2 × ``CSCS_MIN_CHECK_S``): every
+    in-page check gets only what is left."""
+    ticks = max(1, math.ceil(timeout_s * 1000 / CSCS_POLL_MS))
+    deadline = time.monotonic() + timeout_s
+    for tick in range(ticks + 1):
+        user = _visible(page, "#username")
+        if user is not None:
+            return user
+        if cscs_on_portal(str(page.url or "")):
+            left = deadline - time.monotonic()
+            if cscs_token_state(page, budget_s=left).get("state") == VALID:
+                return None
+        _check_challenge(page, submitted=False)
+        if tick >= ticks or time.monotonic() >= deadline:
+            break
+        page.wait_for_timeout(CSCS_POLL_MS)
+    if cscs_token_proof(page, wait_s=CSCS_FINAL_CHECK_S) == VALID:
+        return None
+    raise LoginFailed("Keycloak login form not found")
+
+
+def cscs_preflight(page: Any, item: SiteItem, *, dev: bool = False) -> str:
+    """Before any reservation or secret read: load the login page and see
+    whether the IdP's own session logs the portal in by itself (silent SSO)
+    — ``valid`` — or shows the Keycloak form — ``invalid`` (a password login
+    is needed). Neither → ``LoginFailed`` (pre-submit, nothing reserved); a
+    bot challenge → ``NeedsHuman``. A silent SSO then costs the limiter
+    nothing."""
+    del dev
+    page.goto(item.login_url or CSCS_LOGIN_URL, wait_until="domcontentloaded")
+    return VALID if _cscs_form_or_portal(page, STEP_TIMEOUT_S) is None else INVALID
+
+
+# Site -> its preflight (``run_in_context`` runs it after a failed profile
+# proof, before `get_secret`).
+PREFLIGHTS: dict[str, Callable[..., str]] = {"cscs": cscs_preflight}
+
+
+def _remember_me(page: Any, allowed: list[str], *, dev: bool) -> None:
+    """Tick Keycloak's "Remember me" (only on a fill origin; best effort)."""
+    box = _visible(page, KEYCLOAK_REMEMBER_ME)
+    if box is None:
+        return
+    try:
+        _guard(page, box, allowed, dev=dev)
+        if not box.is_checked():
+            box.check()
+    except OriginViolation:
+        raise
+    except Exception:  # pylint: disable=broad-exception-caught
+        pass
 
 
 def click_keycloak_submit(page: Any, attempt: AttemptController | None = None) -> bool:
@@ -1245,7 +1565,10 @@ def cscs_login(
     """CSCS Keycloak login (port of ``browser.py cmd_cscs_login``) with exact hosts.
 
     Secrets are typed only on ``https://auth.cscs.ch`` (and only if the item
-    lists it); success is the settled ``https://portal.cscs.ch`` app.
+    lists it); success is the settled ``https://portal.cscs.ch`` app — the
+    caller's server proof (``cscs_token_proof``) decides. A portal that lands
+    with a token the server accepts instead of the Keycloak form (a silent SSO
+    through the IdP's remembered session) ends the recipe with nothing typed.
     """
     allowed = [o for o in item.fill_origins if o == CSCS_AUTH_ORIGIN]
     if dev:
@@ -1253,15 +1576,15 @@ def cscs_login(
     if not allowed:
         raise OriginViolation("the cscs item does not list https://auth.cscs.ch")
     page.goto(item.login_url or CSCS_LOGIN_URL, wait_until="domcontentloaded")
-    if cscs_portal_ready(page, wait_s=8.0):
-        return  # the profile's session still holds a token
-    _check_challenge(page, submitted=False)
-    user = _wait_visible(page, "#username", STEP_TIMEOUT_S)
+    user = _cscs_form_or_portal(page, STEP_TIMEOUT_S)
+    if user is None:
+        return  # silent SSO / a session that still works: nothing to type
     pw_field = _visible(page, "#password")
-    if user is None or pw_field is None:
+    if pw_field is None:
         raise LoginFailed("Keycloak login form not found")
     _guard(page, user, allowed, dev=dev)
     user.fill(secret.username)
+    _remember_me(page, allowed, dev=dev)
     # Same protected entry as the generic recipe: wait for the page to settle,
     # verify the field KEPT the password, retry key by key, fail before submit.
     pw_field = _fill_password(page, pw_field, secret, allowed, dev=dev, attempt=attempt)
