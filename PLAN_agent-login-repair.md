@@ -215,7 +215,7 @@ manual acceptance steps under the attempt policy below.
       - re-login at 28 days or more of session age;
       - the promotion gate requires the sentinel visible after a real login.
     - [ ] Security defects in CWA itself: tp#886 (needs Albert's decision).
-  - [ ] galaxus
+  - [ ] galaxus — code released 2026-10-11 (f0f4b16, broker f0f4b16a2490): never-submit guard (field + built-in sites/domains), Safari import manual-only and refused without a Safari session, galaxus.ch via Safari, galaxus-de assisted. Secrets baseline unchanged (28/28). Open: the vault batch (sentinel + /de/orders) needs Albert at the Mac for Touch ID, then `agent-login.py -t galaxus` (import) and Albert's `-g galaxus-de`.
     - [x] Root cause (read-only, Codex diagnose converged in round 1): phase `submit`. The
           identity server accepts the e-mail, then shows "Deine Anmeldedaten sind nicht
           korrekt" for the password. Galaxus' frontend shows that text for `InvalidCredentials`
@@ -413,6 +413,12 @@ manual acceptance steps under the attempt policy below.
   Our own tests can wipe a live session, and raw-CDP cookie deletes leave no journal trace.
 - An SPA in a hidden headless background tab never renders its logged-in marker. Probe
   tabs need their own window (07cf209).
+- A Homebrew upgrade of `node`/`python3` breaks the Touch ID helper (vault-touchid pins
+  their digests): `bw status (pinned CLI) failed` until `tools/vault-touchid/build.sh`
+  runs (2026-10-11 brew → python 3.15 / node 26.11.1). The 3.15 user site also starts
+  empty. WS1b: rebuild vault-touchid and re-sync user-site packages automatically after
+  brew upgrades (brew-maintenance hook or mac_bootstrap), with an alert on failure.
+  Touch ID also refuses (-25308) when nobody is at the unlocked Mac.
 - Subagents never see SessionStart output, only a SubagentStart hook's `additionalContext`. A
   Codex hook without a trust row is skipped silently in `codex exec`, and each seat needs its
   own row.
