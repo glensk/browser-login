@@ -265,7 +265,11 @@ manual acceptance steps under the attempt policy below.
         an agent secret (needs Touch ID), and drop the browser item.
   - [ ] mullvad: account-number login with no password. Albert 2026-10-11: teach the broker
         (`agent_login_mode=username-only`), builder running.
-  - [ ] portainer-ds218: broker-proof indeterminate (blank) — investigation running.
+  - [ ] portainer-ds218: root cause = OUR bug. The strict proof's `goto(check_url)` was a hash-only
+        (same-document) navigation, so Playwright returns None → status 0 → indeterminate. The
+        login itself worked. Jellyfin is hit the same way. Fix: `load_document` via about:blank
+        + a proof reason channel (builder running). 1 `unknown` on the limiter (no reset); release
+        the quarantine after the install.
   - [ ] dsm-readonly, authentik-glensk: submit "still on login page". Both are in WS5
         groups (blocked by the S0 guard anyway); investigate with WS5.
 - [ ] WS5 — account identity (tp#833, hit 2026-10-10). Plan `PLAN_ws5-account-identity.md` (tp#909,
@@ -438,6 +442,8 @@ manual acceptance steps under the attempt policy below.
   presence.
 - Vault items that are not password logins (SSO-only, account-number-only) need an explicit
   mode, or the API route. The broker's "no password → permission" hint was wrong.
+- Playwright `page.goto` returns None for a same-document (hash-only) navigation. Strict
+  proofs must load the check page fresh (about:blank first), never as an SPA route change.
 - Subagents never see SessionStart output, only a SubagentStart hook's `additionalContext`. A
   Codex hook without a trust row is skipped silently in `codex exec`, and each seat needs its
   own row.
