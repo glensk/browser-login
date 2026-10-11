@@ -262,9 +262,15 @@ manual acceptance steps under the attempt policy below.
   - identity proof per item (in-page compare against the vault username, never printed);
   - same-scope group invalidation;
   - per-account browser instances, or merged accounts, where two accounts are needed.
-  - [ ] notion: instrument why the session expires (vendor policy or lost profile state). No
-        subagent runs a guided login. Albert does exactly one `-g notion`, observed over the
-        interval. "Monitored + alert to Albert" is an acceptable durable outcome.
+  - [x] notion — no defect (read-only, Codex converged in round 1). The 2026-10-09 ❌ was
+        SELF-INFLICTED: session 7d725bed deleted all 36 Notion cookies via raw CDP on
+        2026-10-08 21:11 for a guided-login test (tp#836), and raw CDP writes no journal
+        event. Albert's guided login of 2026-10-09 still holds. The cookies slide one year
+        per visit (now to 2027-10-11), so the daily check itself keeps Notion alive. False
+        ❌s on 10-09 came from a hidden background tab (fixed in 07cf209). WS1b items:
+        server-side tri-state probe, tri-state through to the mail (2× invalid before
+        "log in once"), expiry telemetry (warn < 30 days), `_record_login_event` for guided
+        logins, logout tests only on throwaway instances.
 - [ ] WS1b — durability per flow, after WS2's root causes: broker re-export before expiry,
       credential-change handling, Safari-cookie expiry, monitoring of assisted sessions with
       an alert to Albert. Plan → codex-debate → implement.
@@ -396,6 +402,10 @@ manual acceptance steps under the attempt policy below.
   can show the page AFTER the culprit; read the broker profile's visit history instead.
 - Same cookie scope + different accounts = silent overwrite, with every sibling still ✅.
   A logged-in proof must prove WHICH account (WS5).
+- Before calling a ❌ an expiry, check the cookies' creation dates against the transcripts.
+  Our own tests can wipe a live session, and raw-CDP cookie deletes leave no journal trace.
+- An SPA in a hidden headless background tab never renders its logged-in marker. Probe
+  tabs need their own window (07cf209).
 - Subagents never see SessionStart output, only a SubagentStart hook's `additionalContext`. A
   Codex hook without a trust row is skipped silently in `codex exec`, and each seat needs its
   own row.
