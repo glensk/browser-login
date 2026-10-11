@@ -256,7 +256,14 @@ manual acceptance steps under the attempt policy below.
           mail in Gmail, which the main session can click.
     - [x] Albert decided 2026-10-11: MyFRITZ is on-demand (10 h Keycloak session). The
           scheduled check shows it as "on demand", not ❌; agents log in when they need it.
-- [ ] WS5 — account identity (tp#833, hit 2026-10-10): 8 same-scope groups report ✅ for
+- [ ] WS5 — account identity (tp#833, hit 2026-10-10). Plan `PLAN_ws5-account-identity.md` (tp#909,
+      Codex converged in round 1). Albert's decisions 2026-10-11:
+      - guard first (S0, "⚠ account unproven");
+      - proposed defaults accepted (gitlab-sdsc→glensk, abs→albert, navidrome→albert,
+        dsm→readonly, authentik→glensk, runai→test3; admins in the `admin` browser;
+        gitlab-sdsc-test, docker-hub, custos-admin in `alt`);
+      - admin browser ALSO reachable via MCP (Albert chose this over browser.py-only).
+      Original line: account identity (tp#833, hit 2026-10-10): 8 same-scope groups report ✅ for
       the wrong account; gitlab-sdsc-test passed while the browser was `albertadmin`.
       Plan → codex-debate → implement:
   - identity proof per item (in-page compare against the vault username, never printed);
