@@ -256,6 +256,18 @@ manual acceptance steps under the attempt policy below.
           mail in Gmail, which the main session can click.
     - [x] Albert decided 2026-10-11: MyFRITZ is on-demand (10 h Keycloak session). The
           scheduled check shows it as "on demand", not ❌; agents log in when they need it.
+- [ ] Canary round 1 (2026-10-11, new submit code), one approved login each:
+  - [x] calibre, stirling, smartsheet: ✅ and promoted.
+  - [x] navidrome-albert: ✅ after the storage-check fix (`fix(browser): storage write proven at
+        document start`). The app rotates its JWT on every call, and the old exact-value
+        read-back could never pass.
+  - [ ] uptimerobot: no password (SSO + API keys). Albert 2026-10-11: read-only API key as
+        an agent secret (needs Touch ID), and drop the browser item.
+  - [ ] mullvad: account-number login with no password. Albert 2026-10-11: teach the broker
+        (`agent_login_mode=username-only`), builder running.
+  - [ ] portainer-ds218: broker-proof indeterminate (blank) — investigation running.
+  - [ ] dsm-readonly, authentik-glensk: submit "still on login page". Both are in WS5
+        groups (blocked by the S0 guard anyway); investigate with WS5.
 - [ ] WS5 — account identity (tp#833, hit 2026-10-10). Plan `PLAN_ws5-account-identity.md` (tp#909,
       Codex converged in round 1). Albert's decisions 2026-10-11:
       - guard first (S0, "⚠ account unproven");
@@ -419,6 +431,11 @@ manual acceptance steps under the attempt policy below.
   empty. WS1b: rebuild vault-touchid and re-sync user-site packages automatically after
   brew upgrades (brew-maintenance hook or mac_bootstrap), with an alert on failure.
   Touch ID also refuses (-25308) when nobody is at the unlocked Mac.
+- Apps that rotate their token on every API call (Navidrome) break an exact-value
+  read-back after load. Prove the write at document start; afterwards only require
+  presence.
+- Vault items that are not password logins (SSO-only, account-number-only) need an explicit
+  mode, or the API route. The broker's "no password → permission" hint was wrong.
 - Subagents never see SessionStart output, only a SubagentStart hook's `additionalContext`. A
   Codex hook without a trust row is skipped silently in `codex exec`, and each seat needs its
   own row.
