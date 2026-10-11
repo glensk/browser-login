@@ -36,3 +36,23 @@ def peer_uid(sock: socket.socket) -> int:
         sock.getsockopt(socket.SOL_SOCKET, so_peercred, _UCRED.size)
     )
     return int(uid)
+
+
+LOCAL_PEERPID = 0x002
+
+
+def peer_pid(sock: socket.socket) -> int:
+    """The pid of the process on the other end of `sock` (macOS
+    LOCAL_PEERPID, Linux SO_PEERCRED); OSError when unavailable."""
+    if sys.platform == "darwin":
+        pid = int(sock.getsockopt(SOL_LOCAL, LOCAL_PEERPID))
+    else:
+        so_peercred = getattr(socket, "SO_PEERCRED", None)
+        if so_peercred is None:
+            raise OSError("no peer-credential API on this platform")
+        pid, _uid, _gid = _UCRED.unpack(
+            sock.getsockopt(socket.SOL_SOCKET, so_peercred, _UCRED.size)
+        )
+    if pid <= 0:
+        raise OSError("no peer pid")
+    return int(pid)

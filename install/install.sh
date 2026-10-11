@@ -60,11 +60,14 @@ RESET_SITE=""
 RESET_GROUPS=0
 LOGIN_PAIR=""
 SECRETS_PAIR=""
+SAME_A=""
+SAME_B=""
 
 usage() {
 	/bin/cat <<'EOF'
 Usage: sudo install/install.sh [-n] [-U [-P]] [-e] [-r KEY [-G]] [-c]
-                               [-C ORG_ID:COLL_ID] [-X ORG_ID:COLL_ID] [-B] [-h]
+                               [-C ORG_ID:COLL_ID] [-X ORG_ID:COLL_ID] [-B]
+                               [-S SITE_A SITE_B] [-h]
 
 Install (default), update, uninstall or enrol the login broker LaunchDaemon.
 Refuses unless the repo is clean and HEAD is contained in origin/main; installs
@@ -102,6 +105,11 @@ Options:
                           and the daemon reloaded with SIGHUP)
   -B, --rollback-bootstrap
                           restore the newest bootstrap.json.prev-* and reload
+  -S, --same-account SITE_A SITE_B
+                          do the two login items log into the same account
+                          name? prints same / different / unknown (the broker's
+                          account tags, never a name; runs the installed daemon
+                          as the role account; audited)
   -h, --help              show this help and exit
 
 Examples:
@@ -115,6 +123,7 @@ Examples:
   sudo install/install.sh -c     # which collections (IDs) the broker sees
   sudo install/install.sh -C ORG:COLL -X ORG:COLL  # switch collections by ID
   sudo install/install.sh -B     # roll the last switch back
+  sudo install/install.sh -S docker docker-hub  # one account or two?
   sudo install/install.sh -U     # uninstall, keep state
   sudo install/install.sh -U -P  # uninstall and purge state + role account
 EOF
@@ -178,6 +187,14 @@ while (($#)); do
 		shift
 		;;
 	-B | --rollback-bootstrap) MODE="rollback" ;;
+	-S | --same-account)
+		MODE="same"
+		SAME_A="${2:-}"
+		SAME_B="${3:-}"
+		[[ "$SAME_A" =~ ^[a-z0-9][a-z0-9._-]*$ && "$SAME_B" =~ ^[a-z0-9][a-z0-9._-]*$ ]] ||
+			die "-S needs two site ids (e.g. -S docker docker-hub)"
+		shift 2
+		;;
 	*)
 		usage >&2
 		exit 2
@@ -689,6 +706,17 @@ do_switch() {
 	reload_daemon
 }
 
+# do_same — `daemon.py -S A B` as the role account (it owns the tag key and the
+# bw state): same / different / unknown, never a name.
+do_same() {
+	local py="${LIBEXEC}/current/venv/bin/python"
+	[[ -x "$py" ]] || ((DRY)) || die "install the broker first (no ${py})"
+	run /usr/bin/sudo -u "$ROLE" /usr/bin/env HOME="$HOME_DIR" \
+		PATH="${LIBEXEC}/bin:/usr/bin:/bin" "$py" \
+		"${LIBEXEC}/current/broker/daemon.py" -H "$HOME_DIR" -S "$SAME_A" "$SAME_B"
+	audit "same-account check ${SAME_A} ${SAME_B}"
+}
+
 # do_rollback — restore the newest bootstrap.json.prev-*, then reload.
 do_rollback() {
 	local py="${LIBEXEC}/current/venv/bin/python"
@@ -707,4 +735,5 @@ reset) do_reset ;;
 collections) do_collections ;;
 switch) do_switch ;;
 rollback) do_rollback ;;
+same) do_same ;;
 esac

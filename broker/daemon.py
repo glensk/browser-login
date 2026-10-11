@@ -13,6 +13,28 @@ LOCAL_PEERCRED. One JSON request per connection, newline-terminated, at most
   {"op": "logout", "site": "X"}   delete the broker's own profile for X
   {"op": "fingerprint", "site": "X"}  len + 4 hex of the password's SHA-256
 
+Account identity (WS5, broker/identity_ops.py; a username never leaves the
+broker, the page's value never leaves the page):
+
+  {"op": "identity_challenge", "site": "X", "instance": ""}
+                                  -> {"ok": true, "challenge_id": "...",
+                                      "nonce": "<64 hex>", "identity": "gitlab",
+                                      "privilege": "user", "ttl_s": 60}
+                                  only for an item a login would serve (same
+                                  gates, the caller's browser instance); one
+                                  use, bound to X and the peer pid; capped per
+                                  site and per pid
+  {"op": "identity_answer", "challenge_id": "...", "digest": "<64 hex>"}
+                                  sha256(nonce || normalised account name)
+                                  -> {"ok": true, "result": "match" |
+                                      "mismatch" | "expired"}; a mismatch
+                                  blocks X's challenges 1 h, then 6 h, the
+                                  3rd in 7 days until install.sh -r X
+
+"Are A and B one account?" is root-only, never a socket op:
+``sudo install/install.sh -S A B`` (``daemon.py -S A B`` as the broker uid)
+prints same / different / unknown.
+
 Secrets for agents (``secret-run``; the secrets collection of the bootstrap,
 peer uid ``--allow-uid`` only — anything else is ``forbidden`` before any
 vault read):
@@ -58,6 +80,7 @@ import hashlib
 import json
 import os
 import re
+import secrets
 import shutil
 import signal
 import socketserver
@@ -78,7 +101,18 @@ if __package__ in (None, ""):  # run as a script: make `broker` importable
     sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 # pylint: disable=wrong-import-position
+from broker import identity as _identity  # noqa: E402
 from broker.bundle import filter_cookies, filter_storage  # noqa: E402
+from broker.identity_ops import (  # noqa: E402
+    IDENTITY_OPS,
+    TAG_KEY_NAME,
+    GuardStateError,
+    IdentityGuard,
+    IdentityOps,
+    TagKeyError,
+    load_tag_key,
+    same_account_answer,
+)
 from broker.idp_reasons import MAX_KEPT as IDP_MAX_KEPT  # noqa: E402
 from broker.idp_reasons import body_too_large  # noqa: E402
 from broker.idp_reasons import classify as idp_classify  # noqa: E402
@@ -108,7 +142,7 @@ from broker.page_state import (  # noqa: E402
     redacted_snapshot,
     sentinel_shown,
 )
-from broker.peercred import peer_uid  # noqa: E402
+from broker.peercred import peer_pid, peer_uid  # noqa: E402
 from broker.phases import PHASE_V  # noqa: E402
 from broker.recipes import (  # noqa: E402
     INDETERMINATE,
@@ -125,6 +159,7 @@ from broker.recipes import (  # noqa: E402
     NeedsHuman,
     OriginViolation,
     RecipeError,
+    check_page_url,
     check_proof_reason,
     cscs_export_storage,
     load_document,
@@ -325,6 +360,89 @@ class DeadlineError(LoginFailed):
     """The run passed ``RUN_DEADLINE_S`` (code ``timeout``)."""
 
     code = "timeout"
+
+
+# WS5 verdict of the broker's own identity proof -> (code, fixed detail).
+_IDENTITY_FAILURES = {
+    _identity.WRONG_ACCOUNT: (
+        "wrong_account",
+        "the session in the broker's profile belongs to another account",
+    ),
+    _identity.PRIVILEGE_MISMATCH: (
+        "privilege_mismatch",
+        "the account's admin bit does not match agent_privilege",
+    ),
+    _identity.LOGGED_OUT: (
+        "login_failed",
+        "the site's identity endpoint says logged out after the login",
+    ),
+}
+
+
+class IdentityMismatch(LoginFailed):
+    """WS5: the broker's own identity proof (``identity.local_verdict``) did
+    not say ``match`` — phase ``broker-proof``, no bundle. The detail is
+    fixed text: never a name, nonce or digest."""
+
+    def __init__(
+        self, verdict: str, *, submitted: bool = False, auth_proven: bool = False
+    ) -> None:
+        code, detail = _IDENTITY_FAILURES.get(
+            verdict,
+            (
+                "identity_indeterminate",
+                "the site's identity endpoint could not tell which account is "
+                "logged in",
+            ),
+        )
+        super().__init__(
+            detail, phase="broker-proof", submitted=submitted, auth_proven=auth_proven
+        )
+        self.code = code
+        self.verdict = verdict
+
+
+def evaluate_isolated(page: Any, js: str, arg: Any) -> Any:
+    """``js(arg)`` (an async function's source) in a FRESH CDP isolated world
+    of `page`'s main frame, its value returned by value: page scripts share
+    the DOM but not the world's ``fetch`` / ``crypto`` / prototypes, so they
+    cannot hook the identity fetch or its hash. Service workers are bypassed
+    for this session only (its own network agent; detaching drops it). Any
+    CDP or script failure raises — the
+    caller treats it as ``indeterminate``; there is no main-world fallback."""
+    session = page.context.new_cdp_session(page)
+    try:
+        tree = session.send("Page.getFrameTree")
+        frame_id = tree["frameTree"]["frame"]["id"]
+        world = session.send(
+            "Page.createIsolatedWorld",
+            {"frameId": frame_id, "worldName": f"ws5-{secrets.token_hex(6)}"},
+        )
+        context_id = world["executionContextId"]
+        this = session.send(
+            "Runtime.evaluate", {"expression": "globalThis", "contextId": context_id}
+        )
+        object_id = this["result"]["objectId"]
+        # The bypass is a setting of THIS DevTools session's network agent:
+        # detaching the session (below) drops it; nobody else's is touched.
+        session.send("Network.enable")
+        session.send("Network.setBypassServiceWorker", {"bypass": True})
+        got = session.send(
+            "Runtime.callFunctionOn",
+            {
+                "functionDeclaration": js,
+                "objectId": object_id,
+                "arguments": [{"value": arg}],
+                "awaitPromise": True,
+                "returnByValue": True,
+            },
+        )
+        if got.get("exceptionDetails"):
+            raise RuntimeError("the identity recipe raised")
+        return (got.get("result") or {}).get("value")
+    finally:
+        with contextlib.suppress(Exception):
+            session.detach()
 
 
 def deadline_error(exc: BaseException) -> DeadlineError:
@@ -609,6 +727,61 @@ class PlaywrightRunner:
             self.last_diag.setdefault(item.site, {})["proof_reason"] = reason
         return reason
 
+    @staticmethod
+    def _identity_verdict(page: Any, item: SiteItem, username: str) -> str:
+        """WS5: the item's identity recipe (``identity.usable_recipe``) in an
+        ISOLATED world of the broker's OWN page (``evaluate_isolated``: page
+        scripts cannot hook its fetch or crypto, service workers bypassed),
+        on the proven check page, against `username` — compared in-process
+        with a fresh local nonce. ``match`` when the item names no recipe;
+        an item naming one that is not usable is ``indeterminate``."""
+        if not item.identity:
+            return _identity.MATCH
+        recipe = _identity.usable_recipe(item.identity)
+        if recipe is None:
+            return _identity.INDETERMINATE
+        nonce = secrets.token_hex(_identity.NONCE_BYTES)
+        try:
+            answer = evaluate_isolated(
+                page,
+                _identity.RECIPE_JS,
+                _identity.recipe_args(recipe, check_page_url(item), nonce),
+            )
+        except Exception:  # pylint: disable=broad-exception-caught
+            answer = None
+        return _identity.local_verdict(answer, nonce, username, item.privilege)
+
+    def _identity_reuse(self, page: Any, item: SiteItem) -> str:
+        """WS5 on a profile or SSO reuse (nothing reserved yet): ``ok`` (the
+        item's account, export it), ``login`` (logged out: log in), or
+        ``reset`` (ANOTHER account: clear the site's cookies and storage in
+        the broker profile, then ONE fresh login — an attempt like any other,
+        proven again afterwards). Anything else raises before anything is
+        reserved or submitted: ``indeterminate`` (the endpoint could not
+        tell: no guess-login on a 5xx) and a wrong admin bit on the right
+        account (a login cannot fix it)."""
+        verdict = self._identity_verdict(page, item, item.account_name)
+        if verdict == _identity.MATCH:
+            return "ok"
+        if verdict == _identity.LOGGED_OUT:
+            return "login"
+        if verdict == _identity.WRONG_ACCOUNT:
+            return "reset"
+        raise IdentityMismatch(verdict)
+
+    def _identity_after_login(
+        self, page: Any, item: SiteItem, username: str, attempt: AttemptController
+    ) -> None:
+        """WS5 after a VALID login proof: anything but ``match`` raises
+        ``IdentityMismatch`` with ``auth_proven`` — the password worked, so
+        it never feeds the bad-password streak (outcome
+        ``identity_mismatch``) — and no bundle leaves."""
+        verdict = self._identity_verdict(page, item, username)
+        if verdict != _identity.MATCH:
+            raise IdentityMismatch(
+                verdict, submitted=attempt.submitted, auth_proven=True
+            )
+
     def _record_failure(self, page: Any, item: SiteItem, secret: Secret) -> None:
         """Secret-free failure report + screenshot (password fields emptied first)."""
         try:
@@ -748,7 +921,50 @@ class PlaywrightRunner:
                 cleared += 1
         return cleared
 
-    def run_in_context(
+    def reset_site_profile(self, ctx: Any, page: Any, item: SiteItem) -> Any:
+        """WS5 reset of the broker's OWN profile for `item` (another
+        account's session was found in it), returning the tab to log in on.
+
+        First the tab leaves the app (``about:blank``) so its in-memory code
+        cannot write a token back; then the site's cookies go
+        (``clear_site_cookies``), and for every origin its session may live
+        on (fill origins, storage origins, the check page's origin) the
+        localStorage, IndexedDB, Cache Storage and service workers
+        (``Storage.clearDataForOrigin``); finally a FRESH tab replaces the
+        old one (its sessionStorage dies with it). Raises ``LoginFailed``
+        (nothing typed yet) when any step fails: a fresh login on a
+        half-cleared profile proves nothing."""
+        check = _identity.check_origin(check_page_url(item))
+        origins = list(
+            dict.fromkeys(
+                [*item.fill_origins, *item.storage_keys, *([check] if check else [])]
+            )
+        )
+        try:
+            page.goto("about:blank")
+            self.clear_site_cookies(ctx, item)
+            session = ctx.new_cdp_session(page)
+            try:
+                for origin in origins:
+                    session.send(
+                        "Storage.clearDataForOrigin",
+                        {"origin": origin, "storageTypes": SITE_STORAGE_TYPES},
+                    )
+            finally:
+                with contextlib.suppress(Exception):
+                    session.detach()
+            fresh = ctx.new_page()
+            page.close()
+            return fresh
+        except Exception as exc:
+            raise LoginFailed(
+                "could not reset the broker profile's site data before the fresh login",
+                phase="profile-proof",
+            ) from exc
+
+    # One run's pipeline: reuse (with the WS5 identity check), or reserve,
+    # log in, prove, export — kept in one place on purpose.
+    def run_in_context(  # pylint: disable=too-many-branches,too-many-statements
         self,
         ctx: Any,
         item: SiteItem,
@@ -790,15 +1006,23 @@ class PlaywrightRunner:
             # Even after a VALID one: the old proof of a sentinel-less item
             # passes on an Access page (off the fill origins, no password).
             self._access_precheck(page, item, proof)
+            # WS5: [True] once the profile holds ANOTHER account: its cookies
+            # and site storage go before the one fresh login.
+            reset = [False]
             if proof == VALID:
                 # A storage token near its expiry is renewed first; a token
                 # the server rejects means the profile is not reusable.
                 refreshed = refresh_session(page, item, dev=self.dev)
                 if refreshed != REFRESH_REJECTED:
-                    # (a candidate: present here + absent logged out = verified)
-                    return self._export(
-                        ctx, item, "profile", proven=False, refresh=refreshed
-                    )
+                    # WS5: a multi-account profile must hold the item's account
+                    # (an IdP SSO session may have logged it into another one).
+                    reuse = self._identity_reuse(page, item)
+                    if reuse == "ok":
+                        # (a candidate: present here + absent logged out = verified)
+                        return self._export(
+                            ctx, item, "profile", proven=False, refresh=refreshed
+                        )
+                    reset[0] = reuse == "reset"
             if getattr(get_secret, "refresh_only", False):
                 # Not reusable (invalid, indeterminate or token rejected): a
                 # refresh-only request ends here, as `refresh_unavailable`.
@@ -812,10 +1036,16 @@ class PlaywrightRunner:
                     + html_script_hint(page),
                     phase="profile-proof",
                 )
-            bundle = self._before_secret(ctx, page, item, get_secret, deadline)
+            bundle = self._before_secret(
+                ctx, page, item, get_secret, deadline, reset=reset
+            )
             if bundle is not None:
                 return bundle
             secret = get_secret()
+            if reset[0]:
+                # Reserved first (a denied reservation leaves the profile as
+                # it is); then ONE fresh login, in a fresh tab, proven again.
+                page = self.reset_site_profile(ctx, page, item)
         attempt: AttemptController = getattr(get_secret, "attempt", None) or (
             AttemptController()
         )
@@ -866,6 +1096,9 @@ class PlaywrightRunner:
                 phase="broker-proof",
             )
             raise self._note_idp(item, reason, failed)
+        # WS5: logged in, but as WHICH account? (no screenshot: the page may
+        # show another account's name)
+        self._identity_after_login(page, item, secret.username, attempt)
         return self._export(ctx, item, "login", proven=True)
 
     @staticmethod
@@ -902,13 +1135,18 @@ class PlaywrightRunner:
         item: SiteItem,
         get_secret: Callable[[], Secret],
         deadline: float | None,
+        *,
+        reset: list[bool] | None = None,
     ) -> dict[str, Any] | None:
         """The last steps before a password login reserves and reads the
         secret: the site's preflight (``recipes.PREFLIGHTS``) — when the IdP's
         own session logs the site in by itself (CSCS silent SSO) and the proof
         holds, the bundle (``via`` sso): nothing typed, the limiter never
         touched — then, right before the secret, the refusal when too little
-        of the run is left (code ``timeout``). None: go on with the login."""
+        of the run is left (code ``timeout``). None: go on with the login.
+        `reset` (WS5): set to [True] when the SSO session holds another
+        account (``_identity_reuse``): the caller clears the site's cookies
+        before its login."""
         preflight = PREFLIGHTS.get(item.site)
         if preflight is not None and not getattr(get_secret, "candidate", False):
             if (
@@ -916,7 +1154,14 @@ class PlaywrightRunner:
                 and self._profile_proof(page, item) == VALID
             ):
                 refreshed = refresh_session(page, item, dev=self.dev)
-                if refreshed != REFRESH_REJECTED:  # like the profile path
+                reuse = (  # like the profile path
+                    self._identity_reuse(page, item)
+                    if refreshed != REFRESH_REJECTED
+                    else "login"
+                )
+                if reset is not None and reuse == "reset":
+                    reset[0] = True
+                if reuse == "ok":
                     return self._export(
                         ctx, item, "sso", proven=False, refresh=refreshed
                     )
@@ -1098,6 +1343,7 @@ class PlaywrightRunner:
                     OriginViolation,
                     _RateLimited,
                     _SubmitDisabled,
+                    IdentityMismatch,
                 ):
                     # unchanged past the deadline too: exit 4, the origin
                     # violation's audit and the limiter's answer stay theirs
@@ -1234,6 +1480,13 @@ def _err(code: str, detail: str = "") -> dict[str, Any]:
     return {"ok": False, "error": code, "detail": detail}
 
 
+# What a WS5 reset clears per origin of the item (cookies go separately).
+SITE_STORAGE_TYPES = "local_storage,indexeddb,cache_storage,service_workers"
+
+# Limiter states that refuse an identity challenge like they refuse a login
+# (interval / caps / busy do not: a challenge is not a login attempt).
+_CHALLENGE_BLOCKS = frozenset({"locked", "cooldown", "quarantined", "unreadable"})
+
 # The site list (ids, origins, check URLs — no secrets) is kept this long: each
 # Bitwarden read is an unlock + sync + list + lock of ~30-40 s. Secrets are
 # always read fresh.
@@ -1281,15 +1534,18 @@ class Broker(SecretOps):  # pylint: disable=too-many-instance-attributes  # deps
         self._items_lock = threading.Lock()
         self._items_cache: tuple[float, list[SiteItem]] | None = None
         self._probe_slot = threading.Lock()  # `sentinel_absent`: one at a time
+        # WS5: identity challenges and the account-tag key (broker home)
+        self.identity_ops = IdentityOps(home, clock)
 
     def _items(self, *, fresh: bool = False) -> list[SiteItem]:
-        """The vault's site items, cached SITES_TTL_S (raises VaultError)."""
+        """The vault's site items, cached SITES_TTL_S (raises VaultError);
+        declared same-account pairs are checked against their account tags."""
         with self._items_lock:
             now = self.clock()
             cached = self._items_cache
             if not fresh and cached and now - cached[0] < SITES_TTL_S:
                 return cached[1]
-            items = self.vault.items()
+            items = self.identity_ops.apply_tags(self.vault.items())
             self._items_cache = (now, items)
             return items
 
@@ -1335,8 +1591,13 @@ class Broker(SecretOps):  # pylint: disable=too-many-instance-attributes  # deps
             return self._site_locks.setdefault(site, threading.Lock())
 
     # -- ops -------------------------------------------------------------------
-    def handle(self, req: Any, uid: int | None = None) -> dict[str, Any]:
-        """Dispatch one decoded request; always returns a JSON-able dict."""
+    # One branch per op family (secret, sites, login ops, identity ops).
+    def handle(  # pylint: disable=too-many-branches
+        self, req: Any, uid: int | None = None, pid: int | None = None
+    ) -> dict[str, Any]:
+        """Dispatch one decoded request; always returns a JSON-able dict.
+        `pid`: the peer process (LOCAL_PEERPID) — identity challenges are
+        bound to it."""
         if not isinstance(req, dict) or not isinstance(req.get("op"), str):
             resp = _err("bad_request", 'expected {"op": ...}')
             self.audit("?", None, "bad_request", uid)
@@ -1375,6 +1636,10 @@ class Broker(SecretOps):  # pylint: disable=too-many-instance-attributes  # deps
                     resp = self._fingerprint(site)
                 else:
                     resp = self._logout(site)
+            elif op in IDENTITY_OPS:
+                site, resp = self._identity_op(
+                    op, req, site, uid=uid, pid=pid, extra=extra
+                )
             else:
                 resp = _err("bad_request", f"unknown op {op!r}")
         except Exception:  # pylint: disable=broad-exception-caught
@@ -1396,7 +1661,69 @@ class Broker(SecretOps):  # pylint: disable=too-many-instance-attributes  # deps
                 denied = self.limiter.peek_site(it.site, now, group=it.attempt_group)
                 entry["limit"] = denied.limit() if denied else {"state": "ok"}
             out.append(entry)
-        return {"ok": True, "sites": out}
+        return {"ok": True, "sites": out, "identity_v": _identity.IDENTITY_V}
+
+    def _identity_op(  # pylint: disable=too-many-arguments
+        self,
+        op: str,
+        req: dict[str, Any],
+        site: str | None,
+        *,
+        uid: int | None,
+        pid: int | None,
+        extra: dict[str, Any],
+    ) -> tuple[str | None, dict[str, Any]]:
+        """WS5 ``identity_challenge`` / ``identity_answer``
+        (``broker.identity_ops``) → ``(site for the audit, reply)``. The
+        audit gets the answer's enum, never a nonce, digest, tag or name; a
+        mismatch adds its own ``identity_guard`` line (cooldown / quarantined)."""
+        if op == "identity_answer":
+            got_site, resp, guard = self.identity_ops.answer(req, pid)
+            if resp.get("ok"):
+                extra["answer"] = resp.get("result")
+            if guard is not None:
+                self.audit("identity_guard", got_site, guard, uid)
+            return got_site, resp
+        if not site or not SITE_ID_RE.match(site):
+            return None, _err("bad_request", "missing or invalid site id")
+        try:
+            items = self._items()
+        except VaultError as exc:
+            return site, _err("vault_error", str(exc))
+        item = next((it for it in items if it.site == site), None)
+        refusal = self._challenge_gates(item, site, req.get("instance", ""))
+        if refusal is not None or item is None:
+            return site, refusal or _err("unknown_site", site)
+        return site, self.identity_ops.challenge(item, pid)
+
+    # One early return per gate, in the order a login checks them.
+    def _challenge_gates(  # pylint: disable=too-many-return-statements
+        self, item: SiteItem | None, site: str, instance: object
+    ) -> dict[str, Any] | None:
+        """The gates a ``login`` of the item would pass, before a challenge
+        is issued (None = issue it): known, not refused, a proof, a usable
+        identity recipe, asked from the item's own browser instance, and no
+        limiter block (locked / cooldown / quarantined / unreadable) on any
+        of its keys — a challenge never serves a site its login would not."""
+        if item is None:
+            return _err("unknown_site", f"{site!r} is not in agent-logins")
+        if item.refused:
+            return _err("refused", item.refused)
+        if not item.has_proof:
+            return _err("needs_sentinel", "the item has no logged-in proof")
+        if _identity.usable_recipe(item.identity) is None:
+            return _err("identity_unproven", f"{site}: no usable identity recipe")
+        if not isinstance(instance, str) or instance != item.instance:
+            return _err(
+                "wrong_instance",
+                f"{site} lives in browser instance {item.instance or 'default'}",
+            )
+        now = self.clock()
+        for key in self.limiter.site_keys(site, item.attempt_group):
+            denied = self.limiter.peek([key], now, scheduled=True)
+            if denied is not None and denied.state in _CHALLENGE_BLOCKS:
+                return {**_err("rate_limited", denied.reason), "limit": denied.limit()}
+        return None
 
     def _fingerprint(self, site: str) -> dict[str, Any]:
         """Length + 4 hex of the SHA-256 of the password the vault holds for `site`
@@ -1547,6 +1874,18 @@ class Broker(SecretOps):  # pylint: disable=too-many-instance-attributes  # deps
             )
         if item.refused:
             return _phase_err("refused", item.refused, "vault")
+        if (item.multi_account or item.identity) and _identity.usable_recipe(
+            item.identity
+        ) is None:
+            # WS5: its session could be any of the scope's accounts and no
+            # usable recipe (reviewed, live-confirmed, with an admin bit) can
+            # tell which: no bundle, nothing reserved.
+            return _phase_err(
+                "identity_unproven",
+                "the item shares its login scope with another account, or names "
+                "an identity recipe, and has no usable agent_identity recipe",
+                "precheck",
+            )
         if candidate is not None:
             if item.logged_in_selector:
                 return _phase_err(
@@ -1596,6 +1935,10 @@ class Broker(SecretOps):  # pylint: disable=too-many-instance-attributes  # deps
             outcome = _error_outcome(gate.attempt, exc)
             if candidate is not None and outcome == "ok":
                 outcome = "candidate"
+            if isinstance(exc, IdentityMismatch) and outcome != "not_submitted":
+                # WS5: the password worked, the account or its admin bit did
+                # not: its own outcome, never the bad-password streak.
+                outcome = "identity_mismatch"
             sent = outcome != "not_submitted"
             phase = exc.phase or ("submit" if sent else "recipe")
             diag = getattr(self.runner, "last_diag", {}).pop(site, None)
@@ -1835,7 +2178,11 @@ class _Handler(socketserver.StreamRequestHandler):
             req = json.loads(line)
         except ValueError:
             req = None
-        self._reply(server.broker.handle(req, uid))
+        try:
+            pid: int | None = peer_pid(self.connection)
+        except (OSError, ValueError):
+            pid = None  # identity challenges then refuse (fail closed)
+        self._reply(server.broker.handle(req, uid, pid))
 
 
 class BrokerServer(socketserver.ThreadingMixIn, socketserver.UnixStreamServer):
@@ -1892,6 +2239,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
             "  sudo daemon.py -r totp:github      # reset a TOTP item's limiter\n"
             "  sudo daemon.py -r group:galaxus    # reset an attempt group\n"
             "  sudo daemon.py -r galaxus -G       # reset a site and its groups\n"
+            "  daemon.py -S docker docker-hub     # one account? as the broker uid\n"
         ),
     )
     p.add_argument("-s", "--socket", default=DEFAULT_SOCKET, help="socket path")
@@ -1944,6 +2292,15 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         type=int,
         default=DEFAULT_ALLOW_UID,
         help=f"the only peer uid served (default {DEFAULT_ALLOW_UID})",
+    )
+    p.add_argument(
+        "-S",
+        "--same-account",
+        nargs=2,
+        metavar=("SITE_A", "SITE_B"),
+        help="as the broker uid (install.sh -S): do the two items log into the "
+        "same account name? prints same / different / unknown (account tags; "
+        "never a name) and exits",
     )
     return p.parse_args(argv)
 
@@ -2009,6 +2366,12 @@ def _reset(args: argparse.Namespace, home: Path) -> int:  # pylint: disable=too-
             print(f"ℹ️ no group bound to {key} yet — resetting the site only")
         return _reset_keys(limiter, [key, *groups], owner, keep_bindings=False)
     rc = _reset_keys(limiter, [key], owner)
+    try:
+        if IdentityGuard(home).reset(key, owner):
+            print(f"✅ identity challenge guard reset for {key}")
+    except GuardStateError as exc:
+        print(f"❌ {key}: identity guard state not usable ({exc})", file=sys.stderr)
+        rc = rc or 1
     now = time.time()
     for gkey in groups:
         # A PURE read: no crash recovery, nothing written (a write as root
@@ -2047,6 +2410,73 @@ def _reset_keys(
     return rc
 
 
+def _home_problem(home: Path) -> str:
+    """'' when the broker home is a real directory owned by this uid with no
+    group/other bits, else why not (checked at every start: an existing home
+    keeps whatever mode it had)."""
+    try:
+        st = os.lstat(home)
+    except OSError as exc:
+        return f"cannot stat {home} ({exc.strerror})"
+    if not stat.S_ISDIR(st.st_mode):
+        return f"{home} is not a directory"
+    if st.st_uid != os.geteuid() or st.st_mode & 0o077:
+        return (
+            f"{home} is {oct(stat.S_IMODE(st.st_mode))} uid {st.st_uid} "
+            f"(want 0700 uid {os.geteuid()})"
+        )
+    return ""
+
+
+def _same_account_cli(args: argparse.Namespace, home: Path) -> int:
+    """``-S A B``: same / different / unknown from the account tags (never a
+    name), as the broker's own uid — it owns the tag key and the bw state;
+    ``install.sh -S`` runs it so. One audit line with the answer only."""
+    if not args.dev and (os.geteuid() == 0 or _home_owner_uid(home) != os.geteuid()):
+        print(
+            "❌ -S runs as the broker uid (install/install.sh -S A B)", file=sys.stderr
+        )
+        return 2
+    sites = [s.strip().lower() for s in args.same_account]
+    if not all(SITE_ID_RE.match(s) for s in sites) or sites[0] == sites[1]:
+        print("❌ -S needs two different site ids", file=sys.stderr)
+        return 2
+    vault: Vault = (
+        FixtureVault(args.fixture_vault, dev=True)
+        if args.fixture_vault
+        else _LazyBwVault(home)
+    )
+    try:
+        items = vault.items()
+        key = load_tag_key(home / TAG_KEY_NAME)
+    except (VaultError, TagKeyError) as exc:
+        print(f"❌ {exc}", file=sys.stderr)
+        return 1
+    answer = same_account_answer(items, sites[0], sites[1], key)
+    rec = {
+        "ts": round(time.time(), 3),
+        "op": "same_account_cli",
+        "site": None,
+        "sites": sites,
+        "result": answer,
+        "uid": os.getuid(),
+    }
+    fd = os.open(str(home / "audit.log"), os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
+    try:
+        os.write(fd, (json.dumps(rec, sort_keys=True) + "\n").encode())
+    finally:
+        os.close(fd)
+    print(answer)
+    return 0
+
+
+def _home_owner_uid(home: Path) -> int | None:
+    try:
+        return home.stat().st_uid
+    except OSError:
+        return None
+
+
 def _leakcheck_loop(broker: Broker, stop: threading.Event) -> None:
     while not stop.wait(REPUSH_INTERVAL_S):
         with contextlib.suppress(Exception):
@@ -2054,7 +2484,9 @@ def _leakcheck_loop(broker: Broker, stop: threading.Event) -> None:
 
 
 # One early exit per CLI mode / guard.
-def main(argv: list[str] | None = None) -> int:  # pylint: disable=too-many-return-statements
+def main(  # pylint: disable=too-many-return-statements,too-many-branches,too-many-statements
+    argv: list[str] | None = None,
+) -> int:
     """Run the daemon (or the limiter reset)."""
     args = parse_args(argv)
     os.umask(0o077)
@@ -2064,6 +2496,8 @@ def main(argv: list[str] | None = None) -> int:  # pylint: disable=too-many-retu
         return 2
     if args.reset:
         return _reset(args, home)
+    if args.same_account:
+        return _same_account_cli(args, home)
     if args.collections:
         if args.fixture_vault:
             return print_collections(FixtureVault(args.fixture_vault, dev=True))
@@ -2090,6 +2524,10 @@ def main(argv: list[str] | None = None) -> int:  # pylint: disable=too-many-retu
     else:
         vault = _LazyBwVault(home)
     home.mkdir(mode=0o700, parents=True, exist_ok=True)
+    problem = _home_problem(home)
+    if problem and not args.dev:
+        print(f"❌ refusing to start: {problem}", file=sys.stderr)
+        return 1
     limiter.ensure_lock_file()  # created by the broker itself: it owns it
     leakcheck: Registrar
     if args.no_leakcheck:

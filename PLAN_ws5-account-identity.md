@@ -144,7 +144,7 @@ value.
 
 ### S1 — broker (release via install.sh; after the WS1a broker release)
 
-- [ ] Vault fields in `broker/vault.py` `site_item_from_json` (validated, else `refused`):
+- [x] Vault fields in `broker/vault.py` `site_item_from_json` (validated, else `refused`):
   - `agent_instance`: `""` | a known instance slug (`admin`, `alt`);
   - `agent_privilege`: `admin` | `user` | `readonly`; mandatory for every item that
     overlaps another item's scope in any instance;
@@ -154,42 +154,135 @@ value.
   - `agent_alias`: a slug for the group's default member. Refused when it equals any
     static registry name, any broker site id or another alias, or reveals the account
     (reuse `_attempt_group`'s username check).
-- [ ] `sites` view: each entry gets `instance`, `privilege`, `identity`, `alias`,
+- [x] `sites` view: each entry gets `instance`, `privilege`, `identity`, `alias`,
       `same_account_as`, `multi_account`, `identity_v: 1`. Scope validation runs over all
       items: an overlap INSIDE one instance between items not declared same-account →
       the later item (by site id) is refused with `scope conflict in instance <x>: set
       agent_instance on one of them`. A multi-account item without `agent_privilege` →
       refused.
-- [ ] `account_tag` (sanity check only, never authorization): HMAC-SHA256 over the
-      normalised username under a 32-byte key created by `install.sh`, owned by
-      `_loginbroker:_loginbroker` 0600 in the broker's state directory and kept across
-      releases. Declared same-account items with unequal tags → refused. It is not in the
-      public view. Op `same_account {sites: [a, b]}` → `{ok, same: bool}` (enum only,
-      audited) answers Albert's docker and custos questions (`agent-login.py -s A B`).
-- [ ] Challenge ops: `identity_challenge {site}` → `{challenge_id, nonce}` (32 random
-      bytes, one use, TTL 60 s, bound to the site and the peer's pid);
+- [x] `account_tag` (sanity check only, never authorization): HMAC-SHA256 over the
+      normalised username under a 32-byte key (0600, the broker uid, in its state
+      directory, kept across releases). Declared same-account items with unequal tags →
+      refused. It is not in the public view. **No socket op** (security review: an
+      unlimited equality oracle over the collection): Albert's docker / custos questions
+      go through the root-only CLI `sudo install/install.sh -S A B` (runs
+      `daemon.py -S A B` as the broker uid), which prints only `same` / `different` /
+      `unknown` and writes one audit line.
+- [x] Challenge ops: `identity_challenge {site, instance}` → `{challenge_id, nonce}` (32
+      random bytes, one use, TTL 60 s, bound to the site and the peer's pid);
       `identity_answer {challenge_id, digest}` with exactly ONE hex digest of
-      `nonce || normalised value` → `match` | `mismatch` | `expired`. Caps: 6 per site and
-      20 in total per minute, then `rate_limited`. Audited without nonce or digest.
-      Residual oracle risk accepted: the same uid can already fetch full session bundles
-      (op `login`).
-- [ ] Normalisation, identical in Python and JS: NFKC, then reject non-ASCII
-      (→ indeterminate), then ASCII lower-case, then trim.
-- [ ] Broker-side proof: after a login, and on profile reuse before export, the broker
-      runs the same recipe in its OWN page and compares in-process against the vault
-      username, together with the admin bit. A mismatch → phase `broker-proof`, code
-      `wrong_account` / `privilege_mismatch`, no bundle. This catches an IdP SSO session
-      that silently logs the broker profile into another account.
-- [ ] Tests (`tests/test_ws5_broker.py`): field validation and refusals (alias collisions
-      with static names, asymmetric same-account, unknown instance, missing privilege);
-      in-instance conflict refusal; tag key ownership and tag equality; challenge
-      match / mismatch / expired / reused / wrong pid / rate cap; broker-proof mismatch
-      with a fake page; leak test (fixture username `zz-ws5-secret-user`, grepped over
-      audit lines, error texts and the `sites` view).
+      `nonce || normalised value` → `match` | `mismatch` | `expired`. Audited without
+      nonce or digest. **Online-guess oracle, bounded (security review M1):**
+      - issued only when a `login` of the item would be served: known, not refused, a
+        proof, a usable recipe, asked from the item's own instance (`wrong_instance`
+        otherwise), and no limiter `locked` / `cooldown` / `quarantined` /
+        `unreadable` on any of its keys (else `rate_limited` with the limit);
+      - caps: 6 per site and 6 per peer pid per minute (no global cap, no open cap:
+        the per-site cap bounds the open challenges);
+      - every `mismatch` costs (`IdentityGuard`, `identity-guard.json` + flock, an
+        `identity_guard` audit line each time): the site's challenges stop 1 h after
+        the first, 6 h after the second, and the third within 7 days quarantines them
+        until `sudo install/install.sh -r SITE` (which now resets the guard too);
+        unreadable guard state → `identity_unreadable` (closed). So roughly 3 guesses
+        per site per week instead of ~8.6k a day;
+      - no burst past a mismatch (review round 2): a `mismatch` drops every open
+        challenge of the site, answers are decided one at a time, and while the guard
+        blocks the site every answer is `expired` — no verdict at all, even for the
+        right digest;
+      - the guard fails closed on a failed write (review round 3): a challenge is
+        issued only after a probe write of the guard state succeeds
+        (`identity_unwritable` otherwise, for every site — a full disk never reopens
+        the oracle), and a mismatch that cannot be recorded (OSError included) blocks
+        the site in memory for the life of the process (`identity_blocked`, checked by
+        challenge and answer).
+- [x] Normalisation, identical in Python and JS: NFKC, then reject non-ASCII
+      (→ indeterminate), then ASCII lower-case, then trim (JS `trim` whitespace only).
+- [x] Broker-side proof: after a login, and on profile / SSO reuse before export, the
+      broker runs the same recipe in its OWN page and compares in-process against the
+      vault username, together with the admin bit. No bundle unless `match`.
+- [x] Tests (`tests/test_ws5_broker.py`, account names generated per run): field
+      validation and refusals; in-instance conflict refusal; tag key ownership and tag
+      equality; challenge match / mismatch / expired / reused / wrong pid / per-site and
+      per-pid caps / login gates; the mismatch guard (1 h, 6 h, quarantine, 7-day
+      window, persisted, root reset); the identity outcome in the limiter; reuse →
+      reset → one login; the `-S` CLI; leak checks over audit lines, error texts and
+      the `sites` view; RECIPE_JS in a real headless Chromium in an isolated world
+      (incl. a page that hooks `Response.json` and `crypto.subtle`).
+- [x] Built 2026-10-11, revised after the overseer's security review the same day
+      (worktree, not yet released; needs `install.sh` + selfcheck). Decisions, each
+      fail closed:
+  - **Tag key created by the broker on first use**, not by `install.sh`
+    (`<home>/account-tag.key`: temp file + link, `O_NOFOLLOW` read, a regular 0600 file
+    of the broker's euid, exactly 32 bytes; else no key → declared pairs refused).
+  - **Usable recipe = reviewed + `live_confirmed` + an admin bit**
+    (`identity.usable_recipe`). The vault refuses `agent_identity` naming anything else
+    and an `agent_identity` without a login username, with one that does not
+    normalise (non-ASCII: refused at validation, never answered per challenge), or in
+    a form the recipe cannot compare (each recipe declares `forms`; all compare the
+    `username` today, so a vault holding an e-mail reads "the vault holds an email; the
+    gitlab identity proof compares the username" — refused rather than compared with
+    GitLab's `email`, one reviewed field per recipe); `login` and the challenge
+    re-check usability at precheck. Today: `gitlab`, `audiobookshelf`. `dsm` (no admin bit in
+    `SYNO.Core.NormalUser`; its SynoToken is a page global the isolated world cannot
+    see) and `authentik` (docs only) stay in the table, unusable, until S4 confirms
+    them live. navidrome and Run:ai are not in the table.
+  - **RECIPE_JS** (`identity.py`, one generic in-page function driven by the reviewed
+    spec): `redirect: 'manual'` (an opaqueredirect → `why: redirect`), the page must be
+    on the check URL's origin, 200 + JSON + schema, 401/403 → `logged_out`. GitLab
+    `is_admin` absent = not admin; ABS `type` root/admin vs user/guest; authentik
+    `original` present and null.
+  - **The broker runs it in a CDP isolated world** (`daemon.evaluate_isolated`:
+    `Page.createIsolatedWorld` + `Runtime.callFunctionOn`, `Network.setBypassServiceWorker`
+    on its OWN CDP session, dropped with it on detach — never reset on a shared target):
+    page scripts cannot hook its `fetch`, `Response` or `crypto.subtle`.
+    A CDP failure is `indeterminate`, never a main-world fallback. S2 should do the same
+    over browser.py's raw CDP.
+  - **Reuse** (`_identity_reuse`): `match` → export; `logged_out` → log in;
+    `wrong_account` ONLY → the run reserves, then `reset_site_profile`: the tab goes
+    to `about:blank` first (the app cannot write its token back), the site's cookies go,
+    and for its fill / storage / check origins localStorage, IndexedDB, Cache Storage
+    and service workers (`Storage.clearDataForOrigin`); a fresh tab replaces the old one
+    (its sessionStorage dies with it); then ONE login (an attempt like any other,
+    proven again);
+    `indeterminate` and `privilege_mismatch` → fail before anything is reserved or
+    submitted (no guess-login on a 5xx). A `refresh_only` request never clears or logs
+    in.
+  - **After a VALID login proof** (`_identity_after_login`): anything but `match` →
+    `IdentityMismatch` with `auth_proven`, phase `broker-proof`, codes `wrong_account` /
+    `privilege_mismatch` / `identity_indeterminate` / `login_failed`; the limiter
+    records the new outcome `identity_mismatch` (counted for interval and caps, never
+    for the bad-password streak; the 3rd within 24 h sets the site's limiter cooldown,
+    so no password is submitted until it expires; the 5th within 7 days hard-blocks the
+    site like the bad-password streak does, until `sudo install/install.sh -r SITE`, so a
+    persistent wrong-account or logged-out misconfiguration never logs in every day). The run-deadline wrapper passes an
+    `IdentityMismatch` through unchanged (never turned into a `timeout` that the
+    limiter would count as `ok`). No failure screenshot (the page may show the other
+    account's name).
+  - A multi-account item (or one naming a recipe) without a usable recipe → `login`
+    stops at `precheck` · `identity_unproven` before anything is reserved.
+  - **A refused item keeps its scope**: a WS5 field refusal keeps the parsed scope; an
+    item refused before its scope was parsed gets its `agent_cookie_hosts` and
+    fill-origin hosts only (never check / login URL hosts: an IdP there would pull
+    unrelated items in; never generic login URIs).
+  - A refused same-account declarer loses its declaration; duplicate aliases refuse
+    every item sharing one; the in-instance rule refuses the later site id (a NEW item
+    can displace an established one: S5 must show it before install).
+  - The broker refuses to start (non-dev) when its home is not a 0700 directory of its
+    own uid; selfcheck now also checks `account-tag.key` and `identity-guard.json(.lock)`.
+  - **Release effect**, replayed on the live `sites` snapshot (47 items, no WS5 field
+    set yet): exactly the 16 items that were already multi-account under S0 change
+    from `ok` to `refused` (no `agent_privilege`): abs-albert, abs-root,
+    authentik-akadmin, authentik-glensk, custos-admin, docker, docker-hub, dsm-albert,
+    dsm-readonly, gitlab-sdsc-admin, gitlab-sdsc-glensk, gitlab-sdsc-test,
+    navidrome-albert, navidrome-root, runai-admin, runai-test3. No other item changes,
+    and none becomes multi-account. They stay unusable, as under S0, but read
+    `refused` in agent-login rows instead of `⚠ account unproven` until S4 sets the
+    fields.
 
 ### S2 — client identity proof and instances (bin/browser.py, in a worktree)
 
-- [ ] Recipes in `broker/identity.py`: `gitlab`, `audiobookshelf`, `dsm`, `authentik`
+- [x] Recipes in `broker/identity.py` (landed with S1, see there; S2 only calls
+      `RECIPE_JS` + `recipe_args` in the probe page): `gitlab`, `audiobookshelf`, `dsm`, `authentik`
       first; `navidrome` and `runai` once their endpoints are confirmed. Each is one async
       in-page function: fetch ONE fixed path built from `location.origin`
       (`credentials: "same-origin"`); require the final URL on the same origin, status
@@ -231,7 +324,7 @@ value.
       any browser between uses. `identity_unproven` items are never logged in by `-c`.
 - [ ] `-x` matrix: columns `instance`, `multi`, `identity`, `privilege`, `alias`,
       `same-account`.
-- [ ] `-s A B`: the broker's `same_account` answer, enum only.
+- [ ] ~~`-s A B`~~ dropped (security review M2): the same-account question is the root-only `sudo install/install.sh -S A B`.
 - [ ] Tests in `tests/test_agent_login.py`: grouped rendering (no username, fixed
       vocabulary); instance prefix in agents.md; `-c` starts and stops only instances
       that were down; a stale row after an instance change; unproven rows never ✅ and
@@ -243,7 +336,7 @@ value.
       `agent_identity`, `agent_same_account_as` and `agent_alias` (short options without
       collisions), with validation reused from broker/vault.py. Separate commit in
       mydotfiles.
-- [ ] `agent-login.py -s docker docker-hub` and `-s custos-admin runai-admin`: same →
+- [ ] `sudo install/install.sh -S docker docker-hub` and `-S custos-admin runai-admin`: same →
       Albert merges or declares same-account; different → separate instances.
 - [ ] Set the fields per item (proposal in the table above, after Albert's answers), then
       `agent-login.py -x`: no in-instance conflict, no refusal.
@@ -277,17 +370,25 @@ value.
    glensk, abs → albert, navidrome → albert, dsm → readonly, authentik → glensk, runai →
    test3; admin members in `admin`; gitlab-sdsc-test, docker-hub and (if it conflicts)
    custos-admin in `alt`.
-3. **docker vs docker-hub.** Recommended: decide after `agent-login.py -s docker
+3. **docker vs docker-hub.** Recommended: decide after `sudo install/install.sh -S docker
    docker-hub`. Same → merge into one item. Different → docker-hub goes to `alt`, and both
    stay unproven until a Docker identity endpoint exists. Or keep only the one agents
    need.
 4. **custos-admin vs runai-admin.** Recommended: keep the host-level conflict (conservative)
    and put custos-admin in `alt`, unless `-s` shows the same account. Realm-path cookie
    scopes stay deferred.
-5. **Admin UI access via MCP.** The `admin` instance is reachable only through browser.py
-   (`CLAUDE_BROWSER_INSTANCE=admin`), not through the default Playwright MCP. Recommended:
-   keep it that way (least privilege). A `cb-admin` MCP config can be added later if a
-   real need appears.
+5. **Admin UI access via MCP.** DECIDED (Albert, 2026-10-11): the `admin` instance IS
+   reachable through Playwright MCP too, not only through browser.py. This replaces the
+   "admin not via MCP" rule above. How (S2/S4, mydotfiles): a second MCP config, e.g.
+   `~/.claude/mcp/playwright-admin.json` with a server named `playwright-admin`, the same
+   shape as `playwright.json` but `--cdp-endpoint http://127.0.0.1:9224`, its wrapper
+   registered in the admin instance (`"env": {"CLAUDE_BROWSER_INSTANCE": "admin"}`, so
+   `browser.py register-exec -t playwright-mcp-admin` writes the admin instance's
+   coordination files and a guided login / switch there pauses it). A session opts in
+   (`--mcp-config ~/.claude/mcp/playwright-admin.json`, like `cb`), never by default;
+   the browser itself must be up (`CLAUDE_BROWSER_INSTANCE=admin browser.py up`), and
+   `-c` must not stop the admin instance while a registered MCP client uses it (S3).
+   Nothing in S1 blocks this: the broker only advertises `instance` per item.
 
 ## Implementation slicing
 

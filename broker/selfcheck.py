@@ -51,6 +51,10 @@ PRIVATE_STATE = (
     "leakcheck-labels.json",
     "limiter.json",
     "limiter.json.lock",
+    # WS5: the account-tag key and the identity challenge guard
+    "account-tag.key",
+    "identity-guard.json",
+    "identity-guard.json.lock",
 )
 
 

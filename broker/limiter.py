@@ -76,6 +76,10 @@ FINISH_OUTCOMES = {
     # A proven candidate-sentinel login: counted for interval and caps, but it
     # never clears a streak or a cooldown (its proof was not trusted yet).
     "candidate": "candidate",
+    # WS5: a proven password login that landed in another account (or the
+    # wrong admin bit): counted for interval and caps, never for the
+    # bad-password streak (it neither escalates nor clears it).
+    "identity_mismatch": "identity_mismatch",
 }
 # In-flight states after which a crash counts as a post-submit failure.
 RISKY_STATES = frozenset({"entered", "submitted"})
@@ -84,6 +88,12 @@ DAY_S = 86400.0
 DEFAULT_COOLDOWN_S = 30 * 60
 DEFAULT_MAX_CONSECUTIVE = 3
 RESET_HINT = "sudo install/install.sh -r {key}"
+# WS5: this many `identity_mismatch` outcomes within a day set a cooldown,
+# and this many within 7 days the hard block (`install.sh -r`): a persistent
+# wrong-account or logged-out misconfiguration never logs in every day.
+IDENTITY_MISMATCH_MAX = 3
+IDENTITY_MISMATCH_BLOCK = 5
+WEEK_S = 7 * 86400.0
 
 
 def default_cooldown_s() -> float:
@@ -298,12 +308,32 @@ class Limiter:  # pylint: disable=too-many-instance-attributes,too-many-public-m
             entry["cooldown_until"] = ts + self.cooldown_s
 
     def _apply_outcome(self, entry: dict[str, Any], stored: str, ts: float) -> None:
-        """The streak rules of one finished attempt on one key."""
+        """The streak rules of one finished attempt on one key. An
+        ``identity_mismatch`` leaves the bad-password streak alone, but the
+        ``IDENTITY_MISMATCH_MAX``-th within a day sets a cooldown (no
+        password submit until it expires) and the ``IDENTITY_MISMATCH_BLOCK``-th
+        within 7 days the hard block (a root reset)."""
         if stored == "unknown":
             self._post_submit_failure(entry, ts)
         elif stored == "ok":
             entry["consecutive"] = 0
             entry.pop("cooldown_until", None)
+        elif stored == "identity_mismatch":
+            seen = [
+                float(t)
+                for t in entry.get("identity_mismatches", [])
+                if isinstance(t, (int, float)) and ts - float(t) < WEEK_S
+            ]
+            seen.append(ts)
+            entry["identity_mismatches"] = seen
+            if len(seen) >= IDENTITY_MISMATCH_BLOCK:
+                entry["blocked"] = True
+                entry["blocked_by"] = "identity_mismatch"
+            elif len([t for t in seen if ts - t < DAY_S]) >= IDENTITY_MISMATCH_MAX:
+                until = ts + self.cooldown_s
+                entry["cooldown_until"] = max(
+                    until, float(entry.get("cooldown_until") or 0)
+                )
 
     @staticmethod
     def _prune(entry: dict[str, Any], now: float) -> None:
@@ -477,10 +507,16 @@ class Limiter:  # pylint: disable=too-many-instance-attributes,too-many-public-m
         """Why `key` may not take another attempt at `now` (None = it may)."""
         streak = int(entry.get("consecutive", 0) or 0)
         if entry.get("blocked"):
+            why = (
+                f"{IDENTITY_MISMATCH_BLOCK} logins into another account (or one "
+                "whose identity could not be proven) within 7 days"
+                if entry.get("blocked_by") == "identity_mismatch"
+                else f"{entry.get('consecutive', self.max_consecutive)} failed "
+                "logins in a row"
+            )
             return Denied(
                 key,
-                f"{entry.get('consecutive', self.max_consecutive)} failed logins in "
-                f"a row; reset required ({RESET_HINT.format(key=key)})",
+                f"{why}; reset required ({RESET_HINT.format(key=key)})",
                 "locked",
                 0.0,
                 streak,

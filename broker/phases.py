@@ -99,6 +99,10 @@ CODE_TEXT = {
     "identity_unproven": (
         "account unproven: the site shares its login with another account"
     ),
+    # WS5 S1: the server identity proof (broker/identity.py) disagreed.
+    "wrong_account": "logged in as another account than the item's",
+    "privilege_mismatch": "the account's admin rights do not match the item's",
+    "identity_indeterminate": "the site's account check could not tell which account",
 }
 
 # Broker error code -> phase, for replies WITHOUT a phase (an older broker).

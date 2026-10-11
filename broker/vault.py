@@ -8,6 +8,14 @@ without one the broker cannot PROVE a login worked. Secrets never leave this
 module except as a ``Secret`` handed to a recipe; ``Secret`` has a redacting
 ``repr`` so a stray log line shows nothing.
 
+Accounts that share one cookie scope (WS5, tp#833): ``agent_instance``,
+``agent_privilege``, ``agent_identity``, ``agent_same_account_as`` and
+``agent_alias`` are validated per item, then ``identity_rules`` runs over the
+whole collection — at most one account per scope per browser instance, a
+privilege on every multi-account item, symmetric same-account declarations,
+unique aliases. A refused item keeps its scope: it still takes part in the
+conflict check.
+
 ``BwVault`` drives the ``bw`` CLI with secrets in the ENVIRONMENT only (never
 argv): the API key logs the broker's own Vaultwarden user in, the master
 password unlocks (``--passwordenv``), the session key lives in memory and is
@@ -36,10 +44,11 @@ import threading
 import urllib.parse
 from collections.abc import Iterator, Mapping
 from contextlib import contextmanager
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, Protocol
 
+from broker import identity as _identity
 from broker.bundle import SiteBundleSpec, is_idp_host
 from broker.origins import parse_fill_origins
 from broker.recipes import (
@@ -221,6 +230,39 @@ class SiteItem:  # pylint: disable=too-many-instance-attributes
     login_mode: str = PASSWORD_MODE
     refused: str | None = None
     item_id: str = ""
+    # --- WS5 (tp#833, broker/identity.py): accounts sharing one cookie scope.
+    # `agent_instance`: the browser instance the item lives in ("" = the
+    # shared 9222 browser, else identity.ROLE_INSTANCES).
+    instance: str = ""
+    # `agent_privilege`: admin | user | readonly ("" = not declared;
+    # mandatory on a multi-account item and with `agent_identity`).
+    privilege: str = ""
+    # `agent_identity`: the reviewed recipe (identity.IDENTITIES) that proves
+    # WHICH account a session holds; "" = none.
+    identity: str = ""
+    # `agent_same_account_as`: the site id of the item that logs into the
+    # same account — declared on BOTH items, else both are refused.
+    same_account_as: str = ""
+    # `agent_alias`: a name the group's default member also answers to.
+    alias: str = ""
+    # The item's scope overlaps another account's item (any instance): set
+    # by `build_items` over the whole collection.
+    multi_account: bool = False
+    # The login's username, for the broker's identity proof, the challenge
+    # ops and the account tag ONLY: never in `public()`, a log or an error.
+    account_name: str = field(default="", repr=False, compare=False)
+
+    def identity_view(self) -> dict[str, Any]:
+        """The WS5 fields of the ``sites`` view (no account name, no tag)."""
+        return {
+            "instance": self.instance,
+            "privilege": self.privilege or None,
+            "identity": self.identity or None,
+            "alias": self.alias or None,
+            "same_account_as": [self.same_account_as] if self.same_account_as else [],
+            "multi_account": self.multi_account,
+            "identity_v": _identity.IDENTITY_V,
+        }
 
     @property
     def has_proof(self) -> bool:
@@ -261,6 +303,7 @@ class SiteItem:  # pylint: disable=too-many-instance-attributes
             "logged_in_selector": self.logged_in_selector,
             "fresh_login": self.fresh_login,
             "pre_click": self.pre_click,
+            **self.identity_view(),
             "attempt_group": self.attempt_group,
             "sentinel": bool(self.logged_in_selector),
             # the strict proof is possible (sentinel OR a server proof): what
@@ -882,7 +925,7 @@ def site_item_from_json(item: Mapping[str, Any], *, dev: bool = False) -> SiteIt
             "agent_login_mode=username-only needs the generic login recipe "
             "(this site has its own)"
         )
-    return SiteItem(
+    built = SiteItem(
         fill_origins=fill_origins,
         cookie_hosts=cookie_hosts,
         cookie_names=cookie_names,
@@ -905,6 +948,7 @@ def site_item_from_json(item: Mapping[str, Any], *, dev: bool = False) -> SiteIt
         name=name,
         item_id=item_id,
     )
+    return _with_identity_fields(built, item, fields)
 
 
 MAX_SESSION_DAYS_RANGE = (1, 365)
@@ -932,18 +976,227 @@ def _attempt_group(raw: str, item: Mapping[str, Any]) -> tuple[str | None, str]:
         return None, ""
     if not SITE_ID_RE.match(group):
         return None, "bad agent_attempt_group (a slug: a-z 0-9 . _ -, ≤64 chars)"
-    login = item.get("login") or {}
-    user = str(login.get("username") or "") if isinstance(login, Mapping) else ""
-    user = user.strip().lower()
-    for part in (user, user.split("@", 1)[0]):
-        if len(part) >= 3 and part in group:
-            return None, "agent_attempt_group must not reveal the account name"
+    if _reveals_account(group, item):
+        return None, "agent_attempt_group must not reveal the account name"
     return group, ""
 
 
+def _login_username(item: Mapping[str, Any]) -> str:
+    """The login's username as stored ('' when none)."""
+    login = item.get("login") or {}
+    return str(login.get("username") or "") if isinstance(login, Mapping) else ""
+
+
+def _reveals_account(slug: str, item: Mapping[str, Any]) -> bool:
+    """`slug` contains the item's username or its local part (>= 3 chars)."""
+    user = _login_username(item).strip().lower()
+    return any(
+        len(part) >= 3 and part in slug for part in (user, user.split("@", 1)[0])
+    )
+
+
+# ---------------------------------------------------------------------------
+# WS5 (tp#833): account identity of items that share one cookie scope
+# ---------------------------------------------------------------------------
+
+
+# One early return per field rule, in field order.
+def _identity_problem(  # pylint: disable=too-many-return-statements
+    site: str, fields: Mapping[str, str], item: Mapping[str, Any]
+) -> str:
+    """The refusal reason of the item's own WS5 fields ('' = fine). The
+    rules that need the whole collection are `identity_rules`."""
+    instance = fields.get("agent_instance", "").strip().lower()
+    privilege = fields.get("agent_privilege", "").strip().lower()
+    ident = fields.get("agent_identity", "").strip().lower()
+    same = fields.get("agent_same_account_as", "").strip().lower()
+    alias = fields.get("agent_alias", "").strip().lower()
+    if instance not in _identity.INSTANCES:
+        known = ", ".join(_identity.ROLE_INSTANCES)
+        return f"bad agent_instance ({known}, or empty for the shared browser)"
+    if privilege and privilege not in _identity.PRIVILEGES:
+        return "bad agent_privilege (" + ", ".join(_identity.PRIVILEGES) + ")"
+    if ident and ident not in _identity.IDENTITIES:
+        known = ", ".join(sorted(_identity.IDENTITIES))
+        return f"bad agent_identity (a reviewed recipe: {known})"
+    if ident and _identity.usable_recipe(ident) is None:
+        return (
+            f"agent_identity {ident} is not live-confirmed with an admin bit yet "
+            "(the item stays unproven)"
+        )
+    if ident and not privilege:
+        return "agent_identity needs agent_privilege"
+    if ident:
+        problem = _identity_user_problem(ident, _login_username(item))
+        if problem:
+            return problem
+    if same and (not SITE_ID_RE.match(same) or same == site):
+        return "bad agent_same_account_as (the agent_site of another item)"
+    if alias:
+        if not SITE_ID_RE.match(alias):
+            return "bad agent_alias (a slug: a-z 0-9 . _ -, ≤64 chars)"
+        if alias in _identity.STATIC_SITE_NAMES or alias == site:
+            return "agent_alias collides with a site name"
+        if _reveals_account(alias, item):
+            return "agent_alias must not reveal the account name"
+    return ""
+
+
+def _identity_user_problem(ident: str, user: str) -> str:
+    """'' when recipe `ident` can compare the login's username `user`, else
+    why not — decided here, at validation, never per challenge (no
+    per-request answer says anything about the stored name)."""
+    if not user.strip():
+        return "agent_identity needs the login's username"
+    form = _identity.identity_form(user)
+    if form is None:
+        return "agent_identity needs a plain-ASCII login username"
+    forms = _identity.IDENTITIES[ident].forms
+    if form not in forms:
+        return (
+            f"the vault holds an {form}; the {ident} identity proof "
+            f"compares the {' or '.join(forms)}"
+        )
+    return ""
+
+
+def _with_identity_fields(
+    built: SiteItem, item: Mapping[str, Any], fields: Mapping[str, str]
+) -> SiteItem:
+    """`built` with its WS5 fields (`agent_instance`, `agent_privilege`,
+    `agent_identity`, `agent_same_account_as`, `agent_alias`) and the login's
+    username. A bad field refuses the item WITH its scope kept: a refused
+    item still takes part in the conflict check."""
+    if built.refused:
+        return built
+    filled = replace(
+        built,
+        instance=fields.get("agent_instance", "").strip().lower(),
+        privilege=fields.get("agent_privilege", "").strip().lower(),
+        identity=fields.get("agent_identity", "").strip().lower(),
+        same_account_as=fields.get("agent_same_account_as", "").strip().lower(),
+        alias=fields.get("agent_alias", "").strip().lower(),
+        account_name=_login_username(item),
+    )
+    problem = _identity_problem(built.site, fields, item)
+    if problem:
+        return replace(filled, refused=problem, same_account_as="", alias="")
+    return filled
+
+
+def _raw_scope_hosts(raw: Mapping[str, Any]) -> list[str]:
+    """Best-effort hosts of an item refused before its scope was parsed: its
+    agent_cookie_hosts and the hosts of its fill origins — what a valid
+    item's scope holds too. Never its check or login URL hosts (an IdP host
+    there would pull unrelated items into multi-account) and never its
+    generic login URIs."""
+    fields = _fields(raw)
+    hosts = list(_split_list(fields.get("agent_cookie_hosts", "")))
+    for key in ("agent_fill_origins",):
+        for value in _split_list(fields.get(key, "")):
+            url = value if "://" in value else "https://" + value
+            try:
+                host = urllib.parse.urlsplit(url).hostname or ""
+            except ValueError:
+                continue
+            hosts.append(host)
+    return sorted({h.strip().lstrip(".").lower() for h in hosts if h.strip()})
+
+
+def _refuse(it: SiteItem, reason: str) -> SiteItem:
+    """`it` refused, its scope kept, its same-account declaration dropped (a
+    refused item then conflicts with its former partner: fail closed)."""
+    return replace(it, refused=reason, same_account_as="")
+
+
+def identity_rules(  # pylint: disable=too-many-branches
+    items: list[SiteItem], raws: list[Mapping[str, Any]]
+) -> list[SiteItem]:
+    """The WS5 rules over the whole collection, in this order:
+
+    1. an item refused before its scope was parsed gets a best-effort scope
+       (`_raw_scope_hosts`), so its siblings still count as multi-account;
+    2. `agent_same_account_as` must be declared on BOTH items (else every
+       one-sided declarer is refused);
+    3. an `agent_alias` equal to any site id or to another item's alias is
+       refused (all items sharing it);
+    4. `multi_account` = the scope overlaps an item of another account in
+       ANY instance (``identity.scope_conflicts``, refused items included);
+    5. a multi-account item without `agent_privilege` is refused;
+    6. inside ONE instance at most one item per conflict: of two overlapping
+       items not declared the same account, the later (by site id) is refused.
+    """
+    out = list(items)
+    for i, it in enumerate(out):
+        if it.refused and not it.cookie_hosts:
+            out[i] = replace(it, cookie_hosts=_raw_scope_hosts(raws[i]))
+    live = {it.site: it for it in out if not it.refused}
+    for i, it in enumerate(out):
+        partner = live.get(it.same_account_as) if it.same_account_as else None
+        if it.same_account_as and (
+            partner is None or partner.same_account_as != it.site
+        ):
+            out[i] = _refuse(
+                it,
+                f"agent_same_account_as {it.same_account_as}: that item must "
+                "name this one back",
+            )
+    site_ids = {it.site for it in out}
+    aliases: dict[str, int] = {}
+    for it in out:
+        if it.alias and not it.refused:
+            aliases[it.alias] = aliases.get(it.alias, 0) + 1
+    for i, it in enumerate(out):
+        if it.alias and not it.refused:
+            if it.alias in site_ids:
+                out[i] = _refuse(it, "agent_alias collides with a site id")
+            elif aliases[it.alias] > 1:
+                out[i] = _refuse(it, "agent_alias is used by another item")
+    conflicts = _identity.scope_conflicts([it.public() for it in out])
+    for i, it in enumerate(out):
+        if it.site in conflicts:
+            out[i] = replace(it, multi_account=True)
+            if not it.refused and not it.privilege:
+                out[i] = _refuse(
+                    out[i],
+                    "shares its login scope with another account: set "
+                    "agent_privilege (" + ", ".join(_identity.PRIVILEGES) + ")",
+                )
+    kept: dict[str, list[SiteItem]] = {}
+    for i in sorted(range(len(out)), key=lambda n: out[n].site):
+        it = out[i]
+        if it.refused:
+            continue
+        mine = _identity.scope_hosts(it.public())
+        clash = next(
+            (
+                other
+                for other in kept.get(it.instance, [])
+                if _identity.hosts_overlap(mine, _identity.scope_hosts(other.public()))
+                and not (
+                    other.same_account_as == it.site
+                    and it.same_account_as == other.site
+                )
+            ),
+            None,
+        )
+        if clash is not None:
+            where = it.instance or "default (shared browser)"
+            out[i] = _refuse(
+                it,
+                f"scope conflict in instance {where} with {clash.site}: set "
+                "agent_instance on one of them",
+            )
+            continue
+        kept.setdefault(it.instance, []).append(it)
+    return out
+
+
 def build_items(raw_items: list[Any], *, dev: bool = False) -> list[SiteItem]:
-    """All items; a second item claiming an already-taken site id is refused."""
+    """All items; a second item claiming an already-taken site id is refused;
+    then the collection-wide WS5 rules (`identity_rules`)."""
     out: list[SiteItem] = []
+    raws: list[Mapping[str, Any]] = []
     seen: set[str] = set()
     for raw in raw_items:
         if not isinstance(raw, Mapping):
@@ -958,7 +1211,8 @@ def build_items(raw_items: list[Any], *, dev: bool = False) -> list[SiteItem]:
             )
         seen.add(it.site)
         out.append(it)
-    return out
+        raws.append(raw)
+    return identity_rules(out, raws)
 
 
 def secret_from_json(item: Mapping[str, Any]) -> Secret:
