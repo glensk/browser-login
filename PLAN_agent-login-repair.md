@@ -318,12 +318,19 @@ manual acceptance steps under the attempt policy below.
             gitlab-sdsc-test fully removed (Testuser2 blocked; Albert: drop). Overview: 36 ✅.
       - [x] Home LAN 2026-10-12: abs-albert + navidrome-albert (default) and abs-root + navidrome-root
             (admin browser) ✅, all server-proven and promoted.
-      - [ ] DSM (Albert: TOTP for the accounts): dsm-readonly lands in DSM's enforce-2fa wizard, which
-            fails "Unable to load sign-in methods … Secure SignIn Service" — diagnosis subagent running
-            (ssh ds218, read-only). Then TOTP enrollment in Safari (secret → vault authenticator field
-            via a 0600 script, never in the transcript), then the dsm identity recipe.
-      - [ ] authentik (Albert: fix): builder running — broker login (shadow-DOM flow → flow-executor
-            API?) + the authentik identity recipe; live confirmation after.
+      - [ ] DSM (Albert: TOTP): the enforce-2fa wizard error ("Unable to load sign-in methods") was an
+            EXPIRED readonly login token (diagnosis via ssh ds218: pam_syno_1fa_tmptok exp; SecureSignIn
+            is running). Retrying the Safari sign-in then got stuck (DSM login button stopped reacting,
+            no request reached the NAS). Waits on Albert: enroll TOTP himself (secret into the vault item's
+            Authenticator key) or a fresh retry. DSM enforces 2FA for every user.
+      - [x] authentik login fixed 2026-10-12 (e578c67, broker e578c6757cbf): root cause = the broker typed
+            into authentik's off-screen password-manager helper form (empty uid submitted); new recipe
+            drives the flow-executor API (isolated world, one secret POST, no redirect follow, TOTP).
+            Reviewed. Both vault items: authentik usernames, TOTP seeds present.
+      - [ ] authentik live: vault fields via broker-add (Touch ID; -s/-o/-c/-u/-L `ak-interface-user
+            ak-nav-buttons`, glensk -p user -A authentik, akadmin -p admin -I admin), login, then confirm
+            `users/me` (status/keys; `original` absent → null_may_be_absent; is_superuser per account) and
+            flip the recipe flags, then `-i authentik` (Touch ID) and promote.
       - [x] custos-admin ✅ 2026-10-12 in the alt browser: identity recipe `keycloak-admin` (silent
             OIDC PKCE in the isolated world, id_token pins, master-only probe `/admin/realms/master/users/count`;
             d808a8f), reviewed (S1 login_required-only, S2 probe, S3 proxy). Overview: 37 ✅.
