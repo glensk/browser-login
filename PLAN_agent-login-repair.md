@@ -316,7 +316,14 @@ manual acceptance steps under the attempt policy below.
             session-only KEYCLOAK_IDENTITY, confirmed with `login -G` (0e9ace1); admin probe confirmed
             live (200 JSON as admin, 403 text/plain error object as user; d669be8). Promoted (-p).
             gitlab-sdsc-test fully removed (Testuser2 blocked; Albert: drop). Overview: 36 ✅.
-      - [ ] Home-LAN only (Cloudflare Access off-LAN): abs, navidrome, dsm, authentik live proofs.
+      - [x] Home LAN 2026-10-12: abs-albert + navidrome-albert (default) and abs-root + navidrome-root
+            (admin browser) ✅, all server-proven and promoted.
+      - [ ] DSM (Albert: TOTP for the accounts): dsm-readonly lands in DSM's enforce-2fa wizard, which
+            fails "Unable to load sign-in methods … Secure SignIn Service" — diagnosis subagent running
+            (ssh ds218, read-only). Then TOTP enrollment in Safari (secret → vault authenticator field
+            via a 0600 script, never in the transcript), then the dsm identity recipe.
+      - [ ] authentik (Albert: fix): builder running — broker login (shadow-DOM flow → flow-executor
+            API?) + the authentik identity recipe; live confirmation after.
       - [x] custos-admin ✅ 2026-10-12 in the alt browser: identity recipe `keycloak-admin` (silent
             OIDC PKCE in the isolated world, id_token pins, master-only probe `/admin/realms/master/users/count`;
             d808a8f), reviewed (S1 login_required-only, S2 probe, S3 proxy). Overview: 37 ✅.
