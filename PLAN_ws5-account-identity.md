@@ -463,6 +463,12 @@ value.
       probes otherwise; a login only under the attempt policy.
 - [ ] runai / custos-admin endpoints: confirm at their WS2 candidate logins. Until then
       those groups stay `identity_unproven`. (navidrome: confirmed live 2026-10-11, S4a.)
+      - runai: done (S4c, `PLAN_ws5-s4c-runai-keycloak.md`). The `runai` recipe's "not
+        admin" answer (403, runai-test3) and its "admin" answer (200
+        `application/json`, runai-admin) are both live-confirmed 2026-10-12, so
+        `admin_true_confirmed=True`: runai-admin no longer stays unproven once the
+        broker and client are released.
+      - custos-admin: open (no recipe; stays `identity_unproven`).
 - [x] **S4a** built 2026-10-11 (worktree, not yet released; BROKER + client:
       `broker/identity.py` changes what the broker accepts and proves, so `install.sh`):
   - **`navidrome` recipe** (`live_confirmed`): auth `jwt-local-storage` — localStorage

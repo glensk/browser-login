@@ -5,8 +5,11 @@ same-origin ``POST /api/v1/token`` (the HttpOnly refresh cookie authenticates
 it). The recipe sends that POST itself in a CDP isolated world, reads the
 returned JWT's claims (``preferred_username``; ``azp``, the issuer path and
 ``exp`` pinned) and takes the admin bit from a fixed GET with the token as
-bearer (200 admin, 403 not, anything else none). Its "admin" answer is not
-live-confirmed yet: an ``agent_privilege admin`` item stays unproven.
+bearer (200 admin, 403 not, anything else none). Both answers are
+live-confirmed (2026-10-12), so an ``agent_privilege admin`` item may use it;
+the rule that keeps an admin item unproven while a recipe's "admin" answer is
+unconfirmed runs on an explicit ``admin_true_confirmed=False`` variant (the
+``unconfirmed`` fixture).
 
 The recipe runs in a throwaway headless Chromium against a routed fixture
 Run:ai (no network), through BOTH isolated-world evaluators, and end to end
@@ -44,6 +47,9 @@ from broker import daemon, identity, limiter, vault  # noqa: E402
 browser = load_script("bin/browser.py", "ws5runai_browser")
 
 RECIPE = identity.IDENTITIES["runai"]
+# the recipe as it was before its admin answer was seen live: the
+# unconfirmed-admin rule stays covered on it
+UNCONFIRMED = dataclasses.replace(RECIPE, admin_true_confirmed=False)
 ORIGIN = "https://sdsc.run.ai"
 CHECK = f"{ORIGIN}/workloads"
 KC_ORIGIN = "https://custos.datascience.ch"
@@ -93,6 +99,12 @@ def _claims(name: str, **over: Any) -> dict:
 _DROP = object()
 
 
+@pytest.fixture
+def unconfirmed(monkeypatch: pytest.MonkeyPatch) -> None:
+    """`IDENTITIES["runai"]` swapped for the unconfirmed-admin variant."""
+    monkeypatch.setitem(identity.IDENTITIES, "runai", UNCONFIRMED)
+
+
 # ---------------------------------------------------------------------------
 # the reviewed spec
 # ---------------------------------------------------------------------------
@@ -100,7 +112,7 @@ _DROP = object()
 
 def test_the_runai_recipe_is_reviewed() -> None:
     assert identity.usable_recipe("runai") is RECIPE
-    assert RECIPE.live_confirmed and not RECIPE.admin_true_confirmed
+    assert RECIPE.live_confirmed and RECIPE.admin_true_confirmed
     assert RECIPE.auth == "token-endpoint" and RECIPE.forms == ("email",)
     assert RECIPE.allowed_sites == ("runai-admin", "runai-test3")
     assert RECIPE.origin == ORIGIN and RECIPE.admin_field is None
@@ -218,8 +230,16 @@ def test_recipe_refusal_and_proof_ready() -> None:
     )
     assert identity.proof_ready(_entry())
     assert identity.proof_ready(_entry("runai-admin", "readonly"))
+    # the admin answer is live-confirmed: an admin item may use the recipe
+    assert (
+        identity.recipe_refusal(
+            "runai", site="runai-admin", check_url=CHECK, privilege="admin"
+        )
+        == ""
+    )
+    assert identity.proof_ready(_entry("runai-admin", "admin"))
+    assert identity.entry_recipe(_entry("runai-admin", "admin")) is RECIPE
     refusals = {
-        "admin": _entry("runai-admin", "admin"),
         "site": _entry("runai-x"),
         "origin": _entry(check_url=f"{OTHER}/workloads"),
         "port": _entry(check_url=f"{ORIGIN}:8443/workloads"),
@@ -228,19 +248,22 @@ def test_recipe_refusal_and_proof_ready() -> None:
     for why, entry in refusals.items():
         assert not identity.proof_ready(entry), why
         assert identity.entry_recipe(entry) is None, why
+    # a login URL stands in for a missing check URL (where the check looks)
+    assert identity.proof_ready(_entry(check_url="", login_url=f"{ORIGIN}/login"))
+
+
+@pytest.mark.usefixtures("unconfirmed")
+def test_an_unconfirmed_admin_answer_refuses_the_admin_item() -> None:
+    admin = _entry("runai-admin", "admin")
+    assert not identity.proof_ready(admin)
+    assert identity.entry_recipe(admin) is None
     assert "admin answer is not live-confirmed" in identity.recipe_refusal(
         "runai", site="runai-admin", check_url=CHECK, privilege="admin"
     )
-    # a login URL stands in for a missing check URL (where the check looks)
-    assert identity.proof_ready(_entry(check_url="", login_url=f"{ORIGIN}/login"))
-    # the flag flipped: an admin item may use it
-    flipped = dataclasses.replace(RECIPE, admin_true_confirmed=True)
-    old = identity.IDENTITIES["runai"]
-    identity.IDENTITIES["runai"] = flipped
-    try:
-        assert identity.proof_ready(_entry("runai-admin", "admin"))
-    finally:
-        identity.IDENTITIES["runai"] = old
+    # its "not admin" side is confirmed: user / readonly items may use it
+    assert identity.proof_ready(_entry())
+    assert identity.proof_ready(_entry("runai-admin", "readonly"))
+    assert identity.entry_recipe(_entry()) is UNCONFIRMED
 
 
 def _raw(site: str, user: str | None = None, **fields: str) -> dict:
@@ -275,15 +298,32 @@ def _items(*raws: dict) -> dict[str, vault.SiteItem]:
     return {it.site: it for it in vault.build_items(list(raws))}
 
 
-def test_the_vault_admits_the_user_member() -> None:
-    items = _items(
+def _members() -> dict[str, vault.SiteItem]:
+    return _items(
         _raw("runai-test3"), _raw("runai-admin", privilege="admin", instance="admin")
     )
+
+
+def test_the_vault_admits_both_members() -> None:
+    items = _members()
     test3 = items["runai-test3"]
     assert not test3.refused, test3.refused
     assert test3.identity_recipe is RECIPE and test3.multi_account
-    view = test3.public()
-    assert identity.proof_ready(view)
+    assert identity.proof_ready(test3.public())
+    # the admin member: its "admin" answer is live-confirmed
+    admin = items["runai-admin"]
+    assert not admin.refused and admin.multi_account
+    assert admin.identity_recipe is RECIPE
+    assert identity.proof_ready(admin.public())
+
+
+@pytest.mark.usefixtures("unconfirmed")
+def test_the_vault_keeps_an_unconfirmed_admin_member_unproven() -> None:
+    items = _members()
+    test3 = items["runai-test3"]
+    assert not test3.refused, test3.refused
+    assert test3.identity_recipe is UNCONFIRMED and test3.multi_account
+    assert identity.proof_ready(test3.public())
     # the admin member: valid, but unproven while the admin answer is
     # unconfirmed (no recipe for it anywhere: identity_unproven)
     admin = items["runai-admin"]
@@ -367,6 +407,7 @@ def _broker(tmp_path: Path, items: list[vault.SiteItem]) -> Any:
     )
 
 
+@pytest.mark.usefixtures("unconfirmed")
 def test_the_broker_refuses_an_unconfirmed_admin_item(tmp_path: Path) -> None:
     good = _items(_raw("runai-admin", instance="admin"))["runai-admin"]
     assert not good.refused
@@ -390,6 +431,7 @@ def test_the_broker_refuses_an_unconfirmed_admin_item(tmp_path: Path) -> None:
     )
 
 
+@pytest.mark.usefixtures("unconfirmed")
 def test_the_client_refuses_an_unconfirmed_admin_item(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -626,6 +668,33 @@ def test_the_admin_probe_text_plain_403(ra: tuple[Any, _RunAi, Evaluator]) -> No
     api.probe_status, api.probe_ctype = 401, "text/plain"
     api.probe_body = _error_object(code=401)
     assert _run(page, run)["admin"] is None
+
+
+@pytest.mark.launches_chrome
+@CHROME
+def test_the_confirmed_admin_item_matches(ra: tuple[Any, _RunAi, Evaluator]) -> None:
+    """Live 2026-10-12 (the admin account): its own token gets 200
+    `application/json; charset=UTF-8` on the probe. With the confirmed recipe
+    the admin item resolves to it and passes as `match`."""
+    page, api, run = ra
+    entry = _entry("runai-admin", "admin")
+    recipe = identity.entry_recipe(entry)
+    assert recipe is RECIPE and recipe.admin_true_confirmed
+    me = _user()
+    api.mint(me)
+    api.probe_status, api.probe_ctype = 200, "application/json; charset=UTF-8"
+    api.probe_body = json.dumps({"accessRules": [], "totalRecords": 0})
+    nonce = secrets.token_hex(32)
+    got = dict(
+        run(page, identity.RECIPE_JS, identity.recipe_args(recipe, CHECK, nonce))
+    )
+    assert got["state"] == "found" and got["admin"] is True
+    assert identity.local_verdict(got, nonce, me, "admin") == identity.MATCH
+    assert identity.local_verdict(got, nonce, _user(), "admin") == (
+        identity.WRONG_ACCOUNT
+    )
+    assert api.probes == [("subjectType=user", True)]
+    _no_leak(got, api, me)
 
 
 @pytest.mark.launches_chrome
@@ -964,7 +1033,32 @@ def test_e2e_another_account_is_wrong_account_and_cleared(
 
 @pytest.mark.launches_chrome
 @CHROME
-def test_e2e_the_admin_member_stays_unproven(
+def test_e2e_the_admin_member_is_proven(
+    e2e: Any,
+    result_file: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    make, api, _cleared = e2e
+    test3, admin = _user(), _user()
+    fake = make(_pair(test3, admin))
+    token = api.mint(admin)
+    api.probe_status, api.probe_ctype = 200, "application/json; charset=UTF-8"
+    monkeypatch.setattr(browser, "INSTANCE", "admin")
+    assert browser._broker_logged_in(9224, "runai-admin") == 0
+    rec = _record(result_file, 0)
+    assert rec["identity"] == "match" and rec["multi_account"] is True
+    assert fake.ops == ["sites", "identity_challenge", "identity_answer"]
+    assert len(api.posts) == 1 and len(api.probes) == 1
+    _leak_free(
+        [test3, admin, token, *token.split("."), *fake.secrets], capsys, result_file
+    )
+
+
+@pytest.mark.launches_chrome
+@CHROME
+@pytest.mark.usefixtures("unconfirmed")
+def test_e2e_an_unconfirmed_admin_member_stays_unproven(
     e2e: Any, result_file: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     make, api, _cleared = e2e

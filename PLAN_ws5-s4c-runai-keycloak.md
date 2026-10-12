@@ -144,7 +144,8 @@ Verification is not strict-eligible on purpose: it needs the test suite, mypy an
     — whatever the content type — on a body (≤ 64 KiB, UTF-8) that parses as a JSON object
     with exactly those two keys (`code` a finite number, `message` a string). HTML, another
     JSON shape, an oversized body: no bit. A 200 needs `application/json` AND a body that
-    parses as JSON. `admin_true_confirmed` stays False.
+    parses as JSON. `admin_true_confirmed` stayed False here (flipped after the admin
+    confirmation below).
   - WS3 onboarding flagged the items' scope `app1.run.ai /auth/realms/sdsc/` as
     `risk unrelated_cookie_host` (blocks `-p`). Fixed: the cookie-host relation also counts
     the hosts of the item's reviewed identity recipe (`onboarding.recipe_hosts`: the
@@ -162,20 +163,35 @@ Verification is not strict-eligible on purpose: it needs the test suite, mypy an
         a session.
       - **Storage keys:** identity-source keys are rejected in `agent_storage_keys`, so
         they are never exported or injected.
-- [ ] **Privilege:** never implied from the vault.
+- [x] **Privilege:** never implied from the vault.
       - Without a server role artifact, runai-admin stays unusable.
       - Whether a USER member may pass with its identity proven but its privilege
         unproven is put to Albert as an explicit choice.
       - If the spike finds no server-bound identity, both Run:ai members stay
         `identity_unproven`, and the weaker page-claim contract goes to Albert as an
         explicit choice, never as a default.
-      - Built: the admin bit is a server artifact (the admin probe). Its "not admin"
-        answer (403) is live-confirmed, so a `user` member passes with identity AND
-        privilege proven; no question for Albert arises. Its "admin" answer (200) is not
-        yet seen (`admin_true_confirmed=False`), so runai-admin stays `identity_unproven`.
-  - [ ] **Main session:** as runai-admin, confirm that the probe answers 200
+      - Built: the admin bit is a server artifact (the admin probe). Both answers are
+        live-confirmed: "not admin" (403) for the user account, "admin" (200) for the
+        admin account. A `user` member and the `admin` member each pass with identity
+        AND privilege proven; no question for Albert arises.
+  - [x] **Main session:** as runai-admin, confirm that the probe answers 200
         (status only), then set `admin_true_confirmed=True` in `IDENTITIES["runai"]`
-        (and its test), and release the broker again.
+        (and its test).
+        - Live 2026-10-12 (main session, logged in as runai-admin in Albert's Safari,
+          value-free): with the admin's own access token from `POST /api/v1/token`,
+          `GET /api/v1/authorization/access-rules?subjectType=user`,
+          `/api/v1/authorization/access-rules`, `/api/v1/users` and
+          `/api/v1/authorization/roles` each answered `200 application/json;
+          charset=UTF-8`; the broker's `RECIPE_JS` returned `{"state": "found",
+          "admin": true}`.
+        - A Run:ai application token (the manage-users client) gets 403 JSON on the
+          probe: the bit tells user tokens apart (admin user vs non-admin user), not
+          the roles of an application.
+        - Built (builder, worktree): `admin_true_confirmed=True`; the unconfirmed-admin
+          tests run on an explicit `admin_true_confirmed=False` variant, and new tests
+          prove the admin item as `match` (both evaluators, and end to end).
+  - [ ] **Main session:** release the broker and the client again (`install.sh`) so
+        runai-admin becomes usable.
 - [ ] **Live acceptance**, for both accounts: fresh login, profile reuse, restart, logout,
       a switch made outside the broker, a forged or stale artifact, and a role change
       where that can be tested.
@@ -251,7 +267,8 @@ Verification is not strict-eligible on purpose: it needs the test suite, mypy an
     body → admin; 403 with `application/json`, or with a body that is exactly the
     `admin_probe_error_shape` object (`{code, message}`, any content type: Run:ai's 403 is
     text/plain, live 2026-10-12) → not admin. Anything else is no bit, including an HTML
-    200 or 403 (an SPA fallback, a WAF page). `admin_true_confirmed` is False;
+    200 or 403 (an SPA fallback, a WAF page). `admin_true_confirmed` is True (the 200
+    for the admin account seen live 2026-10-12);
   - `allowed_sites` (`runai-admin`, `runai-test3`), `origin` (`https://sdsc.run.ai`),
     `identity_storage_keys` (`logged-in-user-email`), `forms` (`email`).
   - `recipe_problem` validates all of it, and requires `allowed_sites` and `origin` for a
@@ -330,8 +347,9 @@ Verification is not strict-eligible on purpose: it needs the test suite, mypy an
   (`sdsc.run.ai,custos.datascience.ch,app1.run.ai` for the Run:ai items).
 - The check URL must be on `https://sdsc.run.ai`, and the username stays the e-mail.
 - `logged-in-user-email` must not appear in `agent_storage_keys`.
-- runai-admin stays `identity_unproven` until `admin_true_confirmed` flips. custos-admin
-  stays `identity_unproven` (no recipe; it still conflicts through the fill origin).
+- runai-admin is provable once the broker and client with `admin_true_confirmed=True`
+  are released (flipped 2026-10-12). custos-admin stays `identity_unproven` (no recipe;
+  it still conflicts through the fill origin).
 
 ### Release order (cross-repo)
 

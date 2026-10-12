@@ -966,15 +966,20 @@ IDENTITIES: dict[str, IdentityRecipe] = {
     # (the browser stores the new one). Each check runs the recipe once.
     #
     # The admin bit: `GET /api/v1/authorization/access-rules?subjectType=user`
-    # with the access token as bearer → 403 for a non-admin (test3, live
-    # 2026-10-12: `content-type: text/plain; charset=utf-8`, the body Run:ai's
-    # JSON error object {"code": number, "message": string} — the same on
-    # /api/v1/users and /api/v1/authorization/roles), hence
-    # `admin_probe_error_shape`. 200 (application/json, a JSON body) is
-    # expected for an admin but NOT yet seen (`admin_true_confirmed` False:
-    # an `agent_privilege admin` item stays unproven until the main session
-    # confirms it with runai-admin). An HTML 200/403 — an SPA fallback, a WAF
-    # page — is no bit.
+    # with the access token as bearer. Both answers were seen live:
+    # - not admin (the user account, 2026-10-12): 403 with `content-type:
+    #   text/plain; charset=utf-8`, the body Run:ai's JSON error object
+    #   {"code": number, "message": string} — the same on /api/v1/users and
+    #   /api/v1/authorization/roles — hence `admin_probe_error_shape`;
+    # - admin (the admin account, 2026-10-12, its own token from
+    #   `POST /api/v1/token`): 200 `application/json; charset=UTF-8` on the
+    #   probe, on /api/v1/authorization/access-rules, /api/v1/users and
+    #   /api/v1/authorization/roles; RECIPE_JS itself returned
+    #   {"state": "found", "admin": true} — hence `admin_true_confirmed`.
+    # A Run:ai application token (the manage-users client) gets 403 JSON on
+    # the probe: the bit tells USER tokens apart (an admin user from a
+    # non-admin one), not the roles of an application. An HTML 200/403 — an
+    # SPA fallback, a WAF page — is no bit.
     "runai": IdentityRecipe(
         name="runai",
         path="/api/v1/token",
@@ -988,7 +993,7 @@ IDENTITIES: dict[str, IdentityRecipe] = {
         admin_probe_true=(200,),
         admin_probe_false=(403,),
         admin_probe_error_shape=("code", "message"),
-        admin_true_confirmed=False,
+        admin_true_confirmed=True,
         allowed_sites=("runai-admin", "runai-test3"),
         origin="https://sdsc.run.ai",
         identity_storage_keys=("logged-in-user-email",),
