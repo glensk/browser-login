@@ -304,8 +304,19 @@ manual acceptance steps under the attempt policy below.
             JSON admin probe, admin side unconfirmed). Push + install wait on the YubiKey.
             Live gates: A0 logged-in cookie inventory, runai-admin admin probe, refresh-token
             rotation (broker reuse → client check → broker reuse).
-      - [ ] S4 vault fields via `broker-add.py -I/-p/-i/-A` (Albert's Touch ID; -25308 when he is
-            away), live proofs, then log in the held-back group members.
+      - [x] S4 vault fields written 2026-10-12 (broker-add, Touch ID): gitlab-sdsc (vault usernames
+            switched from e-mail to GitLab username), abs, navidrome, runai (+cookie scopes, sentinel
+            `button[aria-label^='Expand "']`), custos-admin (alt). docker/docker-hub removed (Albert:
+            neither). gitlab-sdsc-test dropped (Albert): GitLab user Testuser2 is blocked; demoted,
+            vault `-D` pending Touch ID.
+      - [x] Live: gitlab-sdsc-glensk — the check found tp#833's admin session in 9222, cleared it, and
+            after the 1 h guard cooldown the login is server-proven; glensk + admin promoted (-p).
+      - [ ] runai-test3: broker proof passes (probe fix 65dbff6), but a profile reuse exports no
+            KEYCLOAK_IDENTITY (session cookie lost on broker relaunch; confirmed by `login -G`,
+            0e9ace1) → SPA redirects to custos. Fix next: `broker-add -K` storage keys had-session +
+            _expiredTime (cheap, unproven), else `agent_fresh_login` (broker-add option in build).
+      - [ ] Home-LAN only (Cloudflare Access off-LAN): abs, navidrome, dsm, authentik live proofs.
+      - [ ] runai-admin admin-probe confirmation; custos-admin still needs its own identity check.
       Original line: account identity (tp#833, hit 2026-10-10): 8 same-scope groups report ✅ for
       the wrong account; gitlab-sdsc-test passed while the browser was `albertadmin`.
       Plan → codex-debate → implement:
