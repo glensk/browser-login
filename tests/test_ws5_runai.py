@@ -112,6 +112,8 @@ def test_the_runai_recipe_is_reviewed() -> None:
     assert args["issuer"] == ISS == RECIPE.issuer
     assert args["admin_probe"] == f"{PROBE_PATH}?subjectType=user"
     assert (args["admin_probe_true"], args["admin_probe_false"]) == ([200], [403])
+    assert args["admin_probe_error_shape"] == ["code", "message"]
+    assert args["probe_body_max"] == 64 * 1024
     assert args["id_field"] == ["preferred_username"]
     # the pinned origin wins over a check URL elsewhere (the page check fails)
     assert identity.recipe_args(RECIPE, f"{OTHER}/x", "0" * 64)["origin"] == ORIGIN
@@ -123,6 +125,7 @@ def test_the_other_recipes_send_no_token_fields() -> None:
         assert args["origin"] == OTHER
         assert not args["token_body"] and args["token_field"] is None
         assert args["claim_pins"] == [] and not args["admin_probe"]
+        assert not args["admin_probe_error_shape"]
         assert identity.IDENTITIES[name].admin_true_confirmed
         assert not identity.IDENTITIES[name].allowed_sites
 
@@ -152,6 +155,10 @@ def test_the_other_recipes_send_no_token_fields() -> None:
         ({"admin_probe_true": ()}, "disjoint"),
         ({"admin_probe_true": (True,)}, "disjoint"),
         ({"admin_probe_false": (99,)}, "disjoint"),
+        ({"admin_probe_error_shape": ("code",)}, "admin_probe_error_shape"),
+        ({"admin_probe_error_shape": ("code", "code")}, "admin_probe_error_shape"),
+        ({"admin_probe_error_shape": ("code", "a b")}, "admin_probe_error_shape"),
+        ({"admin_probe_error_shape": ("a", "b", "c")}, "admin_probe_error_shape"),
         ({"base_segments": ("x",)}, "one fixed path"),
         ({"path": "/api/v1/token?x=1"}, "one fixed path"),
         ({"allowed_sites": ()}, "allowed_sites and an origin"),
@@ -178,6 +185,7 @@ def test_token_fields_need_the_token_auth() -> None:
         {"token_field": ("t",)},
         {"claim_pins": (("azp", "x"),)},
         {"issuer": ISS},
+        {"admin_probe_error_shape": ("code", "message")},
     ):
         with pytest.raises(ValueError, match="token fields need auth token-endpoint"):
             dataclasses.replace(gl, **change)
@@ -416,6 +424,7 @@ class _RunAi:
         self.probe_status = 403
         self.probe_redirect: str | None = None
         self.probe_ctype = "application/json"
+        self.probe_body: str | None = None  # None: by content type
         self.sw = ""
         self.posts: list[tuple[str, Any, str | None]] = []
         self.probes: list[tuple[str, bool]] = []
@@ -443,7 +452,9 @@ class _RunAi:
                 route.fulfill(status=302, headers={"Location": self.probe_redirect})
                 return
             status = self.probe_status if bearer else 401
-            body = "[]" if "json" in self.probe_ctype else "<html>app</html>"
+            body = self.probe_body
+            if body is None:
+                body = "[]" if "json" in self.probe_ctype else "<html>app</html>"
             route.fulfill(status=status, content_type=self.probe_ctype, body=body)
         else:
             route.fulfill(status=404, content_type="application/json", body="{}")
@@ -555,6 +566,66 @@ def test_the_admin_probe(ra: tuple[Any, _RunAi, Evaluator]) -> None:
     assert got["state"] == "found" and got["admin"] is None
     # an identity mismatch is still a mismatch without an admin bit
     assert _verdict(got, _user(), "user") == identity.WRONG_ACCOUNT
+
+
+def _error_object(**over: Any) -> str:
+    body: dict[str, Any] = {"code": 403, "message": "permission denied"}
+    body.update(over)
+    return json.dumps({k: v for k, v in body.items() if v is not _DROP})
+
+
+@pytest.mark.launches_chrome
+@CHROME
+def test_the_admin_probe_text_plain_403(ra: tuple[Any, _RunAi, Evaluator]) -> None:
+    """Live 2026-10-12 (runai-test3): Run:ai answers the non-admin's probe
+    403 `text/plain; charset=utf-8` with its JSON error object. That body is
+    the "not admin" answer whatever the content type; anything else in a
+    non-JSON 403 (HTML, a JSON of another shape, an oversized body) is no
+    bit, and a 200 still needs a JSON content type."""
+    page, api, run = ra
+    me = _user()
+    api.mint(me)
+    api.probe_status, api.probe_ctype = 403, "text/plain; charset=utf-8"
+    api.probe_body = _error_object()
+    got = _run(page, run)
+    assert got["state"] == "found" and got["admin"] is False
+    assert _verdict(got, me, "user") == identity.MATCH
+    assert _verdict(got, me, "admin") == identity.PRIVILEGE_MISMATCH
+    _no_leak(got, api, me)
+    # no content type at all: the error object still decides
+    api.probe_ctype = ""
+    assert _run(page, run)["admin"] is False
+    api.probe_ctype = "text/plain; charset=utf-8"
+    for body in (
+        "<html><body>403 Forbidden</body></html>",
+        _error_object(message=_DROP),
+        _error_object(code=_DROP),
+        _error_object(extra="x"),
+        _error_object(code="403"),
+        _error_object(message=7),
+        json.dumps([403, "permission denied"]),
+        "null",
+        "",
+        _error_object(message="x" * (64 * 1024)),
+    ):
+        api.probe_body = body
+        got = _run(page, run)
+        assert got["state"] == "found" and got["admin"] is None, body[:40]
+        assert _verdict(got, me, "user") == identity.INDETERMINATE
+    # a 200 needs a JSON content type, even with a JSON body …
+    api.probe_status, api.probe_body = 200, "[]"
+    got = _run(page, run)
+    assert got["state"] == "found" and got["admin"] is None
+    assert _verdict(got, me, "admin") == identity.INDETERMINATE
+    # … and a JSON body under its JSON content type
+    api.probe_ctype, api.probe_body = "application/json", "<html>app</html>"
+    assert _run(page, run)["admin"] is None
+    api.probe_body = "[]"
+    assert _run(page, run)["admin"] is True
+    # a 401 with the error object is no bit (only the false statuses count)
+    api.probe_status, api.probe_ctype = 401, "text/plain"
+    api.probe_body = _error_object(code=401)
+    assert _run(page, run)["admin"] is None
 
 
 @pytest.mark.launches_chrome

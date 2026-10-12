@@ -373,6 +373,7 @@ def _strict_proof(view: Mapping[str, Any]) -> bool:
 def _scope_findings(site: str, view: Mapping[str, Any]) -> list[Finding]:
     out: list[Finding] = []
     mine = own_hosts(view)
+    related = mine | _identity.recipe_hosts(view)
     for raw in _list(view, "cookie_hosts"):
         host = _host(raw)
         shown = safe_host(host)
@@ -395,14 +396,14 @@ def _scope_findings(site: str, view: Mapping[str, Any]) -> list[Finding]:
                 )
             )
             continue
-        if not any(_identity.domains_related(host, h) for h in mine):
+        if not any(_identity.domains_related(host, h) for h in related):
             out.append(
                 Finding(
                     site,
                     "risk",
                     "unrelated_cookie_host",
                     f"cookie host {shown} is related to none of the item's fill, "
-                    "check, login, proof or storage hosts",
+                    "check, login, proof, storage or identity-recipe hosts",
                 )
             )
             continue

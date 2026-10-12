@@ -645,6 +645,12 @@ class IdentityRecipe:  # pylint: disable=too-many-instance-attributes  # one rev
     admin_probe: str = ""
     admin_probe_true: tuple[int, ...] = (200,)
     admin_probe_false: tuple[int, ...] = (403,)
+    # The probe's "not admin" answer counts from a JSON content type, or —
+    # whatever the content type — from a body (at most 64 KiB) that is
+    # exactly the site's error object: these two keys, the first a number,
+    # the second a string, nothing else (Run:ai answers its 403 as
+    # text/plain with {"code": …, "message": …}). () = JSON content type only.
+    admin_probe_error_shape: tuple[str, ...] = ()
     # The admin bit's "admin" answer was seen live. While False an item
     # with `agent_privilege admin` may not use the recipe (it stays
     # unproven); a `user` / `readonly` item may (its "not admin" side is
@@ -805,6 +811,7 @@ def _token_recipe_problem(  # pylint: disable=too-many-return-statements,too-man
         recipe.claim_pins,
         recipe.issuer,
         recipe.admin_probe,
+        recipe.admin_probe_error_shape,
     )
     if recipe.auth != "token-endpoint":
         return "token fields need auth token-endpoint" if any(token_fields) else ""
@@ -846,6 +853,13 @@ def _token_recipe_problem(  # pylint: disable=too-many-return-statements,too-man
         or set(recipe.admin_probe_true) & set(recipe.admin_probe_false)
     ):
         return "admin_probe statuses must be disjoint HTTP codes"
+    shape = recipe.admin_probe_error_shape
+    if shape and (
+        len(shape) != 2
+        or not all(isinstance(k, str) and _FIELD_KEY.match(k) for k in shape)
+        or shape[0] == shape[1]
+    ):
+        return "admin_probe_error_shape must be two distinct plain keys"
     if recipe.base_segments or "?" in recipe.path:
         return "token-endpoint takes one fixed path"
     if not recipe.allowed_sites or not recipe.origin:
@@ -952,11 +966,15 @@ IDENTITIES: dict[str, IdentityRecipe] = {
     # (the browser stores the new one). Each check runs the recipe once.
     #
     # The admin bit: `GET /api/v1/authorization/access-rules?subjectType=user`
-    # with the access token as bearer, a JSON answer only (an HTML 200/403 —
-    # an SPA fallback, a WAF page — is no bit) → 403 for a non-admin (test3, live);
-    # 200 is expected for an admin but NOT yet seen (`admin_true_confirmed`
-    # False: an `agent_privilege admin` item stays unproven until the main
-    # session confirms it with runai-admin).
+    # with the access token as bearer → 403 for a non-admin (test3, live
+    # 2026-10-12: `content-type: text/plain; charset=utf-8`, the body Run:ai's
+    # JSON error object {"code": number, "message": string} — the same on
+    # /api/v1/users and /api/v1/authorization/roles), hence
+    # `admin_probe_error_shape`. 200 (application/json, a JSON body) is
+    # expected for an admin but NOT yet seen (`admin_true_confirmed` False:
+    # an `agent_privilege admin` item stays unproven until the main session
+    # confirms it with runai-admin). An HTML 200/403 — an SPA fallback, a WAF
+    # page — is no bit.
     "runai": IdentityRecipe(
         name="runai",
         path="/api/v1/token",
@@ -969,6 +987,7 @@ IDENTITIES: dict[str, IdentityRecipe] = {
         admin_probe="/api/v1/authorization/access-rules?subjectType=user",
         admin_probe_true=(200,),
         admin_probe_false=(403,),
+        admin_probe_error_shape=("code", "message"),
         admin_true_confirmed=False,
         allowed_sites=("runai-admin", "runai-test3"),
         origin="https://sdsc.run.ai",
@@ -1054,6 +1073,26 @@ def item_recipe(
     return usable_recipe(name)
 
 
+def recipe_hosts(entry: Mapping[str, object]) -> frozenset[str]:
+    """Hosts of the reviewed recipe a ``sites`` entry declares
+    (``agent_identity``): its pinned ``issuer`` (token-endpoint) and its
+    ``origin`` — Run:ai's Keycloak on app1.run.ai issues the token its SSO
+    login passes through. Only a recipe of the reviewed table whose site and
+    origin pins the entry meets; never a host from the vault. The onboarding
+    review counts them as the item's own for its cookie hosts."""
+    name = entry.get("identity")
+    recipe = IDENTITIES.get(name) if isinstance(name, str) else None
+    if recipe is None:
+        return frozenset()
+    if recipe.allowed_sites and entry.get("site") not in recipe.allowed_sites:
+        return frozenset()
+    check = entry.get("check_url") or entry.get("login_url")
+    if recipe.origin and _https_origin(check) != recipe.origin:
+        return frozenset()
+    hosts = {_norm_host(recipe.issuer), _norm_host(recipe.origin)}
+    return frozenset(h for h in hosts if h)
+
+
 def entry_recipe(entry: Mapping[str, object]) -> IdentityRecipe | None:
     """`item_recipe` of a ``sites`` entry (its check URL, else its login
     URL — where the check looks)."""
@@ -1081,6 +1120,8 @@ def proof_ready(entry: Mapping[str, object]) -> bool:
 
 FETCH_MS = 8000
 TOTAL_MS = 12000
+# The most of an admin probe's error body the recipe reads (bytes).
+PROBE_BODY_MAX = 65536
 
 # The ONE in-page function every recipe runs; its spec comes from
 # `recipe_args` (the reviewed table), never from the page or the vault. It
@@ -1149,6 +1190,61 @@ RECIPE_JS = r"""async (a) => {
       return {err: out('indeterminate', {why: 'redirect', status: r.status})};
     return {r: r};
   };
+  // At most `max` bytes of a response body as UTF-8 text; null when it is
+  // longer, unreadable or not UTF-8.
+  const readCapped = async (r, max) => {
+    if (!r.body) return '';
+    const reader = r.body.getReader();
+    const chunks = [];
+    let n = 0;
+    try {
+      for (;;) {
+        const step = await reader.read();
+        if (step.done) break;
+        n += step.value.length;
+        if (n > max) {
+          try { await reader.cancel(); } catch (e) { /* gone already */ }
+          return null;
+        }
+        chunks.push(step.value);
+      }
+    } catch (e) { return null; }
+    const buf = new Uint8Array(n);
+    let off = 0;
+    for (const c of chunks) { buf.set(c, off); off += c.length; }
+    try { return new TextDecoder('utf-8', {fatal: true}).decode(buf); }
+    catch (e) { return null; }
+  };
+  const jsonType = (r) =>
+    /^application\/json\s*(;|$)/.test((r.headers.get('content-type') || '').toLowerCase());
+  // The admin bit of the probe's answer (null = none). A status in
+  // admin_probe_true: a JSON content type AND a JSON body. In
+  // admin_probe_false: a JSON content type, or — whatever the content type
+  // (Run:ai's 403 is text/plain) — a body (capped) that is exactly the
+  // recipe's error object. An HTML 200/403 (an SPA fallback, a WAF page)
+  // says nothing about the account's rights.
+  const probeBit = async (r) => {
+    if (a.admin_probe_true.indexOf(r.status) >= 0) {
+      if (!jsonType(r)) return null;
+      try { await r.json(); } catch (e) { return null; }
+      return true;
+    }
+    if (a.admin_probe_false.indexOf(r.status) < 0) return null;
+    if (jsonType(r)) return false;
+    const shape = a.admin_probe_error_shape;
+    if (!Array.isArray(shape) || shape.length !== 2) return null;
+    const text = await readCapped(r, a.probe_body_max);
+    if (text === null) return null;
+    let v;
+    try { v = JSON.parse(text); } catch (e) { return null; }
+    if (v === null || typeof v !== 'object' || Array.isArray(v)) return null;
+    const keys = Object.keys(v);
+    if (keys.length !== 2 || keys.indexOf(shape[0]) < 0 || keys.indexOf(shape[1]) < 0)
+      return null;
+    if (typeof v[shape[0]] !== 'number' || !Number.isFinite(v[shape[0]])
+        || typeof v[shape[1]] !== 'string') return null;
+    return false;
+  };
   // token-endpoint (Run:ai): POST the fixed body, read the JWT the server
   // returns, pin its claims, read the identity claim; the admin bit from
   // a fixed GET with that token as bearer. The token never leaves here.
@@ -1179,16 +1275,9 @@ RECIPE_JS = r"""async (a) => {
       return out('indeterminate', {why: 'expired'});
     const id = norm(get(claims, a.id_field));
     if (id === null) return out('indeterminate', {why: 'identity'});
-    let admin = null;
     const probe = await call(origin, a.admin_probe, {method: 'GET',
       headers: {Accept: 'application/json', Authorization: 'Bearer ' + t}});
-    // the bit only from a JSON answer: an HTML 200/403 (an SPA fallback,
-    // a WAF page) says nothing about the account's rights
-    const pct = probe.err ? '' : (probe.r.headers.get('content-type') || '').toLowerCase();
-    if (!probe.err && /^application\/json\s*(;|$)/.test(pct)) {
-      if (a.admin_probe_true.indexOf(probe.r.status) >= 0) admin = true;
-      else if (a.admin_probe_false.indexOf(probe.r.status) >= 0) admin = false;
-    }
+    const admin = probe.err ? null : await probeBit(probe.r);
     return out('found', {digest: await digestOf(id), admin: admin});
   };
   const work = async () => {
@@ -1335,6 +1424,8 @@ def recipe_args(
         "admin_probe": recipe.admin_probe,
         "admin_probe_true": list(recipe.admin_probe_true),
         "admin_probe_false": list(recipe.admin_probe_false),
+        "admin_probe_error_shape": list(recipe.admin_probe_error_shape),
+        "probe_body_max": PROBE_BODY_MAX,
         "fetch_ms": FETCH_MS,
         "total_ms": TOTAL_MS,
     }

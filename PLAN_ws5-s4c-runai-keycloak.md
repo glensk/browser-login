@@ -132,6 +132,26 @@ Verification is not strict-eligible on purpose: it needs the test suite, mypy an
     permission entry. Compare against runai-admin before fixing it.
   - localStorage `logged-in-user-email` did NOT equal test3: it was left over from an earlier
     login. This is live proof of Codex O3: the page claim was stale.
+- Live acceptance finding 2026-10-12 (main session, runai-test3, value-free):
+  - The admin probe answers the non-admin **403 with `content-type: text/plain;
+    charset=utf-8`**; the body is Run:ai's JSON error object `{"code": <number>,
+    "message": <string>}`. The same holds for `/api/v1/users` and
+    `/api/v1/authorization/roles`. The JSON-content-type-only rule therefore gave
+    `state: found, admin: null`, and `browser.py login runai-test3` ended
+    `identity_indeterminate` at broker-proof.
+  - Fixed (builder, worktree): recipe field `admin_probe_error_shape = ("code",
+    "message")`. A status in `admin_probe_false` is "not admin" on a JSON content type, or
+    — whatever the content type — on a body (≤ 64 KiB, UTF-8) that parses as a JSON object
+    with exactly those two keys (`code` a finite number, `message` a string). HTML, another
+    JSON shape, an oversized body: no bit. A 200 needs `application/json` AND a body that
+    parses as JSON. `admin_true_confirmed` stays False.
+  - WS3 onboarding flagged the items' scope `app1.run.ai /auth/realms/sdsc/` as
+    `risk unrelated_cookie_host` (blocks `-p`). Fixed: the cookie-host relation also counts
+    the hosts of the item's reviewed identity recipe (`onboarding.recipe_hosts`: the
+    pinned `issuer` and the `origin`), only when the item meets the recipe's
+    `allowed_sites` and `origin` pins.
+  - Both fixes need `install.sh` (`broker/identity.py` and `broker/onboarding.py` are
+    shared by broker and client).
 - [x] **Rules for any resulting recipe:**
       - **Who may use it:** it declares `allowed_sites`, an exact https origin and a fixed
         source, enforced by both the broker validation and the client proof.
@@ -227,10 +247,11 @@ Verification is not strict-eligible on purpose: it needs the test suite, mypy an
   - `claim_pins` (`azp == runai-admin-ui`), `issuer` (`iss` must equal
     `https://app1.run.ai/auth/realms/sdsc` exactly), `exp` in the future (the isolated
     world's own `Date`);
-  - `admin_probe` (a GET with the token as bearer). The bit comes only from an
-    `application/json` answer: 200 → admin, 403 → not admin. Anything else is no bit,
-    including an HTML 200 or 403 (an SPA fallback, a WAF page). `admin_true_confirmed` is
-    False;
+  - `admin_probe` (a GET with the token as bearer): 200 with `application/json` and a JSON
+    body → admin; 403 with `application/json`, or with a body that is exactly the
+    `admin_probe_error_shape` object (`{code, message}`, any content type: Run:ai's 403 is
+    text/plain, live 2026-10-12) → not admin. Anything else is no bit, including an HTML
+    200 or 403 (an SPA fallback, a WAF page). `admin_true_confirmed` is False;
   - `allowed_sites` (`runai-admin`, `runai-test3`), `origin` (`https://sdsc.run.ai`),
     `identity_storage_keys` (`logged-in-user-email`), `forms` (`email`).
   - `recipe_problem` validates all of it, and requires `allowed_sites` and `origin` for a

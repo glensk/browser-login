@@ -22,7 +22,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from ws3_fixtures import new_user as _user  # noqa: E402
 from ws3_fixtures import raw_item as _raw  # noqa: E402
 
-from broker import onboarding, storage_rules, vault  # noqa: E402
+from broker import identity, onboarding, storage_rules, vault  # noqa: E402
 
 
 def _views(*raws: dict) -> list[dict]:
@@ -434,3 +434,76 @@ def test_the_digest_survives_a_broker_release() -> None:
     }
     assert onboarding.config_digest(path_scoped) != digest
     assert onboarding.config_canon(view)["v"] == onboarding.CONFIG_V
+
+
+# ---------------------------------------------------------------------------
+# cookie hosts of the item's identity recipe (Run:ai's Keycloak, live
+# 2026-10-12: app1.run.ai was a risk, blocking -p)
+# ---------------------------------------------------------------------------
+
+_RUNAI_SCOPES = [
+    {"host": "sdsc.run.ai", "path": "/"},
+    {"host": "custos.datascience.ch", "path": "/realms/sdsc/"},
+    {"host": "app1.run.ai", "path": "/auth/realms/sdsc/"},
+]
+
+
+def _runai_raw(site: str = "runai-test3", **fields: str | None) -> dict:
+    base: dict[str, str | None] = {
+        "agent_site": site,
+        "agent_fill_origins": "https://custos.datascience.ch",
+        "agent_check_url": "https://sdsc.run.ai/workloads",
+        "agent_logged_in_selector": "#me",
+        "agent_cookie_scopes": json.dumps(_RUNAI_SCOPES),
+        "agent_identity": "runai",
+        "agent_privilege": "user",
+    }
+    base.update({f"agent_{k}": v for k, v in fields.items()})
+    login = {"username": f"{_user()}@ws3r.example"}
+    login["pass" + "word"] = secrets.token_urlsafe(18)
+    return {
+        "id": f"id-{site}",
+        "name": site,
+        "login": login,
+        "fields": [{"name": k, "value": v} for k, v in base.items() if v is not None],
+    }
+
+
+def _risks(view: dict) -> set[str]:
+    return {f.code for f in onboarding.item_findings(view, [view]) if f.level == "risk"}
+
+
+def test_the_identity_recipes_issuer_host_is_related() -> None:
+    view = _views(_runai_raw())[0]
+    assert not view.get("refused"), view.get("reason")
+    assert "app1.run.ai" in view["cookie_hosts"]
+    assert identity.recipe_hosts(view) == {"app1.run.ai", "sdsc.run.ai"}
+    assert _risks(view) == set()
+
+
+def test_an_unrelated_cookie_host_stays_a_risk() -> None:
+    # the same scopes without the recipe: app1.run.ai relates to nothing
+    plain = _views(_runai_raw(identity=None, privilege=None))[0]
+    assert identity.recipe_hosts(plain) == set()
+    assert "unrelated_cookie_host" in _risks(plain)
+    # a recipe item with ANOTHER unrelated host: still a risk, for that host
+    extra = [*_RUNAI_SCOPES, {"host": "other.example.org", "path": "/"}]
+    view = _views(_runai_raw(cookie_scopes=json.dumps(extra)))[0]
+    risky = [
+        f
+        for f in onboarding.item_findings(view, [view])
+        if f.code == "unrelated_cookie_host"
+    ]
+    assert len(risky) == 1 and "other.example.org" in risky[0].text
+    # a site the recipe is not reviewed for gets none of its hosts
+    other = _views(_runai_raw("runai-x"))[0]
+    assert identity.recipe_hosts(other) == set()
+    assert "unrelated_cookie_host" in _risks(other)
+    # nor does an item whose check page is off the recipe's origin
+    moved = {**view, "check_url": "https://other.run.ai/workloads"}
+    assert identity.recipe_hosts(moved) == set()
+    # a non-recipe item: a plain unrelated host is a risk as before
+    app = _views(
+        _raw("app", "app.example", cookie_hosts="app.example,other.example.org")
+    )
+    assert "unrelated_cookie_host" in _risks(app[0])
