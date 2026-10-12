@@ -16,7 +16,7 @@ from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
 from typing import Any
 
-from broker.identity import CookieScope, scopes_hold
+from broker.identity import CookieScope, domains_related, scopes_hold
 
 # Exact IdP hosts, plus first-label wildcards (``idp.*``, ``sso.*``, ``keycloak.*``).
 # browser.py mirrors this list for the client-side cookie delete (a test pins
@@ -63,20 +63,36 @@ def is_idp_host(host: str) -> bool:
     return h in IDP_HOSTS or h.split(".", 1)[0] in IDP_LABELS
 
 
+def cookie_drop_reason(
+    domain: str, name: str, spec: SiteBundleSpec, path: str = "/"
+) -> str:
+    """Why the export rule drops one cookie of `domain`, `name` and `path`
+    ('' = it is exported; see the module docstring): ``no_domain``,
+    ``out_of_scope`` (not on a scope host or a subdomain of one: a parent
+    or unrelated domain), ``out_of_path`` (on a scope host, outside every
+    path of its scopes), ``idp_host`` or ``not_in_cookie_names``. The ONE
+    rule behind `cookie_in_scope` and `cookie_diag`."""
+    d = _norm_host(domain)
+    if not d:
+        return "no_domain"
+    scopes = spec.scopes
+    if not scopes_hold(scopes, d, path):
+        if any(d == s.host or d.endswith("." + s.host) for s in scopes):
+            return "out_of_path"
+        return "out_of_scope"
+    if is_idp_host(d) and d not in {s.host for s in scopes}:
+        return "idp_host"
+    if spec.cookie_names is not None and name not in spec.cookie_names:
+        return "not_in_cookie_names"
+    return ""
+
+
 def cookie_in_scope(
     domain: str, name: str, spec: SiteBundleSpec, path: str = "/"
 ) -> bool:
     """The export rule for one cookie of `domain`, `name` and `path` (see
     the module docstring)."""
-    d = _norm_host(domain)
-    if not d:
-        return False
-    scopes = spec.scopes
-    if not scopes_hold(scopes, d, path):
-        return False
-    if is_idp_host(d) and d not in {s.host for s in scopes}:
-        return False
-    return spec.cookie_names is None or name in spec.cookie_names
+    return not cookie_drop_reason(domain, name, spec, path)
 
 
 def filter_cookies(
@@ -110,6 +126,75 @@ def filter_cookies(
             item["expires"] = expires
         out.append(item)
     return out
+
+
+# At most this many cookies are described by `cookie_diag`.
+DIAG_CAP = 64
+DIAG_V = 1
+
+
+def _diag_entry(c: Mapping[str, Any], spec: SiteBundleSpec) -> dict[str, Any]:
+    """One cookie's metadata and export verdict — NEVER its value (nor a
+    digest or length of it)."""
+    domain = str(c.get("domain") or "")
+    name = str(c.get("name") or "")
+    path = str(c.get("path") or "/")
+    why = "no_name" if not name else cookie_drop_reason(domain, name, spec, path)
+    if why == "out_of_scope":
+        d = _norm_host(domain)
+        if any(s.host.endswith("." + d) for s in spec.scopes):
+            why = "parent_domain"  # sent to a scope host, never exported
+    expires = c.get("expires")
+    same_site = c.get("sameSite")
+    return {
+        "domain": domain,
+        "path": path,
+        "name": name,
+        "session": not (isinstance(expires, (int, float)) and expires > 0),
+        "httpOnly": bool(c.get("httpOnly", False)),
+        "secure": bool(c.get("secure", False)),
+        "sameSite": same_site if same_site in ("Strict", "Lax", "None") else None,
+        "partitioned": bool(c.get("partitionKey")),
+        "kept": not why,
+        "why_dropped": why or None,
+    }
+
+
+def cookie_diag(
+    cookies: Iterable[Mapping[str, Any]], spec: SiteBundleSpec, cap: int = DIAG_CAP
+) -> dict[str, Any]:
+    """Value-free picture of the jar the export read (`filter_cookies`' own
+    input): every cookie on a scope host, a subdomain of one or a parent
+    domain of one (sent there too) — kept or dropped, and why
+    (`cookie_drop_reason`, plus ``parent_domain`` / ``no_name``). Names and
+    metadata only: a cookie's value, a digest or its length never appear.
+    Scope-host cookies come first, then parent domains, each sorted by
+    domain, path and name; at most `cap` entries (``truncated``)."""
+    hosts = [s.host for s in spec.scopes if s.host]
+    jar = list(cookies)
+    related = [
+        c
+        for c in jar
+        if (d := _norm_host(str(c.get("domain") or "")))
+        and any(domains_related(d, h) for h in hosts)
+    ]
+    entries = [_diag_entry(c, spec) for c in related]
+    entries.sort(
+        key=lambda e: (
+            e["why_dropped"] == "parent_domain",
+            _norm_host(e["domain"]),
+            e["path"],
+            e["name"],
+        )
+    )
+    return {
+        "v": DIAG_V,
+        "jar_total": len(jar),
+        "matched": len(entries),
+        "kept": sum(1 for e in entries if e["kept"]),
+        "truncated": len(entries) > cap,
+        "cookies": entries[:cap],
+    }
 
 
 def filter_storage(

@@ -662,6 +662,17 @@ def _add_login_parsers(sub: Any) -> None:
         "renewed; NEVER logs in or submits a password (works for pending and "
         "quarantined sites). Exit 0 = still logged in, 2 = not logged in",
     )
+    pl.add_argument(
+        "-G",
+        "--diag",
+        action="store_true",
+        help="broker sites: value-free cookie diagnostics — the broker lists "
+        "every cookie on, under or above the item's scope hosts (name, domain, "
+        "path, flags; kept or why dropped; never a value), how it got the "
+        "session (via) and the open pages' storage key names; the client adds "
+        "what it injected per host and what the browser did not keep. Printed "
+        "and written to the -R result file (bundle_diag, inject_diag)",
+    )
     pli = sub.add_parser(
         "logged-in", help="Exit 0 if SITE is logged in, 2 if not (no login)."
     )
@@ -9759,6 +9770,7 @@ _LOGIN_OPTS: dict[str, Any] = {
     "scheduled": False,
     "candidate": None,
     "refresh_only": False,
+    "diag": False,  # `login -G`: value-free cookie diagnostics
 }
 # The breadcrumb a deadline fired in -> the phase it stopped at.
 _STEP_PHASE = {
@@ -12055,6 +12067,236 @@ def _broker_check_entry(  # pylint: disable=too-many-return-statements
     return 2
 
 
+# `login -G`: at most this many cookies in a client diagnostics list.
+BROKER_DIAG_CAP = 64
+
+
+def _cookie_key(c: Mapping[str, Any]) -> tuple[str, str, str]:
+    """(name, domain without its leading dot, path) — how the read-back
+    after an injection finds a cookie again (never by its value)."""
+    return (
+        str(c.get("name") or ""),
+        str(c.get("domain") or "").strip().lstrip(".").lower(),
+        str(c.get("path") or "/"),
+    )
+
+
+def _cookie_reject_hint(c: Mapping[str, Any]) -> str | None:
+    """Why Chromium would not store cookie `c`, from its metadata alone.
+    ``Storage.setCookies`` (``add_cookies``) drops some cookies WITHOUT an
+    error — SameSite=None without Secure (measured, Chromium for Testing,
+    Playwright 1.60) — and refuses the whole batch for others (a ``__Host-``
+    cookie breaking its rules: "Invalid cookie fields"). None: no known
+    reason."""
+    name = str(c.get("name") or "")
+    domain = str(c.get("domain") or "")
+    secure = bool(c.get("secure"))
+    expires = c.get("expires")
+    rules = (  # the first that holds
+        (
+            not domain.strip(".")
+            or ".." in domain
+            or not re.fullmatch(r"\.?[A-Za-z0-9.-]+", domain),
+            "bad_domain",
+        ),
+        (c.get("sameSite") == "None" and not secure, "samesite_none_without_secure"),
+        (
+            name.startswith("__Host-")
+            and (
+                not secure or str(c.get("path") or "/") != "/" or domain.startswith(".")
+            ),
+            "host_prefix_rules",
+        ),
+        (name.startswith("__Secure-") and not secure, "secure_prefix_without_secure"),
+        (
+            isinstance(expires, (int, float)) and 0 < expires < time.time(),
+            "expired",
+        ),
+        (bool(c.get("partitionKey")), "partitioned"),
+    )
+    return next((code for holds, code in rules if holds), None)
+
+
+def _cookie_inject_error(exc: BaseException) -> str:
+    """A fixed code for an ``add_cookies`` failure (never its message: it
+    may quote the cookie)."""
+    text = str(exc)
+    if "Invalid cookie fields" in text:
+        return "invalid_cookie_fields"  # Storage.setCookies refused the batch
+    if "url or a domain/path" in text:
+        return "missing_domain_path"
+    return f"error:{type(exc).__name__}"
+
+
+def _cookie_ident(c: Mapping[str, Any]) -> dict[str, str]:
+    """A cookie's domain, path and name (never its value)."""
+    return {
+        "domain": str(c.get("domain") or ""),
+        "path": str(c.get("path") or "/"),
+        "name": str(c.get("name") or ""),
+    }
+
+
+def _broker_inject_report(
+    browser: Any, bundle: dict, error: str | None
+) -> dict[str, Any]:
+    """`login -G`, right after the injection: per host how many bundle
+    cookies went to ``add_cookies`` (``sent``) and how many the browser
+    holds afterwards (``present``: read back by name, domain and path, never
+    by value); the bundle cookies the client's own scope filter dropped
+    (``client_dropped``) and every sent cookie the browser did not keep
+    (``missing_after``, with `_cookie_reject_hint`). Value-free."""
+    hosts = [str(h) for h in bundle.get("cookie_hosts") or []]
+    scopes = _cookie_scopes_of(bundle)
+    raw_names = bundle.get("cookie_names")
+    names = [str(n) for n in raw_names] if isinstance(raw_names, list) else None
+    sent_all = [c for c in bundle.get("cookies") or [] if isinstance(c, dict)]
+    sent: list[dict] = []
+    dropped: list[dict] = []
+    for c in sent_all:
+        in_scope = _broker_cookie_in_scope(
+            str(c.get("domain")),
+            str(c.get("name")),
+            hosts,
+            names,
+            path=str(c.get("path") or "/"),
+            scopes=scopes,
+        )
+        (sent if in_scope else dropped).append(c)
+    have: set[tuple[str, str, str]] = set()
+    read_error = None
+    try:
+        ctx = browser.contexts[0] if browser.contexts else None
+        have = {_cookie_key(c) for c in (ctx.cookies() if ctx else [])}
+    except Exception as exc:  # pylint: disable=broad-exception-caught
+        read_error = f"error:{type(exc).__name__}"
+    per_host: dict[str, dict[str, int]] = {}
+    missing = []
+    for c in sent:
+        key = _cookie_key(c)
+        row = per_host.setdefault(key[1], {"sent": 0, "present": 0})
+        row["sent"] += 1
+        if key in have:
+            row["present"] += 1
+        else:
+            missing.append({**_cookie_ident(c), "likely": _cookie_reject_hint(c)})
+    return {
+        "v": 1,
+        "bundle_cookies": len(sent_all),
+        "client_dropped": [_cookie_ident(c) for c in dropped][:BROKER_DIAG_CAP],
+        "per_host": per_host,
+        "missing_after": missing[:BROKER_DIAG_CAP],
+        "add_cookies_error": error,
+        "read_back_error": read_error,
+    }
+
+
+def _diag_flag(value: object) -> str:
+    """One table cell of a boolean flag."""
+    if value is True:
+        return "y"
+    return "-" if value is False else "?"
+
+
+def _diag_row(e: Mapping[str, Any]) -> tuple[str, ...]:
+    """One `bundle_diag` cookie as a table row."""
+    return (
+        _diag_flag(e.get("kept")),
+        str(e.get("domain")),
+        str(e.get("path")),
+        str(e.get("name")),
+        _diag_flag(e.get("session")),
+        _diag_flag(e.get("httpOnly")),
+        _diag_flag(e.get("secure")),
+        str(e.get("sameSite") or "-"),
+        _diag_flag(e.get("partitioned")),
+        str(e.get("why_dropped") or ""),
+    )
+
+
+def _print_storage_names(names: object) -> None:
+    """`login -G`: the broker's open pages' storage NAMES per origin."""
+    for origin, got in names.items() if isinstance(names, dict) else []:
+        if not isinstance(got, dict):
+            print(f"  storage {origin}: no page open on it in the broker")
+        elif "error" in got:
+            print(f"  storage {origin}: {got.get('error')}")
+        else:
+            print(
+                f"  storage {origin}: localStorage {got.get('local_n')} key(s) "
+                f"{got.get('local')}; sessionStorage {got.get('session_n')} "
+                f"{got.get('session')}; IndexedDB {got.get('indexeddb')}"
+            )
+
+
+def _print_bundle_diag(site: str, diag: object) -> None:
+    """`login -G`: the broker's value-free picture of its cookie jar."""
+    if not isinstance(diag, dict):
+        print(
+            f"-G: the broker sent no bundle_diag for {site} (an older broker, or "
+            "this request joined a login already running) — no cookie picture.",
+            file=sys.stderr,
+        )
+        return
+    head = ("KEPT", "DOMAIN", "PATH", "NAME", "SESSION", "HTTPONLY", "SECURE")
+    rows: list[tuple[str, ...]] = [(*head, "SAMESITE", "PARTITIONED", "WHY DROPPED")]
+    rows += [_diag_row(e) for e in diag.get("cookies") or [] if isinstance(e, dict)]
+    widths = [max(len(r[i]) for r in rows) for i in range(len(rows[0]))]
+    print(
+        f"-G {site}: broker session via {diag.get('via')!r}; its jar holds "
+        f"{diag.get('jar_total')} cookie(s), {diag.get('matched')} on, under or "
+        f"above the scope hosts, {diag.get('kept')} exported"
+        + (" (list truncated)" if diag.get("truncated") else "")
+    )
+    for r in rows:
+        print("  | " + " | ".join(c.ljust(w) for c, w in zip(r, widths)) + " |")
+    _print_storage_names(diag.get("storage_names"))
+
+
+def _print_inject_report(site: str, report: Mapping[str, Any]) -> None:
+    """`login -G`: what the injection did in the shared browser."""
+    per_host = report.get("per_host") or {}
+    hosts = ", ".join(
+        f"{h} {v['present']}/{v['sent']}" for h, v in sorted(per_host.items())
+    )
+    error = report.get("add_cookies_error")
+    print(
+        f"-G {site}: injected, present/sent per host: {hosts or 'none'}"
+        + (f"; add_cookies failed: {error}" if error else "")
+    )
+    for c in report.get("client_dropped") or []:
+        print(
+            "  dropped by the client's scope filter: "
+            f"{c['domain']} {c['path']} {c['name']}"
+        )
+    for c in report.get("missing_after") or []:
+        print(
+            f"  NOT kept by the browser: {c['domain']} {c['path']} {c['name']}"
+            f" (likely: {c.get('likely') or 'unknown'})"
+        )
+
+
+def _broker_replace_cookies_diag(browser: Any, bundle: dict, resp: dict) -> int:
+    """`_broker_replace_cookies` for `login -G`: the broker's
+    ``bundle_diag`` and the injection's report (`_broker_inject_report`)
+    are printed and recorded in the result (``bundle_diag``,
+    ``inject_diag``) — also when ``add_cookies`` raises (re-raised)."""
+    diag = resp.get("bundle_diag")
+    _result_set(bundle_diag=diag if isinstance(diag, dict) else None)
+    site = str(bundle.get("site") or _RESULT.get("site") or "?")
+    _print_bundle_diag(site, diag)
+    error: str | None = None
+    try:
+        return _broker_replace_cookies(browser, bundle)
+    except Exception as exc:
+        error = _cookie_inject_error(exc)
+        raise
+    finally:
+        report = _broker_inject_report(browser, bundle, error)
+        _result_set(inject_diag=report)
+        _print_inject_report(site, report)
+
+
 def _broker_replace_cookies(browser, bundle: dict) -> int:
     """Delete the shared browser's in-scope cookies, add the bundle's; return
     count. In scope = the bundle's cookie scopes (`_cookie_scopes_of`: on a
@@ -12563,7 +12805,10 @@ def _broker_fetch_inject(
                     file=sys.stderr,
                 )
             _deadline_step("broker:cookies")
-            n_cookies = _broker_replace_cookies(browser, bundle)
+            if opts.get("diag"):
+                n_cookies = _broker_replace_cookies_diag(browser, bundle, resp)
+            else:
+                n_cookies = _broker_replace_cookies(browser, bundle)
             browser.close()
             pw.stop()
             connected = False
@@ -12800,6 +13045,12 @@ def _broker_login(port: int, site: str) -> int:
     if not candidate:  # the free check first: logged in = done, gates or not
         done = _broker_already(port, site)
         if done is not None:
+            if _LOGIN_OPTS.get("diag"):
+                print(
+                    f"-G: {site} needed no broker login here — no bundle, no "
+                    "diagnostics (they come with a broker login only).",
+                    file=sys.stderr,
+                )
             return done
     renewing = _RESULT.get("renewal") == "due"
     rc = _broker_login_gated(port, site, candidate)
@@ -12843,7 +13094,8 @@ def _broker_login_gated(  # pylint: disable=too-many-return-statements
     entry, rc = _broker_entry_or_rc(site)
     if entry is None:
         return rc
-    opts: dict[str, Any] = {}
+    # `-G`: value-free diagnostics of the bundle and the injection
+    opts: dict[str, Any] = {"diag": True} if _LOGIN_OPTS.get("diag") else {}
     if _LOGIN_OPTS.get("scheduled"):
         # WS3: a promotion holds for ONE configuration of the item.
         allowed, code, why = _als.scheduled_gate(
@@ -15667,6 +15919,7 @@ def cmd_login(  # pylint: disable=too-many-arguments
     scheduled: bool = False,
     candidate: str | None = None,
     refresh_only: bool = False,
+    diag: bool = False,
 ) -> int:
     """Ensure SITE is logged in (automated or assisted, per the site).
 
@@ -15677,12 +15930,13 @@ def cmd_login(  # pylint: disable=too-many-arguments
     anthropic only, see `_anthropic_login_expect`. `result_file` (`-R`): the
     phase record; `scheduled` (`-s`): the daily check's gates; `candidate`
     (`-x`): a one-shot candidate sentinel for a broker item without one;
-    `refresh_only` (`-F`): renew a logged-in site's token, never log in.
+    `refresh_only` (`-F`): renew a logged-in site's token, never log in;
+    `diag` (`-G`): value-free cookie diagnostics of a broker login.
     """
     key = site_name.strip().lower()
     _result_begin("login", key, result_file)
     _LOGIN_OPTS.update(
-        scheduled=scheduled, candidate=candidate, refresh_only=refresh_only
+        scheduled=scheduled, candidate=candidate, refresh_only=refresh_only, diag=diag
     )
     rc = 1
     try:
@@ -16036,6 +16290,8 @@ def _dispatch(args: argparse.Namespace, port: int) -> int:
             extra["candidate"] = args.try_sentinel
         if getattr(args, "refresh_only", False):
             extra["refresh_only"] = True
+        if getattr(args, "diag", False):
+            extra["diag"] = True
         if expect is not None:
             return cmd_login(port, args.site, expect=expect, **extra)
         return cmd_login(port, args.site, **extra)

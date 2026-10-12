@@ -481,6 +481,7 @@ subcommands dispatch through it:
 browser.py login SITE         # ensure logged in; exit 4 + "needs Albert: agent-login.py -g SITE"
                               #   when only you can finish it (never opens a window itself)
 browser.py logged-in SITE     # exit 0 if logged in, 2 if not (no login attempted)
+browser.py login SITE -G      # broker site: plus value-free cookie diagnostics (below)
 browser.py login-log [SITE]   # how often a *real* login was needed (no SITE = all tools)
 browser.py store-creds SITE   # save credentials in the macOS keychain (cscs-style)
 browser.py forget-creds SITE  # delete them
@@ -635,6 +636,28 @@ and shows `phase · reason — detail 📷 screenshot` per ❌ row. `agents.md` 
 ever shows the fixed phase/code texts (no page text). `last-check.json` stays
 as a legacy projection (`ok`, `how`, `at`) for infra/status: `ok=false` is red;
 a check that could not tell (offline, busy) is `ok=false` and does not move `at`.
+
+`browser.py login SITE -G` (`--diag`) asks the broker for `bundle_diag` (request
+field `"diag": true`, audit-logged as `diag`): every cookie its profile holds on,
+under or above the item's scope hosts — domain, path, name, session, httpOnly,
+secure, sameSite, partitioned, kept or `why_dropped` (`out_of_path`,
+`out_of_scope`, `parent_domain`, `idp_host`, `not_in_cookie_names`, `no_name`;
+at most 64) — plus `via` (`login`, `profile`, `sso`) and the localStorage /
+sessionStorage key names and IndexedDB names of the broker pages already open on
+the item's origins. The client adds `inject_diag`: per host the cookies handed
+to `add_cookies` and the ones the browser holds afterwards, the cookies its own
+scope filter dropped, and every cookie the browser silently did not keep (with
+a likely reason: Chromium's `Storage.setCookies` drops a `SameSite=None` cookie
+without `Secure` without an error). Both are printed and written to the `-R`
+record. Never a value, a digest or a length of one. Only a broker login carries
+them: an already logged-in site makes no broker request.
+
+A broker profile REUSE (`via` `profile` or `sso`) runs in a freshly launched
+Chromium, which restores no session cookie (no `Expires`/`Max-Age`). Keycloak's
+`KEYCLOAK_IDENTITY` is one (without "remember me"), its `KEYCLOAK_SESSION` is
+not — so a reused profile exports `KEYCLOAK_SESSION` without the SSO cookie
+behind it. An item whose session needs the IdP's SSO cookie sets
+`agent_fresh_login = true`.
 
 A site without a sentinel keeps working with the old proof (a warning, never a ❌ by
 itself); `agent-login.py -x` also lists sites whose last check ended on another origin than

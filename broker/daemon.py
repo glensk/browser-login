@@ -109,7 +109,12 @@ if __package__ in (None, ""):  # run as a script: make `broker` importable
 
 # pylint: disable=wrong-import-position
 from broker import identity as _identity  # noqa: E402
-from broker.bundle import filter_cookies, filter_storage  # noqa: E402
+from broker.bundle import (  # noqa: E402
+    DIAG_CAP,
+    cookie_diag,
+    filter_cookies,
+    filter_storage,
+)
 from broker.identity_ops import (  # noqa: E402
     IDENTITY_OPS,
     TAG_KEY_NAME,
@@ -228,6 +233,21 @@ CSCS_PORTAL_ORIGIN = "https://portal.cscs.ch"
 # the IdP before the app runs).
 CSCS_EXPORT_URL = CSCS_PORTAL_ORIGIN + "/profile/"
 _STORAGE_JS = "keys => Object.fromEntries(keys.map(k => [k, localStorage.getItem(k)]))"
+# `login` with ``diag`` (value-free): the storage NAMES of an already open
+# page — localStorage / sessionStorage keys and IndexedDB database names,
+# sorted, at most `cap` each; never a value. Run in an isolated world.
+_STORAGE_NAMES_JS = (
+    "async cap => { const keys = s => Object.keys(s).sort().slice(0, cap);"
+    " let idb = null;"
+    " try { idb = (await indexedDB.databases()).map(d => String(d.name))"
+    ".sort().slice(0, cap); } catch (e) {}"
+    " return {local: keys(localStorage), local_n: localStorage.length,"
+    " session: keys(sessionStorage), session_n: sessionStorage.length,"
+    " indexeddb: idb}; }"
+)
+# The bundle key the runner hands its diagnostics to `_do_login` under; never
+# sent as part of the bundle (`Broker._do_login` moves it to the reply).
+BUNDLE_DIAG_KEY = "bundle_diag"
 
 
 # How long the broker profile's proof polls for the sentinel (an SPA boots:
@@ -873,11 +893,52 @@ class PlaywrightRunner:
             with contextlib.suppress(Exception):
                 page.close()
 
-    def export_bundle(self, ctx: Any, item: SiteItem, via: str) -> dict[str, Any]:
+    def storage_names(self, ctx: Any, item: SiteItem) -> dict[str, Any]:
+        """``diag`` only: the storage NAMES (`_STORAGE_NAMES_JS`) of the
+        item's check, storage and fill origins, read on a page ALREADY open
+        on that origin (no navigation: a load would run the app and might
+        rotate the session the bundle just exported). None for an origin
+        with no open page, ``{"error": ...}`` when it could not be read."""
+        check = _identity.check_origin(check_page_url(item))
+        origins = list(
+            dict.fromkeys(
+                [*([check] if check else []), *item.storage_keys, *item.fill_origins]
+            )
+        )
+        out: dict[str, Any] = {}
+        for origin in origins:
+            page = next(
+                (
+                    pg
+                    for pg in list(getattr(ctx, "pages", []) or [])
+                    if _identity.check_origin(str(getattr(pg, "url", "") or ""))
+                    == origin.lower()
+                ),
+                None,
+            )
+            if page is None:
+                out[origin] = None
+                continue
+            try:
+                got = evaluate_isolated(page, _STORAGE_NAMES_JS, DIAG_CAP)
+                out[origin] = got if isinstance(got, dict) else {"error": "no answer"}
+            except Exception:  # pylint: disable=broad-exception-caught
+                out[origin] = {"error": "unreadable"}
+        return out
+
+    def export_bundle(
+        self, ctx: Any, item: SiteItem, via: str, *, diag: bool = False
+    ) -> dict[str, Any]:
         """Allowlisted cookies + named localStorage keys of the listed origins.
 
         CSCS's portal origin is read by `_cscs_portal_storage` (validated,
-        on ``/profile/``); its keys are the ones actually present."""
+        on ``/profile/``); its keys are the ones actually present.
+
+        `diag` (``login`` with ``"diag": true``): also ``BUNDLE_DIAG_KEY`` —
+        the jar the export read, value-free (``bundle.cookie_diag``: every
+        cookie on, under or above a scope host, kept or dropped and why),
+        ``via`` and the open pages' storage names (`storage_names`).
+        ``Broker._do_login`` moves it out of the bundle into the reply."""
         spec = item.bundle_spec
         raw: dict[str, dict[str, Any]] = {}
         if item.site == "cscs":
@@ -885,7 +946,18 @@ class PlaywrightRunner:
             raw[CSCS_PORTAL_ORIGIN] = portal
             storage = {**spec.storage_keys, CSCS_PORTAL_ORIGIN: list(portal)}
             spec = dataclasses.replace(spec, storage_keys=storage)
-        cookies = filter_cookies(ctx.cookies(), spec)
+        # Every cookie of the context, NO url filter: a url-filtered read
+        # (`cookies(url)`) would drop a cookie whose path the url does not
+        # path-match (``/realms/sdsc/`` for the root url).
+        jar = ctx.cookies()
+        cookies = filter_cookies(jar, spec)
+        found: dict[str, Any] | None = None
+        if diag:
+            found = {
+                **cookie_diag(jar, spec),
+                "via": via,
+                "storage_names": self.storage_names(ctx, item),
+            }
         for origin, keys in spec.storage_keys.items():
             if origin in raw:
                 continue
@@ -900,7 +972,7 @@ class PlaywrightRunner:
             finally:
                 with contextlib.suppress(Exception):
                     page.close()
-        return {
+        bundle: dict[str, Any] = {
             "site": item.site,
             "via": via,
             "cookies": cookies,
@@ -915,6 +987,9 @@ class PlaywrightRunner:
             # bundle is complete before it touches the shared browser).
             "storage_keys": {o: list(k) for o, k in spec.storage_keys.items()},
         }
+        if found is not None:
+            bundle[BUNDLE_DIAG_KEY] = found
+        return bundle
 
     def clear_site_cookies(self, ctx: Any, item: SiteItem) -> int:
         """``agent_fresh_login``: delete every cookie of the broker's OWN profile
@@ -1037,7 +1112,12 @@ class PlaywrightRunner:
                     if reuse == "ok":
                         # (a candidate: present here + absent logged out = verified)
                         return self._export(
-                            ctx, item, "profile", proven=False, refresh=refreshed
+                            ctx,
+                            item,
+                            "profile",
+                            proven=False,
+                            refresh=refreshed,
+                            diag=bool(getattr(get_secret, "diag", False)),
                         )
                     reset[0] = reuse == "reset"
             if getattr(get_secret, "refresh_only", False):
@@ -1116,7 +1196,13 @@ class PlaywrightRunner:
         # WS5: logged in, but as WHICH account? (no screenshot: the page may
         # show another account's name)
         self._identity_after_login(page, item, secret.username, attempt)
-        return self._export(ctx, item, "login", proven=True)
+        return self._export(
+            ctx,
+            item,
+            "login",
+            proven=True,
+            diag=bool(getattr(get_secret, "diag", False)),
+        )
 
     @staticmethod
     def _access_precheck(page: Any, item: SiteItem, proof: str | None) -> None:
@@ -1180,7 +1266,12 @@ class PlaywrightRunner:
                     reset[0] = True
                 if reuse == "ok":
                     return self._export(
-                        ctx, item, "sso", proven=False, refresh=refreshed
+                        ctx,
+                        item,
+                        "sso",
+                        proven=False,
+                        refresh=refreshed,
+                        diag=bool(getattr(get_secret, "diag", False)),
                     )
         if deadline is not None and deadline - time.monotonic() < MIN_LOGIN_LEFT_S:
             late = LoginFailed(
@@ -1270,12 +1361,18 @@ class PlaywrightRunner:
         *,
         proven: bool,
         refresh: str = REFRESH_NONE,
+        diag: bool = False,
     ) -> dict[str, Any]:
         """`export_bundle`, raising ``ExportFailed`` when it fails or the
         bundle holds no cookie and no storage key. `proven`: a fresh login was
-        proven just before (the limiter counts it as ``ok`` anyway)."""
+        proven just before (the limiter counts it as ``ok`` anyway). `diag`:
+        `export_bundle`'s value-free diagnostics."""
         try:
-            bundle = self.export_bundle(ctx, item, via)
+            bundle = (
+                self.export_bundle(ctx, item, via, diag=True)
+                if diag
+                else self.export_bundle(ctx, item, via)
+            )
         except BundleExportError as exc:
             # its own code (`bundle_export`): the login stands or falls with it
             exc.auth_proven = proven
@@ -1668,6 +1765,8 @@ class Broker(SecretOps):  # pylint: disable=too-many-instance-attributes  # deps
                         else None,
                         phase=resp.get("phase"),
                         fresh_auth=resp.get("fresh_auth"),
+                        # value-free diagnostics asked for (`login -G`)
+                        diag=req.get("diag") in (True, "1", "true"),
                     )
                 elif op == "sentinel_absent":
                     resp = self._sentinel_absent(site, req.get("sentinel"))
@@ -1903,14 +2002,26 @@ class Broker(SecretOps):  # pylint: disable=too-many-instance-attributes  # deps
         return reply
 
     # One return per refusal of an option combination, then one per route.
-    def _login_request(  # pylint: disable=too-many-return-statements
-        self, site: str, req: dict[str, Any]
+    def _login_request(self, site: str, req: dict[str, Any]) -> dict[str, Any]:
+        """``login`` with its options (`_login_options`); the reply carries
+        ``bundle_diag`` only when THIS request asked for it (``"diag":
+        true``) — a request that joined another's run never gets that run's
+        diagnostics, nor does one that did not ask."""
+        want = req.get("diag") in (True, "1", "true")
+        resp = self._login_options(site, req, diag=want)
+        if BUNDLE_DIAG_KEY not in resp or want:
+            return resp
+        return {k: v for k, v in resp.items() if k != BUNDLE_DIAG_KEY}
+
+    def _login_options(  # pylint: disable=too-many-return-statements
+        self, site: str, req: dict[str, Any], *, diag: bool = False
     ) -> dict[str, Any]:
         """``login`` with its options: ``scheduled`` (the daily check), a
         one-shot ``candidate_sentinel`` (never for a scheduled run) and
         ``refresh_only`` (re-export a still-valid profile, its storage token
         renewed when due — never a password: a profile that is not reusable
-        answers ``refresh_unavailable`` without touching the limiter)."""
+        answers ``refresh_unavailable`` without touching the limiter).
+        `diag`: the runner adds its value-free bundle diagnostics."""
         scheduled = req.get("scheduled") in (True, "1", "true")
         candidate = req.get("candidate_sentinel")
         refresh_only = req.get("refresh_only") in (True, "1", "true")
@@ -1922,10 +2033,14 @@ class Broker(SecretOps):  # pylint: disable=too-many-instance-attributes  # deps
         if refresh_only:
             with self._site_lock(site):
                 return self._do_login(
-                    site, scheduled=scheduled, refresh_only=True, started=started
+                    site,
+                    scheduled=scheduled,
+                    refresh_only=True,
+                    started=started,
+                    diag=diag,
                 )
         if candidate is None:
-            return self._login(site, scheduled=scheduled, started=started)
+            return self._login(site, scheduled=scheduled, started=started, diag=diag)
         if not isinstance(candidate, str) or not selector_ok(candidate.strip()):
             return _phase_err(
                 "bad_request",
@@ -1941,7 +2056,9 @@ class Broker(SecretOps):  # pylint: disable=too-many-instance-attributes  # deps
                 "precheck",
             )
         with self._site_lock(site):
-            return self._do_login(site, candidate=candidate.strip(), started=started)
+            return self._do_login(
+                site, candidate=candidate.strip(), started=started, diag=diag
+            )
 
     # One early return per refusal, in the order they are checked.
     def _sentinel_absent(  # pylint: disable=too-many-return-statements
@@ -1981,7 +2098,12 @@ class Broker(SecretOps):  # pylint: disable=too-many-instance-attributes  # deps
         return {"ok": True, **got}
 
     def _login(
-        self, site: str, *, scheduled: bool = False, started: float | None = None
+        self,
+        site: str,
+        *,
+        scheduled: bool = False,
+        started: float | None = None,
+        diag: bool = False,
     ) -> dict[str, Any]:
         with self._guard:
             flight = self._flights.get(site)
@@ -1997,7 +2119,9 @@ class Broker(SecretOps):  # pylint: disable=too-many-instance-attributes  # deps
         result = _err("internal", "unexpected broker error")
         try:
             with self._site_lock(site):
-                result = self._do_login(site, scheduled=scheduled, started=started)
+                result = self._do_login(
+                    site, scheduled=scheduled, started=started, diag=diag
+                )
         finally:
             flight.result = result
             with self._guard:
@@ -2014,12 +2138,15 @@ class Broker(SecretOps):  # pylint: disable=too-many-instance-attributes  # deps
         candidate: str | None = None,
         refresh_only: bool = False,
         started: float | None = None,
+        diag: bool = False,
     ) -> dict[str, Any]:
         """One login: item checks, then the runner. The limiter is consulted
         only when the runner asks for the secret (`_SecretGate`), so a validated
         profile reuse works in a cooldown and leaves the limiter untouched.
         `started` (monotonic): when the request arrived — the run deadline
-        (``RUN_DEADLINE_S``) counts from there."""
+        (``RUN_DEADLINE_S``) counts from there. `diag`: the runner's
+        value-free bundle diagnostics (``BUNDLE_DIAG_KEY``) move from the
+        bundle into the reply; never left in the bundle."""
         try:
             items = self._items()
             item = next((it for it in items if it.site == site), None)
@@ -2073,6 +2200,7 @@ class Broker(SecretOps):  # pylint: disable=too-many-instance-attributes  # deps
         gate = _SecretGate(self, item, scheduled=scheduled)
         gate.candidate = candidate is not None
         gate.refresh_only = refresh_only
+        gate.diag = diag
         gate.deadline = (
             started if started is not None else time.monotonic()
         ) + RUN_DEADLINE_S
@@ -2126,11 +2254,20 @@ class Broker(SecretOps):  # pylint: disable=too-many-instance-attributes  # deps
             "phase_v": PHASE_V,
             "fresh_auth": outcome in ("ok", "candidate"),
             "proof": "strict" if item.has_proof else "legacy",
+            # out of the bundle in any case; into the reply only when asked
+            **_take_bundle_diag(bundle, diag),
         }
         if candidate is not None:
             # absent logged out (checked first) + present here or after the login
             reply["candidate_verified"] = True
         return reply
+
+
+def _take_bundle_diag(bundle: object, diag: bool) -> dict[str, Any]:
+    """Remove the runner's diagnostics (``BUNDLE_DIAG_KEY``) from `bundle`;
+    ``{BUNDLE_DIAG_KEY: …}`` when `diag` asked for them, else ``{}``."""
+    found = bundle.pop(BUNDLE_DIAG_KEY, None) if isinstance(bundle, dict) else None
+    return {BUNDLE_DIAG_KEY: found} if diag and isinstance(found, dict) else {}
 
 
 def _error_outcome(attempt: AttemptController, exc: RecipeError) -> str:
@@ -2249,6 +2386,7 @@ class _SecretGate:  # pylint: disable=too-many-instance-attributes  # deps + att
         self.candidate_checked = False  # the runner did the logged-out half
         self.refresh_only = False  # a refresh never reaches the secret
         self.deadline: float | None = None  # the request's run deadline
+        self.diag = False  # `login` with "diag": value-free bundle diagnostics
         self.attempt = _LimiterAttempt(self)
 
     def __call__(self) -> Secret:
