@@ -177,6 +177,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.realpath(__file__))))
 # pylint: disable=wrong-import-position
 import agent_login_state as _als  # noqa: E402
 from broker import identity as _identity  # noqa: E402
+from broker import onboarding as _onboarding  # noqa: E402
 from broker import phases as _phases  # noqa: E402
 from broker import safari_cookies as _safari  # noqa: E402
 from broker.bundle import IDP_HOSTS as BROKER_IDP_HOSTS  # noqa: E402
@@ -11549,6 +11550,8 @@ def _broker_probe_page(  # pylint: disable=too-many-return-statements
     origins = _proof_origins(entry)
     server = _broker_has_server_proof(str(entry.get("site") or ""))
     _RESULT.pop("server_proof", None)
+    # WS3: which configuration this proof is about (a promotion holds for it)
+    _RESULT["config"] = _onboarding.config_digest(entry)
     try:
         if not sentinel and not server:
             _RESULT["proof_v"] = 0
@@ -12737,6 +12740,15 @@ def _broker_login_gated(  # pylint: disable=too-many-return-statements
         return rc
     opts: dict[str, Any] = {}
     if _LOGIN_OPTS.get("scheduled"):
+        # WS3: a promotion holds for ONE configuration of the item.
+        allowed, code, why = _als.scheduled_gate(
+            site, config=_onboarding.config_digest(entry)
+        )
+        if not allowed:
+            _result_fail("precheck", code, why)
+            return _broker_fail(
+                2, f"{site}: no scheduled login — {why} (./agent-login.py -p {site})"
+            )
         opts["scheduled"] = True
     if candidate:
         opts["candidate_sentinel"] = str(candidate)
@@ -12899,10 +12911,12 @@ def cmd_broker_sites() -> int:
     return 0
 
 
-def cmd_broker_logout(port: int, site_name: str) -> int:
+# One return per refusal, then per clearing step.
+def cmd_broker_logout(port: int, site_name: str) -> int:  # pylint: disable=too-many-return-statements
     """Drop the broker's own profile for SITE and delete SITE's in-scope cookies
-    from the shared browser (the session ends here; server-side sessions live on
-    until the site expires them)."""
+    and its declared localStorage keys (`_logout_storage_plan`, read back;
+    exit 2 when that cannot be confirmed) from the shared browser (the session
+    ends here; server-side sessions live on until the site expires them)."""
     site = site_name.strip().lower()
     try:
         entry = _broker_site(site)
@@ -12931,7 +12945,41 @@ def cmd_broker_logout(port: int, site_name: str) -> int:
     names = _item_cookie_names(entry)
     gone = _broker_clear_cookies(port, site, entry, names, why="logout")
     print(f"✓ deleted {gone} {site} cookie(s) from the shared browser.")
+    # WS3: a storage-token session (NPM, Jellyfin, ABS …) lives in
+    # localStorage — cookies alone do not end it.
+    plan = _logout_storage_plan(entry)
+    if not plan:
+        return 0
+    try:
+        keys = _broker_clear_foreign_storage(port, site, plan)
+    except ForeignStorageError as exc:
+        return _broker_fail(
+            2, f"{site}: its storage keys could NOT be confirmed cleared ({exc})"
+        )
+    except Exception as exc:  # pylint: disable=broad-exception-caught
+        return _broker_fail(
+            2,
+            f"{site}: its storage keys could NOT be cleared ({type(exc).__name__})",
+        )
+    print(f"✓ deleted {keys} {site} storage key(s) from the shared browser.")
     return 0
+
+
+def _logout_storage_plan(entry: dict) -> dict[str, list[str]]:
+    """``{origin: keys}`` a logout clears in THIS browser: the item's
+    declared ``storage_keys`` (what its bundle injected, on their origins)
+    plus its identity recipe's token / claim keys
+    (`identity.foreign_storage_keys`). Names only, https origins only."""
+    plan: dict[str, set[str]] = {}
+    raw = entry.get("storage_keys")
+    for origin, keys in raw.items() if isinstance(raw, dict) else []:
+        if isinstance(origin, str) and origin.startswith("https://"):
+            plan.setdefault(origin, set()).update(
+                k for k in _identity.str_list(keys) if k
+            )
+    for origin, keys in _identity.foreign_storage_keys(entry).items():
+        plan.setdefault(origin, set()).update(keys)
+    return {o: sorted(k) for o, k in plan.items() if k}
 
 
 def _broker_clear_cookies(

@@ -61,6 +61,7 @@ from broker.recipes import (
     recipe_for,
     session_refresh_name,
 )
+from broker.storage_rules import parse_storage_keys
 from broker.vault_cache import (
     VaultCache,
 )
@@ -854,7 +855,13 @@ def site_item_from_json(item: Mapping[str, Any], *, dev: bool = False) -> SiteIt
     item_id = str(item.get("id") or "")
 
     def refused(reason: str) -> SiteItem:
-        return SiteItem(site=site, name=name, item_id=item_id, refused=reason)
+        # WS3: a refused item keeps a VALID attempt group (one that does not
+        # reveal the account): the broker's `forget` must never drop a group
+        # key an item still declares, refused or not.
+        group, _problem = _attempt_group(fields.get("agent_attempt_group", ""), item)
+        return SiteItem(
+            site=site, name=name, item_id=item_id, refused=reason, attempt_group=group
+        )
 
     if not SITE_ID_RE.match(site):
         return refused("invalid agent_site id")
@@ -878,17 +885,16 @@ def site_item_from_json(item: Mapping[str, Any], *, dev: bool = False) -> SiteIt
     storage_keys: dict[str, list[str]] = {}
     storage_raw = fields.get("agent_storage_keys", "").strip()
     if storage_raw:
+        # WS3: the shared rule (broker/storage_rules.py) — the onboarding
+        # review judges a view with the same function. Fixed reasons only.
         try:
-            parsed = json.loads(storage_raw)
-            if not isinstance(parsed, dict):
-                raise ValueError("not an object")
-            for origin, keys in parsed.items():
-                norm = parse_fill_origins(str(origin), dev=dev)
-                if len(norm) != 1 or not isinstance(keys, list):
-                    raise ValueError("expected {origin: [keys]}")
-                storage_keys[norm[0]] = [str(k) for k in keys]
-        except ValueError as exc:
-            return refused(f"bad agent_storage_keys: {exc}")
+            value = json.loads(storage_raw)
+        except ValueError:
+            return refused("bad agent_storage_keys: not JSON")
+        parsed_keys, problem = parse_storage_keys(value, dev=dev)
+        if parsed_keys is None:
+            return refused(f"bad agent_storage_keys: {problem}")
+        storage_keys = parsed_keys
 
     check_url = fields.get("agent_check_url", "").strip()
     if check_url and not _page_url_ok(check_url, dev=dev):

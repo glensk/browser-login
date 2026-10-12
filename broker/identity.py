@@ -92,6 +92,12 @@ def _list(value: object) -> list[str]:
     return []
 
 
+def str_list(value: object) -> list[str]:
+    """A ``sites`` field that holds one string or a list of strings, as a
+    list of strings (anything else: [])."""
+    return _list(value)
+
+
 def scope_hosts(entry: Mapping[str, object]) -> frozenset[str]:
     """Every host an item's session lives on or is typed into: its cookie
     hosts, and the hosts of its fill and storage origins."""

@@ -33,6 +33,7 @@ sys.path.insert(0, str(REPO / "tests"))
 from ports import unused_port  # noqa: E402
 
 import agent_login_state as als  # noqa: E402
+from broker import onboarding  # noqa: E402
 
 
 def _agent_login() -> Any:
@@ -136,9 +137,17 @@ def _overview(monkeypatch: pytest.MonkeyPatch, sites: list[dict]) -> dict:
 def _check(
     site: str, instance: str = "", state: str = "ok", ident: str = "match"
 ) -> None:
-    """A recorded check; a multi-account ✅ proved its account (`ident`)."""
+    """A recorded check; a multi-account ✅ proved its account (`ident`) —
+    of the listed configuration (WS3 digest)."""
+    config = {s["site"]: onboarding.config_digest(s) for s in _sites()}.get(site, "")
     als.record_check(
-        site, state, "logged in", proof_v=1, instance=instance, identity=ident
+        site,
+        state,
+        "logged in",
+        proof_v=1,
+        instance=instance,
+        identity=ident,
+        config=config,
     )
 
 
@@ -154,6 +163,16 @@ def _all_ok() -> dict:
 
 def _rows(data: dict) -> dict[str, dict]:
     return {r["site"]: r for r in data["rows"]}
+
+
+def _usable(row: dict) -> dict:
+    """`row` promoted for its listed configuration (WS3)."""
+    return {
+        **row,
+        "stage": "usable",
+        "promoted_config": row.get("config"),
+        "promoted_config_v": onboarding.CONFIG_V,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -189,10 +208,8 @@ def test_a_proven_member_is_ok_an_unproven_one_never(
         assert al.row_state(rows[site], checks)[0] == "ok", site
     assert al.row_state(rows["runai-test3"], checks)[0] == "unproven"
     assert al.row_state(rows["abs-root"], checks)[0] == "setup"
-    assert al.check_only_gate({**rows["runai-test3"], "stage": "usable"})[0] == (
-        "identity_unproven"
-    )
-    assert al.check_only_gate({**rows["gitlab-sdsc-admin"], "stage": "usable"}) is None
+    assert al.check_only_gate(_usable(rows["runai-test3"]))[0] == ("identity_unproven")
+    assert al.check_only_gate(_usable(rows["gitlab-sdsc-admin"])) is None
 
 
 def test_a_check_from_another_instance_is_stale(
@@ -424,6 +441,8 @@ def check_env(
     data = _overview(monkeypatch, _sites())
     for row in data["rows"]:
         row["stage"] = "usable"
+        row["promoted_config"] = row.get("config")  # promoted as listed (WS3)
+        row["promoted_config_v"] = onboarding.CONFIG_V
     data["rows"] = [
         r for r in data["rows"] if r["status"] in ("ready", "extra", "refused")
     ]

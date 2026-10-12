@@ -25,7 +25,7 @@ REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO))
 
 import agent_login_state as als  # noqa: E402
-from broker import recipes, vault  # noqa: E402
+from broker import onboarding, recipes, vault  # noqa: E402
 
 
 def _load(name: str, path: Path) -> Any:
@@ -227,13 +227,16 @@ class _Pw:
         pass
 
 
+SHOP_ENTRY = {
+    "site": "shop",
+    "check_url": "https://www.shop.example/account",
+    "logged_in_selector": "#me",
+    "cookie_hosts": ["shop.example"],
+}
+
+
 def _broker_env(monkeypatch: pytest.MonkeyPatch, reply: dict, sent: list) -> None:
-    entry = {
-        "site": "shop",
-        "check_url": "https://www.shop.example/account",
-        "logged_in_selector": "#me",
-        "cookie_hosts": ["shop.example"],
-    }
+    entry = dict(SHOP_ENTRY)
     monkeypatch.setattr(browser, "_broker_logged_in", lambda _p, _s: 2)
     monkeypatch.setattr(browser, "_broker_entry_or_rc", lambda _s: (entry, 0))
     monkeypatch.setattr(browser, "_connect", lambda _p: (_Pw(), _Browser()))
@@ -267,7 +270,7 @@ def test_post_submit_refusal_records_phase_and_quarantines(
     _broker_env(monkeypatch, reply, sent)
     browser._LOGIN_OPTS["scheduled"] = True
     als.ensure_known(["shop"])
-    als.promote("shop")
+    als.promote("shop", config=onboarding.config_digest(SHOP_ENTRY))
     assert browser._broker_login(9222, "shop") == 2
     assert sent == [("login", {"site": "shop", "scheduled": True})]
     browser._result_write(2)
@@ -416,12 +419,19 @@ def _row(site: str, status: str = "ready", **kw: Any) -> dict:
 
 
 def test_schedule_gate_per_row() -> None:
-    assert al.schedule_gate(_row("a", stage="usable")) is None
+    cfg = "a" * 64
+    usable: dict[str, Any] = {
+        "stage": "usable",
+        "config": cfg,
+        "promoted_config": cfg,
+        "promoted_config_v": onboarding.CONFIG_V,
+    }
+    assert al.schedule_gate(_row("a", **usable)) is None
     assert al.schedule_gate(_row("a", stage="pending"))[0] == "pending"
     q = {"phase": "submit", "at_text": "t"}
-    assert al.schedule_gate(_row("a", stage="usable", quarantine=q))[0] == "quarantined"
+    assert al.schedule_gate(_row("a", **usable, quarantine=q))[0] == "quarantined"
     limit = {"state": "locked", "reset": "sudo install/install.sh -r a"}
-    code, why = al.schedule_gate(_row("a", stage="usable", limit=limit))
+    code, why = al.schedule_gate(_row("a", **usable, limit=limit))
     assert code == "locked" and "install.sh -r a" in why
     # the Safari import and the edu-ID SSO click are free: gated in browser.py
     assert al.schedule_gate(_row("k", "safari", flow=al.SAFARI_FLOW)) is None
@@ -443,9 +453,12 @@ def test_promotion_preconditions(monkeypatch: pytest.MonkeyPatch) -> None:
     assert "agent_logged_in_selector" in al.promote_refusal("gh")
     _fresh_listing(monkeypatch, good)
     assert "no fresh successful check" in al.promote_refusal("gh")
-    als.record_check("gh", "ok", "logged in", proof_v=0)
+    cfg = onboarding.config_digest(good)
+    als.record_check("gh", "ok", "logged in", proof_v=0, config=cfg)
     assert "strict proof" in al.promote_refusal("gh")
-    als.record_check("gh", "ok", "logged in", proof_v=1)
+    als.record_check("gh", "ok", "logged in", proof_v=1)  # no config: pre-WS3
+    assert "another configuration" in al.promote_refusal("gh")
+    als.record_check("gh", "ok", "logged in", proof_v=1, config=cfg)
     als.quarantine("gh", "submit", "x")
     assert "quarantined" in al.promote_refusal("gh")
     als.release("gh")
@@ -817,21 +830,34 @@ def test_minor_c_weak_proof_warning_once_and_only_on_a_terminal(
 def test_validate_selectors_lists_what_the_new_broker_refuses(
     monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
+    def view(site: str, **kw: Any) -> dict:
+        host = f"{site}.example.org"
+        base = {
+            "site": site,
+            "fill_origins": [f"https://{host}"],
+            "cookie_hosts": [host],
+            "check_url": f"https://{host}/me",
+            "strict_proof": True,
+            "refused": False,
+        }
+        return {**base, **kw}
+
     sites = [
-        {"site": "ok", "logged_in_selector": "#me", "pre_click": ".btn"},
-        {"site": "bad", "logged_in_selector": "text=Welcome"},
-        {"site": "click", "pre_click": "button >> nth=0"},
+        view("ok", logged_in_selector="#me", pre_click=".btn"),
+        view("bad", logged_in_selector="text=Welcome"),
+        view("click", logged_in_selector="#me", pre_click="button >> nth=0"),
     ]
     monkeypatch.setattr(
         al, "broker_state", lambda **_k: ("running, Bitwarden ok", sites)
     )
-    assert al.selector_audit() == 1
+    assert al.validate_action(None, fresh=False) == 1
     out = capsys.readouterr().out
     assert "bad: agent_logged_in_selector" in out and "click: agent_pre_click" in out
-    assert "ok:" not in out
+    assert "ok: agent" not in out
+    assert "Welcome" not in out  # the selector value is never echoed
     monkeypatch.setattr(
         al, "broker_state", lambda **_k: ("running, Bitwarden ok", sites[:1])
     )
-    assert al.selector_audit() == 0
+    assert al.validate_action(None, fresh=False) == 0
     monkeypatch.setattr(al, "broker_state", lambda **_k: ("not installed", []))
-    assert al.selector_audit() == 3
+    assert al.validate_action(None, fresh=False) == 3

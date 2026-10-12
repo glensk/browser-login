@@ -638,12 +638,12 @@ a check that could not tell (offline, busy) is `ok=false` and does not move `at`
 
 A site without a sentinel keeps working with the old proof (a warning, never a ❌ by
 itself); `agent-login.py -x` also lists sites whose last check ended on another origin than
-the check URL's (set `agent_proof_origins` for them), and `agent-login.py -V` lists live
-items whose selectors the new broker would refuse (run it before installing the broker). A ✅ is a proven check no older than 36 h (`AGENT_LOGIN_MAX_STATUS_AGE_S`);
+the check URL's (set `agent_proof_origins` for them), and `agent-login.py -V` runs the
+onboarding review over every listed item (below). A ✅ is a proven check no older than 36 h (`AGENT_LOGIN_MAX_STATUS_AGE_S`);
 older reads ❓ stale. Broker sites start **pending**: the daily `-c` (no mail —
 logged-out sites are an infra/status item) only probes them until
-`agent-login.py -p SITE` promotes them, which needs a fresh broker listing with
-a sentinel and a fresh, strict ✅. A login that may have submitted the password
+`agent-login.py -p SITE` promotes them — for their current configuration only
+(see "Adding a site to the broker"). A login that may have submitted the password
 and failed **quarantines** the site for every client until
 `agent-login.py -Q SITE`; the broker itself refuses a scheduled login while any
 of the site's keys has an unresolved failure. `-c` never logs in a pending,
@@ -663,6 +663,102 @@ main vault, one after the vault-touchid window has shown every change — and th
 master password never reaches the agent. Without the enrolment it asks for the
 typed master password in a terminal. `-N` (new items from the Keychain) is not
 available through Touch ID; it needs `-P` in a terminal.
+
+### Adding a site to the broker (WS3)
+
+Every item goes through the same four steps. Each guards against a failure
+that actually happened in October 2026.
+
+1. **Review before the write.** Dry-run the item (`broker-add.py NAME … -n`),
+   put its planned `agent_*` fields into a manifest
+   (`{"name": …, "fields": {"agent_site": …, …}}`; add `"replaces": SITE` to
+   change an item that is already listed; never a password), and run
+   `./agent-login.py -V -i planned.json`.
+   - It is the broker's own code (`vault.site_item_from_json` and
+     `identity_rules` over the whole collection, `broker/onboarding.py`), so it
+     says exactly what the broker will refuse.
+   - It also shows every established item the change would refuse
+     (`displaced`) or turn into an unprovable multi-account item
+     (`made_unproven`). Example: the in-instance rule refuses the LATER site id,
+     so a new item can knock out an old one.
+   - Levels: `refused` (the broker refuses it), `unusable` (it can never be a
+     proven ✅: no sentinel or server proof, an account the client cannot
+     prove, a username-dependent field it could not check), `risk` (a cookie
+     host that is a public suffix per the vendored Public Suffix List, a scope
+     or storage origin unrelated to the item, malformed storage keys) and
+     `hint` (an attempt group for a same-account pair, a refresher for a
+     storage token, a wide or IdP scope).
+   - `refused` / `unusable` / `risk` block `-p`. `risk` also keeps `-c` from
+     logging the site in. `./agent-login.py -V` reviews every listed item.
+2. **Write, then refresh:** `broker-add.py NAME …`, then `./agent-login.py -S`.
+3. **Find the sentinel.**
+   - Logged in somewhere: `browser.py logged-in SITE -x 'CSS'` (two-sided:
+     present here, absent in a fresh logged-out profile).
+   - Logged out everywhere: ONE approved `browser.py login SITE -x 'CSS'`.
+   - Then `broker-add.py NAME -L 'CSS'`.
+4. **Promote:** `./agent-login.py -p SITE` is the one promotion transaction.
+   - It needs a fresh listing, a strict proof and no blocking finding.
+   - A fresh strict ✅ of the item's CURRENT configuration on record promotes
+     at once.
+   - Otherwise it runs ONE `browser.py login SITE`, with no retry. That run's
+     own free check is the probe, and its own verify is the proof.
+   - That login is the site's promotion budget, claimed atomically in
+     `site-state.json`. It is refunded only when the record proves the
+     password was never sent. `./agent-login.py -E SITE` re-arms it after a
+     review (audited; `-Q` releases only a quarantine).
+   - `-t SITE` on a site that is not usable takes the same budget.
+   - A promotion holds for ONE configuration: the digest of what the vault
+     item says (`onboarding.config_canon`, versioned `CONFIG_V`; never a
+     view-format detail or a flag the broker's code derives, so a broker
+     release does not change it). A changed item (another sentinel, scope,
+     URL, instance …) is `changed` and not logged in by `-c` until it is
+     promoted again. A promotion of an older (or no) digest version is
+     `config_unknown` and adopts the current digest at the next `-S` — only
+     while its latest check is a fresh strict ✅.
+   - The client state (stage, budget, quarantine) is policy and audit, not a
+     security boundary: every same-uid agent can write it. The boundary is
+     the broker's limiter (root-only reset).
+
+**Removing a site** (e.g. docker / docker-hub):
+
+1. `./agent-login.py -D SITE` while the item is still listed. It demotes the
+   site to pending and runs `browser.py logout SITE` in its instance, which
+   removes the broker's profile, the scoped cookies and the declared
+   localStorage keys (read back; a failure stops here). When another
+   account's item shares the scope in the same browser (abs-root /
+   abs-albert) it does NOT log out — that would end the other session — and
+   says so; `-F` forces it (docker / docker-hub, which both leave).
+2. Take the item out of `agent-login` (`broker-add.py NAME -D` once it
+   exists, else the web vault).
+3. `./agent-login.py -D SITE` again. The broker's `forget` op, run by the live
+   daemon under the site's lock after its own fresh vault read (refused when
+   that read is empty or shrank below half, or when any item — refused ones
+   too — still resolves to the id), drops the site's limiter key and bindings
+   (a group key only when nothing else uses or declares it), its
+   identity-guard entry, its profile and its failure screenshot. A removal
+   never lifts a block: a locked / cooling-down / quarantined limiter key
+   and an identity lockout stay, reported for `sudo install/install.sh -r
+   SITE`.
+   The client deletes its `checks.json`, `last-check.json` and
+   `site-state.json` entries (quarantine and audit included) and its
+   session-age (data only; an empty lock file stays) and login-log files in
+   every instance's cache dir.
+4. One line in `~/.local/state/agent-login/audit.jsonl` (and the broker's
+   audit.log) is all that stays.
+
+**Failure modes learned** (symptom → what to do):
+
+| Failure                         | Symptom                                                                    | Do                                                                                                                                                                                                                       |
+| :------------------------------ | :------------------------------------------------------------------------- | :----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Stale vault password            | `submit` "still on login page" right after a rotation (npm, runai-test3)   | Before ANY submit: `./agent-login.py -f SITE` (length + 4 hex) against the authoritative copy (SOPS, the server's hash). Fix the vault item, never retry blindly.                                                          |
+| SPA stale cache                 | blank page, `indeterminate` after an app upgrade (NPM)                     | Nothing per site: every broker launch clears its HTTP cache, the client's proof tabs bypass it. A blank page is never "logged out".                                                                                      |
+| Hash-only check route           | `goto` returns no response, status 0 → `indeterminate` (portainer, jellyfin) | The proof loads the check page fresh (about:blank first); keep `agent_check_url` on the route that needs a login.                                                                                                       |
+| Token-rotating / expiring SPA   | exact read-back fails (navidrome), or a daily password submit (NPM JWT)    | Storage writes are proven at document start; declare `agent_session_refresh` when a refresher exists (`hint storage_no_refresher`).                                                                                     |
+| Invisible captcha               | a false `needs_human` on a self-submitting reCAPTCHA page (myfritz)        | Already classified: an invisible anchor is not a challenge; a checkbox / popup is. Never click a challenge.                                                                                                             |
+| Username-only login             | `no_password` (Mullvad's account number)                                   | `agent_login_mode=username-only`; the username is then the secret (masked, no screenshot).                                                                                                                               |
+| Multi-account scope conflict    | every sibling ✅ while the browser holds ANOTHER account (gitlab-sdsc)      | `-V -i` shows `account_unproven` / `displaced`: set `agent_instance`, `agent_privilege`, `agent_identity` (a usable recipe) or `agent_same_account_as` on both.                                                          |
+| Path-scoped Keycloak realms     | two realms on one host clear each other (custos-admin vs runai)            | `agent_cookie_scopes` (`[{"host": H, "path": "/realms/R/"}]`) instead of a host-wide scope.                                                                                                                              |
+| Enter-key forgot-password trap  | a submit pressed `forgot` and reset the password (calibre)                 | Submits read the form's buttons first and fail closed; the tripwire aborts a secondary action. A new recipe uses the same helpers; audit a form with secondary buttons before its first login.                          |
 
 ## Campus-only hosts (proxy PAC)
 
@@ -904,12 +1000,15 @@ Examples:
 ./agent-login.py -P           # print the daily LaunchAgent (-I installs, -U removes)
 ./agent-login.py -j           # the same overview as JSON
 ./agent-login.py -x           # acceptance matrix (-x -j: as JSON)
-./agent-login.py -p github    # promote: the daily check may log it in
+./agent-login.py -p github    # promote (one budgeted login at most): -c may log it in
+./agent-login.py -E github    # re-arm its one promotion login (after review, audited)
 ./agent-login.py -Q galaxus   # release a quarantine (main session, audited)
-./agent-login.py -V           # selectors the new broker would refuse (pre-install)
+./agent-login.py -V           # onboarding review of every broker item (read-only)
+./agent-login.py -V -i new.json  # review a PLANNED item before the vault write
+./agent-login.py -D docker    # remove: run while listed, again after the vault item went
 ```
 
-Where a login broke: every check records its PHASE (precheck, limiter, vault, recipe, submit, profile-proof, broker-proof, bundle-export, cookie-inject, storage-inject, client-proof, consumer-followup, safari-source, unknown) and a code, a redacted detail and the broker's screenshot; the overview shows them. A ✅ is a fresh (≤ 36 h), proven check; older reads ❓. The daily check (-c) never logs in a site that is pending, quarantined, locked, in cooldown or without a sentinel, and never retries after the password may have been sent.
+Where a login broke: every check records its PHASE (precheck, limiter, vault, recipe, submit, profile-proof, broker-proof, bundle-export, cookie-inject, storage-inject, client-proof, consumer-followup, safari-source, unknown) and a code, a redacted detail and the broker's screenshot; the overview shows them. A ✅ is a fresh (≤ 36 h), proven check; older reads ❓. The daily check (-c) never logs in a site that is pending, quarantined, locked, in cooldown, without a sentinel, changed since its promotion or flagged by the onboarding review, and never retries after the password may have been sent. Adding a site: README "Adding a site to the broker".
 
 #### Options
 
@@ -918,7 +1017,7 @@ Where a login broke: every check records its PHASE (precheck, limiter, vault, re
 | `-t`, `--test` `SITE` | real login test for SITE |
 | `-f`, `--fingerprint` `SITE` | length + 4 hex of the SHA-256 of the broker's password for SITE (no login) |
 | `-g`, `--guided` `SITE` | guided login by hand (browser.py assisted-login: confirm on the terminal, remote view of a headless tab; the window as fallback) |
-| `-F`, `--force` | with -g: start even with UNREGISTERED CDP clients attached (browser.py assisted-login -f; they are not paused and keep running) |
+| `-F`, `--force` | with -g: start even with UNREGISTERED CDP clients attached (browser.py assisted-login -f; they are not paused and keep running); with -D: log out even when another account's item shares the scope in the same browser instance |
 | `-c`, `--check-all` | every usable site: logged in? if not, `browser.py login`; one line per site, exit 1 if any stays logged out |
 | `-m`, `-M`, `--mail` | with -c: mail `albert.glensk@gmail.com` (gog) when a site stays logged out |
 | `-r`, `--refresh` | ask the broker now (re-reads Bitwarden, ~40 s) instead of the snapshot |
@@ -930,6 +1029,9 @@ Where a login broke: every check records its PHASE (precheck, limiter, vault, re
 | `-P`, `--print-plist` | print both LaunchAgent plists (writes nothing) |
 | `-j`, `--json` | print the overview (with -x: the matrix) as JSON |
 | `-x`, `--matrix` | the acceptance matrix: one row per login (consumer, privilege, sentinel, scope, attempt group, refresh, stage, limit, last phase) |
-| `-p`, `--promote` `SITE` | allow scheduled logins (-c) for SITE — refused unless a fresh broker listing shows its sentinel and its latest check is a fresh, strict ok |
-| `-V`, `--validate-selectors` | list live broker items whose agent_logged_in_selector / agent_pre_click the new broker would refuse (not plain CSS); read-only, from the snapshot; run it before installing the broker |
+| `-p`, `--promote` `SITE` | the ONE promotion transaction (pending -> usable for scheduled logins): a fresh listing, the onboarding review, then a fresh strict ok of this configuration on record, or ONE budgeted `browser.py login` (no retry); audited |
+| `-V`, `--validate`, `--validate-selectors` | the onboarding review (no login, no vault write): selectors the broker refuses, then every listed item's findings (refused / unusable / risk / hint); with -i: a PLANNED change; with -r: ask the broker now and refresh the site-list snapshot first (~40 s) instead of reading it; exit 1 when anything blocks |
+| `-i`, `--item` `MANIFEST` | with -V: review a planned item / batch (JSON: {name, fields, replaces?, username_form?, reveals?} or {items: [...], removes: [...]}; '-' = stdin; never a password) against the listing, displacement included |
+| `-E`, `--rearm` `SITE` | give SITE its one promotion login back (after reviewing why it failed) — the main session's decision, audited |
+| `-D`, `--remove` `SITE` | remove a broker site, run twice: while it is listed -> demote + browser.py logout; after its vault item is gone -> drop every trace (broker `forget`, state files, cache files); audited |
 | `-Q`, `--release` `SITE` | release SITE's quarantine (after a failed login that may have submitted the password) — the main session's decision, audited |

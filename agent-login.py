@@ -33,17 +33,22 @@ Examples:
   ./agent-login.py -P           # print the daily LaunchAgent (-I installs, -U removes)
   ./agent-login.py -j           # the same overview as JSON
   ./agent-login.py -x           # acceptance matrix (-x -j: as JSON)
-  ./agent-login.py -p github    # promote: the daily check may log it in
+  ./agent-login.py -p github    # promote (one budgeted login at most): -c may log it in
+  ./agent-login.py -E github    # re-arm its one promotion login (after review, audited)
   ./agent-login.py -Q galaxus   # release a quarantine (main session, audited)
-  ./agent-login.py -V           # selectors the new broker would refuse (pre-install)
+  ./agent-login.py -V           # onboarding review of every broker item (read-only)
+  ./agent-login.py -V -i new.json  # review a PLANNED item before the vault write
+  ./agent-login.py -D docker    # remove: run while listed, again after the vault item went
 
 Where a login broke: every check records its PHASE (precheck, limiter, vault,
 recipe, submit, profile-proof, broker-proof, bundle-export, cookie-inject,
 storage-inject, client-proof, consumer-followup, safari-source, unknown) and a
 code, a redacted detail and the broker's screenshot; the overview shows them.
 A ✅ is a fresh (≤ 36 h), proven check; older reads ❓. The daily check (-c)
-never logs in a site that is pending, quarantined, locked, in cooldown or
-without a sentinel, and never retries after the password may have been sent.
+never logs in a site that is pending, quarantined, locked, in cooldown,
+without a sentinel, changed since its promotion or flagged by the onboarding
+review, and never retries after the password may have been sent. Adding a
+site: README "Adding a site to the broker".
 """
 
 from __future__ import annotations
@@ -106,6 +111,7 @@ from agent_login_jobs import (  # noqa: E402
 )
 from broker import (  # noqa: E402
     identity,  # noqa: E402
+    onboarding,
     phases,
     safari_cookies,
 )
@@ -320,7 +326,22 @@ def broker_state(*, fresh: bool = False) -> tuple[str, list[dict]]:
     health, sites = _broker_state_live(fresh=fresh)
     if health.startswith("running, Bitwarden"):
         _write_json_atomic(snap, {"at": time.time(), "health": health, "sites": sites})
+        if fresh:
+            adopt_configs(sites)
     return health, sites
+
+
+def adopt_configs(sites: list[dict]) -> list[str]:
+    """WS3 migration, from a FRESH live listing only: a site promoted before
+    the config digest existed adopts its current digest once (audited)."""
+    digests = {
+        str(s.get("site")): onboarding.config_digest(s)
+        for s in sites
+        if s.get("site") and not s.get("refused")
+    }
+    with contextlib.suppress(als.StateError, OSError):
+        return als.adopt_configs(digests)
+    return []
 
 
 def _snapshot_sites() -> list[dict]:
@@ -472,6 +493,8 @@ def _broker_fields(entry: dict) -> dict:
         "storage_origins": list(entry.get("storage_origins") or []),
         "proof_origins": list(entry.get("proof_origins") or []),
         "session_refresh": entry.get("session_refresh"),
+        # WS3: the configuration a promotion holds for
+        "config": onboarding.config_digest(entry) if entry else None,
         **_identity_fields(entry),
     }
 
@@ -527,6 +550,7 @@ def overview(*, fresh: bool = False) -> dict:
         stages = {}
     safari = safari_state([t.site for t in TARGETS if t.flow == SAFARI_FLOW])
     shared = scope_conflicts(sites)  # WS5: items sharing a login with another account
+    risks = onboarding_risks(sites)  # WS3: never logged in unattended
     rows = []
     for t in TARGETS:
         status, detail = classify(t, listed, readable=readable)
@@ -549,6 +573,7 @@ def overview(*, fresh: bool = False) -> dict:
                     else {}
                 ),
                 "shares_login_with": list(shared.get(t.broker_site or t.site, ())),
+                "onboarding_risk": risks.get(t.broker_site or t.site, []),
                 **_stage_fields(stages.get(t.broker_site or t.site)),
                 **safari.get(t.site, {}),
             }
@@ -576,6 +601,7 @@ def overview(*, fresh: bool = False) -> dict:
                 "in_bitwarden": bool(entry.get("fill_origins")),
                 **_broker_fields(entry),
                 "shares_login_with": list(shared.get(site, ())),
+                "onboarding_risk": risks.get(site, []),
                 **_stage_fields(stages.get(site)),
             }
         )
@@ -604,11 +630,28 @@ def overview(*, fresh: bool = False) -> dict:
     }
 
 
+def onboarding_risks(sites: list[dict]) -> dict[str, list[str]]:
+    """``{site: [risk codes]}`` of the listed items (WS3 `onboarding`): such
+    a row is never logged in unattended. Fixed codes only."""
+    out: dict[str, list[str]] = {}
+    for site, findings in onboarding.collection_findings(sites).items():
+        codes = sorted({f.code for f in findings if f.level == "risk"})
+        if codes:
+            out[site] = codes
+    return out
+
+
 def _stage_fields(entry: dict | None) -> dict:
-    """The site-state columns of a row: stage and quarantine."""
+    """The site-state columns of a row: stage, the config it was promoted
+    for (WS3) and quarantine."""
     entry = entry or {}
     q = entry.get("quarantine") if isinstance(entry.get("quarantine"), dict) else None
-    return {"stage": entry.get("stage"), "quarantine": q}
+    return {
+        "stage": entry.get("stage"),
+        "promoted_config": entry.get("config"),
+        "promoted_config_v": entry.get("config_v"),
+        "quarantine": q,
+    }
 
 
 def safari_cell(row: dict) -> str:
@@ -908,6 +951,7 @@ def record_check(
             origin_ok=r.get("origin_ok"),
             instance=inst,
             identity=str(r.get("identity") or ""),
+            config=str(r.get("config") or ""),
         )
 
 
@@ -1258,6 +1302,8 @@ def _no_submit_assisted(site: str) -> bool:
 def derived_result(run: BrowserRun) -> dict:  # pylint: disable=too-many-return-statements
     """The phase record of a `browser.py login` that wrote none (killed,
     an older browser.py): what its exit code tells."""
+    if not run.started:  # the exec failed: nothing ran, nothing was sent
+        return {"phase": "precheck", "code": "not_started", "submitted": False}
     if run.result:
         return run.result
     if run.killed:
@@ -1369,13 +1415,17 @@ def _run_test(site: str) -> int:
             result=True,
         )
     else:
+        # WS3: a broker site not usable for its current config takes the
+        # promotion budget (one login, `-E` re-arms): no unbudgeted bypass.
+        claimed, refusal = _trial_claim_for_test(site)
+        if refusal is not None:
+            print(f"❌ {site}: {refusal} (no login tried)")
+            return 2
         print(
             f"▶ browser.py login {site}  (Safari session or login broker; "
-            "you see no password)"
+            "you see no password)" + ("; budgeted: one login" if claimed else "")
         )
-        login = run_browser(
-            "login", site, timeout_s=browser_timeout("login"), result=True
-        )
+        login = _budgeted_login(site, claimed)
     res = derived_result(login)
     failed = login_run_failure(login)
     if failed is not None:  # 125 or an outer kill: never retried, no check
@@ -1733,7 +1783,9 @@ def _after_inner_timeout(
 def login_run_failure(run: BrowserRun) -> str | None:
     """The NOT-logged-in wording of a login that must not be retried — its
     tab cleanup is unconfirmed (125) or the runner had to kill it — else None.
-    Both reach the failure mail."""
+    Both reach the failure mail (so does a child that never started)."""
+    if not run.started:
+        return "NOT logged in (browser.py could not be started)"
     if run.killed:
         return (
             f"NOT logged in (browser.py login killed by the runner after "
@@ -1834,7 +1886,8 @@ def _check_assisted_row(site: str, failed: list[tuple[str, str]]) -> None:
         failed.append((site, how))
 
 
-def schedule_gate(row: dict) -> tuple[str, str] | None:
+# One early return per gate, in the order they are checked.
+def schedule_gate(row: dict) -> tuple[str, str] | None:  # pylint: disable=too-many-return-statements
     """Why a SCHEDULED run must not log `row` in (code, text with the exact
     command that lifts it), or None. Pure broker rows only: a Safari import
     and the edu-ID SSO click are free — `browser.py login -s` gates their
@@ -1856,6 +1909,11 @@ def schedule_gate(row: dict) -> tuple[str, str] | None:
             f"needs sentinel — no scheduled login with the old proof; find one: "
             f"browser.py logged-in {site} -x 'CSS'"
         )
+    risk = [c for c in row.get("onboarding_risk") or [] if SITE_ID_RE.match(c)]
+    if risk:
+        return "onboarding_risk", (
+            f"onboarding risk ({', '.join(risk)}) — fix the item, see ./agent-login.py -V"
+        )
     limit = row.get("limit") or {}
     if limit.get("state") in ("locked", "cooldown", "quarantined"):
         return str(limit["state"]), (
@@ -1863,6 +1921,18 @@ def schedule_gate(row: dict) -> tuple[str, str] | None:
         )
     if row.get("stage") != "usable":
         return "pending", f"pending — promote: ./agent-login.py -p {site}"
+    promoted = row.get("promoted_config")
+    if not promoted or row.get("promoted_config_v") != onboarding.CONFIG_V:
+        return "config_unknown", (
+            "promoted with an older (or no) config record — adopted at the next "
+            "./agent-login.py -S after a fresh strict ✅, or re-promote: "
+            f"./agent-login.py -p {site}"
+        )
+    if row.get("config") and promoted != row.get("config"):
+        return (
+            "changed",
+            f"changed since its promotion — re-promote: ./agent-login.py -p {site}",
+        )
     return None
 
 
@@ -2017,6 +2087,9 @@ def check_all(*, mail: bool = False) -> int:  # pylint: disable=too-many-branche
     if not data["broker_ok"]:
         print(f"❌ login broker: {data['broker']}")
         failed.append(("login broker", data["broker"]))
+    psl = report_psl()  # once per run, never a per-site gate
+    if psl:
+        failed.append(("onboarding review", psl))
     by_instance: dict[str, list[dict]] = {}
     for row in data["rows"]:
         by_instance.setdefault(check_instance(row), []).append(row)
@@ -2152,31 +2225,94 @@ SELECTOR_FIELDS = (
 )
 
 
-def selector_audit() -> int:
-    """`-V`: every live broker item whose sentinel or pre-click selector the
-    new broker would refuse (not plain CSS: Playwright `text=`/`xpath=`/`>>`,
-    `:has-text(` …). Read-only, from the site-list snapshot, no secrets.
-    Exit 0 none, 1 some (fix them before installing the broker), 3 no list."""
-    health, sites = broker_state()
-    if not sites:
-        print(f"❌ no broker site list to check ({health})")
-        return 3
+def selector_audit(sites: list[dict]) -> int:
+    """The plain-CSS part of `-V`: every live broker item whose sentinel or
+    pre-click selector the broker refuses (Playwright `text=`/`xpath=`/`>>`,
+    `:has-text(` …). How many there are."""
     bad = [
-        (str(s.get("site")), field, str(s.get(key)))
+        (onboarding.safe_id(s.get("site")), field)
         for s in sites
         for key, field in SELECTOR_FIELDS
         if s.get(key) and not selector_ok(str(s.get(key)))
     ]
-    for site, field, value in bad:
-        print(f"❌ {site}: {field} is not plain CSS: {value}")
+    for site, field in bad:
+        print(f"❌ {site}: {field} is not plain CSS")
     if bad:
         print(
-            f"{len(bad)} selector(s) the new broker refuses — fix them "
-            "(broker-add.py) before `sudo install/install.sh`."
+            f"{len(bad)} selector(s) the broker refuses — fix them (broker-add.py) "
+            "before `sudo install/install.sh`."
         )
-        return 1
-    print(f"✅ all {len(sites)} broker items use plain-CSS selectors")
-    return 0
+    return len(bad)
+
+
+def report_psl() -> str:
+    """Print the vendored Public Suffix List's problem ONCE (an
+    infrastructure error: every item's public-suffix judgement is unknown,
+    nothing else is affected) and return it; '' when the list is fine."""
+    problem = onboarding.psl_problem()
+    if problem:
+        print(
+            f"❌ infrastructure: the Public Suffix List is unusable ({problem}) — "
+            "no item's cookie host was checked against it"
+        )
+    return problem
+
+
+LEVEL_ICONS = {"refused": "❌", "unusable": "❌", "risk": "⚠️ ", "hint": "ℹ️ "}
+
+
+def print_findings(findings: list) -> int:
+    """One line per finding (most severe first); how many block."""
+    for f in findings:
+        print(
+            f"{LEVEL_ICONS.get(f.level, '?')} {f.site}: {f.level} {f.code} — {f.text}"
+        )
+    return sum(1 for f in findings if f.blocking)
+
+
+def validate_action(item_file: str | None, *, fresh: bool) -> int:
+    """`-V [-i MANIFEST]`: the onboarding review (broker/onboarding.py) of
+    every listed item, or of a PLANNED change against the listing. Read-only,
+    no secrets (a manifest holding a password is refused). Exit 0 nothing
+    blocks, 1 something does, 2 a bad manifest, 3 no list."""
+    health, sites = broker_state(fresh=fresh)
+    if not sites:
+        print(f"❌ no broker site list to check ({health})")
+        return 3
+    if item_file is not None:
+        if report_psl():
+            print(
+                "❌ planned change not reviewed — the onboarding review is incomplete"
+            )
+            return 1
+        try:
+            raw = (
+                sys.stdin.read()
+                if item_file == "-"
+                else Path(item_file).read_text(encoding="utf-8")
+            )
+            manifest = json.loads(raw)
+            if not isinstance(manifest, dict):
+                raise ValueError("not a JSON object")
+            review = onboarding.review_planned(manifest, sites)
+        except (OSError, ValueError) as exc:
+            print(f"❌ manifest not usable: {onboarding.safe_reason(exc)}")
+            return 2
+        planned = ", ".join(review.planned) or "nothing"
+        print(f"onboarding review of {planned} against {len(sites)} listed items:")
+        blocking = print_findings(review.findings)
+        if not review.findings:
+            print("✅ no findings")
+        return 1 if blocking else 0
+    bad = selector_audit(sites)
+    blocking = 1 if report_psl() else 0
+    for _site, findings in sorted(onboarding.collection_findings(sites).items()):
+        blocking += print_findings(findings)
+    print(
+        f"{'✅' if not (bad or blocking) else '❌'} {len(sites)} broker items: "
+        f"{bad} selector(s) refused, {blocking} blocking finding(s)"
+    )
+    return 1 if (bad or blocking) else 0
 
 
 def release_action(site: str) -> int:
@@ -2198,65 +2334,403 @@ def release_action(site: str) -> int:
     return 0
 
 
-# One early return per promotion precondition, in the order they are checked.
-def promote_refusal(site: str) -> str | None:  # pylint: disable=too-many-return-statements
-    """Why `site` may not be promoted to scheduled logins, or None. Mechanical:
-    a FRESH broker listing shows it usable with a sentinel, its latest check is
-    a fresh ok from the strict proof, and it is not quarantined."""
+# One early return per static precondition, in the order they are checked.
+def promote_precheck(  # pylint: disable=too-many-return-statements
+    site: str,
+) -> tuple[str | None, dict | None, list[dict]]:
+    """(why not, entry, listing) — the static preconditions of a promotion,
+    from a FRESH broker listing: listed and not refused, a broker login
+    (never a no-submit, assisted or Safari site), a strict proof (sentinel
+    or server proof), no blocking onboarding finding (WS3), the account
+    provable (WS5), not quarantined. No login, no check."""
     health, sites = broker_state(fresh=True)
     if not health.startswith("running, Bitwarden"):
-        return f"no fresh broker listing ({health})"
+        return f"no fresh broker listing ({health})", None, sites
     entry = next((s for s in sites if s.get("site") == site), None)
     if entry is None:
-        return "not listed by the broker"
+        return "not listed by the broker", None, sites
     if entry.get("refused"):
-        return f"the broker refuses the item ({entry.get('reason') or '?'})"
+        reason = onboarding.safe_reason(entry.get("reason") or "?")
+        return f"the broker refuses the item ({reason})", entry, sites
+    if (
+        is_no_submit(site, entry)
+        or site in ASSISTED_SITES
+        or site in safari_cookies.SAFARI_SITES
+    ):
+        return (
+            "not a broker login (your session / Safari): nothing to promote",
+            entry,
+            sites,
+        )
     if not has_sentinel(entry):
-        return "the item has no agent_logged_in_selector"
+        return "the item has no agent_logged_in_selector", entry, sites
     siblings = scope_conflicts(sites).get(site)
     multi = bool(siblings) or entry.get("multi_account") is True
     if multi and not identity.proof_ready(entry):
         return (
-            f"account unproven: shares its login with {', '.join(siblings or ())} "
-            "(WS5: no proof of WHICH account the browser holds)"
+            (
+                f"account unproven: shares its login with {', '.join(siblings or ())} "
+                "(WS5: no proof of WHICH account the browser holds)"
+            ),
+            entry,
+            sites,
+        )
+    blocking = [
+        f for f in onboarding.blocking_findings(entry, sites) if f.code != "no_proof"
+    ]
+    if blocking:
+        codes = ", ".join(sorted({f.code for f in blocking}))
+        return (
+            f"onboarding review blocks it ({codes}) — ./agent-login.py -V",
+            entry,
+            sites,
         )
     if als.quarantined(site):
-        return f"quarantined — release first: ./agent-login.py -Q {site}"
+        return f"quarantined — release first: ./agent-login.py -Q {site}", entry, sites
+    return None, entry, sites
+
+
+# One early return per check-record precondition.
+def record_refusal(  # pylint: disable=too-many-return-statements
+    site: str, entry: dict, sites: list[dict]
+) -> str | None:
+    """Why the latest check record does not prove `entry` as listed: a fresh
+    ok from the strict proof, in the item's instance, of THIS configuration
+    (WS3 digest), with the account proven for a multi-account item."""
     rec = als.checks().get(site)
     if als.freshness(rec) != "ok" or not rec:
-        return f"no fresh successful check — run ./agent-login.py -t {site} first"
+        return f"no fresh successful check — run ./agent-login.py -p {site}"
     if int(rec.get("proof_v") or 0) < 1:
-        return "the last check predates the strict proof — re-run ./agent-login.py -t"
+        return "the last check predates the strict proof — re-run ./agent-login.py -p"
     if str(rec.get("instance") or "") != identity.instance_of(entry):
         return (
             "the last check ran in another browser instance than the item's — "
-            f"re-run ./agent-login.py -t {site}"
+            f"re-run ./agent-login.py -p {site}"
         )
+    siblings = scope_conflicts(sites).get(site)
+    multi = bool(siblings) or entry.get("multi_account") is True
     if multi and rec.get("identity") != "match":
         return (
             "the last check did not prove WHICH account (WS5) — re-run "
-            f"./agent-login.py -t {site}"
+            f"./agent-login.py -p {site}"
+        )
+    if rec.get("config") != onboarding.config_digest(entry):
+        return (
+            "the last check proved another configuration of the item (it changed, "
+            f"or the check predates WS3) — re-run ./agent-login.py -p {site}"
         )
     return None
 
 
-def promote_action(site: str) -> int:
-    """`-p SITE`: allow scheduled logins for a proven site (audited)."""
-    site = resolve_site(site)
-    if not SITE_ID_RE.match(site):
-        print(f"❌ not a site id: {site!r}")
-        return 2
-    why = promote_refusal(site)
-    if why is not None:
-        print(f"❌ {site}: not promoted — {why}")
-        return 2
+def promote_refusal(site: str) -> str | None:
+    """Why `site` may not be promoted WITHOUT a login, or None: the static
+    preconditions (`promote_precheck`) and a check record that proves the
+    listed configuration (`record_refusal`)."""
+    why, entry, sites = promote_precheck(site)
+    if why is not None or entry is None:
+        return why or "not listed by the broker"
+    return record_refusal(site, entry, sites)
+
+
+TRIAL_LIMIT_STATES = ("locked", "cooldown", "quarantined", "busy")
+
+
+def _promote(site: str, entry: dict) -> int:
     try:
-        als.promote(site, why="agent-login.py -p")
+        als.promote(
+            site, why="agent-login.py -p", config=onboarding.config_digest(entry)
+        )
     except als.StateError as exc:
         print(f"❌ {site}: site state not usable ({exc})")
         return 1
     print(f"✅ {site}: promoted — the daily check may log it in from now on")
     return 0
+
+
+# One early return per step of the promotion transaction.
+def promote_action(site: str) -> int:  # pylint: disable=too-many-return-statements
+    """`-p SITE`: THE promotion transaction (WS3). Static preconditions on a
+    fresh listing; already usable for its config → done; a fresh strict ✅ of
+    this config on record → promote (no login); else the budgeted trial: ONE
+    `browser.py login SITE -R` (its own free check is the probe, its own
+    verify the proof; no retry), claimed atomically (`als.claim_trial`), then
+    promote when it proved the listed config. Audited."""
+    site = resolve_site(site)
+    if not SITE_ID_RE.match(site):
+        print(f"❌ not a site id: {site!r}")
+        return 2
+    why, entry, sites = promote_precheck(site)
+    if why is not None or entry is None:
+        print(f"❌ {site}: not promoted — {why or 'not listed by the broker'}")
+        return 2
+    if report_psl():
+        # a cookie host on a public suffix could not be ruled out: no new
+        # usable site until the list is fixed (`-c` stays ungated)
+        print(f"❌ {site}: not promoted — the onboarding review is incomplete")
+        return 1
+    digest = onboarding.config_digest(entry)
+    if als.usable_for(als.site_states().get(site), digest):
+        print(f"✅ {site}: already usable for its current configuration")
+        return 0
+    if record_refusal(site, entry, sites) is None:
+        return _promote(site, entry)
+    raw_limit = entry.get("limit")
+    limit: dict = raw_limit if isinstance(raw_limit, dict) else {}
+    if limit.get("state") in TRIAL_LIMIT_STATES:
+        print(
+            f"❌ {site}: not promoted — limiter {limit['state']}: "
+            f"{limit.get('reset') or 'wait'} (no login tried)"
+        )
+        return 2
+    try:
+        claimed, code, why_not = als.claim_trial(site, digest)
+    except als.StateError as exc:
+        print(f"❌ {site}: site state not usable ({exc})")
+        return 1
+    if not claimed:
+        hint = f" — after review: ./agent-login.py -E {site}" if code == "spent" else ""
+        print(f"❌ {site}: not promoted — {why_not}{hint} (no login tried)")
+        return 2
+    print(f"▶ {site}: promotion login (one attempt, budgeted): browser.py login {site}")
+    _trial_login(site)
+    why = record_refusal(site, entry, sites)
+    if why is not None:
+        print(f"❌ {site}: not promoted — {why}")
+        return 1
+    return _promote(site, entry)
+
+
+def _trial_login(site: str) -> dict:
+    """The budgeted login of a claimed trial: ONE `browser.py login SITE -R`
+    in the item's instance, recorded, the claim finished (spent, or refunded
+    when the record proves no password was sent). Its phase record."""
+    # Until browser.py is started nothing can have been sent: an exception
+    # before that (e.g. the item's instance does not start) refunds.
+    res: dict = {"phase": "precheck", "code": "not_started", "submitted": False}
+    try:
+        with site_session(site):
+            res = {"phase": "unknown", "code": "internal", "submitted": None}
+            run = run_browser(
+                "login", site, timeout_s=browser_timeout("login"), result=True
+            )
+        res = derived_result(run)
+        failed = login_run_failure(run)
+        if failed is not None:
+            _quarantine_after_kill(site, run)
+            record_check(site, False, failed, res)
+        elif run.rc == 0:
+            record_check(site, True, "logged in (promotion login)", res)
+        elif run.rc == BUSY_RC:
+            record_check(site, None, BUSY_HOW, {"phase": "precheck", "code": "busy"})
+        else:
+            record_check(site, False, failure_how(res, run.rc), res)
+    finally:
+        with contextlib.suppress(als.StateError, OSError):
+            spent = als.finish_trial(site, res)
+            print(
+                f"  trial budget: {'spent' if spent else 'refunded (no password sent)'}"
+            )
+    return res
+
+
+def rearm_action(site: str) -> int:
+    """`-E SITE`: give a site its one promotion login back (audited; the
+    main session's call after reviewing why the last one failed)."""
+    site = resolve_site(site)
+    if not SITE_ID_RE.match(site):
+        print(f"❌ not a site id: {site!r}")
+        return 2
+    try:
+        had = als.rearm(site, why="agent-login.py -E")
+    except als.StateError as exc:
+        print(f"❌ {site}: {exc}")
+        return 1
+    print(
+        f"✅ {site}: promotion login re-armed (audited)"
+        if had
+        else f"ℹ️ {site} had its promotion login unspent (audit entry written)"
+    )
+    return 0
+
+
+STATIC_SITES = {t.site for t in TARGETS} | {
+    t.broker_site for t in TARGETS if t.broker_site
+}
+
+
+# One early return per step of the two phases.
+def remove_action(site: str, force: bool = False) -> int:  # pylint: disable=too-many-return-statements
+    """`-D SITE` (WS3 removal), run twice. A FRESH listing decides the phase:
+
+    1. still listed: back to ``pending`` (audited; `-c` never logs it in
+       again), then `browser.py logout SITE` in its instance (the broker's
+       profile, its in-scope cookies, its declared storage keys); then the
+       vault step is Albert's (broker-add.py NAME -D, or the web vault);
+    2. gone from the vault: the broker's ``forget`` (limiter, identity guard,
+       profile, screenshot — under its site lock, after its own fresh vault
+       read), then every client-side trace (`als.remove_site`): checks.json,
+       last-check.json, site-state.json, session-age and login-log files;
+       one line stays in audit.jsonl. agents.md is rewritten."""
+    site = resolve_site(site)
+    if not SITE_ID_RE.match(site):
+        print(f"❌ not a site id: {site!r}")
+        return 2
+    if site in STATIC_SITES:
+        print(
+            f"❌ {site} is a built-in target (TARGETS in agent-login.py), not removable here"
+        )
+        return 2
+    health, sites = broker_state(fresh=True)
+    if not health.startswith("running, Bitwarden"):
+        print(f"❌ {site}: no fresh broker listing ({health}) — nothing changed")
+        return 1
+    if any(s.get("site") == site for s in sites):
+        return _remove_phase1(site, sites, force=force)
+    try:
+        resp = broker_request("forget", timeout=300.0, site=site)
+    except (OSError, ValueError) as exc:
+        print(
+            f"❌ {site}: the broker's forget did not answer ({exc}) — nothing changed"
+        )
+        return 1
+    if not resp.get("ok") and resp.get("error") != "forget_incomplete":
+        code = onboarding.safe_reason(resp.get("error"), 40)
+        detail = onboarding.safe_reason(resp.get("detail"))
+        print(f"❌ {site}: broker forget refused ({code}: {detail}) — nothing changed")
+        return 1
+    raw_left = resp.get("left")
+    left: dict[str, str] = (
+        {str(k): str(v) for k, v in raw_left.items()}
+        if isinstance(raw_left, dict)
+        else {}
+    )
+    try:
+        # the broker kept a block: the client keeps the site's state record
+        # (demoted, quarantined) so a re-added item shows the real lockout
+        removed = als.remove_site(site, kept=left or None)
+    except (als.StateError, OSError) as exc:
+        print(f"❌ {site}: client state not usable ({exc})")
+        return 1
+    write_agent_summary()
+    files = len(removed.get("files") or [])
+    print(
+        f"✅ {site}: removed — broker: limiter {'yes' if resp.get('limiter') else 'none'}, "
+        f"{resp.get('groups') or 0} group key(s), guard {'yes' if resp.get('guard') else 'none'}, "
+        f"profile {'yes' if resp.get('profile') else 'none'}, screenshot "
+        f"{'yes' if resp.get('screenshot') else 'none'}; client: state files, {files} cache "
+        "file(s); one line in audit.jsonl"
+    )
+    if left:
+        held = ", ".join(
+            f"{onboarding.safe_reason(k, 40)} ({onboarding.safe_reason(v, 30)})"
+            for k, v in sorted(left.items())
+        )
+        print(
+            f"⚠️ {site}: kept by the broker — {held}: a removal never lifts a block "
+            "(its client state record stays, quarantined); "
+            f"after review: sudo install/install.sh -r {site}"
+        )
+    if not resp.get("ok"):
+        print(
+            f"⚠️ {site}: the broker could not remove everything "
+            f"({onboarding.safe_reason(resp.get('detail'))}) — look, then run -D again"
+        )
+        return 1
+    return 0
+
+
+def sibling_in_instance(site: str, sites: list[dict]) -> list[str]:
+    """The REMAINING items of another account that share `site`'s login
+    scope in the same browser instance (`scope_conflicts`): a logout there
+    would end THEIR session too (abs-root / abs-albert, navidrome-*)."""
+    entry = next((s for s in sites if s.get("site") == site), None)
+    if entry is None:
+        return []
+    inst = identity.instance_of(entry)
+    by_id = {str(s.get("site")): s for s in sites}
+    return [
+        other
+        for other in scope_conflicts(sites).get(site, ())
+        if other in by_id and identity.instance_of(by_id[other]) == inst
+    ]
+
+
+def _remove_phase1(site: str, sites: list[dict], *, force: bool = False) -> int:
+    """`-D` while the site is still listed: demote, then log out — unless
+    another account's item shares the scope in the same instance (its
+    session would go too): then only the state is changed, unless `force`
+    (`-F`)."""
+    try:
+        als.demote(site, why="agent-login.py -D (phase 1)")
+    except als.StateError as exc:
+        print(f"❌ {site}: site state not usable ({exc})")
+        return 1
+    print(f"▶ {site}: demoted to pending (the daily check never logs it in again)")
+    siblings = sibling_in_instance(site, sites)
+    if siblings and not force:
+        print(
+            f"⚠️ {site}: NOT logged out — {', '.join(siblings)} share(s) its login "
+            "scope in the same browser, and a logout would end that session too "
+            "(-F forces it). The broker's own profile goes with the next -D. "
+            "Next: remove its vault item from agent-login (broker-add.py NAME -D, "
+            f"or the web vault), then ./agent-login.py -D {site} again"
+        )
+        return 0
+    with site_session(site):
+        run = run_browser("logout", site, timeout_s=browser_timeout("logout"))
+    if run.rc != 0:
+        print(
+            f"❌ {site}: browser.py logout failed (exit {run.rc}) — the site stays "
+            f"demoted; fix that, then ./agent-login.py -D {site} again"
+        )
+        return 1
+    print(
+        f"✅ {site}: logged out (broker profile, cookies, storage). Next: remove its "
+        "vault item from agent-login (broker-add.py NAME -D, or the web vault), "
+        f"then ./agent-login.py -D {site} again"
+    )
+    return 0
+
+
+def _budgeted_login(site: str, claimed: bool) -> BrowserRun:
+    """`-t`'s one `browser.py login SITE -R`; a `claimed` trial is finished
+    whatever happens (spent, or refunded when no password was sent)."""
+    run: BrowserRun | None = None
+    try:
+        run = run_browser(
+            "login", site, timeout_s=browser_timeout("login"), result=True
+        )
+        return run
+    finally:
+        if claimed:
+            # Refunded only when the record proves no password was sent —
+            # `run_browser`'s own "not started" marker included. An exception
+            # out of it (the child may have run) leaves None: spent.
+            res = derived_result(run) if run is not None else None
+            with contextlib.suppress(als.StateError, OSError):
+                als.finish_trial(site, res)
+
+
+def _trial_claim_for_test(site: str) -> tuple[bool, str | None]:
+    """`-t` of a broker site that is not usable for its current config takes
+    the SAME budget as `-p` (WS3): (claimed, refusal or None)."""
+    if site in ASSISTED_SITES or site in safari_cookies.SAFARI_SITES:
+        return False, None
+    _health, sites = broker_state()
+    entry = next((s for s in sites if s.get("site") == site), None)
+    if entry is None or entry.get("refused") or is_no_submit(site, entry):
+        return False, None
+    digest = onboarding.config_digest(entry)
+    try:
+        if als.usable_for(als.site_states().get(site), digest):
+            return False, None
+        claimed, code, why = als.claim_trial(site, digest)
+    except als.StateError as exc:
+        return False, f"site state not usable ({exc})"
+    if claimed:
+        return True, None
+    hint = f" — after review: ./agent-login.py -E {site}" if code == "spent" else ""
+    return False, f"not promoted yet and its one login is not available: {why}{hint}"
 
 
 # consumer, privilege — only what the code knows; anything else is "?".
@@ -2412,7 +2886,9 @@ def build_parser() -> argparse.ArgumentParser:
         "--force",
         action="store_true",
         help="with -g: start even with UNREGISTERED CDP clients attached "
-        "(browser.py assisted-login -f; they are not paused and keep running)",
+        "(browser.py assisted-login -f; they are not paused and keep running); "
+        "with -D: log out even when another account's item shares the scope "
+        "in the same browser instance",
     )
     ap.add_argument(
         "-c",
@@ -2493,16 +2969,45 @@ def build_parser() -> argparse.ArgumentParser:
         "-p",
         "--promote",
         metavar="SITE",
-        help="allow scheduled logins (-c) for SITE — refused unless a fresh broker "
-        "listing shows its sentinel and its latest check is a fresh, strict ok",
+        help="the ONE promotion transaction (pending -> usable for scheduled "
+        "logins): a fresh listing, the onboarding review, then a fresh strict ok "
+        "of this configuration on record, or ONE budgeted `browser.py login` "
+        "(no retry); audited",
     )
     ap.add_argument(
         "-V",
+        "--validate",
         "--validate-selectors",
+        dest="validate",
         action="store_true",
-        help="list live broker items whose agent_logged_in_selector / "
-        "agent_pre_click the new broker would refuse (not plain CSS); read-only, "
-        "from the snapshot; run it before installing the broker",
+        help="the onboarding review (no login, no vault write): selectors the broker refuses, "
+        "then every listed item's findings (refused / unusable / risk / hint); "
+        "with -i: a PLANNED change; with -r: ask the broker now and refresh the "
+        "site-list snapshot first (~40 s) instead of reading it; exit 1 when "
+        "anything blocks",
+    )
+    ap.add_argument(
+        "-i",
+        "--item",
+        metavar="MANIFEST",
+        help="with -V: review a planned item / batch (JSON: {name, fields, "
+        "replaces?, username_form?, reveals?} or {items: [...], removes: [...]}; "
+        "'-' = stdin; never a password) against the listing, displacement included",
+    )
+    ap.add_argument(
+        "-E",
+        "--rearm",
+        metavar="SITE",
+        help="give SITE its one promotion login back (after reviewing why it "
+        "failed) — the main session's decision, audited",
+    )
+    ap.add_argument(
+        "-D",
+        "--remove",
+        metavar="SITE",
+        help="remove a broker site, run twice: while it is listed -> demote + "
+        "browser.py logout; after its vault item is gone -> drop every trace "
+        "(broker `forget`, state files, cache files); audited",
     )
     ap.add_argument(
         "-Q",
@@ -2550,6 +3055,10 @@ def login_action(args: argparse.Namespace) -> int | None:  # pylint: disable=too
         return promote_action(args.promote)
     if args.release:
         return release_action(args.release)
+    if args.rearm:
+        return rearm_action(args.rearm)
+    if args.remove:
+        return remove_action(args.remove, force=args.force)
     return None
 
 
@@ -2560,13 +3069,15 @@ def main() -> int:  # pylint: disable=too-many-return-statements,too-many-branch
     args = ap.parse_args()
     if args.mail and not args.check_all:
         ap.error("-m/--mail only works together with -c/--check-all")
-    if args.force and not args.guided:
-        ap.error("-F/--force only works together with -g/--guided")
+    if args.force and not (args.guided or args.remove):
+        ap.error("-F/--force only works together with -g/--guided or -D/--remove")
+    if args.item and not args.validate:
+        ap.error("-i/--item only works together with -V/--validate")
     rc = launch_action(args)
     if rc is not None:
         return rc
-    if args.validate_selectors:  # read-only: not even the agents file
-        return selector_audit()
+    if args.validate:  # read-only: not even the agents file
+        return validate_action(args.item, fresh=args.refresh)
     if args.snapshot:
         # First, before anything else touches the browser: a guided login
         # whose owner and watchdog both died leaves its record behind.

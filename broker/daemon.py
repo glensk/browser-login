@@ -12,6 +12,12 @@ LOCAL_PEERCRED. One JSON request per connection, newline-terminated, at most
   {"op": "login", "site": "X"}    -> {"ok": true, "bundle": {...}}
   {"op": "logout", "site": "X"}   delete the broker's own profile for X
   {"op": "fingerprint", "site": "X"}  len + 4 hex of the password's SHA-256
+  {"op": "forget", "site": "X"}   WS3 removal: X's limiter key + bindings
+                                  (an orphan group key too), identity guard,
+                                  profile and failure screenshot - only when
+                                  a FRESH vault read has no item X
+                                  (``still_listed`` otherwise), under X's
+                                  site lock; -> counts / flags only
 
 Account identity (WS5, broker/identity_ops.py; a username never leaves the
 broker, the page's value never leaves the page):
@@ -54,7 +60,8 @@ vault read):
 
 Errors: {"ok": false, "error": "needs_human" | "origin_violation" |
 "rate_limited" | "login_failed" | "export_failed" | "bundle_export" |
-"timeout" | "unknown_site" | "unknown_item" |
+"timeout" | "unknown_site" | "unknown_item" | "still_listed" | "busy" |
+"forget_incomplete" |
 "unknown_field" | "refused" | "vault_error" | "leakcheck_unavailable" |
 "forbidden" | "bad_request" | "internal", "detail": "..."} — never a secret.
 
@@ -190,6 +197,7 @@ from broker.vault import (  # noqa: E402
     VaultCache,
     VaultError,
     selector_ok,
+    slugify,
 )
 
 # pylint: enable=wrong-import-position
@@ -1414,6 +1422,34 @@ def url_host(origin: str) -> str:
 # ---------------------------------------------------------------------------
 
 
+def _forget_path(path: Path, *, directory: bool, problems: list[str]) -> bool:
+    """`forget`: remove `path` when it is a real directory (`directory`) or a
+    regular file; True when something was removed. A symlink or the other
+    kind is never followed or touched — it is reported in `problems`."""
+    try:
+        st = os.lstat(path)
+    except FileNotFoundError:
+        return False
+    except OSError:
+        problems.append(f"cannot inspect {path.name}")
+        return False
+    want = stat.S_ISDIR(st.st_mode) if directory else stat.S_ISREG(st.st_mode)
+    if not want:
+        problems.append(
+            f"{path.name} is not a plain {'directory' if directory else 'file'}"
+        )
+        return False
+    try:
+        if directory:
+            shutil.rmtree(path)
+        else:
+            path.unlink()
+    except OSError:
+        problems.append(f"cannot remove {path.name}")
+        return False
+    return True
+
+
 @dataclass
 class _Flight:
     """One in-progress login; concurrent callers for the site share its result."""
@@ -1617,7 +1653,7 @@ class Broker(SecretOps):  # pylint: disable=too-many-instance-attributes  # deps
                 resp = {"ok": True, "pong": True}
             elif op == "sites":
                 resp = self._sites(fresh=req.get("fresh") in (True, "1", "true"))
-            elif op in ("login", "logout", "fingerprint", "sentinel_absent"):
+            elif op in ("login", "logout", "fingerprint", "sentinel_absent", "forget"):
                 if not site or not SITE_ID_RE.match(site):
                     resp = _err("bad_request", "missing or invalid site id")
                 elif op == "login":
@@ -1637,6 +1673,20 @@ class Broker(SecretOps):  # pylint: disable=too-many-instance-attributes  # deps
                     resp = self._sentinel_absent(site, req.get("sentinel"))
                 elif op == "fingerprint":
                     resp = self._fingerprint(site)
+                elif op == "forget":
+                    resp = self._forget(site)
+                    extra.update(
+                        {
+                            k: resp.get(k)
+                            for k in (
+                                "limiter",
+                                "groups",
+                                "guard",
+                                "profile",
+                                "screenshot",
+                            )
+                        }
+                    )
                 else:
                     resp = self._logout(site)
             elif op in IDENTITY_OPS:
@@ -1744,6 +1794,113 @@ class Broker(SecretOps):  # pylint: disable=too-many-instance-attributes  # deps
             if existed:
                 shutil.rmtree(profile)
         return {"ok": True, "removed": existed}
+
+    # One early return per refusal, then the removals.
+    def _forget_items(self, site: str) -> tuple[list[SiteItem] | None, dict[str, Any]]:
+        """`_forget`'s fresh vault read and its refusals: (items, {}) when the
+        site may be forgotten, else (None, the error reply). Refused: an
+        unreadable vault; an EMPTY read, or one smaller than half the cached
+        item count (a half-synced or wrong collection must never look like
+        "every site was removed"); any item — a refused one too — that
+        resolves to the site id (its ``agent_site``, or the slug of its name
+        that the vault falls back to)."""
+        cached = self._items_cache
+        before = len(cached[1]) if cached else 0
+        try:
+            items = self._items(fresh=True)
+        except VaultError as exc:
+            return None, _err("vault_error", str(exc))
+        if not items or (before and len(items) * 2 < before):
+            return None, _err(
+                "vault_suspect",
+                f"the fresh vault read has {len(items)} item(s) (cached: {before}) "
+                "— refusing to forget anything on it",
+            )
+        if any(site in (it.site, slugify(it.name)) for it in items):
+            return None, _err(
+                "still_listed",
+                f"{site} is still a vault item — remove it from agent-login first",
+            )
+        return items, {}
+
+    def _forget_guard(
+        self, site: str, left: dict[str, str], problems: list[str]
+    ) -> bool:
+        """`_forget`'s identity-guard step: a site whose challenges are in a
+        lockout or quarantined (or whose guard state is unreadable) keeps
+        its entry for ``install.sh -r``; else the entry goes. Removed?"""
+        guard = self.identity_ops.guard
+        denied = guard.denial(site, self.clock())
+        if denied is not None:
+            left["identity-guard"] = denied[0]
+            return False
+        try:
+            return bool(guard.reset(site))
+        except (GuardStateError, OSError):
+            problems.append("identity guard state not usable")
+            return False
+
+    # One early return per refusal, then the removals.
+    def _forget(self, site: str) -> dict[str, Any]:  # pylint: disable=too-many-return-statements
+        """``forget`` (WS3 removal, `agent-login.py -D` phase 2): drop the
+        broker-side traces of a site that NO vault item carries any more —
+        under the site's own lock (every login of it holds that lock), after
+        a FRESH vault read that also replaces the item cache (a later login
+        answers ``unknown_site``; `_forget_items` lists the refusals), and
+        never while a login is in flight on the site or one of its groups.
+        It is never a way around the limiter: a limiter key that is locked,
+        cooling down or quarantined, and an identity-guard entry in a lockout
+        or quarantine, stay (``left``, for ``sudo install/install.sh -r
+        SITE``); the rest goes: the limiter key and bindings (a group key
+        only when no other entry binds it and no item, refused ones
+        included, declares it), the guard entry, the profile directory and
+        the failure screenshot. Idempotent; the reply carries counts, flags
+        and state words only."""
+        with self._site_lock(site):
+            items, refusal = self._forget_items(site)
+            if items is None:
+                return refusal
+            keep = {it.attempt_group for it in items if it.attempt_group}
+            try:
+                pruned = self.limiter.prune_site(site, keep, self.clock())
+            except LimiterBusy:
+                return _err("busy", f"a login is in flight on {site} or its group")
+            except (LimiterStateError, OSError):
+                return _err("internal", "limiter state not usable")
+            problems: list[str] = []
+            left: dict[str, str] = dict(pruned.get("left") or {})
+            guard = self._forget_guard(site, left, problems)
+            profile = _forget_path(
+                self.home / "profiles" / site, directory=True, problems=problems
+            )
+            diag_dir = getattr(self.runner, "diag_dir", None)
+            shot = (
+                _forget_path(
+                    Path(diag_dir) / f"last-failure-{site}.png",
+                    directory=False,
+                    problems=problems,
+                )
+                if diag_dir is not None
+                else False
+            )
+            for name in ("last_diag", "proof_reasons"):
+                memo = getattr(self.runner, name, None)
+                if isinstance(memo, dict):
+                    memo.pop(site, None)
+        reply: dict[str, Any] = {
+            "ok": not problems,
+            "limiter": pruned["site"],
+            "groups": len(pruned["groups"]),
+            "guard": guard,
+            "profile": profile,
+            "screenshot": shot,
+            # keys kept for root (key -> locked / cooldown / quarantined /
+            # identity_cooldown / identity_quarantined …): `install.sh -r SITE`
+            "left": left,
+        }
+        if problems:
+            reply.update(_err("forget_incomplete", "; ".join(problems)))
+        return reply
 
     # One return per refusal of an option combination, then one per route.
     def _login_request(  # pylint: disable=too-many-return-statements

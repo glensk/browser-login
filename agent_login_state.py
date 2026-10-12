@@ -37,6 +37,9 @@ from typing import Any
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))  # the repo's `broker`
 # pylint: disable=wrong-import-position
+from broker.identity import ROLE_INSTANCES  # noqa: E402
+from broker.limiter import owner_alive, proc_start  # noqa: E402
+from broker.onboarding import CONFIG_V  # noqa: E402
 from broker.phases import PHASES, redact  # noqa: E402
 
 # pylint: enable=wrong-import-position
@@ -50,6 +53,13 @@ MAX_STATUS_AGE_S = 36 * 3600.0
 STATES = frozenset({"ok", "failed", "unknown"})
 SCREENSHOT_RE = re.compile(r"^/var/db/login-broker-run/last-failure-[a-z0-9._-]+\.png$")
 LOCK_TIMEOUT_S = 10.0
+CONFIG_RE = re.compile(r"^[0-9a-f]{64}$")
+SITE_ID_RE = re.compile(r"^[a-z0-9][a-z0-9._-]{0,63}$")  # broker/vault.py's rule
+AUDIT_FILE = "audit.jsonl"
+# A trial login's result proves that no broker request reached the password:
+# the login's own free check found the session (route ``already``), or it
+# stopped in one of these phases with ``submitted`` False.
+PRE_SUBMIT_PHASES = frozenset({"precheck", "limiter", "vault", "profile-proof"})
 
 
 class StateError(RuntimeError):
@@ -178,6 +188,7 @@ def record_check(  # pylint: disable=too-many-arguments
     origin_ok: object = None,
     instance: str = "",
     identity: str = "",
+    config: str = "",
     now: float | None = None,
 ) -> dict[str, Any]:
     """Record a site's LATEST check (checks.json v2 + the legacy projection).
@@ -216,6 +227,9 @@ def record_check(  # pylint: disable=too-many-arguments
         # WS5: the identity proof's verdict (a word of browser.py's fixed set;
         # '' = no proof ran).
         "identity": identity if re.match(r"^[a-z_]{0,32}$", identity or "") else "?",
+        # WS3: the config digest (broker/onboarding.config_digest) of the item
+        # the proof ran against ('' = unknown): a promotion holds for it only.
+        "config": config if CONFIG_RE.match(config or "") else "",
     }
 
     def put(data: dict[str, Any]) -> None:
@@ -360,16 +374,97 @@ def release(site: str, why: str = "", now: float | None = None) -> bool:
     return bool(had and had[0])
 
 
-def promote(site: str, why: str = "", now: float | None = None) -> None:
-    """Mark `site` usable for scheduled logins (audited; checks are the caller's)."""
+def promote(
+    site: str, why: str = "", now: float | None = None, *, config: str = ""
+) -> None:
+    """Mark `site` usable for scheduled logins (audited; checks are the
+    caller's) — for the configuration whose digest is `config` (WS3: a
+    changed item is not usable until it is promoted again)."""
     now = time.time() if now is None else now
 
     def put(data: dict[str, Any]) -> None:
         entry = _site(data, site, now)
         entry["stage"] = "usable"
+        good = bool(CONFIG_RE.match(config or ""))
+        entry["config"] = config if good else None
+        entry["config_v"] = CONFIG_V if good else None
+        entry.pop("trial", None)  # a promoted site starts a fresh budget later
         entry.setdefault("audit", []).append(_audit_entry("promote", why, now))
 
     update(SITE_STATE_FILE, put, strict=True)
+
+
+def demote(site: str, why: str = "", now: float | None = None) -> None:
+    """Back to ``pending`` (audited): `agent-login.py -D` phase 1."""
+    now = time.time() if now is None else now
+
+    def put(data: dict[str, Any]) -> None:
+        entry = _site(data, site, now)
+        entry["stage"] = "pending"
+        entry.setdefault("audit", []).append(_audit_entry("demote", why, now))
+
+    update(SITE_STATE_FILE, put, strict=True)
+
+
+def _config_v(entry: dict[str, Any]) -> int:
+    """The digest version an entry's promotion was recorded with (0 = none,
+    a promotion from before WS3)."""
+    value = entry.get("config_v")
+    if not entry.get("config") or isinstance(value, bool) or not isinstance(value, int):
+        return 0
+    return value
+
+
+def strict_fresh_ok(rec: dict[str, Any] | None, now: float | None = None) -> bool:
+    """`rec` is a fresh (`freshness`) ✅ from the strict proof (``proof_v`` 1)."""
+    if not rec or freshness(rec, now) != "ok":
+        return False
+    try:
+        return int(rec.get("proof_v") or 0) >= 1
+    except (TypeError, ValueError):
+        return False
+
+
+def adopt_configs(digests: dict[str, str], now: float | None = None) -> list[str]:
+    """WS3 migration: a ``usable`` entry whose promotion was recorded with an
+    OLDER digest version (or none: before WS3) adopts its CURRENT digest
+    (`digests`, of the current `CONFIG_V`) — only while its latest check is
+    a fresh strict ✅ (`strict_fresh_ok`), audited. A current-version
+    promotion is never re-adopted (a changed item stays ``changed``). Call
+    it only with a FRESH live listing. Returns the adopting sites."""
+    now = time.time() if now is None else now
+    recs = checks()
+    adopted: list[str] = []
+
+    def put(data: dict[str, Any]) -> None:
+        for site, digest in digests.items():
+            entry = data.get(site)
+            if not isinstance(entry, dict) or entry.get("stage") != "usable":
+                continue
+            if _config_v(entry) >= CONFIG_V or not CONFIG_RE.match(digest or ""):
+                continue
+            if not strict_fresh_ok(recs.get(site), now):
+                continue
+            old = _config_v(entry)
+            entry["config"] = digest
+            entry["config_v"] = CONFIG_V
+            entry.setdefault("audit", []).append(
+                _audit_entry("adopt_config", f"config_v {old} -> {CONFIG_V}", now)
+            )
+            adopted.append(site)
+
+    update(SITE_STATE_FILE, put, strict=True)
+    return adopted
+
+
+def usable_for(entry: dict[str, Any] | None, config: str | None) -> bool:
+    """`entry` is promoted FOR `config` of the current digest version (None:
+    the stage alone decides)."""
+    if not isinstance(entry, dict) or entry.get("stage") != "usable":
+        return False
+    if config is None:
+        return True
+    return _config_v(entry) == CONFIG_V and entry.get("config") == config
 
 
 def quarantined(site: str) -> dict[str, Any] | None:
@@ -383,10 +478,15 @@ def quarantined(site: str) -> dict[str, Any] | None:
     return q if isinstance(q, dict) else None
 
 
-def scheduled_gate(site: str) -> tuple[bool, str, str]:
+# One early return per refusal, in the order they are checked.
+def scheduled_gate(  # pylint: disable=too-many-return-statements
+    site: str, config: str | None = None
+) -> tuple[bool, str, str]:
     """(allowed, code, reason) for a SCHEDULED broker login of `site`.
     Fail-closed: anything but a readable ``usable`` and unquarantined entry
-    refuses."""
+    refuses; with `config` (the listed item's digest, WS3) also a promotion
+    of another configuration (``changed``) or of an unknown one
+    (``config_unknown``)."""
     try:
         entry = read(SITE_STATE_FILE, strict=True).get(site)
     except StateError as exc:
@@ -402,6 +502,19 @@ def scheduled_gate(site: str) -> tuple[bool, str, str]:
         )
     if entry.get("stage") != "usable":
         return False, "pending", "not promoted yet"
+    if config is not None:
+        stored = entry.get("config")
+        if not stored or _config_v(entry) != CONFIG_V:
+            return (
+                False,
+                "config_unknown",
+                (
+                    "promoted with an older (or no) config record — adopted after "
+                    "a fresh strict check, or re-promote"
+                ),
+            )
+        if stored != config:
+            return False, "changed", "the item changed since its promotion"
     return True, "", ""
 
 
@@ -432,4 +545,297 @@ def prune(keep: set[str]) -> list[str]:
     ):
         with contextlib.suppress(StateError, OSError):
             update(name, fn, strict=strict)
+    for site in gone:  # WS3: its session-age record goes with it
+        delete_cache_files(site, login_log=False)
     return sorted(gone)
+
+
+# ---------------------------------------------------------------------------
+# WS3: the promotion trial budget (one login per site, claimed under the lock)
+# ---------------------------------------------------------------------------
+
+
+# A claim whose owner's start time is unknown cannot tell a reused pid from
+# its owner: past this age it counts as dead. It is far beyond one promotion
+# login (browser.py's LOGIN_TIMEOUT_S 480 s + the runner's 90 s margin).
+TRIAL_STALE_S = 15 * 60.0
+
+
+def _owner_alive(inflight: dict[str, Any], now: float | None = None) -> bool:
+    """The claim's owner still runs (pid + start time, the limiter's rule).
+    An unknown start time counts as alive — never recover a claim that may
+    be live — until the claim is older than `TRIAL_STALE_S` (pid reuse)."""
+    if not inflight.get("pid_start"):
+        now = time.time() if now is None else now
+        try:
+            if now - float(inflight.get("at") or 0) > TRIAL_STALE_S:
+                return False
+        except (TypeError, ValueError):
+            return False
+    return owner_alive(inflight.get("pid"), inflight.get("pid_start"))
+
+
+def _trial_of(entry: dict[str, Any]) -> dict[str, Any]:
+    raw = entry.get("trial")
+    return raw if isinstance(raw, dict) else {}
+
+
+def trial_state(site: str) -> dict[str, Any]:
+    """`site`'s trial record ({} = budget unspent, nothing running)."""
+    try:
+        entry = site_states().get(site)
+    except StateError:
+        return {}
+    return _trial_of(entry) if isinstance(entry, dict) else {}
+
+
+def _recover_trial(entry: dict[str, Any], now: float) -> None:
+    """A claim whose owner died: spent, outcome unknown (it may have
+    submitted)."""
+    trial = entry.get("trial")
+    inflight = trial.get("inflight") if isinstance(trial, dict) else None
+    if isinstance(inflight, dict) and not _owner_alive(inflight, now):
+        entry["trial"] = {
+            "spent": True,
+            "at": now,
+            "at_text": _when(now),
+            "phase": "unknown",
+            "code": "crashed",
+            "submitted": None,
+            "outcome": "unknown",
+        }
+        entry.setdefault("audit", []).append(
+            _audit_entry("trial_recovered", "owner died", now)
+        )
+
+
+def claim_trial(
+    site: str, config: str | None = None, now: float | None = None
+) -> tuple[bool, str, str]:
+    """Claim `site`'s ONE promotion login (atomic, under the site-state
+    flock): (claimed, code, why). Refused when the site is already usable
+    for `config`, quarantined, its budget is spent, or a LIVE claim exists;
+    a dead owner's claim is recovered as spent first."""
+    now = time.time() if now is None else now
+    verdict: list[tuple[bool, str, str]] = []
+
+    def put(data: dict[str, Any]) -> None:
+        entry = _site(data, site, now)
+        _recover_trial(entry, now)
+        trial = _trial_of(entry)
+        q = entry.get("quarantine")
+        if usable_for(entry, config):
+            verdict.append((False, "usable", "already usable for its current config"))
+        elif isinstance(q, dict):
+            verdict.append(
+                (False, "quarantined", f"quarantined after {q.get('phase', '?')}")
+            )
+        elif isinstance(trial.get("inflight"), dict):
+            verdict.append((False, "busy", "another promotion login is running"))
+        elif trial.get("spent"):
+            verdict.append(
+                (
+                    False,
+                    "spent",
+                    f"trial already used {trial.get('at_text', '?')} "
+                    f"({trial.get('phase') or '?'})",
+                )
+            )
+        else:
+            entry["trial"] = {
+                "inflight": {
+                    "pid": os.getpid(),
+                    "pid_start": proc_start(os.getpid()),
+                    "at": now,
+                }
+            }
+            entry.setdefault("audit", []).append(_audit_entry("trial_claim", "", now))
+            verdict.append((True, "", ""))
+
+    update(SITE_STATE_FILE, put, strict=True)
+    return verdict[0]
+
+
+def trial_refund(result: dict[str, Any] | None) -> bool:
+    """A trial login's result proves the password was never sent: its free
+    check found the session (route ``already``), or it stopped before the
+    broker reached the secret (``submitted`` False in a PRE_SUBMIT_PHASES
+    phase), or browser.py refused to run at all (exit 75 ``busy``: a guided
+    login owns the browser — refused at registration, before any check or
+    request)."""
+    r = result or {}
+    if r.get("route") == "already" and r.get("phase") == "ok":
+        return True
+    if r.get("phase") == "precheck" and r.get("code") in ("busy", "not_started"):
+        return True
+    return r.get("submitted") is False and r.get("phase") in PRE_SUBMIT_PHASES
+
+
+def finish_trial(
+    site: str, result: dict[str, Any] | None, now: float | None = None
+) -> bool:
+    """End `site`'s claim: refunded (budget unspent) when `trial_refund`
+    holds, else spent with the phase / code / submitted it stopped at.
+    Returns True when the budget was spent."""
+    now = time.time() if now is None else now
+    r = result or {}
+    refund = trial_refund(r)
+
+    def put(data: dict[str, Any]) -> None:
+        entry = _site(data, site, now)
+        if refund:
+            entry.pop("trial", None)
+        else:
+            submitted = r.get("submitted")
+            entry["trial"] = {
+                "spent": True,
+                "at": now,
+                "at_text": _when(now),
+                "phase": str(r.get("phase") or "unknown")
+                if r.get("phase") in PHASES
+                else "unknown",
+                "code": re.sub(r"[^a-z_]", "", str(r.get("code") or ""))[:32],
+                "submitted": submitted if isinstance(submitted, bool) else None,
+                "outcome": "ok" if r.get("phase") == "ok" else "failed",
+            }
+        entry.setdefault("audit", []).append(
+            _audit_entry("trial_finish", "refunded" if refund else "spent", now)
+        )
+
+    update(SITE_STATE_FILE, put, strict=True)
+    return not refund
+
+
+def rearm(site: str, why: str = "", now: float | None = None) -> bool:
+    """Give `site` its promotion login back (`-E`, audited); False when its
+    budget was unspent. A LIVE claim is never re-armed."""
+    now = time.time() if now is None else now
+    had: list[bool] = []
+
+    def put(data: dict[str, Any]) -> None:
+        entry = _site(data, site, now)
+        _recover_trial(entry, now)
+        trial = _trial_of(entry)
+        if isinstance(trial.get("inflight"), dict):
+            raise StateError("a promotion login is running — re-arm after it ends")
+        had.append(bool(trial.get("spent")))
+        entry.pop("trial", None)
+        entry.setdefault("audit", []).append(_audit_entry("rearm", why, now))
+
+    update(SITE_STATE_FILE, put, strict=True)
+    return bool(had and had[0])
+
+
+# ---------------------------------------------------------------------------
+# WS3: removal (`agent-login.py -D` phase 2)
+# ---------------------------------------------------------------------------
+
+
+def cache_dirs() -> list[Path]:
+    """browser.py's cache dir of every instance (``$CLAUDE_BROWSER_CACHE_DIR``
+    alone when set: the tests' and a disposable browser's)."""
+    env = os.environ.get("CLAUDE_BROWSER_CACHE_DIR")
+    if env:
+        return [Path(env)]
+    base = Path.home() / ".cache"
+    names = ["claude-browser"] + [
+        f"claude-browser-{i}" for i in ("private", *ROLE_INSTANCES)
+    ]
+    return [base / n for n in names]
+
+
+def _delete_session_age(directory: Path, site: str) -> bool:
+    """Delete ``<site>.json`` under the site's own flock (browser.py's
+    `_session_age_lock`). The lock file itself stays — empty, no content:
+    unlinking a lock another process may hold would let a second writer
+    take a second inode. Never creates a lock that was not there."""
+    lock = directory / f"{site}.lock"
+    record = directory / f"{site}.json"
+    if not record.exists():
+        return False
+    try:
+        fd = os.open(str(lock), os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+    except OSError:
+        return False
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        had = record.exists()
+        record.unlink(missing_ok=True)
+        return had
+    finally:
+        os.close(fd)
+
+
+def delete_cache_files(site: str, *, login_log: bool = True) -> list[str]:
+    """Delete `site`'s session-age record (and, with `login_log`, its real-
+    login log) in every instance's cache dir; returns what went (paths)."""
+    if not SITE_ID_RE.match(site):
+        return []
+    gone: list[str] = []
+    for base in cache_dirs():
+        with contextlib.suppress(OSError):
+            if _delete_session_age(base / "session-age", site):
+                gone.append(str(base / "session-age" / f"{site}.json"))
+        if login_log:
+            log = base / "login-log" / f"{site}.jsonl"
+            with contextlib.suppress(OSError):
+                if log.is_file() and not log.is_symlink():
+                    log.unlink()
+                    gone.append(str(log))
+    return gone
+
+
+def audit_event(
+    action: str, site: str, why: str = "", now: float | None = None
+) -> None:
+    """One line in ``audit.jsonl`` (append-only history, never state)."""
+    now = time.time() if now is None else now
+    rec = {"site": site if SITE_ID_RE.match(site) else "?"}
+    rec.update(_audit_entry(action, why, now))
+    path = state_dir() / AUDIT_FILE
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd = os.open(
+        str(path), os.O_WRONLY | os.O_APPEND | os.O_CREAT | os.O_NOFOLLOW, 0o600
+    )
+    try:
+        os.write(fd, (json.dumps(rec, sort_keys=True) + "\n").encode())
+    finally:
+        os.close(fd)
+
+
+def remove_site(site: str, *, kept: dict[str, str] | None = None) -> dict[str, Any]:
+    """Delete EVERY client-side trace of `site` (the caller proved with a
+    fresh listing that no vault item carries it): its checks.json,
+    last-check.json and site-state.json entries — quarantine and audit
+    included — and its session-age / login-log files in every cache dir.
+    Then one line in ``audit.jsonl``. Returns what was removed.
+
+    `kept`: the broker kept blocking state for the site (``forget``'s
+    ``left``: key -> locked / cooldown / quarantined / identity_*). Then the
+    site-state entry STAYS — demoted, with a quarantine naming that state
+    when it had none — so a re-added item shows the real lockout, not only
+    "rate limited"; everything else goes."""
+    if not SITE_ID_RE.match(site):
+        raise StateError("not a site id")
+    removed: dict[str, Any] = {}
+
+    def drop(name: str) -> Callable[[dict[str, Any]], None]:
+        def fn(data: dict[str, Any]) -> None:
+            removed[name] = data.pop(site, None) is not None
+
+        return fn
+
+    if kept:
+        state = next(iter(sorted(kept.values())))
+        phase = "client-proof" if state.startswith("identity") else "limiter"
+        if quarantined(site) is None:
+            quarantine(site, phase, state)
+        demote(site, why="agent-login.py -D: the broker kept a block")
+        removed[SITE_STATE_FILE] = False
+    else:
+        update(SITE_STATE_FILE, drop(SITE_STATE_FILE), strict=True)
+    update(CHECKS_FILE, drop(CHECKS_FILE))
+    update(LEGACY_FILE, drop(LEGACY_FILE))
+    removed["files"] = delete_cache_files(site)
+    audit_event("remove", site, "agent-login.py -D")
+    return removed

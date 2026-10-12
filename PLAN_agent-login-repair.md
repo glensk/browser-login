@@ -391,6 +391,14 @@ manual acceptance steps under the attempt policy below.
       item (sentinel present, fill origins, cookie scope, attempt group), a budgeted
       promotion test (`pending` → `usable`), and a removal path (`broker-add.py` remove or
       documented) that also prunes agent-login state
+  - [x] Plan `PLAN_ws3-onboarding.md`, Codex (gpt-5.6-sol) converged in round 2 (17
+        objections, all accepted; two parts of O6 rejected with evidence). Built 2026-10-12
+        in a worktree (not yet released): `broker/onboarding.py` + `storage_rules.py` +
+        vendored PSL, `-V -i`, the `-p` transaction + budget + `-E`, config digest,
+        `-D` two phases + the broker's `forget` op, logout storage clear, README section.
+  - [ ] Release: broker install (storage-key rule + `forget`), then `-V -r` (no `bad
+        agent_storage_keys` → else roll back), docker / docker-hub removal, one `-p` canary.
+  - [ ] mydotfiles: broker-add dry-run review section + `-D` (spec in the WS3 plan).
 - [ ] Final acceptance: a check-only inventory (logged-in probes only), then per-site canaries
       under the attempt policy. Re-enable the 09:15 job (`./agent-login.py -I`) only after
       locked / cooldown / pending / assisted / quarantined sites provably cannot trigger a

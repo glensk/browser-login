@@ -59,6 +59,7 @@ from broker import (  # noqa: E402
     daemon,
     limiter,
     login_form,
+    onboarding,
     origins,
     phases,
     recipes,
@@ -1385,6 +1386,10 @@ def _row(**kw: Any) -> dict:
         "status": "ready",
         "flow": "one-page",
         "stage": "usable",
+        # promoted for the listed configuration (WS3 digest)
+        "config": "c" * 64,
+        "promoted_config": "c" * 64,
+        "promoted_config_v": onboarding.CONFIG_V,
         **kw,
     }
 

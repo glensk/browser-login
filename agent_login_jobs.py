@@ -290,6 +290,9 @@ BROWSER_TIMEOUTS = {
     "eval": 60.0,
     "eval-fresh": 60.0,
     "reap-owned": 60.0,
+    # WS3 removal (`agent-login.py -D`): the broker's profile, the scoped
+    # cookies and the declared storage keys (one owned tab per origin)
+    "logout": 120.0 + RUNNER_MARGIN_S,
     # Stale-record recovery (`recover_stale_guided_login`): close the owned
     # tabs (15 s), reap (gate wait + raw CDP), revert headed, resume clients.
     "maintenance-watchdog": 120.0,
@@ -330,6 +333,9 @@ class BrowserRun:
     stdout: str
     elapsed_s: float
     result: dict | None = None
+    # False: the child could not even be started (the exec failed) — rc is
+    # None, nothing ran, so nothing can have been sent (WS3: a trial refund)
+    started: bool = True
 
 
 def run_browser(
@@ -375,6 +381,11 @@ def run_browser(
             res = subprocess.run(
                 argv, check=False, stdout=out, stderr=out, timeout=timeout_s
             )
+    except OSError:
+        # Raised by Popen's exec (no interpreter, no permission, no fork):
+        # the child never ran. (`run` raises OSError only there; a child that
+        # started ends in a return code or TimeoutExpired.)
+        return BrowserRun(None, False, "", time.monotonic() - t0, started=False)
     except subprocess.TimeoutExpired as exc:
         partial = exc.stdout or ""
         if isinstance(partial, bytes):
@@ -403,8 +414,13 @@ def read_result(path: Path) -> dict | None:
 def reap_owned_tabs() -> int | None:
     """`browser.py reap-owned`: close the tabs dead browser.py runs left
     (after a kill, and at the start of the daily check). Its exit code, None
-    when it had to be killed itself; never raises."""
-    run = run_browser("reap-owned", timeout_s=browser_timeout("reap-owned"), quiet=True)
+    when it had to be killed itself or could not run; never raises."""
+    try:
+        run = run_browser(
+            "reap-owned", timeout_s=browser_timeout("reap-owned"), quiet=True
+        )
+    except OSError:
+        return None
     return run.rc
 
 

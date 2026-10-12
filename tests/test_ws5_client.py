@@ -25,7 +25,7 @@ REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO))
 
 import agent_login_state as als  # noqa: E402
-from broker import identity  # noqa: E402
+from broker import identity, onboarding  # noqa: E402
 
 
 def _script(rel: str) -> Any:
@@ -273,8 +273,11 @@ def _overview(monkeypatch: pytest.MonkeyPatch, sites: list[dict]) -> dict:
 
 
 def _ok_checks(sites: list[str] | tuple[str, ...]) -> dict:
-    for site in sites:
-        als.record_check(site, "ok", "logged in", proof_v=1)
+    listed = {s["site"]: onboarding.config_digest(s) for s in _live_like()}
+    for site in sites:  # of the listed configuration (WS3 digest)
+        als.record_check(
+            site, "ok", "logged in", proof_v=1, config=listed.get(site, "")
+        )
     checks: dict = al.last_checks()
     return checks
 

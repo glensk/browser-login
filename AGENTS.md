@@ -263,6 +263,28 @@ framework. It is a **provider**: other repos depend on it, not the reverse. See
   and withhold a text the page side had to cut. Never screenshot such a login
   (`screenshot_withheld`), never expose such an item through the secret ops,
   never put the mode's name in the `sites` view (`username_only` flag).
+- **Onboarding guard (WS3, `PLAN_ws3-onboarding.md`)**: a new or changed broker
+  item is reviewed BEFORE the vault write (`agent-login.py -V -i MANIFEST`,
+  `broker/onboarding.py`: the broker's own `site_item_from_json` +
+  `identity_rules` over the whole collection, displacement of established items
+  included; levels refused / unusable / risk / hint, fixed codes, sanitised
+  ids). Never duplicate a broker refusal rule in the review — call the broker's
+  function (the storage-key rule lives in the leaf `broker/storage_rules.py`
+  for both). `-p SITE` is the ONE promotion transaction: one budgeted
+  `browser.py login` at most (`als.claim_trial` under the site-state flock,
+  refunded only on a proven pre-submit record, `-E` re-arms), never a retry;
+  a promotion holds for ONE `onboarding.config_digest` of the VAULT-authored
+  config (`config_canon`, versioned `CONFIG_V`: never hash a view-format
+  detail or a code-derived flag, or a broker release flips every promotion;
+  `changed` / `config_unknown` stop `login -s`; an older version re-adopts
+  only after a fresh strict ✅). `-t` of a not-usable broker site takes the
+  same budget. Removal is `-D SITE` twice (listed: demote + logout incl.
+  storage, skipped when a sibling account shares the scope in the same
+  instance unless `-F`; gone: the daemon's `forget` op under its site lock
+  after a fresh, non-shrunken vault read, then every client trace). `forget`
+  never lifts a limiter block or an identity lockout (`left`, for
+  `install.sh -r`). Client state is same-uid policy, not a security
+  boundary — the broker limiter is.
 - **`security` (keychain) calls go through `_security_run` only**: new session, no
   timeout, never `kill`/`terminate` — killing a client mid-dialog crashed
   `securityd` (tp#504). Writes are delete-then-add pinned to the default keychain,

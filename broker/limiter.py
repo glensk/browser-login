@@ -59,8 +59,9 @@ import os
 import stat
 import subprocess
 import threading
+import time
 import uuid
-from collections.abc import Callable, Iterator, Mapping
+from collections.abc import Callable, Iterable, Iterator, Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -137,6 +138,18 @@ def proc_start(pid: int) -> str | None:
         return None
     text = out.stdout.strip()
     return text or None
+
+
+def owner_alive(pid: object, pid_start: object) -> bool:
+    """A mark's owner still runs: `pid` is alive with the recorded start time
+    (an unknown start time on either side = alive: never recover a mark that
+    might be live). Shared with agent-login's trial claims."""
+    if not pid_alive(pid):
+        return False
+    if not pid_start or not isinstance(pid, int):
+        return True
+    now_start = proc_start(pid)
+    return now_start is None or now_start == pid_start
 
 
 def group_key(group: str) -> str:
@@ -352,14 +365,7 @@ class Limiter:  # pylint: disable=too-many-instance-attributes,too-many-public-m
         """The mark's owner still runs: its pid is alive with the recorded
         start time (unknown start time on either side = alive: never recover
         a mark that might be live)."""
-        pid = inflight.get("pid")
-        if not pid_alive(pid):
-            return False
-        want = inflight.get("pid_start")
-        if not want or not isinstance(pid, int):
-            return True
-        now_start = proc_start(pid)
-        return now_start is None or now_start == want
+        return owner_alive(inflight.get("pid"), inflight.get("pid_start"))
 
     def _abandoned(self, inflight: dict[str, Any]) -> bool:
         """An in-flight mark of a dead owner (see the module docstring), or
@@ -786,3 +792,75 @@ class Limiter:  # pylint: disable=too-many-instance-attributes,too-many-public-m
                 os.chown(self.state_path, *owner, follow_symlinks=False)
                 os.fchown(fd, *owner)
             return groups
+
+    @staticmethod
+    def protected(entry: object, now: float) -> str:
+        """The state that keeps a limiter entry out of any prune: ``locked``
+        (hard block), ``cooldown`` (still running) or ``quarantined`` (an
+        unresolved post-submit failure); '' = none. Only root lifts those
+        (``install.sh -r``): a removal must never be a way around them."""
+        if not isinstance(entry, dict):
+            return ""
+        if entry.get("blocked"):
+            return "locked"
+        try:
+            if now < float(entry.get("cooldown_until") or 0):
+                return "cooldown"
+            if int(entry.get("consecutive", 0) or 0) > 0:
+                return "quarantined"
+        except (TypeError, ValueError):
+            return "locked"  # unreadable counters: never pruned
+        return ""
+
+    def prune_site(
+        self, site: str, keep_groups: Iterable[str] = (), now: float | None = None
+    ) -> dict[str, Any]:
+        """WS3 removal (the daemon's ``forget`` op, for a site NO vault item
+        carries any more): drop `site`'s key and its group bindings, and each
+        bound ``group:<id>`` key that no other entry binds and that is not in
+        `keep_groups` (the groups the vault items declare, refused ones
+        included: a binding is only made at a reservation, so a declared
+        group may have none yet). A key that is locked, cooling down or
+        quarantined (`protected`) is NEVER dropped — the site key then stays
+        whole, bindings included, so its groups stay too; those keys are
+        returned in ``left`` for ``install.sh -r``. Returns ``{"site":
+        removed?, "groups": [dropped ids], "left": {key: state}}``.
+
+        Raises LimiterBusy while a LIVE owner holds an in-flight mark on the
+        site or one of its bound groups (nothing changed), LimiterStateError
+        on an unreadable state (nothing changed: unlike `reset`, a corrupt
+        file is never replaced here)."""
+        now = time.time() if now is None else now
+        keep = {g for g in keep_groups if g}
+        with self._locked():
+            data = self._load()
+            sites = data["sites"]
+            bound = self._bound_groups(data, site)
+            for key in [site, *(group_key(g) for g in bound)]:
+                entry = sites.get(key)
+                inflight = entry.get("inflight") if isinstance(entry, dict) else None
+                if isinstance(inflight, dict) and not self._abandoned(inflight):
+                    raise LimiterBusy(f"a login is in flight on {key}")
+            left: dict[str, str] = {}
+            state = self.protected(sites.get(site), now)
+            removed = False
+            if state:
+                left[site] = state
+            else:
+                removed = sites.pop(site, None) is not None
+            dropped = []
+            for group in bound:
+                gkey = group_key(group)
+                gstate = self.protected(sites.get(gkey), now)
+                if gstate:
+                    left[gkey] = gstate
+                    continue
+                if group in keep:
+                    continue
+                if any(group in self._bound_groups(data, other) for other in sites):
+                    continue
+                if sites.pop(gkey, None) is not None:
+                    dropped.append(group)
+            if removed or dropped:
+                self._save(data)
+            return {"site": removed, "groups": dropped, "left": left}
