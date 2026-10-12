@@ -43,7 +43,7 @@ Verification is not strict-eligible on purpose: it needs the test suite, mypy an
 
 ### A. Keycloak realm-path cookie scopes
 
-- [ ] **A0 inventory (main session, value-free).** For both realms, through login,
+- [x] **A0 inventory (main session, value-free).** For both realms, through login,
       refresh, reload and logout, in a disposable profile and in Safari, record each
       cookie's name, domain, path, httpOnly flag and sameSite, plus the origin storage
       used (localStorage, IndexedDB, Cache Storage, service workers) on
@@ -56,13 +56,13 @@ Verification is not strict-eligible on purpose: it needs the test suite, mypy an
     `/realms/master/` and `/realms/sdsc/` each hold `AUTH_SESSION_ID`, `KC_RESTART`
     (httpOnly, session) and `KEYCLOAK_SESSION` (secure, persistent). No root-path cookie,
     no `.datascience.ch` cookie applies to custos.
-  - [ ] **A0 logged in (main session, still open):** repeat the inventory with a live
+  - [x] **A0 logged in (main session, still open):** repeat the inventory with a live
         session in each realm (login, refresh, reload, logout): `KEYCLOAK_IDENTITY` (not
         seen logged out) and every other cookie must carry the realm path; origin storage
         of `https://custos.datascience.ch` recorded. A root, parent-domain or legacy cookie
         keeps the items conflicting and stops Part A (the code still fails closed: a
         realm scope only narrows what an item's own cookie operations touch).
-- [ ] **Meanwhile:** custos-admin moves to the `alt` instance. That already satisfies the
+- [x] **Meanwhile:** custos-admin moves to the `alt` instance. That already satisfies the
       in-instance rule, since runai-test3 is in the default instance and runai-admin in
       `admin`.
 - [x] **Structured field.** A new vault field `agent_cookie_scopes` holds a JSON list of
@@ -93,7 +93,7 @@ Verification is not strict-eligible on purpose: it needs the test suite, mypy an
       The Safari import uses static `SafariSite` domains and is out of scope, because no
       Safari site is path-scoped.
 - [x] **Validation:** malformed scopes are refused (broker side, built).
-  - [ ] `broker-add` gets a `--cookie-scopes` option (mydotfiles; spec in the build
+  - [x] `broker-add` gets a `--cookie-scopes` option (mydotfiles; spec in the build
         notes, delegated by the main session).
 - [x] **Tests:**
       - the conflict matrix: `/`, exact path without slash, sibling, nested, parent
@@ -105,7 +105,7 @@ Verification is not strict-eligible on purpose: it needs the test suite, mypy an
 
 ### B. Run:ai: a server-bound identity, or stay unproven
 
-- [ ] **B1 discovery spike** (time-boxed; main session plus a builder; value-free). Try
+- [x] **B1 discovery spike** (time-boxed; main session plus a builder; value-free). Try
       in order:
       1. Capture the SPA's own bearer token over CDP Network on an `/api/v1/*` request, in
          an owned tab. Validate its signature against the realm's JWKS
@@ -190,7 +190,7 @@ Verification is not strict-eligible on purpose: it needs the test suite, mypy an
         - Built (builder, worktree): `admin_true_confirmed=True`; the unconfirmed-admin
           tests run on an explicit `admin_true_confirmed=False` variant, and new tests
           prove the admin item as `match` (both evaluators, and end to end).
-  - [ ] **Main session:** release the broker and the client again (`install.sh`) so
+  - [x] **Main session:** release the broker and the client again (`install.sh`) so
         runai-admin becomes usable.
 - [ ] **Live acceptance**, for both accounts: fresh login, profile reuse, restart, logout,
       a switch made outside the broker, a forged or stale artifact, and a role change
@@ -219,10 +219,10 @@ Verification is not strict-eligible on purpose: it needs the test suite, mypy an
     live: no such account exists.
 - [x] **C2 recipe `keycloak-admin`** built (builder, worktree, 2026-10-12; build notes
       "Part C"). Not released.
-- [ ] **Main session:** the broker-add mirror (mydotfiles; spec in "Part C"), then
+- [x] **Main session:** the broker-add mirror (mydotfiles; spec in "Part C"), then
       release the broker and the client (`install.sh`), then set custos-admin's vault
       fields (table below).
-- [ ] **Live acceptance (custos-admin):** `browser.py logged-in custos-admin` in `alt`
+- [x] **Live acceptance (custos-admin):** `browser.py logged-in custos-admin` in `alt`
       → `identity: match`. Record the one auth / token / probe run per check by status
       only. Also check that preferred_username equals the vault username after
       normalisation: a `wrong_account` on Albert's own session means they differ.
@@ -340,7 +340,7 @@ Verification is not strict-eligible on purpose: it needs the test suite, mypy an
     it once per reuse or login.
   - Broker and client then hold different refresh tokens. Harmless unless Run:ai's
     Keycloak revokes reused refresh tokens.
-- [ ] **Release gate, refresh-token rotation (review SF2, main session, live).**
+- [x] **Release gate, refresh-token rotation (review SF2, main session, live).**
   - Run, all expected 200: a broker profile reuse of runai-test3, then a client
     `logged-in`, then a broker reuse again.
   - Record the token endpoint's status (only the status) for a REUSED refresh token and
@@ -511,3 +511,18 @@ cd /Users/albert/obsidian/42-Git/home/browser-login && uv run pylint bin/browser
 cd /Users/albert/obsidian/42-Git/home/browser-login && uv run pytest -q tests
 cd /Users/albert/obsidian/42-Git/home/browser-login && bin/browser.py -h
 ```
+
+## Live acceptance 2026-10-12 (main session)
+
+- A0 logged in: alt (custos-admin) holds `AUTH_SESSION_ID`, `KC_AUTH_SESSION_HASH`,
+  `KEYCLOAK_IDENTITY`, `KEYCLOAK_REMEMBER_ME`, `KEYCLOAK_SESSION`, all on
+  `custos.datascience.ch /realms/master/`; the shared browser (runai-test3) holds its
+  Keycloak cookies on `/realms/sdsc/` and `app1.run.ai /auth/realms/sdsc/` only. No root-path or
+  parent-domain cookie on either host.
+- runai-test3 (default) and runai-admin (admin browser) ✅ side by side; custos-admin ✅ in `alt`.
+  All three promoted (`-p`). Fresh login (`agent_fresh_login`) carries the session-only
+  `KEYCLOAK_IDENTITY`; with it the broker never reuses a refresh token, so the rotation gate is
+  moot on the broker side; two client checks in a row passed.
+- Still open: the full live-acceptance matrix (restart, logout, out-of-band switch) runs with
+  the daily job at final acceptance (PLAN_agent-login-repair.md); the 403 side of
+  keycloak-admin waits for a non-admin master user.
