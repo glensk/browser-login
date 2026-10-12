@@ -317,8 +317,9 @@ manual acceptance steps under the attempt policy below.
             live (200 JSON as admin, 403 text/plain error object as user; d669be8). Promoted (-p).
             gitlab-sdsc-test fully removed (Testuser2 blocked; Albert: drop). Overview: 36 ✅.
       - [ ] Home-LAN only (Cloudflare Access off-LAN): abs, navidrome, dsm, authentik live proofs.
-      - [ ] custos-admin (alt browser, fresh login set) still needs its own identity check (Keycloak
-            admin console token is in page memory; no recipe yet).
+      - [x] custos-admin ✅ 2026-10-12 in the alt browser: identity recipe `keycloak-admin` (silent
+            OIDC PKCE in the isolated world, id_token pins, master-only probe `/admin/realms/master/users/count`;
+            d808a8f), reviewed (S1 login_required-only, S2 probe, S3 proxy). Overview: 37 ✅.
       Original line: account identity (tp#833, hit 2026-10-10): 8 same-scope groups report ✅ for
       the wrong account; gitlab-sdsc-test passed while the browser was `albertadmin`.
       Plan → codex-debate → implement:
