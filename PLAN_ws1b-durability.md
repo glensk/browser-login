@@ -592,7 +592,7 @@ On SIGTERM safari.py clears the clipboard (feature `sigterm_clear`).
 
 ## Live acceptance (main session; not in the Verification block)
 
-- [ ] L0 Notion spike (owned tab, read-only): the status + key shapes of `loadUserContent`.
+- [x] L0 (2026-10-12) Notion: `logged-in notion` → proof `server`, server `valid`, identity `match` (expected e-mail set). `notion_probe_verified` left false on purpose (the logged-out redirect is untested; unverified = a redirect is "cannot tell", never ❌). Slack ids from `auth.test` with Albert's own token (slack-api). OpenAI workspace id: no independent source yet → OpenAI import stays unconfigured (fails closed). Override file written (0600). Original: Notion spike (owned tab, read-only): the status + key shapes of `loadUserContent`.
       The expected e-mail is confirmed from an independent source (workspace members in
       Albert's Safari, or the invitation mail), then written to the override file. The
       OpenAI workspace id (`expected_workspace_id`) is confirmed in the Business admin
@@ -604,16 +604,16 @@ On SIGTERM safari.py clears the clipboard (feature `sigterm_clear`).
       cookies are gone. Then `down`.
 - [ ] L2 Per recipe, in Albert's Safari (after M0/M1/M2/M4): confirm the hosts and labels
       (`safari.py -r`), fix the table, one `-L SITE` where a session is due.
-- [ ] L3 `-L notion -n`, then `-L notion` (import path).
+- [ ] L3 (dry run ✅ 2026-10-12: features complete, gate closes when the Mac is idle, Safari session present → import first) `-L notion -n`, then `-L notion` (import path).
 - [ ] L4 Final acceptance: `./agent-login.py -I`, then one observed refresh pass.
-- [ ] L5 Portainer NPM change + the header proof (fails before, passes after).
-- [ ] L6 mydotfiles M0–M4, M6 (builders in mydotfiles, their own plan).
+- [x] L5 (tp#935, done 2026-10-12) Portainer NPM change + the header proof (fails before, passes after).
+- [x] L6 (M0–M4 released 2026-10-12; M6 not needed: himalaya `epfl` reads the Notion mails) mydotfiles M0–M4, M6 (builders in mydotfiles, their own plan).
 - [ ] L7 edu-ID:
       1. `browser.py logged-in eduid -x '<CSS>'` (two-sided);
       2. `agent-login.py -V -i <manifest>`;
       3. `broker-add.py -L` (Touch ID);
       4. `-p eduid`, then `-p switch`.
-- [ ] L8 Mailbox: which himalaya account reads the Notion/Slack code mails. None → M6, then a
+- [x] L8 (2026-10-12: Notion codes go to albert.glensk@epfl.ch → himalaya `epfl`) Mailbox: which himalaya account reads the Notion/Slack code mails. None → M6, then a
       self-sent test mail is listed and read. Blocking.
 
 ## Deferred
