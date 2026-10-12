@@ -387,13 +387,15 @@ manual acceptance steps under the attempt policy below.
   - Real renewals on nixos and the raspi; nixos nginx reloaded. The raspi add-on was
     restarted with Albert's go, and serves the cert until 2027-01-08; all 7 hosts answer.
   - Records committed in macbook2014-nixos, credplane and tp.
-- [ ] WS3 — onboarding guard (plan → codex-debate → implement; subagent running 2026-10-12): static validation of a new
+- [ ] WS3 — onboarding guard (tp#934; plan → codex-debate → implement): static validation of a new
       item (sentinel present, fill origins, cookie scope, attempt group), a budgeted
       promotion test (`pending` → `usable`), and a removal path (`broker-add.py` remove or
       documented) that also prunes agent-login state
   - [x] Plan `PLAN_ws3-onboarding.md`, Codex (gpt-5.6-sol) converged in round 2 (17
         objections, all accepted; two parts of O6 rejected with evidence). Built 2026-10-12
-        in a worktree (not yet released): `broker/onboarding.py` + `storage_rules.py` +
+        in a worktree; 3 security review rounds (blocker: digest drift across broker
+        releases → vault-authored `config_canon` + `config_v`); committed locally c6730b4,
+        not yet released: `broker/onboarding.py` + `storage_rules.py` +
         vendored PSL, `-V -i`, the `-p` transaction + budget + `-E`, config digest,
         `-D` two phases + the broker's `forget` op, logout storage clear, README section.
   - [ ] Release: broker install (storage-key rule + `forget`), then `-V -r` (no `bad
