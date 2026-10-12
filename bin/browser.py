@@ -955,7 +955,15 @@ def parse_args() -> argparse.Namespace:
         "bot-check cookies never travel; values are never printed).",
     )
     pis.add_argument(
-        "site", help=f"Site to import ({', '.join(_safari.SAFARI_SITES)})."
+        "site",
+        help=f"Site to import ({', '.join([*_safari.SAFARI_SITES, *_safari.SAFARI_BUILTIN])}).",
+    )
+    pis.add_argument(
+        "-a",
+        "--agent-login",
+        action="store_true",
+        help="an agent just logged Safari in (agent-login.py -L): record the "
+        "login event as safari-agent (default: safari-import, a copy)",
     )
     pis.add_argument(
         "-n",
@@ -8517,25 +8525,63 @@ def cmd_anthropic_logged_in(port: int) -> int:
 
 
 def _chatgpt_logged_in(page) -> bool:
-    """ACTIVE check: navigate to the ChatGPT Business admin members page and
-    confirm we land there logged in. The 'Invite member' button is the most
-    stable signal that we're on the right page AND have admin rights (same
-    sentinel openai-team.py uses). A bounce to the auth screen or away from
-    /admin/members means not logged in (or no admin rights)."""
+    """ACTIVE check: chatgpt.com's own session endpoint names a user
+    (`_chatgpt_state`)."""
+    return _chatgpt_state(page) == "valid"
+
+
+# chatgpt.com's session endpoint, asked from the page (10 s): a user in the
+# answer = valid, ``{}`` (no user) = invalid, anything else (an error page, a
+# challenge, a timeout, another shape) = indeterminate. Only the enum leaves.
+CHATGPT_SESSION_JS = r"""async () => {
+  const ctl = new AbortController();
+  const timer = setTimeout(() => ctl.abort(), 10000);
+  try {
+    const r = await fetch("/api/auth/session", { credentials: "include",
+      redirect: "manual", signal: ctl.signal });
+    if (r.status !== 200) return "indeterminate";
+    const j = await r.json();
+    if (!j || typeof j !== "object" || Array.isArray(j)) return "indeterminate";
+    if (Object.keys(j).length === 0) return "invalid";
+    return j.user && typeof j.user === "object" ? "valid" : "indeterminate";
+  } catch (err) { return "indeterminate"; } finally { clearTimeout(timer); }
+}"""
+CHATGPT_HOME_URL = "https://chatgpt.com/"
+# A Cloudflare interstitial (headless or a flagged IP): it says nothing about
+# the session — "cannot tell", never "logged out".
+CHALLENGE_JS = (
+    "() => !!document.querySelector('#challenge-form,#cf-challenge-running,"
+    'iframe[src*="challenges.cloudflare.com"]\') || '
+    "/^just a moment/i.test(document.title)"
+)
+
+
+def _page_challenged(page) -> bool:
+    """True when `page` shows a Cloudflare challenge (False if unreadable)."""
+    try:
+        return page.evaluate(CHALLENGE_JS) is True
+    except Exception:  # pylint: disable=broad-exception-caught
+        return False
+
+
+def _chatgpt_state(page) -> str:
+    """WS1b B1/SF3: valid / invalid / indeterminate from chatgpt.com's own
+    session endpoint (``CHATGPT_SESSION_JS``) — the landing URL is not the
+    signal. A navigation error or a Cloudflare challenge cannot tell."""
     from playwright.sync_api import Error as PlaywrightError
 
     try:
-        page.goto(CHATGPT_ADMIN_URL, wait_until="domcontentloaded")
-        page.wait_for_timeout(2500)
+        page.goto(CHATGPT_HOME_URL, wait_until="domcontentloaded")
+        page.wait_for_timeout(1500)
     except PlaywrightError:
-        return False
-    if "/admin/members" not in page.url:
-        return False
+        return "indeterminate"
+    if _page_challenged(page):
+        return "indeterminate"
     try:
-        page.wait_for_selector('button:has-text("Invite member")', timeout=15000)
-        return True
+        got = page.evaluate(CHATGPT_SESSION_JS)
     except PlaywrightError:
-        return False
+        return "indeterminate"
+    return got if got in ("valid", "invalid") else "indeterminate"
 
 
 def _chatgpt_wait_for_login(page, timeout_s: int = 300) -> bool:
@@ -8626,11 +8672,34 @@ def _openai_login_owned(port: int, page) -> int:
 
 
 def cmd_openai_logged_in(port: int) -> int:
-    """Exit 0 if chatgpt.com admin is logged in ('Invite member' reachable), else 2."""
-    if _logged_in_page_check(port, _chatgpt_logged_in):
-        print("✓ Logged into ChatGPT (chatgpt.com).")
+    """Exit 0 if chatgpt.com admin is logged in ('Invite member' reachable),
+    else 2 — the result record says ``logged_out`` (the sign-in surface) or
+    ``indeterminate`` (anything that cannot tell)."""
+    return _tristate_report(
+        "ChatGPT (chatgpt.com)", _logged_in_page_state(port, _chatgpt_state)
+    )
+
+
+def _logged_in_page_state(port: int, check: Callable[[Any], str]) -> str:
+    """`_logged_in_page_check` for a tri-state check (a tab that cannot be
+    opened is ``indeterminate``)."""
+    got = _background_page_run(port, "about:blank", _broker_probe_viewport, check)
+    if got is True:  # a boolean check (True = logged in) said yes
+        return "valid"
+    return got if got in ("valid", "invalid", "indeterminate") else "indeterminate"
+
+
+def _tristate_report(what: str, state: str) -> int:
+    """Exit code + result record of a tri-state built-in check (WS1b B1)."""
+    if state == "valid":
+        print(f"✓ Logged into {what}.")
         return 0
-    print("Not logged into ChatGPT (chatgpt.com).", file=sys.stderr)
+    if state == "invalid":
+        _result_fail("client-proof", "logged_out")
+        print(f"Not logged into {what}.", file=sys.stderr)
+        return 2
+    _result_fail("client-proof", "indeterminate")
+    print(f"{what}: could not tell whether it is logged in.", file=sys.stderr)
     return 2
 
 
@@ -8682,22 +8751,52 @@ def _slack_session_from_page(ctx, page) -> dict | None:
 def _slack_logged_in(page) -> bool:
     """ACTIVE check: navigate to the Slack web client and confirm a real session
     (a team with an xoxc token in localStorage), not the workspace-signin page."""
+    return _slack_state(page) == "valid"
+
+
+def _slack_poll_once(page) -> str | None:
+    """One look at the Slack client: a verdict, or None (not booted yet)."""
+    from playwright.sync_api import Error as PlaywrightError
+
+    try:
+        url = page.url
+    except PlaywrightError:
+        return "indeterminate"
+    if any(m in url for m in SLACK_SIGNIN_MARKERS):
+        return "invalid"
+    if _page_challenged(page):
+        return "indeterminate"
+    creds = _slack_session_from_page(page.context, page)
+    if creds is None:
+        return None
+    creds.clear()  # never keep the token around
+    return "valid"
+
+
+def _slack_state(page) -> str:
+    """WS1b B1/SF3: valid / invalid / indeterminate for the Slack web client.
+    invalid ONLY when a sign-in page is reached; a navigation error, a
+    challenge or a client that did not write its ``localConfig_v2`` within
+    ``SLACK_BOOT_WAIT_S`` (it boots slowly after a cookie import) cannot
+    tell."""
     from playwright.sync_api import Error as PlaywrightError
 
     try:
         page.goto(SLACK_APP_URL, wait_until="domcontentloaded")
-        page.wait_for_timeout(3000)
+        deadline = time.monotonic() + SLACK_BOOT_WAIT_S
+        while (state := _slack_poll_once(page)) is None:
+            if time.monotonic() >= deadline:
+                return "indeterminate"
+            page.wait_for_timeout(SLACK_BOOT_POLL_S * 1000)
     except PlaywrightError:
-        return False
-    url = ""
-    try:
-        url = page.url
-    except PlaywrightError:
-        return False
-    if any(m in url for m in SLACK_SIGNIN_MARKERS):
-        return False
-    ctx = page.context
-    return _slack_session_from_page(ctx, page) is not None
+        return "indeterminate"
+    return state
+
+
+# The Slack client writes its token store some seconds after the page loads
+# (longer right after a cookie import): poll it, up to this long.
+SLACK_BOOT_WAIT_S = 20.0
+SLACK_BOOT_POLL_S = 1.0
 
 
 def _slack_prefill_email(page) -> None:
@@ -8822,12 +8921,11 @@ def _slack_login_owned(port: int, page) -> int:
 
 
 def cmd_slack_logged_in(port: int) -> int:
-    """Exit 0 if app.slack.com is logged in, 2 if not."""
-    if _logged_in_page_check(port, _slack_logged_in):
-        print("✓ Logged into Slack (app.slack.com).")
-        return 0
-    print("Not logged into Slack (app.slack.com).", file=sys.stderr)
-    return 2
+    """Exit 0 if app.slack.com is logged in, else 2 — the result record says
+    ``logged_out`` (a sign-in page) or ``indeterminate``."""
+    return _tristate_report(
+        "Slack (app.slack.com)", _logged_in_page_state(port, _slack_state)
+    )
 
 
 def _slack_session_in_page(page) -> tuple[str, dict | None]:
@@ -9477,7 +9575,11 @@ def _record_login_event(site_name: str, mode: str) -> None:
 # Modes where a HUMAN had to act (vs. fully unattended re-auth). The aggregate
 # view highlights the assisted count — that's "how often we had to sign in".
 # `sso` (an edu-ID click that completed without a password) is AUTOMATED.
-ASSISTED_MODES = {"assisted", "1password"}
+ASSISTED_MODES = {"assisted", "1password", "guided"}
+# A COPY of a session that already existed elsewhere (Safari's cookies into
+# the shared browser): logged, but not a login (WS1b). `safari-agent` (an
+# agent logged Safari in, then imported) IS one.
+COPY_MODES = {"safari-import"}
 
 
 def _load_login_events(site_name: str) -> list[dict]:
@@ -9511,10 +9613,13 @@ def _load_login_events(site_name: str) -> list[dict]:
 def _print_login_stats(label: str, events: list[dict]) -> None:
     """Shared header: total (+assisted), first/last, average interval."""
     events.sort(key=lambda e: e.get("ts", 0))
-    n = len(events)
+    copies = sum(1 for e in events if e.get("mode") in COPY_MODES)
+    n = len(events) - copies
     assisted = sum(1 for e in events if e.get("mode") in ASSISTED_MODES)
+    extra = f"; {copies} session cop(ies) from Safari" if copies else ""
     print(
-        f"Login frequency — {label}: {n} real login(s)  [{assisted} you had to sign in]."
+        f"Login frequency — {label}: {n} real login(s)  "
+        f"[{assisted} you had to sign in{extra}]."
     )
     print(f"  first: {events[0].get('iso', '?')}")
     print(f"  last:  {events[-1].get('iso', '?')}")
@@ -13349,6 +13454,7 @@ def cmd_import_safari(
     *,
     dry_run: bool = False,
     result_file: str | None = None,
+    agent: bool = False,
 ) -> int:
     """Copy SITE's Safari session into the shared browser, then the positive check.
 
@@ -13356,19 +13462,26 @@ def cmd_import_safari(
     nothing in Safari, 3 broker unreachable (consent cannot be confirmed).
     The explicit import: it also runs for a site whose import is never
     unattended (``import_unattended``; `agent-login.py -t` calls it).
-    `result_file` (`-R`): the phase record.
+    `result_file` (`-R`): the phase record. `agent` (`-a`): an agent just
+    logged Safari in (`agent-login.py -L`) — the login event is
+    ``safari-agent``, else ``safari-import`` (a copy, not a login).
+    A built-in site (``SAFARI_BUILTIN``: notion, slack, openai) takes
+    `_import_builtin`: one transaction with an account proof (WS1b).
     """
     site = site_name.strip().lower()
     _result_begin("import-safari", site, result_file)
     rc = 1
     try:
-        rc = _import_safari(port, site, dry_run=dry_run)
+        if site in _safari.SAFARI_BUILTIN:
+            rc = _import_builtin(port, site, dry_run=dry_run, agent=agent)
+        else:
+            rc = _import_safari(port, site, dry_run=dry_run, agent=agent)
         return rc
     finally:
         _result_write(rc)
 
 
-def _import_safari(port: int, site: str, *, dry_run: bool) -> int:
+def _import_safari(port: int, site: str, *, dry_run: bool, agent: bool = False) -> int:
     """`cmd_import_safari`'s body."""
     entry, rc = _safari_gated_entry(site, port)
     if entry is None:
@@ -13395,7 +13508,7 @@ def _import_safari(port: int, site: str, *, dry_run: bool) -> int:
     _safari_inject(port, site, cookies)
     rc = _broker_check_entry(port, site, entry)
     if rc == 0:
-        _record_login_event(site, "safari")
+        _record_login_event(site, "safari-agent" if agent else "safari-import")
         print(f"✅ {site}: logged in with your Safari session.")
         return 0
     if _RESULT.get("code") not in _IDENTITY_MESSAGES:  # keep an identity verdict
@@ -13409,7 +13522,7 @@ def _import_safari(port: int, site: str, *, dry_run: bool) -> int:
 
 def _safari_session_names(site: str) -> str:
     """The session cookies an import needs, for messages (names only)."""
-    return ", ".join(_safari.SAFARI_SITES[site].session_cookies) or "any cookie"
+    return ", ".join(_safari.rule(site).session_cookies) or "any cookie"
 
 
 def _safari_logged_in(port: int, site: str) -> int:
@@ -13436,9 +13549,387 @@ def _safari_try_import(port: int, site: str, entry: dict) -> bool:
     _safari_inject(port, site, cookies)
     if _broker_check_entry(port, site, entry) != 0:
         return False
-    _record_login_event(site, "safari")
+    _record_login_event(site, "safari-import")  # a copy, not a login (WS1b)
     print(f"✅ {site}: logged in — route: Safari session")
     return True
+
+
+# ---------------------------------------------------------------------------
+# WS1b: Safari import of a BUILT-IN site (notion, slack, openai) — one
+# transaction under ONE interaction lease:
+#   1. the site's own check in the shared browser must say a DEFINITE
+#      "logged out" (S7; Notion: or another account) — a working or
+#      undecidable session is never replaced;
+#   2. Safari's cookies are proven in a THROWAWAY browser context (S6:
+#      Playwright's new_context = Target.createBrowserContext, disposed on
+#      close and on detach): the session AND its account, server-side
+#      (Slack auth.test team + user, OpenAI's account ids, Notion's user
+#      record), only an enum leaves the page;
+#   3. only on `match` the cookies go into the shared jar (Slack's token store
+#      cleared first), then the shared browser's own check; if that fails the
+#      import is undone — a failed undo is recorded (`undo: failed`).
+# A foreign account's session never sits in the shared jar.
+# ---------------------------------------------------------------------------
+
+# Client storage a replace clears first (origin → keys): Slack keeps the xoxc
+# tokens of every team it saw in localStorage — an old team's must not stay.
+SAFARI_BUILTIN_STORAGE = {"slack": {"https://app.slack.com": ("localConfig_v2",)}}
+# The page each storage origin is cleared on (same origin, no app boot needed).
+SAFARI_BUILTIN_STORAGE_PAGE = "/robots.txt"
+# The override-file keys each built-in import's account proof needs.
+BUILTIN_EXPECTED_KEYS = {
+    "notion": ("expected_email",),
+    "slack": ("expected_team_id", "expected_user_id"),
+    "openai": ("expected_workspace_id",),
+}
+OVERRIDES_HINT = "~/.config/agent-login/safari-logins.json"
+
+
+def _safari_overrides(site: str) -> tuple[dict[str, Any], str]:
+    """(`site`'s entry of agent-login's private override file, '') or ({},
+    why) when the file cannot be used."""
+    try:
+        from agent_login_safari import (  # pylint: disable=import-outside-toplevel
+            OverrideError,
+            load_overrides,
+        )
+    except ImportError:
+        return {}, "agent_login_safari.py not importable"
+    try:
+        return load_overrides().get(site, {}), ""
+    except OverrideError as exc:
+        return {}, str(exc)
+
+
+def _builtin_expected(site: str) -> tuple[dict[str, str], str]:
+    """({key: expected value}, '') for a built-in import, or ({}, why) when a
+    value is missing — from the override file only (never this repo)."""
+    keys = BUILTIN_EXPECTED_KEYS.get(site)
+    if keys is None:
+        return {}, f"no account proof for {site}"
+    entry, why = _safari_overrides(site)
+    if why:
+        return {}, why
+    values = {k: str(entry.get(k) or "") for k in keys}
+    missing = [k for k, v in values.items() if not v]
+    if missing:
+        return {}, f"no {', '.join(missing)} for {site} in {OVERRIDES_HINT}"
+    for key in BUILTIN_OPTIONAL_KEYS.get(site, ()):
+        if entry.get(key):
+            values[key] = str(entry[key])
+    return values, ""
+
+
+# Optional extra proof per built-in import (compared when configured).
+BUILTIN_OPTIONAL_KEYS = {"openai": ("expected_email",)}
+
+
+# Slack's own API from the web client's origin: auth.test answers the team and
+# user of the token (+ the `d` cookie) — compared in the page, enum out.
+SLACK_IDENTITY_JS = r"""async (want) => {
+  const ctl = new AbortController();
+  const timer = setTimeout(() => ctl.abort(), 10000);
+  try {
+    const c = JSON.parse(localStorage.getItem("localConfig_v2") || "{}");
+    const t = (c.teams || {})[c.lastActiveTeamId] || null;
+    if (!t || !t.token) return "indeterminate";
+    const body = new URLSearchParams({ token: t.token });
+    const r = await fetch("/api/auth.test", { method: "POST", body,
+      credentials: "include", redirect: "manual", signal: ctl.signal });
+    if (r.status !== 200) return "indeterminate";
+    const j = await r.json();
+    if (!j || j.ok !== true) return j && j.error === "invalid_auth" ? "logged_out" : "indeterminate";
+    return j.team_id === want.team && j.user_id === want.user ? "match" : "mismatch";
+  } catch (err) { return "indeterminate"; } finally { clearTimeout(timer); }
+}"""
+
+# OpenAI: the session's access token (never leaves the page) asks the account
+# list; an expected workspace id among its ids = match.
+OPENAI_IDENTITY_JS = r"""async (want) => {
+  const ctl = new AbortController();
+  const timer = setTimeout(() => ctl.abort(), 10000);
+  try {
+    const s = await fetch("/api/auth/session", { credentials: "include",
+      redirect: "manual", signal: ctl.signal });
+    if (s.status !== 200) return "indeterminate";
+    const sj = await s.json();
+    if (!sj || !sj.accessToken) return "logged_out";
+    if (want.email) {
+      const mail = sj.user && typeof sj.user.email === "string" ? sj.user.email : "";
+      if (!mail) return "indeterminate";
+      if (mail.toLowerCase() !== String(want.email).toLowerCase()) return "mismatch";
+    }
+    const r = await fetch("/backend-api/accounts/check/v4-2023-04-27", {
+      headers: { Authorization: "Bearer " + sj.accessToken },
+      credentials: "include", redirect: "manual", signal: ctl.signal });
+    if (r.status !== 200) return "indeterminate";
+    const j = await r.json();
+    const accounts = (j && j.accounts) || {};
+    if (typeof accounts !== "object") return "indeterminate";
+    const ids = new Set(Object.keys(accounts));
+    for (const v of Object.values(accounts)) {
+      const a = v && v.account;
+      if (a && typeof a.account_id === "string") ids.add(a.account_id);
+    }
+    return ids.has(want.workspace) ? "match" : "mismatch";
+  } catch (err) { return "indeterminate"; } finally { clearTimeout(timer); }
+}"""
+
+
+def _eval_enum(page: Any, js: str, arg: object) -> str:
+    """`js(arg)` in `page`, kept only when it is one of the proof words."""
+    try:
+        got = page.evaluate(js, arg)
+    except Exception:  # pylint: disable=broad-exception-caught
+        return "indeterminate"
+    words = ("match", "mismatch", "logged_out", "indeterminate")
+    return got if got in words else "indeterminate"
+
+
+def _slack_identity(page: Any, expected: dict[str, str]) -> str:
+    """match / mismatch / logged_out / indeterminate: Slack's server
+    (auth.test) against the expected team AND user id."""
+    state = _slack_state(page)
+    if state != "valid":
+        return "logged_out" if state == "invalid" else "indeterminate"
+    want = {"team": expected["expected_team_id"], "user": expected["expected_user_id"]}
+    return _eval_enum(page, SLACK_IDENTITY_JS, want)
+
+
+def _openai_identity(page: Any, expected: dict[str, str]) -> str:
+    """match / mismatch / logged_out / indeterminate: the account ids the
+    session's own API lists against the expected workspace id."""
+    from playwright.sync_api import Error as PlaywrightError
+
+    try:
+        page.goto("https://chatgpt.com/", wait_until="domcontentloaded")
+        page.wait_for_timeout(2000)
+    except PlaywrightError:
+        return "indeterminate"
+    if _page_challenged(page):
+        return "indeterminate"
+    want = {
+        "workspace": expected["expected_workspace_id"],
+        "email": expected.get("expected_email", ""),
+    }
+    return _eval_enum(page, OPENAI_IDENTITY_JS, want)
+
+
+def _notion_identity(page: Any, expected: dict[str, str]) -> str:
+    """match / mismatch / logged_out / indeterminate: Notion's server alone
+    (``NOTION_SERVER_JS``: the user record of the session) — no sidebar wait,
+    so the throwaway proof context lives only as long as one fetch (SF1)."""
+    from playwright.sync_api import Error as PlaywrightError
+
+    try:
+        page.goto(NOTION_APP_ORIGIN + "/", wait_until="domcontentloaded")
+        raw = page.evaluate(
+            NOTION_SERVER_JS,
+            {
+                "expected": expected["expected_email"],
+                "verified": True,
+                "mine": _notion_user_id(page),
+            },
+        )
+    except PlaywrightError:
+        return "indeterminate"
+    raw = raw if isinstance(raw, dict) else {}
+    if raw.get("server") == "invalid":
+        return "logged_out"
+    if raw.get("server") != "valid":
+        return "indeterminate"
+    ident = raw.get("identity")
+    return ident if ident in ("match", "mismatch") else "indeterminate"
+
+
+BUILTIN_PROVERS: dict[str, Callable[[Any, dict[str, str]], str]] = {
+    "notion": _notion_identity,
+    "slack": _slack_identity,
+    "openai": _openai_identity,
+}
+
+
+def _builtin_prove_isolated(
+    port: int, site: str, cookies: Sequence[_safari.Cookie], expected: dict[str, str]
+) -> str:
+    """The account proof of Safari's `cookies` in a THROWAWAY browser context
+    (closed in the `finally`; Playwright disposes it on detach too): the
+    shared jar is not touched."""
+    pw, browser = _connect(port)
+    try:
+        ctx = browser.new_context()
+        try:
+            ctx.add_cookies(
+                [
+                    c.to_playwright()
+                    for c in cookies
+                    if _safari.importable(c.domain, c.name, site)
+                ]
+            )
+            return BUILTIN_PROVERS[site](ctx.new_page(), expected)
+        finally:
+            with contextlib.suppress(Exception):
+                ctx.close()
+    finally:
+        browser.close()
+        pw.stop()
+
+
+def _builtin_state(port: int, site: str, expected: dict[str, str]) -> str:
+    """The shared browser's OWN check of a built-in site (S7): valid /
+    invalid / indeterminate / wrong_account (Notion, with the expected
+    e-mail)."""
+    if site == "notion":
+        res = _notion_check(port, expected.get("expected_email", ""))
+        if res["verdict"] == "valid" and res["identity"] == "mismatch":
+            return "wrong_account"
+        return str(res["verdict"])
+    check = _slack_state if site == "slack" else _chatgpt_state
+    return _logged_in_page_state(port, check)
+
+
+def _builtin_replace(port: int, site: str, cookies: Sequence[_safari.Cookie]) -> int:
+    """Replace `site`'s in-scope cookies with Safari's (no lease of its own:
+    the caller holds it)."""
+    pw, browser = _connect(port)
+    try:
+        return _safari_replace_cookies(browser, site, cookies)
+    finally:
+        browser.close()
+        pw.stop()
+
+
+def _builtin_clear_storage(port: int, site: str) -> bool:
+    """Remove `site`'s declared client storage keys (True when gone)."""
+    ok = True
+    for origin, keys in SAFARI_BUILTIN_STORAGE.get(site, {}).items():
+
+        def drop(page: Any, keys: tuple[str, ...] = keys) -> object:
+            return page.evaluate(
+                "(ks) => { ks.forEach((k) => localStorage.removeItem(k)); "
+                "return ks.every((k) => localStorage.getItem(k) === null); }",
+                list(keys),
+            )
+
+        done = _with_background_page(port, origin + SAFARI_BUILTIN_STORAGE_PAGE, drop)
+        ok = ok and done is True
+    return ok
+
+
+def _builtin_clear(port: int, site: str) -> bool:
+    """Undo an import: delete every in-scope cookie of `site` (Chromium's own
+    bot cookies stay unless the rule drops them) and its declared storage
+    keys. True when everything went."""
+    ok = True
+    try:
+        pw, browser = _connect(port)
+        try:
+            ctx = browser.contexts[0] if browser.contexts else browser.new_context()
+            for ck in ctx.cookies():
+                if _safari.replaced_on_import(
+                    str(ck.get("domain")), str(ck.get("name")), site
+                ):
+                    ctx.clear_cookies(
+                        name=ck["name"], domain=ck["domain"], path=ck["path"]
+                    )
+        finally:
+            browser.close()
+            pw.stop()
+    except Exception:  # pylint: disable=broad-exception-caught
+        ok = False
+    return _builtin_clear_storage(port, site) and ok
+
+
+# One return per gate of the transaction (cookies, expected account, own
+# check, isolated proof, commit).
+def _import_builtin(  # pylint: disable=too-many-return-statements
+    port: int, site: str, *, dry_run: bool, agent: bool
+) -> int:
+    """`import-safari` for a ``SAFARI_BUILTIN`` site (see the block comment)."""
+    cookies, rc = _safari_site_cookies(site)
+    if rc:
+        _result_fail("safari-source", "no_safari_session", "cookie file unreadable")
+        return rc
+    if dry_run:
+        return _safari_dry_run(site, cookies)
+    if not _safari.has_session(site, cookies):
+        _result_fail("safari-source", "no_safari_session")
+        return _broker_fail(
+            2,
+            f"{site}: Safari holds no usable session "
+            f"({_safari_session_names(site)}) — nothing replaced.",
+        )
+    expected, why = _builtin_expected(site)
+    if not expected:
+        _result_fail("precheck", "identity_unconfigured", why)
+        return _broker_fail(
+            2, f"{site}: no expected account — nothing imported ({why})"
+        )
+    _result_set(route="safari")
+    # Gate (registration) FIRST, lease second — the lock order of every client.
+    reg = _registry_register("browser.py", f"import-safari {site}", port)
+    try:
+        with _interaction_lease(f"import-safari {site}"):
+            return _import_builtin_leased(port, site, cookies, expected, agent=agent)
+    finally:
+        reg()
+
+
+def _import_builtin_leased(  # pylint: disable=too-many-return-statements
+    port: int,
+    site: str,
+    cookies: Sequence[_safari.Cookie],
+    expected: dict[str, str],
+    *,
+    agent: bool,
+) -> int:
+    """`_import_builtin` under the interaction lease."""
+    before = _builtin_state(port, site, expected)
+    if before == "valid":
+        _result_set(phase="ok", code="ok")
+        print(f"✓ {site}: the shared browser is logged in — nothing replaced.")
+        return 0
+    if before not in ("invalid", "wrong_account"):
+        _result_fail("client-proof", "indeterminate", "own check could not tell")
+        return _broker_fail(
+            2,
+            f"{site}: the shared browser's own check could not tell — nothing replaced.",
+        )
+    verdict = _builtin_prove_isolated(port, site, cookies, expected)
+    _result_set(identity=verdict if verdict in ("match", "mismatch") else "")
+    if verdict != "match":
+        code = {"mismatch": "wrong_account", "logged_out": "logged_out"}.get(
+            verdict, "indeterminate"
+        )
+        _result_fail("client-proof", code)
+        return _broker_fail(
+            2,
+            f"{site}: Safari's session proved {verdict} in a throwaway context — "
+            "nothing imported.",
+        )
+    storage_ok = _builtin_clear_storage(port, site)
+    n = _builtin_replace(port, site, cookies)
+    print(f"Copied {n} {site} cookie(s) from Safari (values not shown).")
+    after = _builtin_state(port, site, expected)
+    if after == "valid" and storage_ok:
+        _record_login_event(site, "safari-agent" if agent else "safari-import")
+        print(f"✅ {site}: logged in with your Safari session (account proven).")
+        return 0
+    undone = _builtin_clear(port, site)
+    _result_fail(
+        "client-proof",
+        "logged_out" if after == "invalid" else "indeterminate",
+        undo="done" if undone else "failed",
+    )
+    return _broker_fail(
+        2,
+        f"{site}: the imported session does not work in the shared browser — "
+        + (
+            "undone (logged out)."
+            if undone
+            else "the undo FAILED: cookies may be left."
+        ),
+    )
 
 
 def _safari_login(port: int, site: str) -> int:
@@ -13546,16 +14037,176 @@ def _notion_wait_for_login(
 
 
 def _notion_probe(port: int) -> bool:
-    """READ-ONLY: open app.notion.com in a BACKGROUND tab (never focused, no
-    tab of the user's touched), wait up to 30 s for the workspace sidebar,
-    close the tab. Anything that goes wrong is False (fail closed)."""
-    return bool(
-        _with_background_page(
-            port,
-            NOTION_APP_ORIGIN + "/",
-            lambda page: _notion_wait_for_login(page, timeout_s=30, poll_s=0.5),
-        )
+    """READ-ONLY: the tri-state check (`_notion_check`) says ``valid``."""
+    return bool(_notion_check(port)["verdict"] == "valid")
+
+
+# WS1b (PLAN_ws1b-durability.md D8): Notion's own server decides, the sidebar
+# only corroborates. One same-origin fetch of the user content (10 s
+# AbortController, no redirects followed); ONLY an enum leaves the page:
+# server valid / invalid / indeterminate, identity match / mismatch / unknown.
+# The account is the user record whose id is the session's `notion_user_id`
+# cookie (S10; read from the browser context, passed in), else the ONLY user
+# record; its e-mail is compared in the page.
+# Until the probe was verified live (L0: `notion_probe_verified` in the
+# override file) only a 401 is "invalid" (S11): a redirect or any other status
+# cannot tell.
+NOTION_SERVER_JS = r"""async (p) => {
+  const out = { server: "indeterminate", identity: "unknown" };
+  const ctl = new AbortController();
+  const timer = setTimeout(() => ctl.abort(), 10000);
+  try {
+    const r = await fetch("/api/v3/loadUserContent", {
+      method: "POST", headers: { "content-type": "application/json" },
+      body: "{}", credentials: "same-origin", redirect: "manual",
+      signal: ctl.signal });
+    if (r.status === 401 || (p.verified && r.type === "opaqueredirect")) {
+      out.server = "invalid"; return out;
+    }
+    if (r.status !== 200) return out;
+    const j = await r.json();
+    const users = j && j.recordMap && j.recordMap.notion_user;
+    if (!users || typeof users !== "object") return out;
+    const rec = (u) => (u && u.value && (u.value.value || u.value)) || null;
+    const all = Object.entries(users).map(([id, u]) => [id, rec(u)])
+      .filter(([, v]) => v && typeof v.email === "string");
+    if (!all.length) return out;
+    out.server = "valid";
+    const mine = String(p.mine || "");
+    let user = null;
+    if (mine) user = (all.find(([id, v]) => id === mine || v.id === mine) || [null, null])[1];
+    else if (all.length === 1) user = all[0][1];
+    if (p.expected && user) out.identity =
+      user.email.toLowerCase() === String(p.expected).toLowerCase() ? "match" : "mismatch";
+    return out;
+  } catch (err) { return out; } finally { clearTimeout(timer); }
+}"""
+NOTION_AUTH_COOKIES = ("token_v2", "notion_user_id")
+NOTION_SERVER_VERDICTS = ("valid", "invalid", "indeterminate")
+
+
+def notion_verdict(
+    server: str, sidebar: bool, on_login: bool, verified: bool = True
+) -> tuple[str, str]:
+    """(verdict, proof) from the server's answer and the page (pure, D8).
+    Before L0 (`verified` False) a visible sidebar keeps a server "invalid"
+    from turning a working session ❌ (proof ``dom-unverified``)."""
+    if server == "valid":
+        return "valid", "server"
+    if server == "invalid":
+        if sidebar:
+            return ("indeterminate", "") if verified else ("valid", "dom-unverified")
+        return "invalid", "server"
+    if sidebar:
+        return "valid", "dom"
+    if on_login:
+        return "invalid", "dom"
+    return "indeterminate", ""
+
+
+def _notion_cookie_days(page: Any) -> int | None:
+    """Days until the earliest of Notion's auth cookies expires (values are
+    never kept: only names and expiry are read off the list)."""
+    try:
+        cookies = page.context.cookies([NOTION_APP_ORIGIN])
+    except Exception:  # pylint: disable=broad-exception-caught
+        return None
+    ends = [
+        float(c.get("expires") or -1)
+        for c in cookies
+        if c.get("name") in NOTION_AUTH_COOKIES
+    ]
+    cookies.clear()
+    ends = [e for e in ends if e > 0]
+    if not ends:
+        return None
+    return int((min(ends) - time.time()) // 86400)
+
+
+def _notion_user_id(page: Any) -> str:
+    """The session's ``notion_user_id`` cookie from the browser context (it
+    may be HttpOnly, out of ``document.cookie``'s reach); '' when absent.
+    An account id, not a secret; no other cookie value is kept."""
+    try:
+        cookies = page.context.cookies([NOTION_APP_ORIGIN])
+    except Exception:  # pylint: disable=broad-exception-caught
+        return ""
+    found = next(
+        (
+            str(c.get("value") or "")
+            for c in cookies
+            if c.get("name") == "notion_user_id"
+        ),
+        "",
     )
+    cookies.clear()
+    return urllib.parse.unquote(found)
+
+
+def _notion_check_page(page: Any, expected: str, verified: bool = False) -> dict:
+    """`_notion_check` in its owned tab (already on app.notion.com)."""
+    sidebar = _notion_wait_for_login(page, timeout_s=30, poll_s=0.5)
+    try:
+        parts = urllib.parse.urlsplit(page.url)
+        on_login = parts.hostname == NOTION_APP_HOST and parts.path.startswith("/login")
+    except Exception:  # pylint: disable=broad-exception-caught
+        on_login = False
+    try:
+        raw = page.evaluate(
+            NOTION_SERVER_JS,
+            {"expected": expected, "verified": verified, "mine": _notion_user_id(page)},
+        )
+    except Exception:  # pylint: disable=broad-exception-caught
+        raw = {}
+    raw = raw if isinstance(raw, dict) else {}
+    server = raw.get("server")
+    server = server if server in NOTION_SERVER_VERDICTS else "indeterminate"
+    ident = raw.get("identity")
+    ident = ident if ident in ("match", "mismatch") else "unknown"
+    verdict, proof = notion_verdict(server, sidebar, on_login, verified)
+    days = _notion_cookie_days(page) if verdict == "valid" else None
+    return {
+        "verdict": verdict,
+        "proof": proof,
+        "server": server,
+        "identity": ident if expected else "unconfigured",
+        "cookie_days_left": days,
+    }
+
+
+def _notion_probe_verified() -> bool:
+    """L0 done: the override file says ``notion_probe_verified: true``."""
+    entry, _why = _safari_overrides("notion")
+    return entry.get("notion_probe_verified") is True
+
+
+def _notion_check(port: int, expected: str = "") -> dict:
+    """The tri-state Notion check in a fresh background tab: ``verdict``
+    (valid / invalid / indeterminate), ``proof`` (server / dom /
+    dom-unverified), ``server``, ``identity`` (match / mismatch / unknown /
+    unconfigured), and ``cookie_days_left``. A tab that cannot be opened is
+    indeterminate."""
+    verified = _notion_probe_verified()
+    got = _with_background_page(
+        port,
+        NOTION_APP_ORIGIN + "/",
+        lambda page: _notion_check_page(page, expected, verified),
+    )
+    if isinstance(got, dict):
+        return got
+    return {
+        "verdict": "indeterminate",
+        "proof": "",
+        "server": "indeterminate",
+        "identity": "unknown",
+        "cookie_days_left": None,
+    }
+
+
+def _notion_expected_email() -> str:
+    """The expected Notion account from agent-login's override file ('' none)."""
+    entry, _why = _safari_overrides("notion")
+    return str(entry.get("expected_email") or "")
 
 
 def cmd_notion_login(port: int) -> int:
@@ -13609,13 +14260,38 @@ def _notion_login_owned(port: int, page) -> int:
 
 
 def cmd_notion_logged_in(port: int) -> int:
-    """Exit 0 if Notion is logged in (workspace sidebar on app.notion.com), else
-    2 — also when it cannot be told (fail closed). READ-ONLY: no lease, one
-    background tab, closed again."""
-    if _notion_probe(port):
+    """Exit 0 if Notion is logged in, else 2 — also when it cannot be told
+    (fail closed; the result record's code says ``indeterminate`` then, never
+    ``logged_out``). Notion's server decides (`_notion_check`, D8); with an
+    expected e-mail configured, another account is ``wrong_account``.
+    READ-ONLY: no lease, one background tab, closed again."""
+    expected = _notion_expected_email()
+    res = _notion_check(port, expected)
+    _result_set(
+        server=res["server"],
+        proof=res["proof"],
+        cookie_days_left=res["cookie_days_left"],
+        identity=res["identity"] if res["identity"] != "unknown" else "",
+    )
+    if res["verdict"] == "valid" and res["identity"] != "mismatch":
+        if res["proof"] == "dom-unverified":
+            print(
+                "⚠ Notion: the server probe disagrees with the visible workspace — "
+                "kept ✅ until the probe is verified live (notion_probe_verified).",
+                file=sys.stderr,
+            )
         print("✓ Logged into Notion (app.notion.com).")
         return 0
-    print("Not logged into Notion (app.notion.com).", file=sys.stderr)
+    if res["verdict"] == "valid":
+        _result_fail("client-proof", "wrong_account")
+        print("Notion is logged in as ANOTHER account.", file=sys.stderr)
+        return 2
+    if res["verdict"] == "invalid":
+        _result_fail("client-proof", "logged_out")
+        print("Not logged into Notion (app.notion.com).", file=sys.stderr)
+        return 2
+    _result_fail("client-proof", "indeterminate")
+    print("Notion: could not tell whether it is logged in.", file=sys.stderr)
     return 2
 
 
@@ -14781,6 +15457,7 @@ def _assisted_login_tty(tty: Any, port: int, req: GuidedRequest) -> int:
         return rc
     start = _guided_start_url(req.site, req.url)
     deadline = time.monotonic() + GUIDED_TOTAL_S
+    began = time.time()
     try:
         with _maintenance(
             req.site, "A" if req.window else "B", port=port, force=req.force
@@ -14797,7 +15474,21 @@ def _assisted_login_tty(tty: Any, port: int, req: GuidedRequest) -> int:
     except KeyboardInterrupt:
         print("❌ guided login cancelled — cleaned up", file=sys.stderr)
         return 130
-    return _guided_report(req.site, outcome, why)
+    rc = _guided_report(req.site, outcome, why)
+    if rc == 0:
+        _record_guided_event(_static_site_name(req.site) or req.site, began)
+    return rc
+
+
+def _record_guided_event(site: str, began: float) -> None:
+    """WS1b: a guided login that ended logged in is a real login Albert did —
+    recorded once, at the transaction layer: skipped when an inner flow (a
+    site's own window flow, in this or a child process) already logged an
+    event for `site` since the transaction `began`."""
+    key = site.strip().lower()
+    if any(float(e.get("ts", 0)) >= began for e in _load_login_events(key)):
+        return
+    _record_login_event(key, "guided")
 
 
 def _offer_window(
@@ -15368,7 +16059,11 @@ def _dispatch(args: argparse.Namespace, port: int) -> int:
         return cmd_broker_logout(port, args.site)
     if args.cmd == "import-safari":
         return cmd_import_safari(
-            port, args.site, dry_run=args.dry_run, result_file=args.result_file
+            port,
+            args.site,
+            dry_run=args.dry_run,
+            result_file=args.result_file,
+            agent=args.agent_login,
         )
     if args.cmd == "login-cscs-assisted":
         return cmd_login_cscs_assisted(port)

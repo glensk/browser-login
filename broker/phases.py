@@ -84,6 +84,42 @@ CODE_TEXT = {
     "followup_failed": "the follow-up step failed",
     "no_safari_session": "Safari holds no usable session",
     "manual_import": "the Safari import of this site runs by hand only",
+    # WS1b: an agent's login in Albert's Safari (`agent-login.py -L SITE`).
+    # The four `needs_albert_*` stops (and a locked vault) are the ONLY ones
+    # that are Albert's; every other code is for the agent.
+    "needs_albert_captcha": "needs Albert: a CAPTCHA in Safari",
+    "needs_albert_sms": "needs Albert: an SMS code",
+    "needs_albert_push": "needs Albert: a push approval on his phone",
+    "needs_albert_hardware_key": "needs Albert: a security key / passkey",
+    "needs_albert_vault_locked": "needs Albert: unlock Vaultwarden in Safari",
+    "email_code": (
+        "the site sent an e-mail code — an agent reads it from the mailbox "
+        "and types it in Safari, then re-runs -L"
+    ),
+    "recipe_stuck": "the Safari login recipe found no next step on the page",
+    "safari_unavailable": (
+        "Safari is not running, or JavaScript from Apple Events is off"
+    ),
+    "safari_py_missing": "safari.py (mydotfiles bin) is not installed",
+    "safari_py_outdated": "safari.py lacks a feature this login needs (mydotfiles)",
+    "safari_tab_moved": "the Safari login tab left the recipe's hosts — stopped",
+    "safari_no_recipe": "no Safari login recipe for this site",
+    "safari_flush_timeout": "Safari did not write the new session to disk in time",
+    "identity_unconfigured": (
+        "no expected account configured for this import — nothing imported"
+    ),
+    "safari_timeout": "safari.py overstayed its budget and was stopped",
+    "safari_signal": "safari.py died of a signal — its step may have been done",
+    "safari_window_unknown": (
+        "Safari opened a login window without naming it — it may be left open"
+    ),
+    # WS1b S5: a Safari login never runs on an unattended Mac.
+    "scheduled": "a scheduled run never drives Safari",
+    "console_locked": "the Mac's screen is locked — no Safari login now",
+    "not_on_console": "Albert's session is not on the console — no Safari login now",
+    "console_unknown": "the console state cannot be read — no Safari login now",
+    "albert_idle": "nobody used the Mac recently — no Safari login now",
+    "idle_unknown": "the Mac's idle time cannot be read — no Safari login now",
     "timeout": "the step did not finish in time",
     "killed": "the run was killed by its runner",
     "internal": "internal error",

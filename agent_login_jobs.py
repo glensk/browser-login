@@ -32,6 +32,13 @@ LAUNCH_HOUR, LAUNCH_MINUTE = 9, 15
 
 SNAPSHOT_LABEL = "com.albert.agent-login-snapshot"
 SNAPSHOT_INTERVAL_S = 600
+# WS1b: the refresh-only pass (`-R`): renews refreshable tokens (NPM's 1-day
+# JWT) between daily checks; never logs in, never submits a password.
+REFRESH_LABEL = "com.albert.agent-login-refresh"
+REFRESH_INTERVAL_S = 6 * 3600
+# Set in every agent-login LaunchAgent: a scheduled run. `-L` (the Safari
+# login, which drives Albert's real Safari) refuses to run with it.
+SCHEDULED_ENV = "AGENT_LOGIN_SCHEDULED"
 
 
 def _plist_path(label: str) -> Path:
@@ -99,6 +106,8 @@ def launchagent_plist(
     <dict>
         <key>PATH</key>
         <string>{search_path}</string>
+        <key>{SCHEDULED_ENV}</key>
+        <string>1</string>
     </dict>
     <key>RunAtLoad</key>
     <{"true" if run_at_load else "false"}/>
@@ -107,46 +116,127 @@ def launchagent_plist(
 """
 
 
-def _bootout(label: str) -> None:
-    subprocess.run(
-        ["launchctl", "bootout", f"gui/{os.getuid()}/{label}"],
-        check=False,
-        capture_output=True,
+def refresh_plist() -> str:
+    """The 6-hourly refresh-only LaunchAgent (`agent-login.py -R`), as text. Pure."""
+    return launchagent_plist(
+        label=REFRESH_LABEL,
+        args=("-R",),
+        schedule=(
+            f"<key>StartInterval</key>\n    <integer>{REFRESH_INTERVAL_S}</integer>"
+        ),
+        run_at_load=False,
     )
 
 
-def _install_agent(label: str, text: str, what: str) -> int:
-    path = _plist_path(label)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(text, encoding="utf-8")
-    _bootout(label)
-    rc = subprocess.run(
-        ["launchctl", "bootstrap", f"gui/{os.getuid()}", str(path)], check=False
+def agent_plists() -> list[tuple[str, str, str]]:
+    """(label, plist text, what) of every agent-login LaunchAgent. Pure."""
+    return [
+        (
+            LAUNCH_LABEL,
+            launchagent_plist(),
+            f"daily {LAUNCH_HOUR:02d}:{LAUNCH_MINUTE:02d}, -c; log {LAUNCH_LOG}",
+        ),
+        (
+            SNAPSHOT_LABEL,
+            snapshot_plist(),
+            f"every {SNAPSHOT_INTERVAL_S // 60} min, -S: site list + agents file",
+        ),
+        (
+            REFRESH_LABEL,
+            refresh_plist(),
+            f"every {REFRESH_INTERVAL_S // 3600} h, -R: refresh-only pass",
+        ),
+    ]
+
+
+def _launchctl(*args: str) -> int:
+    """`launchctl ARGS` (output discarded); its exit code."""
+    return subprocess.run(
+        ["launchctl", *args], check=False, capture_output=True
     ).returncode
-    if rc != 0:
-        print(f"❌ launchctl bootstrap {path} failed (exit {rc})")
-        return 1
-    print(f"✅ installed {label} ({what})")
-    return 0
+
+
+def _bootout(label: str) -> None:
+    _launchctl("bootout", f"gui/{os.getuid()}/{label}")
+
+
+def _loaded(label: str) -> bool:
+    """Is `label` loaded in the user's GUI domain right now?"""
+    return _launchctl("print", f"gui/{os.getuid()}/{label}") == 0
+
+
+def _bootstrap(path: Path) -> int:
+    return _launchctl("bootstrap", f"gui/{os.getuid()}", str(path))
+
+
+def daily_loaded() -> bool:
+    """Is the daily check's LaunchAgent loaded? (The refresh pass runs only
+    with it: both are off until the final acceptance.)"""
+    return _loaded(LAUNCH_LABEL)
 
 
 def install_daily() -> int:
-    """Write + (re)load both LaunchAgents: the daily check and the snapshot."""
-    rc = _install_agent(
-        LAUNCH_LABEL,
-        launchagent_plist(),
-        f"daily {LAUNCH_HOUR:02d}:{LAUNCH_MINUTE:02d}, -c; log {LAUNCH_LOG}",
-    )
-    return rc or _install_agent(
-        SNAPSHOT_LABEL,
-        snapshot_plist(),
-        f"every {SNAPSHOT_INTERVAL_S // 60} min, -S: site list + agents file",
-    )
+    """Write + (re)load every agent-login LaunchAgent (daily check, snapshot,
+    refresh pass) as ONE transaction: on any failure every label it touched
+    is booted out, the previous plist files are restored and the agents
+    that were loaded before are loaded again — never a partial set."""
+    jobs = agent_plists()
+    before = {label: _loaded(label) for label, _t, _w in jobs}
+    backups: dict[str, str | None] = {}
+    for label, _text, _what in jobs:
+        path = _plist_path(label)
+        try:
+            backups[label] = path.read_text(encoding="utf-8")
+        except OSError:
+            backups[label] = None
+    done: list[str] = []
+    for label, text, what in jobs:
+        path = _plist_path(label)
+        done.append(label)  # before the write: a half-written file is undone too
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(text, encoding="utf-8")
+        except OSError as exc:
+            print(f"❌ writing {path} failed ({exc.strerror or exc}) — rolling back")
+            _rollback(done, backups, before)
+            return 1
+        _bootout(label)
+        rc = _bootstrap(path)
+        if rc != 0:
+            print(f"❌ launchctl bootstrap {path} failed (exit {rc}) — rolling back")
+            _rollback(done, backups, before)
+            return 1
+        print(f"✅ installed {label} ({what})")
+    return 0
+
+
+def _rollback(
+    labels: list[str], backups: dict[str, str | None], before: dict[str, bool]
+) -> None:
+    """Undo `install_daily` for `labels`: unload, restore the old plist (or
+    remove it), reload what was loaded before. A file error is reported and
+    the rest still rolled back (N3)."""
+    for label in labels:
+        _bootout(label)
+        path = _plist_path(label)
+        old = backups.get(label)
+        try:
+            if old is None:
+                path.unlink(missing_ok=True)
+            else:
+                path.write_text(old, encoding="utf-8")
+        except OSError as exc:
+            print(f"❌ rollback: {path} could not be restored ({exc.strerror or exc})")
+            continue
+        if old is not None and before.get(label) and _bootstrap(path) != 0:
+            print(f"❌ rollback: {label} could not be reloaded")
+            continue
+        print(f"↩ rolled back {label}")
 
 
 def uninstall_daily() -> int:
-    """Unload + remove both LaunchAgents."""
-    for label in (LAUNCH_LABEL, SNAPSHOT_LABEL):
+    """Unload + remove every agent-login LaunchAgent."""
+    for label, _text, _what in agent_plists():
         _bootout(label)
         _plist_path(label).unlink(missing_ok=True)
         print(f"removed {label}")
@@ -246,10 +336,12 @@ def safari_sessions(sites: list[str]) -> dict[str, dict]:
         }
     out = {}
     for site in sites:
-        picked = safari_cookies.site_cookies(jar, site)
-        names = safari_cookies.SAFARI_SITES[site].session_cookies
-        if names:  # only the cookies that ARE the login count
-            picked = [c for c in picked if c.name in names]
+        # only the cookies that ARE the login count (fnmatch patterns)
+        picked = [
+            c
+            for c in safari_cookies.site_cookies(jar, site)
+            if safari_cookies.is_session_cookie(c.name, site)
+        ]
         latest = max((c.expires for c in picked), default=None)
         out[site] = {
             "safari": bool(picked),

@@ -760,6 +760,100 @@ that actually happened in October 2026.
 | Path-scoped Keycloak realms     | two realms on one host clear each other (custos-admin vs runai)            | `agent_cookie_scopes` (`[{"host": H, "path": "/realms/R/"}]`) instead of a host-wide scope.                                                                                                                              |
 | Enter-key forgot-password trap  | a submit pressed `forgot` and reset the password (calibre)                 | Submits read the form's buttons first and fail closed; the tripwire aborts a secondary action. A new recipe uses the same helpers; audit a form with secondary buttons before its first login.                          |
 
+### Agents renew Albert's own sessions through his Safari (WS1b)
+
+The sites that live on Albert's session do not wait for him: the Safari
+marketplace sites, galaxus, galaxus-de, Notion, Slack, OpenAI and claude.ai. An
+agent that needs one runs `./agent-login.py -L SITE`. Plan, debate and the
+security review: `PLAN_ws1b-durability.md`.
+
+1. **Free check** in the shared Chromium. ✅ → nothing to do. Only a DEFINITE
+   "logged out" (code `logged_out`; for Notion also `wrong_account`) goes on;
+   "could not tell", internal errors and gated sites stop with their code.
+2. **Safari already holds a session** (cookie file; names and expiry only) →
+   `browser.py import-safari SITE` and its proof.
+3. **Otherwise the agent logs Safari in.** It uses mydotfiles' `safari.py` in a
+   NEW Safari window (`--new-window`). Every action names that window
+   (`--handle`) and the host the tab must be on (`--expect-host`, re-checked
+   in the page right before each fill or click). Credentials come from
+   Albert's unlocked Vaultwarden tab through his clipboard, never through argv
+   or output. The steps per site are the recipes in `agent_login_safari.py`:
+   username, password, TOTP, "Continue with Google", the account chooser, and
+   the e-mail code. The code is read by himalaya: only a new mail, DKIM-signed
+   by the sender's domain, with one code that two polls in a row agree on.
+4. **Wait** until Safari wrote the new session to disk.
+5. **Import** it (`import-safari -a`).
+
+Guards:
+
+- **A Safari login never runs on an unattended Mac.** `-L` exits 3, naming why,
+  unless the console session is unlocked (neither `CGSSessionScreenIsLocked`
+  nor `IOConsoleLocked` set), someone touched keyboard or mouse in the last
+  15 min (`HIDIdleTime`), and no LaunchAgent started it
+  (`AGENT_LOGIN_SCHEDULED`, any non-empty value). The gate proves someone is
+  at the Mac, not that Albert started the run. Exit 3 means: retry later,
+  do not ask Albert.
+- **Albert's stops:** only a CAPTCHA, an SMS code, a push / security-key
+  approval and a locked vault are his. `-L` detects them by the page's
+  structure, never clicks them, and exits 4 naming the stop.
+- **No retries:** every credential step runs at most once. A failure after one
+  quarantines the site; `-Q SITE` releases it.
+- **A hung safari.py** gets SIGTERM (it clears the clipboard), then SIGKILL;
+  after a killed credential step `-L` clears the clipboard itself.
+- **One Safari login at a time.**
+- **safari.py features:** `--capabilities` must list `handle`, `new_window`,
+  `close`, `expect_host` and `sigterm_clear`, plus `user_only` / `account_pick`
+  where a recipe needs them. Until then:
+  - `-L` only imports a session Safari already holds (`safari_py_outdated`);
+  - agents.md keeps the old wording for those sites;
+  - `-L SITE -n` shows the check, read-only.
+
+**Built-in imports** (Notion, Slack, OpenAI) are one transaction under one
+interaction lease:
+
+1. the shared browser's own check must say a definite "logged out";
+2. Safari's cookies are proven in a THROWAWAY browser context, so the shared
+   jar is untouched. The proof covers the session AND its account,
+   server-side, and only an enum leaves the page:
+
+   | site   | proof                                                        | expected (override file)                     |
+   | :----- | :----------------------------------------------------------- | :------------------------------------------- |
+   | Slack  | `auth.test` with the token + `d`                              | `expected_team_id`, `expected_user_id`       |
+   | Notion | the user record of the `notion_user_id` cookie (or the only one) | `expected_email`                          |
+   | OpenAI | the account ids of `/backend-api/accounts/check`              | `expected_workspace_id`                      |
+
+   The override file is `~/.config/agent-login/safari-logins.json`, 0600,
+   outside this repo.
+3. only on a match: Slack's token store is cleared, the cookies are copied
+   into the shared jar, and the shared browser's own check runs again. If it
+   fails, the import is undone; a failed undo is recorded (`undo: failed`)
+   and shown by `-L`.
+
+A plain import is logged as `safari-import` (a copy, not a login); an agent's
+login as `safari-agent`; a guided login as `guided`.
+
+**More durability:**
+
+- **On demand:** `myfritz` (10 h sessions) is never checked or logged in by the
+  daily run. Agents call `browser.py login myfritz` when they need it.
+- **Refresh pass:** `-R` runs as the LaunchAgent `com.albert.agent-login-refresh`,
+  every 6 h, and only while the daily job is loaded. It renews refreshable
+  tokens (NPM) below 12 h left. It never logs in and never submits.
+- **Notion's check is tri-state.** Its server (`loadUserContent`, 10 s) decides
+  and the sidebar only corroborates; "cannot tell" is never "logged out".
+  - Until the probe was verified live (`notion_probe_verified: true` in the
+    override file), only a 401 counts as logged out, and a visible workspace
+    keeps ✅ with a warning.
+  - The failure mail (`-m`) names an assisted site only after two failed RUNS
+    at least 1 h apart.
+- **After a Homebrew upgrade** the overview and `-c` print the exact fix:
+  - ❌ for a stale `vault-touchid` build (any pinned file);
+  - ❌ for user-site packages missing from a new python minor (within 14 days of
+    the change; ⚠️ afterwards; `AGENT_LOGIN_USERSITE_IGNORE` lists names never
+    reported).
+
+  The automatic remedy belongs to mydotfiles' brew maintenance.
+
 ## Campus-only hosts (proxy PAC)
 
 Some sites answer only from inside a campus network: `groups.epfl.ch` (needed to
@@ -982,7 +1076,7 @@ agent-login.py — which of Albert's logins can agents use through the login bro
 
 Without arguments: a health line for the broker, then every login we want agents to use, once: ✅ when it works for agents (setup complete AND the latest real check, -c/-t, passed) or ❌ with the reason. Read-only: it asks the broker for its site list (never a secret), reads the names and expiry dates (never values) of Safari's cookies, and logs into nothing unless you pass -t, -g or -c.
 
-The marketplace sites (anibis, tutti, Ricardo, Kleinanzeigen) and Galaxus run on YOUR Safari session: you log in in Safari, `browser.py login SITE` copies that site's session cookies into the shared Chromium (Kleinanzeigen falls back to the broker). The broker never submits a password for galaxus and galaxus-de (their bot check rejects it; any item opts in with agent_no_submit=true): galaxus-de, like every such site, needs your own login, `-g SITE` in the shown window; -t and -c only check it. CSCS and Smartsheet log in through the broker. SWITCH Cloud logs in with the portal's SSO click, on the browser's own edu-ID session first, then on the broker's (no window; your own login only when neither works). Anthropic, OpenAI and Slack need you once (email code / SSO): `-g SITE` asks you on the terminal, then shows a remote view of a headless tab (the window only as a fallback) and waits; -t and -c only check them.
+The marketplace sites (anibis, tutti, Ricardo, Kleinanzeigen), Galaxus and Galaxus DE run on YOUR Safari session: `browser.py login SITE` copies that site's session cookies into the shared Chromium (Kleinanzeigen falls back to the broker). The broker never submits a password for galaxus and galaxus-de (their bot check rejects it; any item opts in with agent_no_submit=true). When such a session or one of Notion, Slack, OpenAI or claude.ai lapses, an AGENT renews it: `-L SITE` imports your Safari session — logging Safari in first (safari.py with every feature its recipe needs, your Vaultwarden tab) when it has lapsed there too — claude.ai through its automated magic link. Only a CAPTCHA, an SMS code, a push / security-key approval or a locked vault stay yours (exit 4, named); `-g SITE` is still there for a login by hand. CSCS and Smartsheet log in through the broker. SWITCH Cloud logs in with the portal's SSO click, on the browser's own edu-ID session first, then on the broker's (no window).
 
 Examples:
 
@@ -1006,7 +1100,12 @@ Examples:
 ./agent-login.py -V           # onboarding review of every broker item (read-only)
 ./agent-login.py -V -i new.json  # review a PLANNED item before the vault write
 ./agent-login.py -D docker    # remove: run while listed, again after the vault item went
+./agent-login.py -L notion    # an AGENT imports Albert's Safari session (+ a Safari login)
+./agent-login.py -L galaxus-de -n  # what -L would do (no import, no Safari login)
+./agent-login.py -R           # refresh-only pass (NPM tokens; LaunchAgent every 6 h)
 ```
+
+Sites on Albert's session (Safari sites, galaxus-de, Notion, Slack, OpenAI, claude.ai) are renewed by AGENTS with -L — never a to-do for Albert, except a CAPTCHA, an SMS code, a push / security-key approval or a locked vault (exit 4, named). myfritz is on demand: never checked daily.
 
 Where a login broke: every check records its PHASE (precheck, limiter, vault, recipe, submit, profile-proof, broker-proof, bundle-export, cookie-inject, storage-inject, client-proof, consumer-followup, safari-source, unknown) and a code, a redacted detail and the broker's screenshot; the overview shows them. A ✅ is a fresh (≤ 36 h), proven check; older reads ❓. The daily check (-c) never logs in a site that is pending, quarantined, locked, in cooldown, without a sentinel, changed since its promotion or flagged by the onboarding review, and never retries after the password may have been sent. Adding a site: README "Adding a site to the broker".
 
@@ -1024,9 +1123,9 @@ Where a login broke: every check records its PHASE (precheck, limiter, vault, re
 | `-S`, `--snapshot` | recover a stale guided login whose watchdog died (one line), refresh the site-list and secret-run snapshots and the agents file (which also lists the secrets agents can inject), print nothing else (LaunchAgent, every 10 min) |
 | `-K`, `--keychain` | rescan the login keychain (~15 s) and list every item (names only) with whether agents can read it |
 | `-A`, `--agents` | print the summary agent sessions get at start (the agents file) |
-| `-I`, `--install-daily` | install + load the LaunchAgents com.albert.agent-login-check (`-c` daily 09:15) and com.albert.agent-login-snapshot (`-S` every 10 min) |
-| `-U`, `--uninstall-daily` | unload + remove both LaunchAgents |
-| `-P`, `--print-plist` | print both LaunchAgent plists (writes nothing) |
+| `-I`, `--install-daily` | install + load the LaunchAgents com.albert.agent-login-check (`-c` daily 09:15), com.albert.agent-login-snapshot (`-S` every 10 min) and com.albert.agent-login-refresh (`-R` every 6 h) as one transaction (any failure restores the previous set) |
+| `-U`, `--uninstall-daily` | unload + remove all three LaunchAgents |
+| `-P`, `--print-plist` | print the three LaunchAgent plists (writes nothing) |
 | `-j`, `--json` | print the overview (with -x: the matrix) as JSON |
 | `-x`, `--matrix` | the acceptance matrix: one row per login (consumer, privilege, sentinel, scope, attempt group, refresh, stage, limit, last phase) |
 | `-p`, `--promote` `SITE` | the ONE promotion transaction (pending -> usable for scheduled logins): a fresh listing, the onboarding review, then a fresh strict ok of this configuration on record, or ONE budgeted `browser.py login` (no retry); audited |
@@ -1035,3 +1134,6 @@ Where a login broke: every check records its PHASE (precheck, limiter, vault, re
 | `-E`, `--rearm` `SITE` | give SITE its one promotion login back (after reviewing why it failed) — the main session's decision, audited |
 | `-D`, `--remove` `SITE` | remove a broker site, run twice: while it is listed -> demote + browser.py logout; after its vault item is gone -> drop every trace (broker `forget`, state files, cache files); audited |
 | `-Q`, `--release` `SITE` | release SITE's quarantine (after a failed login that may have submitted the password) — the main session's decision, audited |
+| `-L`, `--safari-login` `SITE` | an AGENT's login through Albert's Safari (WS1b): free check, else import Safari's own session (works without new safari.py features), else log Safari in (safari.py, a new window, his Vaultwarden tab and clipboard) and import it; claude.ai: the automated magic link. One run, no retries; never from a LaunchAgent. Exit 4 = needs Albert (CAPTCHA, SMS, push / security key, locked vault); exit 3 = the Mac is locked or idle: retry later |
+| `-n`, `--dry-run` | with -L: report what it would do (no import, no Safari login) |
+| `-R`, `--refresh-pass` | refresh-only pass: renew every refreshable token (NPM) with < 12 h left; never logs in (LaunchAgent com.albert.agent-login-refresh, every 6 h) |

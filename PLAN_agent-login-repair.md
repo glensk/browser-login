@@ -324,6 +324,18 @@ manual acceptance steps under the attempt policy below.
 - [ ] WS1b — durability per flow, after WS2's root causes. Albert 2026-10-11: assisted/guided logins (galaxus-de, notion, openai, slack, Safari sites) are done by AGENTS in Albert's Safari (`safari.py -L/-O` from the Vaultwarden tab) plus a Safari cookie import into the shared Chromium — never a `-g` to-do for Albert (only CAPTCHA / locked vault / hardware or push approval / SMS stay his). Build: a SAFARI_SITES entry for galaxus-de and an `agent-login.py` path that runs the Safari login + import itself. The guided-login confirm is now 'press Enter'. broker re-export before expiry,
       credential-change handling, Safari-cookie expiry, monitoring of assisted sessions with
       an alert to Albert. Plan → codex-debate → implement.
+  - [x] Plan `PLAN_ws1b-durability.md`, Codex (gpt-5.6-sol) converged in round 3 (19
+        objections, 18 accepted, the non-strict Verification block kept). Built 2026-10-12
+        in a worktree, not committed:
+        - `-L SITE` (agent-invoked Safari login + import, claude.ai via the magic link);
+        - `agent_login_safari.py` (recipes, window-handle step machine, hard stops, mail
+          codes);
+        - built-in imports with an account proof that fail to logged-out;
+        - myfritz on demand;
+        - the `-R` refresh pass + its LaunchAgent (transactional `-I`);
+        - Notion tri-state + the 2-run mail rule + expiry telemetry;
+        - toolchain lines.
+  - [ ] Release + live steps L0–L8 of the WS1b plan; mydotfiles M0–M4, M6 first.
 - [ ] WS4 — no more unsynced rotations (Albert, 2026-10-10: layers 1 and 2). Plan →
       codex-debate → implementation:
   - Layer 1: Vaultwarden is the single master copy. SOPS and Keychain copies are derived

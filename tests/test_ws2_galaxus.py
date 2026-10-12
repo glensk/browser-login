@@ -37,8 +37,14 @@ sys.path.insert(0, str(REPO / "tests"))
 from test_safari_cookies import _Ctx, al, browser, encode  # noqa: E402
 from test_ws1a_broker import _Vault  # noqa: E402
 
+import agent_login_safari  # noqa: E402
 from broker import daemon, idp_reasons, limiter, phases, recipes, vault  # noqa: E402
 from broker import safari_cookies as sc  # noqa: E402
+
+# every safari.py feature a recipe can need (WS1b S2)
+ALL_FEATURES = sorted(
+    frozenset().union(*(r.features() for r in agent_login_safari.RECIPES.values()))
+)
 
 FUTURE = time.time() + 86400 * 200
 # Runtime-generated dummy values: never a real cookie or password.
@@ -118,8 +124,11 @@ def test_galaxus_site_rules() -> None:
     assert rules.domains == ("galaxus.ch", "digitecgalaxus.ch")
     assert rules.session_cookies == (".at",)
     assert rules.drop_bot_cookies and not rules.broker_fallback
-    # every other site keeps Chromium's own bot cookies
-    assert [s for s, r in sc.SAFARI_SITES.items() if r.drop_bot_cookies] == ["galaxus"]
+    # every other site keeps them; galaxus-de shares the wall (WS1b)
+    assert [s for s, r in sc.SAFARI_SITES.items() if r.drop_bot_cookies] == [
+        "galaxus",
+        "galaxus-de",
+    ]
 
 
 def test_galaxus_import_picks_session_not_bot_cookies(jar) -> None:
@@ -324,12 +333,23 @@ def test_g_generic_no_submit_site(monkeypatch, capsys) -> None:
     assert "no guided login known" in capsys.readouterr().out
 
 
-def test_t_galaxus_de_only_checks(monkeypatch) -> None:
-    monkeypatch.setattr(al, "run_browser", pytest.fail)  # no `browser.py login`
-    monkeypatch.setattr(al, "assisted_check", lambda s: (False, "NOT logged in"))
+def test_t_galaxus_de_imports_explicitly(monkeypatch) -> None:
+    """WS1b: galaxus-de is a Safari site now: -t imports by hand, never a
+    `browser.py login` (the broker never submits there)."""
+    calls: list[tuple] = []
+
+    def run(*argv: str, **_kw: Any) -> Any:
+        calls.append(argv)
+        return al.BrowserRun(2, False, "", 0.0, {"phase": "safari-source"})
+
+    monkeypatch.setattr(al, "run_browser", run)
+    monkeypatch.setattr(al, "probe", lambda site, quiet=True: (2, None))
     monkeypatch.setattr(al, "record_check", lambda *a, **k: None)
     assert al.run_test("galaxus-de") == 2
+    assert calls[0] == ("import-safari", "galaxus-de")
+    assert not any(c[0] == "login" for c in calls)
     assert not al._no_submit_assisted("galaxus")  # Safari import, not assisted
+    assert not al._no_submit_assisted("galaxus-de")
 
 
 def test_overview_galaxus_rows(monkeypatch) -> None:
@@ -345,15 +365,24 @@ def test_overview_galaxus_rows(monkeypatch) -> None:
     monkeypatch.setattr(al, "safari_state", lambda s: {})
     rows = {r["site"]: r for r in al.overview()["rows"]}
     assert rows["galaxus"]["status"] == "safari"
-    assert rows["galaxus-de"]["status"] == "assisted"  # built in, no broker flag
+    # WS1b: galaxus-de is a Safari target (an agent logs Safari in: -L)
+    assert rows["galaxus-de"]["status"] == "safari"
     assert rows["shopx"]["status"] == "assisted"
     assert "never submits" in rows["shopx"]["detail"]
     assert rows["plain"]["status"] == "extra"
     # a no-submit row is checked by -c, never logged in by it
     checks = {"galaxus-de": {"state": "failed", "at": time.time()}}
     text = al.agent_summary({"rows": [rows["galaxus-de"]], "broker_ok": True}, checks)
-    assert "needs Albert: ./agent-login.py -g galaxus-de" in text
-    assert "./agent-login.py -g galaxus-de" in al.safari_fix("galaxus-de")
+    # without the safari.py features its recipe needs: the old wording
+    assert "Albert logs in in Safari" in text  # no Safari session readable
+    assert "./agent-login.py -t galaxus-de" in al.safari_fix("galaxus-de")
+    # with them (WS1b S2): an agent's Safari login
+    monkeypatch.setenv("AGENT_LOGIN_SAFARI_FEATURES", ",".join(ALL_FEATURES))
+    text = al.agent_summary({"rows": [rows["galaxus-de"]], "broker_ok": True}, checks)
+    assert (
+        "an agent renews it: ./agent-login.py -L galaxus-de (Albert's Safari)" in text
+    )
+    assert "./agent-login.py -L galaxus-de" in al.safari_fix("galaxus-de")
     # a custom no-submit site's failure mail names -g too
     assert "./agent-login.py -g shopx" in al.safari_fix("shopx")
     assert "-t plain and read" in al.safari_fix("plain")
@@ -379,7 +408,7 @@ def test_t_galaxus_imports_explicitly(monkeypatch) -> None:
     assert calls[0][0] == ("login", "anibis")
 
 
-def test_agents_md_says_check_only_for_galaxus() -> None:
+def test_agents_md_says_check_only_for_galaxus(monkeypatch) -> None:
     row = {
         "site": "galaxus",
         "name": "Galaxus",
@@ -389,16 +418,38 @@ def test_agents_md_says_check_only_for_galaxus() -> None:
         "safari_expires": "2099-01-01",
     }
     ok = {"galaxus": {"state": "ok", "at": time.time(), "at_text": "now"}}
+    bad = {"galaxus": {"state": "failed", "at": time.time(), "at_text": "now"}}
+    # no Safari session readable (or an expired one): Albert logs in in Safari
+    for stale in ({**row, "safari": False}, {**row, "safari_expires": "2000-01-01"}):
+        text = al.agent_summary({"rows": [stale], "broker_ok": True}, ok)
+        assert "- ❌ Galaxus: Safari session missing, expired or unreadable" in text
+        assert "-L galaxus" not in text
+    # no new safari.py features, but Safari holds a live session: -L imports
+    # it (SF2) — the plain `-t` wording is gone for a routed site
     text = al.agent_summary({"rows": [row], "broker_ok": True}, ok)
     assert (
-        "- ✅ Galaxus (`galaxus`): check only; Albert re-imports "
-        "(`agent-login.py -t galaxus`)" in text
+        "- ✅ Galaxus (`galaxus`): Albert's Safari session; the daily run only "
+        "checks it — when it lapses — an agent imports Albert's existing Safari "
+        "session: ./agent-login.py -L galaxus" in text
+    )
+    text = al.agent_summary({"rows": [row], "broker_ok": True}, bad)
+    assert (
+        "- ❌ Galaxus: not logged in — an agent imports Albert's existing "
+        "Safari session: ./agent-login.py -L galaxus — never ask Albert" in text
+    )
+    # with them (WS1b S2): an agent's Safari login
+    monkeypatch.setenv("AGENT_LOGIN_SAFARI_FEATURES", ",".join(ALL_FEATURES))
+    text = al.agent_summary({"rows": [row], "broker_ok": True}, ok)
+    assert (
+        "- ✅ Galaxus (`galaxus`): Albert's Safari session; the daily run only "
+        "checks it — when it lapses — an agent renews it: ./agent-login.py -L "
+        "galaxus (Albert's Safari)" in text
     )
     bad = {"galaxus": {"state": "failed", "at": time.time(), "at_text": "now"}}
     text = al.agent_summary({"rows": [row], "broker_ok": True}, bad)
     assert (
-        "- ❌ Galaxus: not logged in — needs Albert: ./agent-login.py -t galaxus"
-        in text
+        "- ❌ Galaxus: not logged in — an agent renews it: ./agent-login.py -L "
+        "galaxus (Albert's Safari) — never ask Albert" in text
     )
 
 

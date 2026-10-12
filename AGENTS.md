@@ -49,8 +49,10 @@ framework. It is a **provider**: other repos depend on it, not the reverse. See
   the ledger's life) and `open -N` handoffs (the caller's; NEVER ledgered).
   Two-phase marker: the entry (random marker) is written before
   `Target.createTarget {url: about:blank#owned-<marker>, background}` — no
-  `browserContextId`, no `new_context()`; the target id is bound right after
-  the reply; the tab is navigated only after that. Liveness is tri-state
+  `browserContextId`, no `new_context()` (ONE exception, outside the ledger:
+  the WS1b import proof's throwaway context, see "Agents renew Albert's own
+  sessions" below); the target id is bound right after the reply; the tab is
+  navigated only after that. Liveness is tri-state
   (`_owner_state`: live = flock held or pid+start time match; dead = flock free
   and pid gone/reused; unknown = unreadable → never reaped). Reaping only via
   `reap-owned`, the guided-login transaction (start, `_guided_a`'s finally) and
@@ -285,6 +287,68 @@ framework. It is a **provider**: other repos depend on it, not the reverse. See
   never lifts a limiter block or an identity lockout (`left`, for
   `install.sh -r`). Client state is same-uid policy, not a security
   boundary — the broker limiter is.
+- **Agents renew Albert's own sessions through his Safari (WS1b,
+  `PLAN_ws1b-durability.md`)**:
+  - **Who runs it:** `agent-login.py -L SITE` is agent-invoked ONLY. Every
+    LaunchAgent sets `AGENT_LOGIN_SCHEDULED=1` and `-L` refuses with it. Never
+    call it from `-c`, `-S` or `-R`.
+  - **The interactive gate** (`alsafari.interactive_gate`, exit 3): it also
+    refuses on a locked console, when Albert is not on the console, and when
+    nobody touched the Mac for 15 min. Locked = `CGSSessionScreenIsLocked` or
+    `IOConsoleLocked` true; either present but not a boolean, or anything
+    unreadable = refused. It proves SOMEONE is at the Mac, not that Albert
+    started the run (the explicit agent invocation is that part).
+  - **When `-L` goes on:** only from a DEFINITE logged-out of the free check
+    (code `logged_out`; Notion also `wrong_account`). Never from `internal`,
+    `unknown`, `indeterminate` or a gated code.
+  - **Safari is driven only through `safari.py`, by LONG option names**
+    (`--new-window`, `--handle`, `--expect-host`, `--user-only`, `--close`,
+    `--capabilities`; never the short letters). Every fill, click and eval names
+    the window AND the RECIPE's host (`--expect-host`, never a host read off the
+    tab; safari.py also pins the tab's full origin). A safari.py exit by a
+    signal (≥ 128, or negative) counts as "may have been done", like a kill.
+    A safari.py whose `--capabilities` lack
+    `handle`, `new_window`, `close`, `expect_host` or `sigterm_clear` drives
+    nothing (`safari_py_outdated`). agents.md promises `-L` only when every
+    feature the site's recipe needs is there (`agent_route`).
+  - **The runner:** SIGTERM, a grace period, then SIGKILL. After a killed
+    credential step `-L` clears the clipboard.
+  - **What leaves safari.py:** only the closed fields `agent_login_safari`
+    parses. Its page text, candidates and error messages are never stored or
+    printed.
+  - **Albert's stops:** only `needs_albert_captcha|sms|push|hardware_key|vault_locked`.
+    Every other stop is the agent's.
+  - **Credentials:** a credential step runs once. A failure after one
+    quarantines (`-Q` releases it).
+  - **A built-in import** (`SAFARI_BUILTIN`: notion, slack, openai) is one
+    interaction-lease transaction:
+    1. the site's own check must say a definite logged-out;
+    2. Safari's cookies are proven in a THROWAWAY browser context, server-side
+       (Slack `auth.test` team + user id, OpenAI account ids, Notion's user
+       record);
+    3. only on `match` does the shared jar change.
+
+    A failed post-copy check is undone, and a failed undo is recorded
+    (`undo: failed`).
+  - **The ONE `new_context()` / `new_page` exception to the owned-tab ledger:**
+    `_builtin_prove_isolated` (allowlisted in `tests/test_owned_tabs_tp845.py`).
+    - The context is Playwright's (`Target.createBrowserContext`; no
+      `browserContextId` in this source). It is closed in a `finally` right
+      after the prover answers, and disposed when the process detaches.
+    - The proof window is as short as the prover: Notion one server fetch (≤ 10
+      s, no sidebar wait), OpenAI two fetches (≤ 10 s), Slack its boot poll (≤ 20
+      s) + `auth.test` (≤ 10 s), each plus the page load.
+    - Residual: for up to ~45 s, another Playwright client attached to the
+      shared browser (an agent's MCP, `browser.py eval`) can LIST the proof
+      tab. Its cookie jar, storage and service workers stay separate from the
+      default context, so it holds no foreign session where agents work.
+  - **Mail codes** count only from DKIM-signed mail (the topmost
+    Authentication-Results) and only when two polls in a row agree.
+  - **Expected accounts** live in the 0600 override file
+    `~/.config/agent-login/safari-logins.json`, never in this repo.
+  - **Tests** set `AGENT_LOGIN_SAFARI_OVERRIDES`, `AGENT_LOGIN_TOOLCHAIN=off` and
+    `AGENT_LOGIN_SAFARI_FEATURES=none` (conftest), and fake safari.py, himalaya
+    and ioreg.
 - **`security` (keychain) calls go through `_security_run` only**: new session, no
   timeout, never `kill`/`terminate` — killing a client mid-dialog crashed
   `securityd` (tp#504). Writes are delete-then-add pinned to the default keychain,

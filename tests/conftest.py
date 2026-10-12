@@ -133,6 +133,12 @@ def _private_agent_login_state(tmp_path, monkeypatch):
     state = tmp_path / "agent-login-state"
     state.mkdir(exist_ok=True)
     monkeypatch.setenv("AGENT_LOGIN_STATE_FILE", str(state / "last-check.json"))
+    # WS1b: never the machine's Safari-login overrides or its toolchain
+    monkeypatch.setenv("AGENT_LOGIN_SAFARI_OVERRIDES", str(state / "overrides.json"))
+    monkeypatch.setenv("AGENT_LOGIN_TOOLCHAIN", "off")
+    # the installed safari.py never decides a test: no feature unless a test
+    # sets its own list
+    monkeypatch.setenv("AGENT_LOGIN_SAFARI_FEATURES", "none")
 
 
 @pytest.fixture(autouse=True)

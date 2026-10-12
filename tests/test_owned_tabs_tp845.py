@@ -253,6 +253,9 @@ def _stub_checks(monkeypatch) -> None:
     monkeypatch.setattr(browser, "_claude_logged_in", lambda page: True)
     monkeypatch.setattr(browser, "_chatgpt_logged_in", lambda page: True)
     monkeypatch.setattr(browser, "_slack_logged_in", lambda page: True)
+    # WS1b B1: the `logged-in` commands use the tri-state checks
+    monkeypatch.setattr(browser, "_chatgpt_state", lambda page: "valid")
+    monkeypatch.setattr(browser, "_slack_state", lambda page: "valid")
     monkeypatch.setattr(browser, "_biopolwifi_logged_in", lambda page: True)
     monkeypatch.setattr(
         browser, "_slack_session_from_page", lambda ctx, page: {"token": "x"}
@@ -769,14 +772,52 @@ def test_the_url_pickers_are_gone_and_no_context_is_forged():
         assert not hasattr(browser, name), name
         assert name not in src, name
     assert "browserContextId" not in src
-    new_pages = [
-        c
-        for c in ast.walk(_tree())
-        if isinstance(c, ast.Call)
-        and isinstance(c.func, ast.Attribute)
-        and c.func.attr == "new_page"
-    ]
-    assert not new_pages  # every tab is a background one, created by id
+    # every tab is a background one, created by id — the ONE exception is the
+    # WS1b import proof's page in its own THROWAWAY browser context (closed in
+    # a finally, disposed on detach): it never lives in the shared jar.
+    new_pages = _calls_by_enclosing_function(_tree(), "new_page")
+    assert [name for name, _line in new_pages] == ["_builtin_prove_isolated"]
+    contexts = _calls_by_enclosing_function(_tree(), "new_context")
+    # the throwaway context, plus the pre-WS1b `contexts[0] if … else
+    # new_context()` fallbacks of a browser with no context yet
+    assert "_builtin_prove_isolated" in {name for name, _line in contexts}
+
+
+def _calls_by_enclosing_function(tree: ast.AST, attr: str) -> list[tuple[str, int]]:
+    """Every ``X.<attr>(…)`` call of `tree` with the name of its INNERMOST
+    enclosing function (def or async def; ``<module>`` at module level) —
+    each call counted once."""
+    found: list[tuple[str, int]] = []
+
+    def visit(node: ast.AST, owner: str) -> None:
+        for child in ast.iter_child_nodes(node):
+            name = owner
+            if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                name = child.name
+            if (
+                isinstance(child, ast.Call)
+                and isinstance(child.func, ast.Attribute)
+                and child.func.attr == attr
+            ):
+                found.append((owner, child.lineno))
+            visit(child, name)
+
+    visit(tree, "<module>")
+    return found
+
+
+def test_the_call_mapper_counts_each_call_once_in_its_innermost_function():
+    src = (
+        "x.new_page()\n"
+        "def outer():\n"
+        "    def inner():\n"
+        "        y.new_page()\n"
+        "    z.new_page()\n"
+        "async def coro():\n"
+        "    await w.new_page()\n"
+    )
+    got = _calls_by_enclosing_function(ast.parse(src), "new_page")
+    assert got == [("<module>", 1), ("inner", 4), ("outer", 5), ("coro", 7)]
 
 
 # --- tp#864: `logged-in switch`'s probe tab is owned, ledgered, closed by id ------------

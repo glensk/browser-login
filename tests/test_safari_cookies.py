@@ -184,6 +184,7 @@ def test_site_rules() -> None:
         "ricardo": ("ricardo.ch",),
         "kleinanzeigen": ("kleinanzeigen.de",),
         "galaxus": ("galaxus.ch", "digitecgalaxus.ch"),
+        "galaxus-de": ("galaxus.de", "galaxus.eu"),
     }
     assert [s for s, r in sc.SAFARI_SITES.items() if r.broker_fallback] == [
         "kleinanzeigen"
@@ -487,7 +488,7 @@ def test_check_all(monkeypatch, capsys) -> None:
     subject, body = mails[0]
     assert "1 site(s)" in subject
     assert "tutti" in body and "anibis" not in body
-    assert "./agent-login.py -t tutti" in body
+    assert "./agent-login.py -t tutti" in body  # safari.py lacks -L features
     out = capsys.readouterr().out
     assert "✅ anibis" in out and "❌ tutti" in out
 

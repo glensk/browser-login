@@ -60,6 +60,11 @@ AUDIT_FILE = "audit.jsonl"
 # the login's own free check found the session (route ``already``), or it
 # stopped in one of these phases with ``submitted`` False.
 PRE_SUBMIT_PHASES = frozenset({"precheck", "limiter", "vault", "profile-proof"})
+# WS1b: a server probe's verdicts (Notion) as recorded in checks.json.
+SERVER_VERDICTS = frozenset({"valid", "invalid", "indeterminate"})
+# Two failed checks count as two in a row only this far apart (and from two
+# different runs): a re-probe minutes later is not an independent result.
+STREAK_SPACING_S = 3600.0
 
 
 class StateError(RuntimeError):
@@ -189,6 +194,9 @@ def record_check(  # pylint: disable=too-many-arguments
     instance: str = "",
     identity: str = "",
     config: str = "",
+    server: str = "",
+    cookie_days_left: object = None,
+    run_id: str = "",
     now: float | None = None,
 ) -> dict[str, Any]:
     """Record a site's LATEST check (checks.json v2 + the legacy projection).
@@ -197,6 +205,13 @@ def record_check(  # pylint: disable=too-many-arguments
     previous `last_success`, and only `ok` sets it. `instance`: the browser
     instance the check ran in ('' = the shared one; WS5: a ✅ from another
     instance than the item's current one is stale). Returns the record.
+
+    WS1b: `server` is a server probe's verdict (valid / invalid /
+    indeterminate, Notion), `cookie_days_left` the session cookie's days to
+    expiry (telemetry). ``invalid_streak`` counts RUNS with a failed verdict:
+    +1 at most once per `run_id` and only ``STREAK_SPACING_S`` after the
+    previous counted failure; ok resets it, unknown keeps it (the failure
+    mail of an assisted site waits for 2).
     """
     if state not in STATES:
         raise ValueError(f"state must be one of {sorted(STATES)}")
@@ -230,12 +245,20 @@ def record_check(  # pylint: disable=too-many-arguments
         # WS3: the config digest (broker/onboarding.config_digest) of the item
         # the proof ran against ('' = unknown): a promotion holds for it only.
         "config": config if CONFIG_RE.match(config or "") else "",
+        "server": server if server in SERVER_VERDICTS else "",
+        "cookie_days_left": (
+            cookie_days_left
+            if isinstance(cookie_days_left, int)
+            and not isinstance(cookie_days_left, bool)
+            else None
+        ),
     }
 
     def put(data: dict[str, Any]) -> None:
         old = data.get(site) if isinstance(data.get(site), dict) else {}
         last = old.get("last_success") if isinstance(old, dict) else None
         rec["last_success"] = now if state == "ok" else last
+        rec.update(_streak(old if isinstance(old, dict) else {}, state, run_id, now))
         data[site] = rec
 
     update(CHECKS_FILE, put)
@@ -254,6 +277,41 @@ def record_check(  # pylint: disable=too-many-arguments
     with contextlib.suppress(StateError, OSError):
         update(LEGACY_FILE, legacy)
     return rec
+
+
+def _streak(old: dict[str, Any], state: str, run_id: str, now: float) -> dict[str, Any]:
+    """The ``invalid_streak`` fields of a new record (see `record_check`)."""
+    count = old.get("invalid_streak")
+    count = count if isinstance(count, int) and not isinstance(count, bool) else 0
+    at = old.get("invalid_at")
+    at = (
+        float(at) if isinstance(at, (int, float)) and not isinstance(at, bool) else None
+    )
+    run = str(old.get("invalid_run") or "")
+    if state == "ok":
+        return {"invalid_streak": 0, "invalid_at": None, "invalid_run": ""}
+    if state != "failed":
+        return {"invalid_streak": count, "invalid_at": at, "invalid_run": run}
+    same_run = bool(run_id) and run_id == run
+    too_soon = at is not None and now - at < STREAK_SPACING_S
+    if count and (same_run or too_soon):
+        return {"invalid_streak": count, "invalid_at": at, "invalid_run": run}
+    return {
+        "invalid_streak": count + 1,
+        "invalid_at": now,
+        "invalid_run": run_id[:64],
+    }
+
+
+def drop_legacy(site: str) -> None:
+    """Remove `site`'s row from the legacy ``last-check.json`` projection
+    (WS1b: an on-demand site is not judged by infra/status)."""
+
+    def drop(data: dict[str, Any]) -> None:
+        data.pop(site, None)
+
+    with contextlib.suppress(StateError, OSError):
+        update(LEGACY_FILE, drop)
 
 
 def checks() -> dict[str, dict[str, Any]]:

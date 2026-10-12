@@ -7,17 +7,19 @@ passed) or ❌ with the reason. Read-only: it asks the broker for its site list 
 secret), reads the names and expiry dates (never values) of Safari's cookies, and logs
 into nothing unless you pass -t, -g or -c.
 
-The marketplace sites (anibis, tutti, Ricardo, Kleinanzeigen) and Galaxus run on YOUR
-Safari session: you log in in Safari, `browser.py login SITE` copies that site's
+The marketplace sites (anibis, tutti, Ricardo, Kleinanzeigen), Galaxus and
+Galaxus DE run on YOUR Safari session: `browser.py login SITE` copies that site's
 session cookies into the shared Chromium (Kleinanzeigen falls back to the broker).
 The broker never submits a password for galaxus and galaxus-de (their bot check
-rejects it; any item opts in with agent_no_submit=true): galaxus-de, like every such
-site, needs your own login, `-g SITE` in the shown window; -t and -c only check it.
-CSCS and Smartsheet log in through the broker. SWITCH Cloud logs in with the portal's
-SSO click, on the browser's own edu-ID session first, then on the broker's (no window;
-your own login only when neither works). Anthropic, OpenAI and Slack need you once (email code /
-SSO): `-g SITE` asks you on the terminal, then shows a remote view of a headless tab
-(the window only as a fallback) and waits; -t and -c only check them.
+rejects it; any item opts in with agent_no_submit=true). When such a session or
+one of Notion, Slack, OpenAI or claude.ai lapses, an AGENT renews it: `-L SITE`
+imports your Safari session — logging Safari in first (safari.py with every
+feature its recipe needs, your Vaultwarden tab) when it has lapsed there too —
+claude.ai through its automated magic link. Only a CAPTCHA, an SMS code, a push /
+security-key approval or a locked vault stay yours (exit 4, named); `-g SITE` is
+still there for a login by hand. CSCS and Smartsheet log in through the broker.
+SWITCH Cloud logs in with the portal's SSO click, on the browser's own edu-ID
+session first, then on the broker's (no window).
 
 Examples:
   ./agent-login.py              # overview
@@ -39,6 +41,14 @@ Examples:
   ./agent-login.py -V           # onboarding review of every broker item (read-only)
   ./agent-login.py -V -i new.json  # review a PLANNED item before the vault write
   ./agent-login.py -D docker    # remove: run while listed, again after the vault item went
+  ./agent-login.py -L notion    # an AGENT imports Albert's Safari session (+ a Safari login)
+  ./agent-login.py -L galaxus-de -n  # what -L would do (no import, no Safari login)
+  ./agent-login.py -R           # refresh-only pass (NPM tokens; LaunchAgent every 6 h)
+
+Sites on Albert's session (Safari sites, galaxus-de, Notion, Slack, OpenAI,
+claude.ai) are renewed by AGENTS with -L — never a to-do for Albert, except
+a CAPTCHA, an SMS code, a push / security-key approval or a locked vault
+(exit 4, named). myfritz is on demand: never checked daily.
 
 Where a login broke: every check records its PHASE (precheck, limiter, vault,
 recipe, submit, profile-proof, broker-proof, bundle-export, cookie-inject,
@@ -58,8 +68,10 @@ from __future__ import annotations
 # pylint: disable=too-many-lines
 import argparse
 import contextlib
+import fcntl
 import json
 import os
+import shutil
 import socket
 import sys
 import time
@@ -70,8 +82,10 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))  # the repo's `broker` package
 # pylint: disable=wrong-import-position
 import agent_login_keychain  # noqa: E402
+import agent_login_safari as alsafari  # noqa: E402
 import agent_login_secrets  # noqa: E402
 import agent_login_state as als  # noqa: E402
+import agent_login_toolchain  # noqa: E402
 from agent_login_claude import (  # noqa: E402
     CLAUDE_ACCOUNTS,
     SITE_INSTANCE,
@@ -90,18 +104,22 @@ from agent_login_jobs import (  # noqa: E402
     LOGIN_TIMEOUT_RC,
     MAIL_TO,
     NETWORK_HOST,
+    REFRESH_INTERVAL_S,
+    REFRESH_LABEL,
     SNAPSHOT_INTERVAL_S,
     SNAPSHOT_LABEL,
     BrowserRun,
     _browser,
     browser_mode,
     browser_timeout,
+    daily_loaded,
     guided_busy,
     guided_window,
     install_daily,
     launchagent_plist,
     login_timeout_s,
     recover_stale_guided_login,
+    refresh_plist,
     run_browser,
     safari_sessions,
     send_mail,
@@ -134,9 +152,17 @@ SUPPORTED_FLOWS = {"one-page", "two-step", "cscs", "smartsheet", "eduid-sso"}
 EDUID_SSO_FLOW = "eduid-sso"
 # Albert's Safari session, copied by `browser.py login` (broker/safari_cookies.py).
 SAFARI_FLOW = "safari"
-# Built-in browser.py sites whose login needs Albert (email code, SSO click): agents
-# use the session he leaves in the shared Chromium; the check never logs in.
+# Built-in browser.py sites whose login needs a human-style step (email code,
+# SSO click): the check never logs in; an AGENT renews them through Albert's
+# Safari (`-L SITE`, WS1b) — claude.ai through its automated magic link.
 ASSISTED_FLOW = "assisted"
+# WS1b: logged in when an agent needs it, never by the daily check (Albert,
+# 2026-10-11: MyFRITZ's Keycloak session lasts 10 h — a daily ✅ would be
+# stale by the evening). `-c` neither checks nor logs them in.
+ON_DEMAND_SITES = frozenset({"myfritz"})
+# One id per agent-login run: a site's failed checks count as two in a row
+# only from two different runs (agent_login_state.record_check, WS1b O10).
+RUN_ID = f"{os.getpid()}-{int(time.time())}"
 
 
 @dataclass(frozen=True)
@@ -179,8 +205,14 @@ TARGETS = (
         "Galaxus",
         "https://id.digitecgalaxus.ch",
         SAFARI_FLOW,
-        _SAFARI_NOTE + " (the broker never submits a password here; or your "
-        "own login: ./agent-login.py -g galaxus)",
+        _SAFARI_NOTE + " (the broker never submits a password here)",
+    ),
+    Target(
+        "galaxus-de",
+        "Galaxus DE",
+        "https://id.galaxus.eu",
+        SAFARI_FLOW,
+        "a separate account in Albert's Safari; the broker never submits here",
     ),
     Target(
         "cscs",
@@ -202,7 +234,7 @@ TARGETS = (
         "Anthropic work",
         "https://claude.ai",
         ASSISTED_FLOW,
-        "claude.ai work account (SDSC Team admin): ./agent-login.py -g anthropic",
+        "claude.ai work account (SDSC Team admin)",
     ),
     Target(
         "anthropic-private",
@@ -210,29 +242,28 @@ TARGETS = (
         "https://claude.ai",
         ASSISTED_FLOW,
         "claude.ai private account, own browser instance "
-        "(CLAUDE_BROWSER_INSTANCE=private, CDP 9223): ./agent-login.py -g "
-        "anthropic-private",
+        "(CLAUDE_BROWSER_INSTANCE=private, CDP 9223)",
     ),
     Target(
         "openai",
         "OpenAI",
         "https://chatgpt.com",
         ASSISTED_FLOW,
-        "chatgpt.com Business admin: log in with ./agent-login.py -g openai (Google SSO)",
+        "chatgpt.com Business admin (Google SSO)",
     ),
     Target(
         "slack",
         "Slack",
         "https://app.slack.com",
         ASSISTED_FLOW,
-        "SDSC Slack: log in with ./agent-login.py -g slack",
+        "SDSC Slack",
     ),
     Target(
         "notion",
         "Notion",
         "https://app.notion.com",
         ASSISTED_FLOW,
-        "Notion (SDSC/Renku workspace): log in with ./agent-login.py -g notion",
+        "Notion (SDSC/Renku workspace)",
     ),
     Target(
         "switch",
@@ -376,7 +407,7 @@ def classify(
     if not target.fill_origin:
         return "unknown", ""
     if target.flow == ASSISTED_FLOW:  # browser.py built-in, no broker involved
-        return "assisted", target.note
+        return "assisted", target.note + route_hint(target.site)
     if target.flow == EDUID_SSO_FLOW:
         return _classify_eduid_sso(target, listed, readable=readable)
     if not readable:
@@ -433,8 +464,10 @@ def _classify_listed(target: Target, entry: dict) -> tuple[str, str]:
         # only rules out the broker fallback. (No sentinel: the row's
         # `sentinel` flag says so — the old proof still decides.)
         if refused:
-            return "safari", f"{target.note}; broker item refused: {reason}"
-        return "safari", target.note
+            return "safari", (
+                f"{target.note}{route_hint(target.site)}; broker item refused: {reason}"
+            )
+        return "safari", target.note + route_hint(target.site)
     if refused:
         return "refused", reason
     if is_no_submit(target.site, entry):
@@ -548,7 +581,13 @@ def overview(*, fresh: bool = False) -> dict:
         stages = als.site_states()
     except als.StateError:
         stages = {}
-    safari = safari_state([t.site for t in TARGETS if t.flow == SAFARI_FLOW])
+    safari = safari_state(
+        [
+            t.site
+            for t in TARGETS
+            if t.flow == SAFARI_FLOW or t.site in safari_cookies.SAFARI_BUILTIN
+        ]
+    )
     shared = scope_conflicts(sites)  # WS5: items sharing a login with another account
     risks = onboarding_risks(sites)  # WS3: never logged in unattended
     rows = []
@@ -695,7 +734,9 @@ def _summary_name(row: dict) -> str | None:
     return site
 
 
-def _summary_reason(row: dict, state: str, checks: dict[str, dict]) -> str:
+def _summary_reason(  # pylint: disable=too-many-return-statements
+    row: dict, state: str, checks: dict[str, dict]
+) -> str:
     """The ❌ text of agents.md: fixed vocabulary only (phase/code texts, the
     fixed setup reasons, fixed hints) — never a detail or a page's words."""
     site = row["site"]
@@ -708,12 +749,90 @@ def _summary_reason(row: dict, state: str, checks: dict[str, dict]) -> str:
             "Safari session missing, expired or unreadable — Albert logs in in Safari"
         )
     rec = checks.get(site) or {}
-    text = phases.text(str(rec.get("phase") or ""), str(rec.get("code") or ""))
+    code = str(rec.get("code") or "")
+    text = phases.text(str(rec.get("phase") or ""), code)
+    if code.startswith("needs_albert_"):
+        return f"not logged in — {phases.CODE_TEXT.get(code, 'needs Albert')}"
+    if isinstance(row.get("quarantine"), dict):
+        return (
+            "not logged in — quarantined after a login that may have sent a "
+            f"credential; the main session releases it: ./agent-login.py -Q {site}"
+        )
+    if agent_route(site, row):
+        return f"not logged in{route_hint(site, row)} — never ask Albert"
     if row.get("flow") == ASSISTED_FLOW or row["status"] == "assisted":
         return f"not logged in — needs Albert: ./agent-login.py -g {site}"
     if manual_import(site):
         return f"not logged in — needs Albert: ./agent-login.py -t {site}"
     return f"not logged in — {text}"
+
+
+def _route_header(rows: list[dict]) -> str:
+    """agents.md's sentence on sites that live on Albert's session, built from
+    `agent_route` (SF2): `-L` is promised only for the sites it can renew
+    now; the rest keep "ask Albert"."""
+    routed = sorted(
+        {
+            r["site"]
+            for r in rows
+            if SITE_ID_RE.match(str(r.get("site") or "")) and agent_route(r["site"], r)
+        }
+    )
+    rest = (
+        "for the other sites on Albert's session do NOT start a login — ask "
+        "Albert to run `agent-login.py -g <site>`."
+    )
+    if not routed:
+        return rest
+    return (
+        f"for {', '.join(routed)} run `agent-login.py -L <site>` yourself (it "
+        "renews the session through Albert's Safari or the magic link; one run, "
+        "no retries) — never ask Albert to log in: only a CAPTCHA, an SMS code, "
+        "a push / security-key approval or a locked vault are his, and -L names "
+        "them; exit 3 = the Mac is locked or idle: retry later, do not ask "
+        f"Albert; {rest}"
+    )
+
+
+def agent_route(site: str, row: dict | None = None) -> bool:
+    """WS1b S2: an agent can renew `site` itself with `-L` — claude.ai through
+    its automated magic link; a recipe site when the installed safari.py
+    offers EVERY feature its recipe needs, or (no safari.py driving at all)
+    when Safari already holds a session `-L` would import (`row`'s Safari
+    columns, an importable recipe). Else the old wording stays."""
+    if site in alsafari.MAGIC_LINK_SITES:
+        return True
+    recipe = alsafari.RECIPES.get(site)
+    if recipe is None:
+        return False
+    if not alsafari.missing_features(site):
+        return True
+    return recipe.import_after and _safari_session_live(row or {})
+
+
+def _safari_session_live(row: dict) -> bool:
+    """`row`'s Safari columns: Safari holds the site's session, not expired."""
+    expires = row.get("safari_expires")
+    fresh = not expires or str(expires) >= time.strftime("%Y-%m-%d")
+    return row.get("safari") is True and fresh
+
+
+def route_hint(site: str, row: dict | None = None) -> str:
+    """The note's renewal hint for `site` (fixed words; '' when none)."""
+    if agent_route(site, row):
+        if site in alsafari.MAGIC_LINK_SITES:
+            return f" — an agent renews it: ./agent-login.py -L {site} (magic link)"
+        if alsafari.missing_features(site):
+            return (
+                f" — an agent imports Albert's existing Safari session: "
+                f"./agent-login.py -L {site}"
+            )
+        return f" — an agent renews it: ./agent-login.py -L {site} (Albert's Safari)"
+    if site in alsafari.RECIPES and site in {
+        t.site for t in TARGETS if t.flow == SAFARI_FLOW
+    }:
+        return f" — Albert logs in in Safari, then ./agent-login.py -t {site}"
+    return f" — your own login: ./agent-login.py -g {site}"
 
 
 # agents.md words for an item's `agent_privilege` (ADMIN in capitals: an
@@ -773,7 +892,12 @@ def _summary_line(
     prefix = f"CLAUDE_BROWSER_INSTANCE={inst} " if inst and inst != "?" else ""
     if state == "ok":
         how = _HOW_TO_USE.get(row["status"], "login broker")
-        if manual_import(site):
+        if manual_import(site) and agent_route(site, row):
+            how = (
+                "Albert's Safari session; the daily run only checks it — when "
+                f"it lapses{route_hint(site, row)}"
+            )
+        elif manual_import(site):
             how = f"check only; Albert re-imports (`agent-login.py -t {site}`)"
         if site in CLAUDE_ACCOUNTS:
             how += f", {CLAUDE_ACCOUNTS[site]}"
@@ -792,6 +916,12 @@ def _summary_line(
         return "ok", f"{indent}- ✅ {name} (`{browser_site(site)}`): {how}"
     if state == "unproven":
         return "warn", f"{indent}- ⚠ {name} (`{site}`): {unproven_text(row)}"
+    if state == "on-demand":
+        return "ok", (
+            f"{indent}- ⏯ {name} (`{site}`): on demand — `{prefix}browser.py "
+            f"logged-in {site}`; if it fails, `{prefix}browser.py login {site}` "
+            "(broker login, about a minute); its sessions are short"
+        )
     if state in _CHECK_FIRST:
         note = _account_note(row)
         return "check", (
@@ -871,11 +1001,11 @@ def agent_summary(data: dict, checks: dict[str, dict]) -> str:
         "",
         "The shared logged-in Chromium (CDP http://127.0.0.1:9222; `browser.py`, "
         "Playwright MCP `browser_*` tools) holds these sessions. Before using a "
-        "site: `browser.py logged-in <site>`. If it fails: for broker/Safari sites "
-        "run `browser.py login <site>` (never asks for a password); for sites on "
-        "Albert's session do NOT start a login — ask Albert to run "
-        "`agent-login.py -g <site>`. Never ask Albert for passwords. A site that "
-        "fails after its password was submitted is quarantined: do not retry it.",
+        "site: `browser.py logged-in <site>`. If it fails: for broker sites run "
+        "`browser.py login <site>` (never asks for a password); "
+        + _route_header(data["rows"])
+        + " A site that fails after its password was submitted is quarantined: "
+        "do not retry it.",
         "",
         *ok_lines,
         *check_lines,
@@ -883,7 +1013,8 @@ def agent_summary(data: dict, checks: dict[str, dict]) -> str:
         *bad_lines,
         *agent_login_secrets.summary_lines(data.get("secrets") or []),
         "",
-        f"Full status: `{here}/agent-login.py` (❌ items need Albert unless noted).",
+        f"Full status: `{here}/agent-login.py` (❌ items name the command an "
+        "agent runs; only lines saying 'needs Albert' are his).",
     ]
     if not data.get("broker_ok"):
         out.insert(2, "⚠️ login broker unavailable — broker sites cannot log in now\n")
@@ -952,6 +1083,9 @@ def record_check(
             instance=inst,
             identity=str(r.get("identity") or ""),
             config=str(r.get("config") or ""),
+            server=str(r.get("server") or ""),
+            cookie_days_left=r.get("cookie_days_left"),
+            run_id=RUN_ID,
         )
 
 
@@ -976,7 +1110,9 @@ def _setup_problem(row: dict) -> str | None:
     if status in _SETUP_REASON:
         detail = f" ({row['detail']})" if row.get("detail") else ""
         return _SETUP_REASON[status] + detail
-    if status != "safari" or row.get("fallback"):
+    if status != "safari" or row.get("fallback") or agent_route(row["site"], row):
+        # WS1b: a site an agent can log Safari into (`-L`) is judged by its
+        # check alone; a missing Safari session is a flag (`_row_flags`).
         return None
     expires = row.get("safari_expires")
     problem = None
@@ -1062,7 +1198,7 @@ def refusal_text(row: dict) -> str:
 
 
 # One return per state, in the order they are decided.
-def row_state(  # pylint: disable=too-many-return-statements
+def row_state(  # pylint: disable=too-many-return-statements,too-many-branches
     row: dict, checks: dict[str, dict]
 ) -> tuple[str, str]:
     """(state, why) of one login: ``ok`` (setup complete AND the latest real
@@ -1080,6 +1216,14 @@ def row_state(  # pylint: disable=too-many-return-statements
     site = row["site"]
     rec = checks.get(site)
     fresh = als.freshness(rec)
+    if site in ON_DEMAND_SITES:
+        # WS1b: never judged by age — its session is short on purpose.
+        last = (
+            f"last check {rec.get('at_text', '?')}: {rec.get('state')}"
+            if rec
+            else "never checked"
+        )
+        return "on-demand", f"on demand — {last}; log in when needed"
     if not rec or fresh == "unchecked":
         return "unchecked", f"not checked yet — ./agent-login.py -t {site}"
     when = rec.get("at_text", "?")
@@ -1174,8 +1318,28 @@ def _row_flags(row: dict) -> str:
     if limit.get("state") in ("locked", "cooldown", "quarantined", "busy"):
         flags.append(f"{limit['state']}: {limit.get('reset') or limit.get('key')}")
     if row.get("stage") == "pending" and row["status"] in ("ready", "extra"):
-        flags.append(f"pending — no scheduled login until ./agent-login.py -p {site}")
+        if site not in ON_DEMAND_SITES:
+            flags.append(
+                f"pending — no scheduled login until ./agent-login.py -p {site}"
+            )
+    if site in ON_DEMAND_SITES:
+        flags.append(f"on demand — never checked daily; browser.py login {site}")
+    if (
+        row["status"] == "safari"
+        and agent_route(site, row)
+        and row.get("safari") is False
+    ):
+        flags.append(f"Safari session missing — renew: ./agent-login.py -L {site}")
     return "; ".join(flags)
+
+
+def cookie_warning(rec: dict) -> str:
+    """The overview's expiry warning of a check record (WS1b telemetry: the
+    session cookie's days left, < 30 → warn), else ''."""
+    days = rec.get("cookie_days_left")
+    if isinstance(days, int) and not isinstance(days, bool) and days < 30:
+        return f"session cookie expires in {days} day(s) — a visit renews it"
+    return ""
 
 
 def print_overview(data: dict) -> None:
@@ -1193,6 +1357,7 @@ def print_overview(data: dict) -> None:
     judged = [(r, *row_state(r, checks)) for r in rows]
     order = {
         "ok": 0,
+        "on-demand": 0,
         "stale": 1,
         "unknown": 1,
         "unreachable": 1,
@@ -1204,6 +1369,7 @@ def print_overview(data: dict) -> None:
     col = "agent_fill_origins"
     icons = {
         "ok": "✅",
+        "on-demand": "⏯ ",
         "stale": "❓",
         "unknown": "❓",
         "unreachable": "❓",
@@ -1221,7 +1387,7 @@ def print_overview(data: dict) -> None:
                 why += f" — {rec['detail']}"
             if rec.get("screenshot"):
                 why += f"  📷 {rec['screenshot']}"
-        flags = _row_flags(r)
+        flags = "; ".join(f for f in (_row_flags(r), cookie_warning(rec)) if f)
         if flags:
             why += f"  [{flags}]"
         print(line + (_c("2", why) if state == "ok" else why))
@@ -1560,25 +1726,79 @@ VIEWER_SITES = ASSISTED_SITES - set(CLAUDE_ACCOUNTS)
 
 def assisted_check(site: str) -> tuple[bool | None, str]:
     """(works?, how) for a site you log into yourself; never starts a login."""
+    ok, how, _res = assisted_probe(site)
+    return ok, how
+
+
+def assisted_probe(site: str) -> tuple[bool | None, str, dict | None]:
+    """`assisted_check` plus browser.py's result record (a tri-state site's
+    ``server`` / ``proof`` / ``cookie_days_left``), None when there is none."""
     with site_session(site):
         return _assisted_check(site)
 
 
-def _assisted_check(site: str) -> tuple[bool | None, str]:
-    """(True, how) logged in, (False, how) not, (None, busy) a guided login
-    owns the browser right now — re-check later, it says nothing either way."""
+def assisted_verdict(site: str) -> tuple[bool | None, str, dict | None]:
+    """What `-c` uses: a tri-state site's full probe (its result record),
+    every other assisted site's plain `assisted_check`."""
+    if site in TRISTATE_SITES:
+        return assisted_probe(site)
+    ok, how = assisted_check(site)
+    return ok, how, None
+
+
+# WS1b D8: built-in sites whose `logged-in` is tri-state (its result record
+# says `indeterminate` when it cannot tell — never "logged out").
+TRISTATE_SITES = frozenset({"notion", "slack", "openai"})
+
+
+def _login_hint(site: str) -> str:
+    """How a logged-out site you own the session of gets back (fixed text)."""
+    if agent_route(site):
+        return f"an agent runs ./agent-login.py -L {site}"
+    return f"log in once: ./agent-login.py -g {site}"
+
+
+# One return per verdict (busy, tri-state, plain, claude.ai).
+def _assisted_check(  # pylint: disable=too-many-return-statements
+    site: str,
+) -> tuple[bool | None, str, dict | None]:
+    """(True, how) logged in, (False, how) not, (None, how) it cannot be told
+    right now: a guided login owns the browser (busy) or a tri-state check
+    could not decide — re-check later, it says nothing either way."""
     busy = guided_busy()
     if busy:
-        return None, f"{busy} — re-check later"
-    hint = f"log in once: ./agent-login.py -g {site}"
+        return None, f"{busy} — re-check later", None
+    hint = _login_hint(site)
+    if site in TRISTATE_SITES:
+        run = run_browser(
+            "logged-in",
+            site,
+            timeout_s=browser_timeout("logged-in"),
+            quiet=True,
+            result=True,
+        )
+        res = run.result or {}
+        if run.rc == BUSY_RC:
+            return None, BUSY_RECHECK, None
+        if run.rc == 0:
+            return True, "logged in", res
+        code = str(res.get("code") or "")
+        if code == "logged_out":
+            return False, f"NOT logged in — {hint}", res
+        if code == "wrong_account":
+            return False, "logged in as ANOTHER account — " + hint, res
+        return None, "could not tell — " + phases.text("client-proof", code), res
     if site not in CLAUDE_ACCOUNTS:
         rc = _browser(
             "logged-in", site, quiet=True, timeout_s=browser_timeout("logged-in")
         )
         if rc == BUSY_RC:
-            return None, BUSY_RECHECK
-        return (True, "logged in") if rc == 0 else (False, f"NOT logged in — {hint}")
-    return _claude_check(site, hint)
+            return None, BUSY_RECHECK, None
+        if rc == 0:
+            return True, "logged in", None
+        return False, f"NOT logged in — {hint}", None
+    ok, how = _claude_check(site, hint)
+    return ok, how, None
 
 
 BUSY_RECHECK = "busy: guided login in progress — re-check later"
@@ -1843,9 +2063,14 @@ def failure_mail(failed: list[tuple[str, str]]) -> tuple[str, str]:
 
 
 def safari_fix(site: str) -> str:
-    """What Albert does when `site` is logged out (depends on its login flow)."""
+    """What to do when `site` is logged out (depends on its login flow)."""
     here = Path(__file__).resolve().parent
     flow = next((t.flow for t in TARGETS if t.site == site), "")
+    if agent_route(site):
+        return (
+            f"an agent runs ./agent-login.py -L {site} (through your Safari; "
+            f"it names the step only you can do, if any) (in {here})"
+        )
     if flow == ASSISTED_FLOW or (flow != SAFARI_FLOW and _no_submit_assisted(site)):
         return f"run ./agent-login.py -g {site} and finish the login (in {here})"
     if flow == EDUID_SSO_FLOW:
@@ -1871,19 +2096,69 @@ def ensure_browser_up() -> bool:
     return browser_mode() is not None
 
 
-def _check_assisted_row(site: str, failed: list[tuple[str, str]]) -> None:
-    """`-c` for a site you log into yourself: check only; busy = unknown."""
-    ok, how = assisted_check(site)
+def _check_assisted_row(
+    site: str,
+    failed: list[tuple[str, str]],
+    deferred: list[str] | None = None,
+) -> None:
+    """`-c` for a site you log into yourself: check only; busy or a
+    tri-state "cannot tell" = unknown. A first "logged out" is re-probed ONCE
+    at the end of the run (`deferred`, `recheck_deferred`) before it counts;
+    the failure mail lists it only from its second failed RUN (O10)."""
+    ok, how, res = assisted_verdict(site)
     if ok is None:
         print(f"⏸  {site}: {how}")
-        record_check(site, None, how, {"phase": "precheck", "code": "busy"})
+        record_check(site, None, how, res or {"phase": "precheck", "code": "busy"})
         return
+    if not ok and deferred is not None:
+        print(f"↻ {site}: {how} — re-checked at the end of this run")
+        deferred.append(site)
+        return
+    _record_assisted(site, ok, how, res, failed)
+
+
+def _record_assisted(
+    site: str,
+    ok: bool,
+    how: str,
+    res: dict | None,
+    failed: list[tuple[str, str]],
+) -> None:
+    """Record an assisted row's verdict; a failure joins `failed` (the mail)
+    only at ``invalid_streak`` ≥ 2."""
     print(f"{'✅' if ok else '❌'} {site}: {how}")
-    record_check(
-        site, ok, how, None if ok else {"phase": "client-proof", "code": "logged_out"}
+    # a check that named another account keeps that verdict (N7)
+    code = (
+        "wrong_account" if (res or {}).get("code") == "wrong_account" else "logged_out"
     )
-    if not ok:
+    result = res if ok else {**(res or {}), "phase": "client-proof", "code": code}
+    record_check(site, ok, how, result)
+    if ok:
+        return
+    streak = int((last_checks().get(site) or {}).get("invalid_streak") or 0)
+    if streak >= ASSISTED_MAIL_STREAK:
         failed.append((site, how))
+    else:
+        print(
+            f"   {site}: first failed run — the mail waits for a second one "
+            f"(≥ {als.STREAK_SPACING_S / 3600:g} h later)"
+        )
+
+
+# The failure mail names an assisted site only after this many failed RUNS.
+ASSISTED_MAIL_STREAK = 2
+
+
+def recheck_deferred(deferred: list[str], failed: list[tuple[str, str]]) -> None:
+    """End of `-c`: the one re-probe of each assisted row that read "logged
+    out" earlier in this run; it decides this run's verdict only."""
+    for site in deferred:
+        ok, how, res = assisted_verdict(site)
+        if ok is None:
+            print(f"⏸  {site}: {how}")
+            record_check(site, None, how, res or {"phase": "precheck", "code": "busy"})
+            continue
+        _record_assisted(site, ok, how, res, failed)
 
 
 # One early return per gate, in the order they are checked.
@@ -1946,9 +2221,14 @@ def check_only_gate(row: dict) -> tuple[str, str] | None:
     rule = safari_cookies.SAFARI_SITES.get(row["site"])
     if row.get("flow") == SAFARI_FLOW and rule is not None:
         if not rule.import_unattended:
+            site = row["site"]
+            if agent_route(site, row):
+                return "manual_import", (
+                    f"the Safari import runs by hand only{route_hint(site, row)} "
+                    f"(a plain import: -t {site})"
+                )
             return "manual_import", (
-                "the Safari import runs by hand only — "
-                f"./agent-login.py -t {row['site']}"
+                f"the Safari import runs by hand only — ./agent-login.py -t {site}"
             )
     return schedule_gate(row)
 
@@ -2090,12 +2370,15 @@ def check_all(*, mail: bool = False) -> int:  # pylint: disable=too-many-branche
     psl = report_psl()  # once per run, never a per-site gate
     if psl:
         failed.append(("onboarding review", psl))
+    failed += toolchain_report()  # WS1b D9: after a brew upgrade
     by_instance: dict[str, list[dict]] = {}
     for row in data["rows"]:
         by_instance.setdefault(check_instance(row), []).append(row)
+    deferred: list[str] = []
     for row in by_instance.pop("", []):
-        if not _check_row(row, failed, ensure_browser_up):
+        if not _check_row(row, failed, ensure_browser_up, deferred):
             break
+    recheck_deferred(deferred, failed)
     for inst in identity.ROLE_INSTANCES:
         _check_role_instance(inst, by_instance.pop(inst, []), failed)
     if failed and mail:
@@ -2163,13 +2446,23 @@ def _check_role_instance(
 
 # One return per way a row ends (skipped, recorded, checked, browser gone).
 def _check_row(  # pylint: disable=too-many-return-statements
-    row: dict, failed: list[tuple[str, str]], alive: Callable[[], bool]
+    row: dict,
+    failed: list[tuple[str, str]],
+    alive: Callable[[], bool],
+    deferred: list[str] | None = None,
 ) -> bool:
     """`-c` for one row in the CURRENT browser instance; False when the
-    browser went away (the caller stops: never fail every remaining site)."""
+    browser went away (the caller stops: never fail every remaining site).
+    `deferred`: where a first-failed assisted row waits for its re-probe."""
     site, inst = row["site"], row_instance(row)
+    if site in ON_DEMAND_SITES:
+        # WS1b D6: never checked or logged in by the daily run; its row
+        # leaves the legacy projection so infra/status does not judge it.
+        print(f"⏭  {site}: on demand — not checked")
+        als.drop_legacy(site)
+        return True
     if row["status"] == "assisted":
-        _check_assisted_row(site, failed)
+        _check_assisted_row(site, failed, deferred)
         return True
     if row["status"] == "unchecked":  # the broker cannot read Bitwarden
         record_check(
@@ -2862,6 +3155,480 @@ def origin_mismatches(rows: list[dict]) -> list[dict]:
     return [r for r in rows if r.get("origin_ok") is False and r.get("final_origin")]
 
 
+# ---------------------------------------------------------------------------
+# WS1b: `-L SITE` — an agent's login through Albert's Safari, then the import
+# (PLAN_ws1b-durability.md D1). Explicit and attended only: never from a
+# LaunchAgent, never on a locked or unattended Mac (`interactive_gate`).
+# ---------------------------------------------------------------------------
+
+SAFARI_LOCK_WAIT_S = 120.0
+FLUSH_WAIT_S = 90.0
+FLUSH_POLL_S = 2.0
+# The ONLY free-check verdicts `-L` goes on from (B1): a definite "logged
+# out" — for Notion also another account, which the import's own proof
+# handles. Everything else (cannot tell, internal, gated) stops.
+CONTINUE_CODES = {"notion": frozenset({"logged_out", "wrong_account"})}
+DEFAULT_CONTINUE = frozenset({"logged_out"})
+# An import that ran out of time or met a guided login: the shared browser's
+# state is unknown — never followed by a Safari login (N5).
+IMPORT_STOP_RCS = frozenset({BUSY_RC, LOGIN_TIMEOUT_RC, LOGIN_TIMEOUT_DIRTY_RC})
+
+
+@contextlib.contextmanager
+def safari_login_lock(wait_s: float = SAFARI_LOCK_WAIT_S) -> Iterator[bool]:
+    """One Safari login at a time (they share Albert's Safari and clipboard):
+    an exclusive flock on ``<state>/safari-login.lock``; yields False when it
+    was not free within `wait_s`."""
+    path = als.state_dir() / "safari-login.lock"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd = os.open(str(path), os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+    try:
+        deadline = time.monotonic() + wait_s
+        while True:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                got = True
+                break
+            except BlockingIOError:
+                if time.monotonic() >= deadline:
+                    got = False
+                    break
+                time.sleep(0.5)
+        yield got
+    finally:
+        os.close(fd)
+
+
+def _safari_fail(site: str, out: alsafari.Outcome, how: str) -> int:
+    """Record a failed `-L` (phase/code fixed), quarantine when a credential
+    step may have sent something; the exit code. Says "quarantined" only
+    when the quarantine was written (N8)."""
+    quarantined = False
+    if out.credential:
+        try:
+            als.quarantine(site, out.phase, out.code)
+            quarantined = True
+        except (als.StateError, OSError):
+            quarantined = False
+    record_check(
+        site,
+        None if out.rc in (BUSY_RC, 3) else False,
+        how,
+        {"phase": out.phase, "code": out.code, "route": "safari-login"},
+    )
+    who = "needs Albert" if out.rc == alsafari.NEEDS_ALBERT_RC else "not logged in"
+    print(f"❌ {site}: {who} — {phases.text(out.phase, out.code)}")
+    if quarantined:
+        print(
+            f"   quarantined (a credential step ran) — the main session releases "
+            f"it: ./agent-login.py -Q {site}"
+        )
+    elif out.credential:
+        print(
+            "   a credential step ran but the quarantine could NOT be written — "
+            f"do not run -L {site} again before the main session looked at it"
+        )
+    if out.window_left:
+        print("   a Safari login window may be left open (its id never came back)")
+    return out.rc
+
+
+def _safari_jar(site: str) -> tuple[list, str | None]:
+    """(`site`'s usable Safari cookies, None) or ([], why) — values stay in
+    memory only."""
+    try:
+        jar = safari_cookies.read_binarycookies()
+    except (OSError, ValueError) as exc:
+        return [], str(getattr(exc, "strerror", None) or type(exc).__name__)
+    return safari_cookies.site_cookies(jar, site), None
+
+
+def _import_run(site: str, agent: bool) -> BrowserRun:
+    """`browser.py import-safari SITE -R` (`-a`: after an agent's login)."""
+    args = ["import-safari", site, *(["-a"] if agent else [])]
+    with site_session(site):
+        return run_browser(
+            *args, timeout_s=browser_timeout("import-safari"), capture=True, result=True
+        )
+
+
+def _free_check(site: str) -> tuple[int, dict]:
+    """The free `logged-in` probe in the site's instance."""
+    with site_session(site):
+        rc, check = probe(browser_site(site))
+    return rc, check or {}
+
+
+def _import_how(run: BrowserRun, base: str) -> str:
+    """`base`, plus a failed undo the import recorded (S6)."""
+    if (run.result or {}).get("undo") == "failed":
+        return f"{base} — the import's UNDO FAILED (cookies may be left)"
+    return base
+
+
+# One return per stage of the pipeline (D1).
+def safari_login_action(  # pylint: disable=too-many-return-statements
+    site: str, *, dry_run: bool = False
+) -> int:
+    """`-L SITE`: free check → Safari's own session → a login in Safari →
+    import. See the section comment; one run, no retries."""
+    site = resolve_site(site)
+    if alsafari.scheduled():
+        print(
+            f"❌ -L drives Albert's Safari: never from a LaunchAgent "
+            f"({alsafari.SCHEDULED_ENV}=1) — an agent runs it when it needs {site}"
+        )
+        return 2
+    if site in alsafari.MAGIC_LINK_SITES:
+        return magic_link_login(site, dry_run=dry_run)
+    recipe = alsafari.RECIPES.get(site)
+    if recipe is None:
+        known = ", ".join(sorted([*alsafari.RECIPES, *alsafari.MAGIC_LINK_SITES]))
+        print(f"❌ {site}: no Safari login for this site (known: {known})")
+        return 2
+    if dry_run:
+        return safari_dry_run(site, recipe)
+    gate = alsafari.interactive_gate()
+    if gate is not None:
+        print(f"❌ {site}: {phases.CODE_TEXT.get(gate, gate)} ({gate})")
+        return 3
+    q = als.quarantined(site)
+    if q is not None:
+        print(
+            f"❌ {site}: quarantined after {q.get('phase')} {q.get('at_text', '')} — "
+            f"the main session releases it: ./agent-login.py -Q {site}"
+        )
+        return 2
+    with safari_login_lock() as got:
+        if not got:
+            print(f"⏸  {site}: another Safari login runs — try again later")
+            return BUSY_RC
+        return _safari_login_locked(site, recipe)
+
+
+def safari_dry_run(site: str, recipe: alsafari.Recipe) -> int:
+    """`-L SITE -n`: READ-ONLY — safari.py's capabilities against the recipe,
+    the interactive gate, whether Safari holds a session. No check, no
+    import, no record."""
+    have = alsafari.available_features()
+    missing = recipe.features() - have
+    if missing:
+        print(
+            f"ℹ️ {site}: safari.py lacks {', '.join(sorted(missing))} — -L would only "
+            "import a session Safari already holds (mydotfiles specs)"
+        )
+    else:
+        print(f"ℹ️ {site}: safari.py offers every feature the recipe needs")
+    gate = alsafari.interactive_gate()
+    print(
+        f"ℹ️ {site}: interactive gate "
+        + ("open" if gate is None else f"closed — {phases.CODE_TEXT.get(gate, gate)}")
+    )
+    cookies, why = _safari_jar(site)
+    if why is not None:
+        print(f"ℹ️ {site}: Safari's cookie file unreadable ({why})")
+        return 0
+    held = safari_cookies.has_session(site, cookies)
+    print(
+        f"ℹ️ {site}: Safari {'holds' if held else 'holds NO'} session — -L would "
+        + ("import it first" if held and recipe.import_after else "log Safari in")
+    )
+    return 0
+
+
+def _free_check_gate(site: str) -> int | None:
+    """None when `-L` may go on (a DEFINITE logged-out, B1); else the exit
+    code after saying why — the session works (0), busy (75) or the check
+    could not tell (2, its code named)."""
+    rc, check = _free_check(site)
+    code = str(check.get("code") or "")
+    if rc == 0:
+        print(f"✅ {site}: the shared Chromium is logged in — nothing to do")
+        record_check(site, True, "logged in", {**check, "phase": "ok", "code": "ok"})
+        return 0
+    if rc == BUSY_RC:
+        print(f"⏸  {site}: {BUSY_HOW}")
+        return BUSY_RC
+    if rc == 2 and code in CONTINUE_CODES.get(site, DEFAULT_CONTINUE):
+        return None
+    print(
+        f"⏸  {site}: the free check is not a definite logged-out "
+        f"(exit {rc}, code {code or 'none'}: {identity_text(check)}) — nothing "
+        "replaced; try again later"
+    )
+    return 2
+
+
+# One return per stage, in pipeline order.
+def _safari_login_locked(  # pylint: disable=too-many-return-statements
+    site: str, recipe: alsafari.Recipe
+) -> int:
+    """`safari_login_action` under the Safari-login lock."""
+    if recipe.import_after:
+        stop = _free_check_gate(site)
+        if stop is not None:
+            return stop
+    cookies, why = _safari_jar(site)
+    if why is not None:
+        out = alsafari.Outcome(3, "no_safari_session")
+        return _safari_fail(site, out, f"Safari's cookie file unreadable ({why})")
+    before = safari_cookies.session_fingerprint(site, cookies)
+    if safari_cookies.has_session(site, cookies) and recipe.import_after:
+        print(f"▶ {site}: Safari holds a session — importing it")
+        run = _import_run(site, agent=False)
+        if run.rc == 0:
+            record_check(
+                site,
+                True,
+                "logged in (Safari session imported)",
+                {
+                    **(run.result or {}),
+                    "phase": "ok",
+                    "code": "ok",
+                    "route": "safari-import",
+                },
+            )
+            print(f"✅ {site}: logged in with Albert's Safari session")
+            return 0
+        res = run.result or {}
+        code = str(res.get("code") or "")
+        if (
+            run.rc in IMPORT_STOP_RCS
+            or run.rc is None
+            or code
+            in (
+                "identity_unconfigured",
+                "wrong_account",
+                "indeterminate",
+            )
+        ):
+            # a Safari login cannot fix it, or the browser's state is unknown
+            out = alsafari.Outcome(
+                BUSY_RC if run.rc == BUSY_RC else 2,
+                code or "timeout",
+                phase=str(res.get("phase") or "client-proof"),
+            )
+            return _safari_fail(
+                site, out, _import_how(run, f"Safari session not imported — {out.code}")
+            )
+        print(f"↻ {site}: the imported session does not work — logging Safari in")
+    out = _drive_safari(site, recipe)
+    if not out.ok:
+        return _safari_fail(site, out, f"Safari login stopped — {out.code}")
+    if not recipe.import_after:
+        record_check(
+            site,
+            True,
+            "Safari logged in (agents use Safari)",
+            {"phase": "ok", "code": "ok", "route": "safari-login"},
+        )
+        print(f"✅ {site}: Safari is logged in (agents work in Safari for {site})")
+        return 0
+    if not _wait_flush(site, before):
+        print(f"⚠️ {site}: Safari did not write the new session yet — importing anyway")
+    run = _import_run(site, agent=bool(out.steps))
+    if run.rc == 0:
+        record_check(
+            site,
+            True,
+            "logged in (agent's Safari login)",
+            {
+                **(run.result or {}),
+                "phase": "ok",
+                "code": "ok",
+                "route": "safari-login",
+            },
+        )
+        print(f"✅ {site}: logged in through Albert's Safari")
+        return 0
+    res = run.result or {}
+    failed = alsafari.Outcome(
+        BUSY_RC if run.rc == BUSY_RC else 2,
+        str(
+            res.get("code")
+            or ("timeout" if run.rc in IMPORT_STOP_RCS else "logged_out")
+        ),
+        credential=out.credential,
+        phase=str(res.get("phase") or "client-proof"),
+    )
+    return _safari_fail(
+        site, failed, _import_how(run, "Safari login done, the import failed")
+    )
+
+
+def _wait_flush(site: str, before: str) -> bool:
+    """Wait until Safari's cookie file holds a NEW session for `site` (a
+    value-inclusive digest differs from `before`)."""
+    deadline = time.monotonic() + FLUSH_WAIT_S
+    while time.monotonic() < deadline:
+        cookies, why = _safari_jar(site)
+        if why is None and safari_cookies.has_session(site, cookies):
+            if safari_cookies.session_fingerprint(site, cookies) != before:
+                return True
+        time.sleep(FLUSH_POLL_S)
+    return False
+
+
+# One return per thing the Safari run needs before it can start.
+def _drive_safari(  # pylint: disable=too-many-return-statements
+    site: str, recipe: alsafari.Recipe
+) -> alsafari.Outcome:
+    """Resolve what the recipe needs, check safari.py, run the step machine."""
+    binary = alsafari.safari_py_bin()
+    if binary is None:
+        return alsafari.Outcome(3, "safari_py_missing")
+    call = alsafari.run_safari_py(binary)
+    missing = recipe.features() - alsafari.features(call)
+    if missing:
+        print(f"   safari.py lacks: {', '.join(sorted(missing))} (mydotfiles specs)")
+        return alsafari.Outcome(3, "safari_py_outdated")
+    status = call(["--status"])
+    if status.rc != 0 or status.data.get("javascript") is not True:
+        return alsafari.Outcome(3, "safari_unavailable")
+    try:
+        over = alsafari.load_overrides().get(site, {})
+    except alsafari.OverrideError as exc:
+        print(f"   {exc}")
+        return alsafari.Outcome(2, "identity_unconfigured")
+    plan = _safari_plan(site, recipe, over)
+    if plan is None:
+        return alsafari.Outcome(2, "safari_no_recipe")
+    print(f"▶ {site}: logging in in Albert's Safari (a new window; his clipboard)")
+    return alsafari.Machine(recipe, plan, call).run()
+
+
+def _safari_plan(
+    site: str, recipe: alsafari.Recipe, over: dict
+) -> alsafari.Plan | None:
+    """The run's start page, sentinel, vault item, account and mailbox."""
+    entry: dict = {}
+    if recipe.broker:
+        _health, sites = broker_state()
+        entry = next((s for s in sites if s.get("site") == site), {}) or {}
+    start = recipe.start_url or str(entry.get("login_url") or "")
+    sentinel = recipe.sentinel or str(entry.get("logged_in_selector") or "")
+    item = str(over.get("item") or entry.get("name") or "")
+    if not start or not sentinel or (recipe.broker and not item):
+        return None
+    mail = None
+    if any(s.kind == "mail_code" for s in recipe.steps):
+        himalaya = shutil.which("himalaya")
+        if himalaya:
+            mail = alsafari.MailReader(
+                himalaya,
+                str(over.get("mailbox") or "")
+                or os.environ.get("ANTHROPIC_LOGIN_HIMALAYA_ACCOUNT"),
+            )
+    return alsafari.Plan(
+        start_url=start,
+        sentinel=sentinel,
+        item=item,
+        account=str(over.get("account") or ""),
+        expected_email=str(over.get("expected_email") or ""),
+        mail=mail,
+    )
+
+
+@contextlib.contextmanager
+def _env(**values: str) -> Iterator[None]:
+    """Set environment variables for the child processes of the block."""
+    old = {k: os.environ.get(k) for k in values}
+    os.environ.update(values)
+    try:
+        yield
+    finally:
+        for k, v in old.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+
+
+def magic_link_login(site: str, *, dry_run: bool = False) -> int:
+    """`-L anthropic[-private]`: claude.ai's automated magic link (sender
+    allow-list, baseline, embedded-e-mail check, bin/browser.py
+    `_claude_auto_login`) in the account's own browser instance — no Safari.
+    Without a readable mailbox it stops with browser.py's "needs Albert"."""
+    if dry_run:
+        print(f"ℹ️ {site}: -L would run the automated magic-link login (no Safari)")
+        return 0
+    ok, how = assisted_check(site)
+    if ok:
+        print(f"✅ {site}: {how} — nothing to do")
+        record_check(site, True, how)
+        return 0
+    if ok is None:
+        print(f"⏸  {site}: {how}")
+        return BUSY_RC
+    if "one claude.ai session per browser profile" in how:
+        print(f"❌ {site}: {how}")
+        return 2
+    print(f"▶ {site}: automated magic-link login (mail read by himalaya)")
+    with site_session(site), _env(ANTHROPIC_LOGIN_EMAIL=CLAUDE_ACCOUNTS[site]):
+        rc = _browser("login", "anthropic", timeout_s=browser_timeout("login"))
+    ok, how = assisted_check(site)
+    if ok is not None:
+        record_check(site, ok, how)
+    print(f"{'✅' if ok else '❌'} {site}: {how}")
+    if rc == alsafari.NEEDS_ALBERT_RC and not ok:
+        print("   needs a mailbox himalaya can read for this account (plan L8)")
+    return 0 if ok else (rc or 2)
+
+
+# ---------------------------------------------------------------------------
+# WS1b: `-R` — the refresh-only pass (D7) and the toolchain lines (D9)
+# ---------------------------------------------------------------------------
+
+REFRESH_NETWORK_WAIT_S = 60.0
+
+
+def refresh_pass() -> int:
+    """Renew every refreshable token (NPM's JWT) that has < 12 h left: the
+    free probe, then `login -F` (never a login, never a password, never a
+    quarantine). Records nothing; exit 1 when a refresh failed. Skipped
+    while the daily check is not loaded (N2: the pass belongs to that set)."""
+    if not daily_loaded():
+        print(f"⏭  {LAUNCH_LABEL} is not loaded — refresh pass skipped")
+        return 0
+    if not wait_for_network(timeout_s=REFRESH_NETWORK_WAIT_S):
+        print(f"⏸  no network ({NETWORK_HOST}) — refresh pass skipped")
+        return 0
+    if not ensure_browser_up():
+        print("❌ shared Chromium down and `browser.py up` failed — no refresh")
+        return 1
+    _browser("reap-owned", quiet=True, timeout_s=browser_timeout("reap-owned"))
+    bad = 0
+    for row in overview()["rows"]:
+        site = row["site"]
+        if not row.get("session_refresh"):
+            continue
+        if check_instance(row):
+            print(f"⏭  {site}: lives in the {check_instance(row)} browser — skipped")
+            continue
+        rc, check = probe(site)
+        if rc == BUSY_RC:
+            print(f"⏸  {site}: {BUSY_HOW}")
+            continue
+        if rc != 0:
+            print(f"⏭  {site}: not logged in — the daily check handles it")
+            continue
+        how = refresh_step(site, check, "logged in")
+        print(f"✅ {site}: {how}")
+        if "refresh failed" in how:
+            bad += 1
+    return 1 if bad else 0
+
+
+def toolchain_report() -> list[tuple[str, str]]:
+    """Print the toolchain findings (D9); the `failed` rows for `-c`."""
+    out = []
+    for finding in agent_login_toolchain.findings():
+        print(finding.line())
+        if not finding.unknown:
+            out.append(("toolchain", finding.line()))
+    return out
+
+
 def build_parser() -> argparse.ArgumentParser:
     """The CLI."""
     ap = argparse.ArgumentParser(
@@ -2937,20 +3704,22 @@ def build_parser() -> argparse.ArgumentParser:
         "--install-daily",
         action="store_true",
         help=f"install + load the LaunchAgents {LAUNCH_LABEL} "
-        f"(`-c` daily {LAUNCH_HOUR:02d}:{LAUNCH_MINUTE:02d}) and {SNAPSHOT_LABEL} "
-        f"(`-S` every {SNAPSHOT_INTERVAL_S // 60} min)",
+        f"(`-c` daily {LAUNCH_HOUR:02d}:{LAUNCH_MINUTE:02d}), {SNAPSHOT_LABEL} "
+        f"(`-S` every {SNAPSHOT_INTERVAL_S // 60} min) and {REFRESH_LABEL} "
+        f"(`-R` every {REFRESH_INTERVAL_S // 3600} h) as one transaction "
+        "(any failure restores the previous set)",
     )
     ap.add_argument(
         "-U",
         "--uninstall-daily",
         action="store_true",
-        help="unload + remove both LaunchAgents",
+        help="unload + remove all three LaunchAgents",
     )
     ap.add_argument(
         "-P",
         "--print-plist",
         action="store_true",
-        help="print both LaunchAgent plists (writes nothing)",
+        help="print the three LaunchAgent plists (writes nothing)",
     )
     ap.add_argument(
         "-j",
@@ -3016,6 +3785,33 @@ def build_parser() -> argparse.ArgumentParser:
         help="release SITE's quarantine (after a failed login that may have "
         "submitted the password) — the main session's decision, audited",
     )
+    ap.add_argument(
+        "-L",
+        "--safari-login",
+        metavar="SITE",
+        help="an AGENT's login through Albert's Safari (WS1b): free check, "
+        "else import Safari's own session (works without new safari.py "
+        "features), else log Safari in (safari.py, a "
+        "new window, his Vaultwarden tab and clipboard) and import it; "
+        "claude.ai: the automated magic link. One run, no retries; never "
+        "from a LaunchAgent. Exit 4 = needs Albert (CAPTCHA, SMS, push / "
+        "security key, locked vault); exit 3 = the Mac is locked or idle: "
+        "retry later",
+    )
+    ap.add_argument(
+        "-n",
+        "--dry-run",
+        action="store_true",
+        help="with -L: report what it would do (no import, no Safari login)",
+    )
+    ap.add_argument(
+        "-R",
+        "--refresh-pass",
+        action="store_true",
+        help=f"refresh-only pass: renew every refreshable token (NPM) with "
+        f"< 12 h left; never logs in (LaunchAgent {REFRESH_LABEL}, every "
+        f"{REFRESH_INTERVAL_S // 3600} h)",
+    )
     return ap
 
 
@@ -3024,6 +3820,7 @@ def launch_action(args: argparse.Namespace) -> int | None:
     if args.print_plist:
         print(launchagent_plist(), end="")
         print(snapshot_plist(), end="")
+        print(refresh_plist(), end="")
         return 0
     if args.install_daily:
         return install_daily()
@@ -3059,6 +3856,10 @@ def login_action(args: argparse.Namespace) -> int | None:  # pylint: disable=too
         return rearm_action(args.rearm)
     if args.remove:
         return remove_action(args.remove, force=args.force)
+    if args.safari_login:
+        return safari_login_action(args.safari_login, dry_run=args.dry_run)
+    if args.refresh_pass:
+        return refresh_pass()
     return None
 
 
@@ -3073,6 +3874,25 @@ def main() -> int:  # pylint: disable=too-many-return-statements,too-many-branch
         ap.error("-F/--force only works together with -g/--guided or -D/--remove")
     if args.item and not args.validate:
         ap.error("-i/--item only works together with -V/--validate")
+    if args.dry_run and not args.safari_login:
+        ap.error("-n/--dry-run only works together with -L/--safari-login")
+    others = (
+        args.check_all,
+        args.snapshot,
+        args.refresh_pass,
+        args.install_daily,
+        args.uninstall_daily,
+        args.test,
+        args.guided,
+        args.promote,
+        args.release,
+        args.remove,
+        args.rearm,
+    )
+    if args.safari_login and any(others):
+        ap.error(
+            "-L/--safari-login runs alone (not with -c/-S/-R/-I/-U/-t/-g/-p/-Q/-D/-E)"
+        )
     rc = launch_action(args)
     if rc is not None:
         return rc
@@ -3113,6 +3933,8 @@ def main() -> int:  # pylint: disable=too-many-return-statements,too-many-branch
         print(json.dumps(data, indent=1))
     else:
         print_overview(data)
+        for line in agent_login_toolchain.describe():  # WS1b D9
+            print(f"  {line}")
         print()
         agent_login_keychain.print_list(_state_path("keychain.json"), _c)
     return 0 if data["broker_ok"] else 1

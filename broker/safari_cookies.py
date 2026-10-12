@@ -18,6 +18,7 @@ at 16..32, expiry as Mac absolute time (double at 40, seconds since 2001-01-01).
 from __future__ import annotations
 
 import fnmatch
+import hashlib
 import os
 import struct
 import time
@@ -107,7 +108,64 @@ SAFARI_SITES: dict[str, SafariSite] = {
         drop_bot_cookies=True,
         import_unattended=False,
     ),
+    # galaxus.de is a SEPARATE account (WS2): the shop on www.galaxus.de, its
+    # IdP on id.galaxus.eu. Same Akamai/reCAPTCHA wall as galaxus.ch, so the
+    # broker never submits (vault.NO_SUBMIT_SITES) and Chromium's own bot
+    # cookies go on import. The session reaches Safari through an agent's
+    # Safari login (`agent-login.py -L galaxus-de`, WS1b); imports run only
+    # when explicitly asked (`-L`, `-t`), never from the daily check.
+    "galaxus-de": SafariSite(
+        ("galaxus.de", "galaxus.eu"),
+        session_cookies=(".at",),
+        drop_bot_cookies=True,
+        import_unattended=False,
+    ),
 }
+
+# browser.py BUILT-IN sites (not broker items) whose session an agent may copy
+# from Safari with the explicit `browser.py import-safari SITE` (WS1b; Albert,
+# 2026-10-11: agents log these in through his Safari). Consent is this table,
+# not a vault item; the import's check is the built-in site's own `logged-in`.
+# `login`/`logged-in` of these sites keep their own flows — only the explicit
+# import knows them, so they are never imported unattended.
+SAFARI_BUILTIN: dict[str, SafariSite] = {
+    "notion": SafariSite(
+        ("notion.so", "notion.com"),
+        session_cookies=("token_v2",),
+        import_unattended=False,
+    ),
+    "slack": SafariSite(
+        ("slack.com",), session_cookies=("d",), import_unattended=False
+    ),
+    # next-auth splits a large session token into `.0`, `.1`, …
+    "openai": SafariSite(
+        ("chatgpt.com", "openai.com"),
+        session_cookies=("__Secure-next-auth.session-token*",),
+        import_unattended=False,
+    ),
+}
+
+
+def rule(site: str) -> SafariSite:
+    """`site`'s import rules (``SAFARI_SITES``, else ``SAFARI_BUILTIN``);
+    KeyError for a site with neither."""
+    found = SAFARI_SITES.get(site) or SAFARI_BUILTIN.get(site)
+    if found is None:
+        raise KeyError(site)
+    return found
+
+
+def importable_site(site: str) -> bool:
+    """May `import-safari SITE` run at all (a broker-listed Safari site or a
+    built-in one)?"""
+    return site in SAFARI_SITES or site in SAFARI_BUILTIN
+
+
+def is_session_cookie(name: str, site: str) -> bool:
+    """True if cookie `name` is one of `site`'s session cookies (fnmatch
+    patterns; a site that names none counts every allowed cookie)."""
+    pats = rule(site).session_cookies
+    return not pats or any(fnmatch.fnmatchcase(name, p) for p in pats)
 
 
 @dataclass(frozen=True)
@@ -228,33 +286,47 @@ def denied(name: str, rules: SafariSite) -> bool:
 
 def in_site(domain: str, site: str) -> bool:
     """True if cookie `domain` belongs to one of `site`'s domains."""
-    return any(domain_matches(domain, r) for r in SAFARI_SITES[site].domains)
+    return any(domain_matches(domain, r) for r in rule(site).domains)
 
 
 def importable(domain: str, name: str, site: str) -> bool:
     """True if a cookie may be copied INTO the shared browser for `site`:
     in its domains and not a bot-management cookie."""
-    return in_site(domain, site) and not denied(name, SAFARI_SITES[site])
+    return in_site(domain, site) and not denied(name, rule(site))
 
 
 def replaced_on_import(domain: str, name: str, site: str) -> bool:
     """True if the shared browser's OWN cookie is deleted by an import of
     `site`: every cookie in its domains, except the bot-management ones —
     which go too for a site with ``drop_bot_cookies``."""
-    rules = SAFARI_SITES[site]
+    rules = rule(site)
     return in_site(domain, site) and (rules.drop_bot_cookies or not denied(name, rules))
 
 
 def has_session(site: str, cookies: Iterable[Cookie]) -> bool:
     """True if `cookies` (already filtered by `site_cookies`) hold at least one
-    of `site`'s ``session_cookies`` — the login itself (any cookie counts for
-    a site that names none). Without it an import must change NOTHING: a
-    logged-out Safari never wipes the shared browser's good session."""
-    names = SAFARI_SITES[site].session_cookies
-    cookies = list(cookies)
-    if not names:
-        return bool(cookies)
-    return any(c.name in names for c in cookies)
+    of `site`'s ``session_cookies`` (fnmatch patterns) — the login itself (any
+    cookie counts for a site that names none). Without it an import must
+    change NOTHING: a logged-out Safari never wipes the shared browser's good
+    session."""
+    return any(is_session_cookie(c.name, site) for c in cookies)
+
+
+def session_fingerprint(site: str, cookies: Iterable[Cookie]) -> str:
+    """One sha256 over `site`'s session cookies in `cookies` (domain, name,
+    path, flags, expiry AND value): two reads that differ tell that Safari
+    wrote a new session — a rotated value with the same expiry included.
+    In memory only: never persist or print it (it digests secrets)."""
+    rows = sorted(
+        (c.domain, c.name, c.path, c.secure, c.http_only, round(c.expires), c.value)
+        for c in cookies
+        if is_session_cookie(c.name, site)
+    )
+    h = hashlib.sha256()
+    for row in rows:
+        h.update(repr(row).encode("utf-8", "surrogatepass"))
+        h.update(b"\0")
+    return h.hexdigest()
 
 
 def site_cookies(
