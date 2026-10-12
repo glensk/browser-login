@@ -311,12 +311,14 @@ manual acceptance steps under the attempt policy below.
             vault `-D` pending Touch ID.
       - [x] Live: gitlab-sdsc-glensk — the check found tp#833's admin session in 9222, cleared it, and
             after the 1 h guard cooldown the login is server-proven; glensk + admin promoted (-p).
-      - [ ] runai-test3: broker proof passes (probe fix 65dbff6), but a profile reuse exports no
-            KEYCLOAK_IDENTITY (session cookie lost on broker relaunch; confirmed by `login -G`,
-            0e9ace1) → SPA redirects to custos. Fix next: `broker-add -K` storage keys had-session +
-            _expiredTime (cheap, unproven), else `agent_fresh_login` (broker-add option in build).
+      - [x] runai-test3 + runai-admin ✅ 2026-10-12, both server-proven, side by side (default and
+            admin browser). Fix: `agent_fresh_login` (broker-add -F) — a broker relaunch loses Keycloak's
+            session-only KEYCLOAK_IDENTITY, confirmed with `login -G` (0e9ace1); admin probe confirmed
+            live (200 JSON as admin, 403 text/plain error object as user; d669be8). Promoted (-p).
+            gitlab-sdsc-test fully removed (Testuser2 blocked; Albert: drop). Overview: 36 ✅.
       - [ ] Home-LAN only (Cloudflare Access off-LAN): abs, navidrome, dsm, authentik live proofs.
-      - [ ] runai-admin admin-probe confirmation; custos-admin still needs its own identity check.
+      - [ ] custos-admin (alt browser, fresh login set) still needs its own identity check (Keycloak
+            admin console token is in page memory; no recipe yet).
       Original line: account identity (tp#833, hit 2026-10-10): 8 same-scope groups report ✅ for
       the wrong account; gitlab-sdsc-test passed while the browser was `albertadmin`.
       Plan → codex-debate → implement:
