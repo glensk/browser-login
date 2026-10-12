@@ -1901,6 +1901,18 @@ def _needs_fill(field: Any, username: str) -> bool:
     return editable
 
 
+def open_login_page(page: Any, url: str) -> None:
+    """Load the login page as a fresh document (a hash-only goto has no
+    Response, and ``raise_if_blocked`` would be blind to a 401/403):
+    a Cloudflare Access login → ``AccessGated``, HTTP 401/403 →
+    ``LoginBlocked``, a challenge page → ``NeedsHuman`` — nothing typed."""
+    resp = load_document(page, url)
+    if access_gated(page.url):
+        raise AccessGated()
+    raise_if_blocked(page, resp)
+    _check_challenge(page, submitted=False)
+
+
 def generic_login(
     page: Any,
     item: SiteItem,
@@ -1926,13 +1938,7 @@ def generic_login(
     any request that names a secondary form action.
     """
     allowed = list(item.fill_origins)
-    # a fresh document load: a hash-only goto has no Response, and
-    # raise_if_blocked would be blind to a 401/403
-    resp = load_document(page, item.login_url)
-    if access_gated(page.url):
-        raise AccessGated()
-    raise_if_blocked(page, resp)
-    _check_challenge(page, submitted=False)
+    open_login_page(page, item.login_url)
     if item.pre_click:
         _pre_click(page, item.pre_click, allowed, dev=dev)
     if secret.mode == USERNAME_ONLY_MODE:
@@ -2833,7 +2839,20 @@ def smartsheet_login(
 
 Recipe = Callable[..., None]
 
+# The broker items that log into authentik (one site, two accounts: WS5);
+# their recipe is ``broker.authentik.authentik_login``.
+AUTHENTIK_SITES = frozenset({"authentik-akadmin", "authentik-glensk"})
+
 
 def recipe_for(site: str) -> Recipe:
-    """The recipe for a site id (recipes are code: changing one needs sudo)."""
+    """The recipe for a site id (recipes are code: changing one needs sudo).
+    The authentik items log in through authentik's flow executor API
+    (``broker/authentik.py``: its login page hides the real form in shadow
+    roots behind a password-manager helper form)."""
+    if site in AUTHENTIK_SITES:
+        # broker.authentik builds on this module's helpers: imported on use
+        # pylint: disable-next=import-outside-toplevel,cyclic-import
+        from broker.authentik import authentik_login
+
+        return authentik_login
     return {"cscs": cscs_login, "smartsheet": smartsheet_login}.get(site, generic_login)

@@ -618,6 +618,14 @@ class IdentityRecipe:  # pylint: disable=too-many-instance-attributes  # one rev
     # authentik: this field must be present and null (non-null = an admin
     # impersonating the user → indeterminate).
     must_be_null: tuple[str, ...] | None = None
+    # ... or, with this flag, absent: authentik 2026.8.1's `users/me` sets
+    # `original` only while impersonating (`SessionUserSerializer`,
+    # required=False) and leaves the key out otherwise.
+    null_may_be_absent: bool = False
+    # A 401/403 counts as logged out only under a JSON content type (the
+    # API's own answer); an HTML or plain 401/403 — a proxy, a WAF page —
+    # is indeterminate. Off: any 401/403 is logged out.
+    logged_out_json: bool = False
     # Verified against the live site (status + key names, never values).
     live_confirmed: bool = False
     # The forms of a vault username this recipe's identity field can be
@@ -797,6 +805,14 @@ def recipe_problem(  # pylint: disable=too-many-return-statements,too-many-branc
             return "path_claim takes no base_segments"
     elif recipe.auth == "jwt-local-storage":
         return "jwt-local-storage needs path_claim"
+    if recipe.null_may_be_absent and (
+        not recipe.must_be_null or len(recipe.must_be_null) != 1
+    ):
+        # absent is told apart from null only for a top-level key: deeper,
+        # a missing parent would read as "absent" too
+        return "null_may_be_absent needs a one-key must_be_null"
+    if recipe.logged_out_json and recipe.auth in TOKEN_AUTHS:
+        return f"{recipe.auth} decides logged out itself (no logged_out_json)"
     return _token_recipe_problem(recipe) or _scope_rule_problem(recipe)
 
 
@@ -1019,14 +1035,37 @@ IDENTITIES: dict[str, IdentityRecipe] = {
         error_code_field=("error", "code"),
         logged_out_codes=(106, 107, 119),
     ),
-    # authentik API docs (UserSelf): `user.username`, `user.is_superuser`;
-    # `original` (impersonation) must be null.
+    # authentik (auth.dev.renku.ch, the authentik-glensk and
+    # authentik-akadmin items), API docs (SessionUser / UserSelf):
+    # `GET /api/v3/core/users/me/` with the session cookie → `user.username`,
+    # `user.is_superuser` (the admin bit); `original` is set while an admin
+    # impersonates the user → indeterminate. Logged out (Albert's Safari,
+    # 2026-10-12): 403 `application/json` {"detail": …} — logged out only
+    # under JSON (`logged_out_json`): an HTML 403 is no answer.
+    # authentik 2026.8.1's sources leave `original` OUT when nobody
+    # impersonates (`SessionUserSerializer`, required=False; the view sets
+    # it only then), so `null_may_be_absent` must flip with the live check
+    # if the live answer has no `original` key.
+    #
+    # Unusable until the main session confirms it live (value-free: status
+    # and key names): `live_confirmed` (a 200 JSON answer with `user` and
+    # its keys), `admin_false_confirmed` (as authentik-glensk:
+    # `user.is_superuser` false) and `admin_true_confirmed` (as
+    # authentik-akadmin: true).
     "authentik": IdentityRecipe(
         name="authentik",
         path="/api/v3/core/users/me/",
         id_field=("user", "username"),
         admin_field=("user", "is_superuser"),
         must_be_null=("original",),
+        null_may_be_absent=False,
+        logged_out_json=True,
+        allowed_sites=("authentik-akadmin", "authentik-glensk"),
+        origin="https://auth.dev.renku.ch",
+        live_confirmed=False,
+        admin_true_confirmed=False,
+        admin_false_confirmed=False,
+        forms=("username",),
     ),
     # Run:ai (S4c B1, live 2026-10-11 as runai-test3, value-free): the SPA
     # keeps its bearer in page memory only; it renews it with ITS OWN
@@ -1628,7 +1667,11 @@ RECIPE_JS = r"""async (a) => {
     try { final = new URL(r.url); } catch (e) { final = null; }
     if (r.redirected || !final || final.origin !== origin || final.pathname !== url.pathname)
       return out('indeterminate', {why: 'redirect', status: r.status});
-    if (r.status === 401 || r.status === 403) return out('logged_out', {status: r.status});
+    if (r.status === 401 || r.status === 403) {
+      if (a.logged_out_json && !jsonType(r))
+        return out('indeterminate', {why: 'content-type', status: r.status});
+      return out('logged_out', {status: r.status});
+    }
     if (r.status !== 200) return out('indeterminate', {why: 'status', status: r.status});
     const ct = (r.headers.get('content-type') || '').toLowerCase();
     if (!/^application\/json\s*(;|$)/.test(ct))
@@ -1643,8 +1686,11 @@ RECIPE_JS = r"""async (a) => {
         return out('logged_out', {why: 'api'});
       return out('indeterminate', {why: 'schema'});
     }
-    if (a.must_be_null && get(body, a.must_be_null) !== null)
-      return out('indeterminate', {why: 'impersonation'});
+    if (a.must_be_null) {
+      const v = get(body, a.must_be_null);
+      if (!(v === null || (v === undefined && a.null_may_be_absent)))
+        return out('indeterminate', {why: 'impersonation'});
+    }
     if (a.claim_field && (claim === null || get(body, a.claim_field) !== claim))
       return out('indeterminate', {why: 'claim'});
     const id = norm(get(body, a.id_field));
@@ -1719,6 +1765,8 @@ def recipe_args(
         "error_code_field": opt(recipe.error_code_field),
         "logged_out_codes": list(recipe.logged_out_codes),
         "must_be_null": opt(recipe.must_be_null),
+        "null_may_be_absent": recipe.null_may_be_absent,
+        "logged_out_json": recipe.logged_out_json,
         "token_body": dict(recipe.token_body),
         "token_field": opt(recipe.token_field),
         "claim_pins": [list(pin) for pin in recipe.claim_pins],

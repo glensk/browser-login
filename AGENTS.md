@@ -265,6 +265,31 @@ framework. It is a **provider**: other repos depend on it, not the reverse. See
   and withhold a text the page side had to cut. Never screenshot such a login
   (`screenshot_withheld`), never expose such an item through the secret ops,
   never put the mode's name in the `sites` view (`username_only` flag).
+- **API recipes log in without a form (authentik, `broker/authentik.py`)**: a
+  site whose login form defeats the form recipe (authentik: shadow-root stages
+  plus an off-screen password-manager helper form the generic recipe typed
+  into) logs in through the site's own documented API, the one its UI uses.
+  The rules:
+  - **Where it runs:** every request in a FRESH CDP isolated world of the
+    login page, which must be on the item's fill origin (checked in Python and
+    in the page).
+  - **What it may call:** ONE fixed path (authentik's flow executor,
+    `/api/v3/flows/executor/<slug>/`), same-origin only (`mode:
+    'same-origin'`, the final URL must be that path). A POST never follows a
+    redirect: a 307/308 would re-send its body; on a redirect the step GETs
+    the fixed path itself.
+  - **The secret:** origins are checked, then `attempt.entered()` and
+    `mark_submitted()` run, right before the ONE POST that carries the secret.
+    That secret is never sent again: a stage asking for it again is a failure.
+    Once it went out, a passed deadline or an unanswered request ends the
+    recipe WITHOUT a verdict (the broker's logged-in check decides), never a
+    "did not finish" failure.
+  - **What comes back:** only a value-free summary (stage name, error field
+    names and codes, device classes) — never page text, never a secret.
+
+  `SubmitTripwire` and `read_submit_buttons` do not apply: there is no form, so
+  no default button to guess, no secondary form action to screen, and every
+  request is the recipe's own to a fixed path.
 - **Onboarding guard (WS3, `PLAN_ws3-onboarding.md`)**: a new or changed broker
   item is reviewed BEFORE the vault write (`agent-login.py -V -i MANIFEST`,
   `broker/onboarding.py`: the broker's own `site_item_from_json` +

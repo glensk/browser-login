@@ -1518,20 +1518,12 @@ def test_js_audiobookshelf_bearer_from_local_storage(chrome: tuple[Any, _Api]) -
 
 @pytest.mark.launches_chrome
 @CHROME
-def test_js_authentik_impersonation_and_dsm_isolation(chrome: tuple[Any, _Api]) -> None:
+def test_js_dsm_isolation(chrome: tuple[Any, _Api]) -> None:
+    # (authentik is pinned to its origin since its login recipe: its
+    # RECIPE_JS tests run against a fixture of that origin, with every
+    # other host unresolvable, in tests/test_authentik.py)
     page, api = chrome
     name = _user()
-    check = "https://auth.ws5.example/if/user/"
-    api.body = {"user": {"username": name, "is_superuser": False}, "original": None}
-    got = _run(page, "authentik", check)
-    assert identity.local_verdict(got, got["_nonce"], name, "user") == identity.MATCH
-    api.body = {
-        "user": {"username": name, "is_superuser": False},
-        "original": {"pk": 1},
-    }
-    assert _run(page, "authentik", check)["state"] == "indeterminate"
-    api.body = {"user": {"username": name, "is_superuser": False}}  # no `original`
-    assert _run(page, "authentik", check)["state"] == "indeterminate"
     # DSM's SynoToken is a page global: the isolated world does not see it,
     # so dsm stays indeterminate (and unusable) until S4 picks another source
     dsm = "https://nas.ws5.example/"
