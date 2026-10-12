@@ -141,6 +141,7 @@ def test_recipes_are_reviewed_and_unconfirmed_ones_absent() -> None:
         "dsm",
         "authentik",
         "runai",
+        "keycloak-admin",
     }
     for name, recipe in identity.IDENTITIES.items():
         assert recipe.name == name and recipe.path.startswith("/")
@@ -158,6 +159,8 @@ def test_recipes_are_reviewed_and_unconfirmed_ones_absent() -> None:
     assert identity.usable_recipe("navidrome") is identity.IDENTITIES["navidrome"]
     # runai (S4c): usable; who may use it is `identity.item_recipe`
     assert identity.usable_recipe("runai") is identity.IDENTITIES["runai"]
+    keycloak = identity.IDENTITIES["keycloak-admin"]
+    assert identity.usable_recipe("keycloak-admin") is keycloak
     for name in ("dsm", "authentik", "nope", None):
         assert identity.usable_recipe(name) is None
 

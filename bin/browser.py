@@ -11788,6 +11788,8 @@ _IDENTITY_WHY = frozenset(
         "token",
         "claim",
         "expired",
+        "state",
+        "code",
     }
 )
 # A challenge the broker refused → the client's code (default: indeterminate).

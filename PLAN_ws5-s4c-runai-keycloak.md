@@ -196,6 +196,43 @@ Verification is not strict-eligible on purpose: it needs the test suite, mypy an
       a switch made outside the broker, a forged or stale artifact, and a role change
       where that can be tested.
 
+### C. Keycloak admin console (custos-admin): a server-bound identity
+
+- [x] **C1 discovery** (main session, live 2026-10-12, Albert's Safari logged into the
+      console, value-free; everything same-origin on `https://custos.datascience.ch`):
+  - A silent `fetch` of `/realms/master/protocol/openid-connect/auth` (client
+    `security-admin-console`, `redirect_uri` `/admin/master/console/`, `response_type
+    code`, `response_mode query`, `scope openid`, `prompt none`, state, S256 challenge)
+    ends on `/admin/master/console/` with a `code`, or with an `error`
+    (`login_required`) when there is no session. A fetch never runs the console page,
+    so nothing else spends the code.
+  - The code exchange (form POST to `/realms/master/protocol/openid-connect/token`)
+    answers 200 JSON with `access_token`, `id_token`, `refresh_token` (and other keys).
+  - The access token is lightweight: exp, iat, jti, iss, typ, azp, sid, scope. It has
+    no account name, and userinfo answers 401.
+  - The ID token's claims include `preferred_username` (it contains `@`), `sub`,
+    `email`, `azp` = `aud` = `security-admin-console`, and `iss` = `/realms/master`.
+  - `GET /admin/realms` with the access token answers 200
+    `application/json;charset=UTF-8` for the admin account; so do
+    `/admin/realms/master/users/count` (one JSON integer; the recipe's probe since the
+    review round) and `/admin/serverinfo`. A non-admin's 403 is expected, but not seen
+    live: no such account exists.
+- [x] **C2 recipe `keycloak-admin`** built (builder, worktree, 2026-10-12; build notes
+      "Part C"). Not released.
+- [ ] **Main session:** the broker-add mirror (mydotfiles; spec in "Part C"), then
+      release the broker and the client (`install.sh`), then set custos-admin's vault
+      fields (table below).
+- [ ] **Live acceptance (custos-admin):** `browser.py logged-in custos-admin` in `alt`
+      → `identity: match`. Record the one auth / token / probe run per check by status
+      only. Also check that preferred_username equals the vault username after
+      normalisation: a `wrong_account` on Albert's own session means they differ.
+      Switching the recipe to the `email` claim would then also need `email_verified ===
+      true`, and a master realm that forbids duplicate e-mails and does not let users
+      edit their own e-mail. Otherwise an account could claim another's address.
+- [ ] **403 side:** once a non-admin master-realm user exists, record the probe's
+      status and content type. Then flip `admin_false_confirmed`, or adjust the
+      false-side rule.
+
 ## Build notes (2026-10-11, worktree; BROKER + client: needs `install.sh` and the client release together)
 
 ### Part A — cookie scopes
@@ -335,21 +372,122 @@ Verification is not strict-eligible on purpose: it needs the test suite, mypy an
    cookies in shared-browser deletes; no `%` in scope paths; the page claim key in the
    foreign clear; a service-worker test.
 
+### Part C — the `keycloak-admin` recipe (custos-admin, 2026-10-12)
+
+- **New auth `oidc-silent-pkce`** (`TOKEN_AUTHS` = token-endpoint + oidc-silent-pkce
+  share the token rules: `token_field`, `claim_pins`, an exact `issuer`, the admin
+  probe, `allowed_sites` + `origin`). Its own reviewed fields:
+  - `client_id` (`security-admin-console`);
+  - `auth_path` (`/realms/master/protocol/openid-connect/auth`);
+  - `redirect_path` (`/admin/master/console/`);
+  - `path`, the token endpoint (`/realms/master/protocol/openid-connect/token`);
+  - `audience` (the `aud` pin: a string equal to it, or a list holding it);
+  - `bearer_field` (`access_token`, the probe's bearer), with `token_field`
+    (`id_token`) as the identity source.
+
+  `_oidc_recipe_problem` requires the issuer on the recipe's origin, and both endpoints
+  under the issuer's path. Fields of either token auth on any other auth are refused.
+- **RECIPE_JS**: one new branch `silentWork`, entered only for `oidc-silent-pkce`.
+  - The verifier (32 bytes), the state and the OIDC `nonce` (16 bytes each) come from
+    the isolated world's `crypto.getRandomValues`, and the S256 challenge from its
+    `crypto.subtle`.
+  - The authorization fetch uses `redirect: 'follow'` and `mode: 'same-origin'`: a hop to
+    another origin is a network error, never a request.
+  - The final URL must have the same origin and the redirect path, and exactly one
+    `state` equal to ours. Next, an `iss` that equals the issuer if present, checked
+    BEFORE any error is believed (RFC 9207). Then exactly one `code` of safe
+    characters.
+  - Only a single `error=login_required` → `logged_out`. Every other error
+    (`interaction_required`, i.e. a pending required action, `invalid_request`,
+    `unauthorized_client`, `server_error`, `temporarily_unavailable`, …) →
+    indeterminate (why `error`). A server fault or a required action must never
+    trigger a password login that would then stall into quarantine. Anything else
+    unexpected → indeterminate (`redirect`, `state`, `claim`, `code`).
+  - The code exchange goes through the existing `call` (redirect manual, final URL
+    pinned). Any non-200 is indeterminate: the auth step already proved a session.
+  - The claim pins moved into a shared helper `found` (pins, audience, the OIDC nonce,
+    iss, exp, identity, probe); runai's `tokenWork` calls it unchanged
+    (`found(origin, t, t)`: no nonce, no leeway).
+  - ID-token pins: `azp` and `typ` = `ID` (`claim_pins`), `aud`, `nonce` = this run's,
+    the exact issuer, and `exp` with 30 s of leeway (`exp_leeway_s`, 0–60, default 0).
+    The master realm's token lifespan is 60 s, so a few seconds of clock skew would
+    otherwise fail a fresh token.
+  - Tokens never leave the function, and the refresh token is never read.
+- **Admin bit**: `GET /admin/realms/master/users/count` (review round: 200 JSON live,
+  C1). It needs user rights IN the master realm, which only master administrators
+  hold. `/admin/realms` would also say yes for an admin delegated for one other realm
+  (its list is filtered).
+  - 200 under a JSON content type whose body is ONE non-negative JSON integer, read
+    with the capped reader (`admin_probe_true_integer`) → admin. Any other 200 body
+    (a list, an object, a string, a negative or fractional number, > 64 KiB) → no bit.
+  - 403 under a JSON content type → not admin. No error-object shape: Keycloak's is
+    not confirmed, so a plain-text 403 is no bit.
+  - HTML 200/403, 401, 404, 500 → no bit.
+- **`admin_false_confirmed`** (new; default True, so all other recipes are unchanged):
+  False for keycloak-admin. `recipe_refusal` then keeps every non-admin item unproven
+  (`identity_unproven`, valid in the vault), mirroring `admin_true_confirmed`.
+- **Side effects of one run**: Keycloak adds a client session of
+  `security-admin-console` to the SSO session and may record LOGIN / CODE_TO_TOKEN
+  events. Per check: exactly one authorization request, one code exchange and one
+  probe (tested, also end to end through the real broker).
+  - The check page IS the console: loading it also runs the console's own keycloak-js
+    flow (its own authorization request, code exchange and API calls). One check
+    therefore costs about twice the Keycloak calls of the recipe alone.
+  - Every check refreshes the Single Sign-On (SSO) session's idle timer: a scheduled
+    check keeps an otherwise idle custos session alive until its maximum lifespan.
+- **Tests**: `tests/test_ws5_keycloak_admin.py`. It covers the spec and its refusals,
+  who may use the recipe, the vault, and both evaluators.
+  - Evaluator cases: match / mismatch / privilege; login_required vs every other
+    error; the azp / typ / aud / nonce / iss / exp pins and the exp leeway; state /
+    code / iss (also before an error) / path / off-origin redirects; token-endpoint
+    statuses and shapes; the probe's count answers; page hooks of crypto (a
+    predictable state and nonce) / Response.json / JSON / atob / fetch; another page
+    origin; leak checks.
+  - End to end: match, wrong_account (cookies cleared, no storage), and a user item
+    unproven without a single request.
+  - Playwright does NOT route the request that follows a fulfilled redirect: it goes to
+    the network. The fixture therefore maps the fixture hosts to a local TLS server
+    (`--host-resolver-rules`, a throwaway certificate) and every other host to
+    `~NOTFOUND`. The test browser runs with `--no-proxy-server`, and the fixture's
+    teardown asserts that every follow-up landed on a fixture host.
+  - The first test runs of this build lacked that mapping. They sent the follow-up
+    GETs of the console URL, with random fixture `state`/`code` values, from a
+    cookie-less throwaway browser to the real custos host: no login, no credential.
+  - `tests/test_ws5_broker.py`: the pinned recipe set gains `keycloak-admin`.
+  - `bin/browser.py`: `_IDENTITY_WHY` gains `state` and `code`, so the result records
+    them instead of `other`.
+- **broker-add mirror** (mydotfiles `bin/broker_add_fields.py`, main session):
+  - `IDENTITIES` gains `"keycloak-admin"`.
+  - `USABLE_IDENTITY_FORMS` gains `"keycloak-admin": ("email",)`.
+  - `RECIPE_RULES` gains `"keycloak-admin": RecipeRules(allowed_sites=("custos-admin",),
+    origin="https://custos.datascience.ch")`.
+  - (The probe, the pins and the leeway are broker-only; the mirror needs none of
+    them.)
+  - `RecipeRules` gains `admin_false_confirmed: bool = True` (False for
+    keycloak-admin), with a `recipe_admin_note` twin for a non-admin privilege: "the
+    item stays unproven until the not-admin answer is confirmed".
+  - Separately, the mirror's `runai` still says `admin_true_confirmed=False`; the
+    broker flipped it to True on 2026-10-12.
+
 ### Vault values (main session, after the broker-add change)
 
 | Item         | `agent_cookie_scopes`                                                                                                                            | `agent_instance` | `agent_privilege` | `agent_identity` |
 | :----------- | :----------------------------------------------------------------------------------------------------------------------------------------------- | :--------------- | :---------------- | :--------------- |
 | runai-test3  | `[{"host":"sdsc.run.ai","path":"/"},{"host":"custos.datascience.ch","path":"/realms/sdsc/"},{"host":"app1.run.ai","path":"/auth/realms/sdsc/"}]` | (empty)          | `user`            | `runai`          |
 | runai-admin  | the same                                                                                                                                         | `admin`          | `admin`           | `runai`          |
-| custos-admin | `[{"host":"custos.datascience.ch","path":"/realms/master/"}]`                                                                                    | `alt`            | `admin`           | (none)           |
+| custos-admin | `[{"host":"custos.datascience.ch","path":"/realms/master/"}]`                                                                                    | `alt`            | `admin`           | `keycloak-admin` |
 
 - `agent_cookie_hosts`: either remove it, or set it to exactly the scope hosts
   (`sdsc.run.ai,custos.datascience.ch,app1.run.ai` for the Run:ai items).
 - The check URL must be on `https://sdsc.run.ai`, and the username stays the e-mail.
 - `logged-in-user-email` must not appear in `agent_storage_keys`.
 - runai-admin is provable once the broker and client with `admin_true_confirmed=True`
-  are released (flipped 2026-10-12). custos-admin stays `identity_unproven` (no recipe;
-  it still conflicts through the fill origin).
+  are released (flipped 2026-10-12).
+- custos-admin (`-i keycloak-admin -p admin -I alt`): its check URL must be on
+  `https://custos.datascience.ch` (the console, `/admin/master/console/`), and its
+  username stays the e-mail (`forms=("email",)`). It is provable once the broker-add
+  mirror and the broker + client with `keycloak-admin` are released. It still conflicts
+  with the Run:ai items through the fill origin, so the proof is what makes it usable.
 
 ### Release order (cross-repo)
 
@@ -360,6 +498,8 @@ Verification is not strict-eligible on purpose: it needs the test suite, mypy an
   change must land before the Run:ai vault fields are set.
 - Old clients do not know `runai` and keep its items unproven (fail closed). Release the
   client with the broker.
+- The same holds for `keycloak-admin`: the broker-add mirror (Part C) first, then the
+  broker and client release, then `-i keycloak-admin` on custos-admin.
 
 ## Verification
 

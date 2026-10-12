@@ -468,7 +468,16 @@ value.
         `application/json`, runai-admin) are both live-confirmed 2026-10-12, so
         `admin_true_confirmed=True`: runai-admin no longer stays unproven once the
         broker and client are released.
-      - custos-admin: open (no recipe; stays `identity_unproven`).
+      - custos-admin: recipe `keycloak-admin` built 2026-10-12 (worktree, not yet
+        released; S4c plan, "Part C"). A silent OIDC authorization-code request
+        with PKCE in the isolated world; the ID token's `preferred_username` is the
+        identity, `GET /admin/realms/master/users/count` (master-realm user rights,
+        one JSON integer) the admin bit. Only `error=login_required` reads as
+        logged out. Its "admin" answer is
+        live-confirmed, so custos-admin (`-p admin`) is provable once broker and
+        client are released. The 403 side is not confirmed (no non-admin master
+        user exists), so a `privilege user` item would stay unproven
+        (`admin_false_confirmed=False`).
 - [x] **S4a** built 2026-10-11 (worktree, not yet released; BROKER + client:
       `broker/identity.py` changes what the broker accepts and proves, so `install.sh`):
   - **`navidrome` recipe** (`live_confirmed`): auth `jwt-local-storage` — localStorage

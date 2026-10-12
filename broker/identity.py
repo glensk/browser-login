@@ -651,11 +651,34 @@ class IdentityRecipe:  # pylint: disable=too-many-instance-attributes  # one rev
     # the second a string, nothing else (Run:ai answers its 403 as
     # text/plain with {"code": …, "message": …}). () = JSON content type only.
     admin_probe_error_shape: tuple[str, ...] = ()
+    # The probe's "admin" answer is a count: ONE non-negative JSON integer
+    # (read capped at PROBE_BODY_MAX); any other body is no bit.
+    admin_probe_true_integer: bool = False
+    # Seconds a token's `exp` may lie in the past (clock skew against a
+    # short-lived token); 0 = exp must be in the future.
+    exp_leeway_s: int = 0
     # The admin bit's "admin" answer was seen live. While False an item
     # with `agent_privilege admin` may not use the recipe (it stays
     # unproven); a `user` / `readonly` item may (its "not admin" side is
     # confirmed).
     admin_true_confirmed: bool = True
+    # Its mirror: the "not admin" answer was seen live. While False only an
+    # `agent_privilege admin` item may use the recipe; a `user` /
+    # `readonly` item stays unproven.
+    admin_false_confirmed: bool = True
+    # --- "oidc-silent-pkce" (the Keycloak admin console): a silent OIDC
+    # authorization-code request with PKCE (`prompt=none`) on `auth_path`
+    # for the public client `client_id`, redirected to `redirect_path`;
+    # the code is exchanged at `path` (the token endpoint). The response's
+    # `token_field` (the ID token) is the identity source, pinned like a
+    # token-endpoint JWT plus its audience (`audience`: `aud` equals it or
+    # is a list holding it); `bearer_field` (the access token) is the admin
+    # probe's bearer. All of them on the recipe's `origin`.
+    client_id: str = ""
+    auth_path: str = ""
+    redirect_path: str = ""
+    audience: str = ""
+    bearer_field: tuple[str, ...] | None = None
     # localStorage keys the page keeps its OWN claim of the account in
     # (forgeable, seen stale: Run:ai B1): an item using the recipe may not
     # list them in `agent_storage_keys` — never exported, never injected.
@@ -674,7 +697,11 @@ AUTHS = (
     "jwt-local-storage",
     "syno-token",
     "token-endpoint",
+    "oidc-silent-pkce",
 )
+# The ones whose identity is a JWT the recipe obtains from the server itself
+# (the token fields: `token_field`, `claim_pins`, `issuer`, `admin_probe` …).
+TOKEN_AUTHS = frozenset({"token-endpoint", "oidc-silent-pkce"})
 # The ones that read a token from the origin's localStorage: a foreign
 # session of such a site lives there, not (only) in cookies.
 LOCAL_STORAGE_AUTHS = frozenset({"bearer-local-storage", "jwt-local-storage"})
@@ -735,7 +762,12 @@ def recipe_problem(  # pylint: disable=too-many-return-statements,too-many-branc
         return "bad path"
     if not recipe.id_field:
         return "no identity field"
-    for field_path in (recipe.id_field, recipe.admin_field, recipe.claim_field):
+    for field_path in (
+        recipe.id_field,
+        recipe.admin_field,
+        recipe.claim_field,
+        recipe.bearer_field,
+    ):
         if field_path is not None and not all(
             isinstance(k, str) and _FIELD_KEY.match(k) for k in field_path
         ):
@@ -800,11 +832,12 @@ def _scope_rule_problem(recipe: IdentityRecipe) -> str:
 def _token_recipe_problem(  # pylint: disable=too-many-return-statements,too-many-branches
     recipe: IdentityRecipe,
 ) -> str:
-    """The token-endpoint rules: a fixed JSON body of plain keys and
-    printable values, the token's response field, claim pins, an issuer
-    path suffix, a fixed admin probe with disjoint status sets, and a
-    recipe pinned to its sites AND its origin (a fixed source). Any other
-    auth carries none of these fields."""
+    """The token rules (`TOKEN_AUTHS`): for token-endpoint a fixed JSON body
+    of plain keys and printable values, for oidc-silent-pkce its OIDC
+    fields (`_oidc_recipe_problem`); for both the token's response field,
+    claim pins, an issuer, a fixed admin probe with disjoint status sets,
+    and a recipe pinned to its sites AND its origin (a fixed source). Any
+    other auth carries none of these fields."""
     token_fields = (
         recipe.token_body,
         recipe.token_field,
@@ -812,21 +845,37 @@ def _token_recipe_problem(  # pylint: disable=too-many-return-statements,too-man
         recipe.issuer,
         recipe.admin_probe,
         recipe.admin_probe_error_shape,
+        recipe.admin_probe_true_integer,
+        recipe.exp_leeway_s,
     )
-    if recipe.auth != "token-endpoint":
-        return "token fields need auth token-endpoint" if any(token_fields) else ""
-    if not recipe.token_body or not all(
-        isinstance(k, str)
-        and _FIELD_KEY.match(k)
-        and isinstance(v, str)
-        and _PIN_VALUE.match(v)
-        for k, v in recipe.token_body
-    ):
-        return "token-endpoint needs a token_body of plain keys and values"
+    oidc_fields = (
+        recipe.client_id,
+        recipe.auth_path,
+        recipe.redirect_path,
+        recipe.audience,
+        recipe.bearer_field,
+    )
+    if recipe.auth not in TOKEN_AUTHS:
+        if any(token_fields):
+            return "token fields need auth token-endpoint or oidc-silent-pkce"
+        return "oidc fields need auth oidc-silent-pkce" if any(oidc_fields) else ""
+    if recipe.auth == "token-endpoint":
+        if any(oidc_fields):
+            return "oidc fields need auth oidc-silent-pkce"
+        if not recipe.token_body or not all(
+            isinstance(k, str)
+            and _FIELD_KEY.match(k)
+            and isinstance(v, str)
+            and _PIN_VALUE.match(v)
+            for k, v in recipe.token_body
+        ):
+            return "token-endpoint needs a token_body of plain keys and values"
+    elif recipe.token_body:
+        return "oidc-silent-pkce takes no token_body"
     if not recipe.token_field or not all(
         isinstance(k, str) and _FIELD_KEY.match(k) for k in recipe.token_field
     ):
-        return "token-endpoint needs a token_field"
+        return f"{recipe.auth} needs a token_field"
     if not all(
         isinstance(k, str)
         and _CLAIM_NAME.match(k)
@@ -836,9 +885,9 @@ def _token_recipe_problem(  # pylint: disable=too-many-return-statements,too-man
     ):
         return "bad claim_pins"
     if not _ISSUER.match(recipe.issuer):
-        return "token-endpoint needs an issuer (an https URL, no query)"
+        return f"{recipe.auth} needs an issuer (an https URL, no query)"
     if recipe.admin_field is not None:
-        return "token-endpoint takes its admin bit from admin_probe"
+        return f"{recipe.auth} takes its admin bit from admin_probe"
     problem = _fixed_path_problem(recipe.admin_probe)
     if problem:
         return f"admin_probe {problem}"
@@ -860,10 +909,49 @@ def _token_recipe_problem(  # pylint: disable=too-many-return-statements,too-man
         or shape[0] == shape[1]
     ):
         return "admin_probe_error_shape must be two distinct plain keys"
+    leeway = recipe.exp_leeway_s
+    if isinstance(leeway, bool) or not isinstance(leeway, int) or not 0 <= leeway <= 60:
+        return "exp_leeway_s must be 0-60 seconds"
+    if not isinstance(recipe.admin_probe_true_integer, bool):
+        return "bad admin_probe_true_integer"
     if recipe.base_segments or "?" in recipe.path:
-        return "token-endpoint takes one fixed path"
+        return f"{recipe.auth} takes one fixed path"
     if not recipe.allowed_sites or not recipe.origin:
-        return "token-endpoint needs allowed_sites and an origin (a fixed source)"
+        return f"{recipe.auth} needs allowed_sites and an origin (a fixed source)"
+    return _oidc_recipe_problem(recipe) if recipe.auth == "oidc-silent-pkce" else ""
+
+
+_CLIENT_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
+
+
+# One return per rule of the oidc-silent-pkce spec, in the order they are checked.
+def _oidc_recipe_problem(  # pylint: disable=too-many-return-statements
+    recipe: IdentityRecipe,
+) -> str:
+    """The oidc-silent-pkce rules (after the common token rules): a plain
+    public `client_id`; fixed paths without a query for the authorization
+    endpoint, the redirect and (`path`) the token endpoint; an issuer ON
+    the recipe's origin whose path the authorization and token endpoints
+    lie under (Keycloak: ``/realms/<realm>/protocol/openid-connect/…``); an
+    `audience` pin; the access token's response field (`bearer_field`)."""
+    if not _CLIENT_ID.match(recipe.client_id):
+        return "oidc-silent-pkce needs a plain client_id"
+    for name, path in (
+        ("auth_path", recipe.auth_path),
+        ("redirect_path", recipe.redirect_path),
+    ):
+        problem = _fixed_path_problem(path)
+        if problem or "?" in path:
+            return f"{name} {problem or 'takes no query'}"
+    if _https_origin(recipe.issuer) != recipe.origin:
+        return "oidc-silent-pkce needs an issuer on its origin"
+    base = urllib.parse.urlsplit(recipe.issuer).path.rstrip("/") + "/"
+    if not (recipe.auth_path.startswith(base) and recipe.path.startswith(base)):
+        return "oidc-silent-pkce endpoints must lie under the issuer's path"
+    if not _PIN_VALUE.match(recipe.audience):
+        return "oidc-silent-pkce needs an audience pin"
+    if not recipe.bearer_field:
+        return "oidc-silent-pkce needs a bearer_field (the access token)"
     return ""
 
 
@@ -1000,6 +1088,86 @@ IDENTITIES: dict[str, IdentityRecipe] = {
         live_confirmed=True,
         forms=("email",),
     ),
+    # The Keycloak admin console of custos (custos-admin, realm master;
+    # live 2026-10-12, Albert's Safari logged into the console, value-free,
+    # everything same-origin on https://custos.datascience.ch). Like Run:ai
+    # it keeps its tokens in page memory only, so the recipe obtains its
+    # own:
+    # - a silent OIDC authorization-code request with PKCE (`prompt=none`,
+    #   the console's own public client security-admin-console, its own
+    #   redirect URI, a random state and nonce) on
+    #   /realms/master/protocol/openid-connect/auth: with the SSO session
+    #   the fetch ends on /admin/master/console/ with a `code` parameter;
+    #   without one with `error=login_required`. Only that error means
+    #   logged out; any other (interaction_required — a pending required
+    #   action —, server_error, …) is indeterminate: never a reason for a
+    #   password login. A fetch never runs the console page, so nothing else
+    #   spends the code;
+    # - the code exchange (form POST, the PKCE verifier) on
+    #   /realms/master/protocol/openid-connect/token → 200 JSON with
+    #   access_token, id_token, refresh_token (and other keys).
+    # The access token is "lightweight": its claims are only exp, iat, jti,
+    # iss, typ, azp, sid and scope (no account name; userinfo answers 401).
+    # The ID token's claims include preferred_username (an e-mail address:
+    # it holds an "@"), sub, email, azp = aud = security-admin-console and
+    # iss = the realm URL — so the identity is the ID token's
+    # preferred_username, pinned by azp, typ ID, aud, our nonce, the exact
+    # issuer and its exp. The master realm's token lifespan is 60 s: `exp`
+    # gets 30 s of leeway for clock skew. Why that is a SERVER proof without
+    # a JWKS check: as for runai, the isolated world sends both requests
+    # itself (the page cannot hook its fetch, crypto, JSON or atob), its own
+    # random state, nonce and verifier bind the code and the ID token to
+    # this request, and the final URL's origin, path, state and `iss`
+    # (RFC 9207, checked before the error) are checked. The tokens never
+    # leave the function (no storage, no export, the refresh token is never
+    # used); no page cookie or storage key is read as an identity.
+    #
+    # The admin bit: GET /admin/realms/master/users/count with the access
+    # token as bearer answered 200 `application/json;charset=UTF-8` for the
+    # admin account (one JSON integer; so did /admin/realms and
+    # /admin/serverinfo) — hence `admin_true_confirmed`. The count needs
+    # user rights IN the master realm, which only master administrators
+    # hold; /admin/realms would also answer 200 to an admin delegated for a
+    # single other realm (its list is filtered). The 200 counts only as one
+    # non-negative JSON integer (capped read). The 403 of a non-admin master
+    # user is expected, NOT seen live (no such account exists):
+    # `admin_false_confirmed` stays False, so a `privilege user` /
+    # `readonly` item stays unproven. Only a 403 under a JSON content type
+    # counts as "not admin" (no error-object shape: Keycloak's is
+    # unconfirmed); an HTML or plain-text 200/403 is no bit.
+    #
+    # Side effects of one run: Keycloak adds a client session of
+    # security-admin-console to the existing SSO session (and may record a
+    # LOGIN and a CODE_TO_TOKEN event) and refreshes the SSO session's
+    # idle timer — what the console itself does on every load. Each check
+    # runs the recipe once: one authorization request, one token request,
+    # one probe (the check page itself, the console, runs its own
+    # keycloak-js flow on top).
+    "keycloak-admin": IdentityRecipe(
+        name="keycloak-admin",
+        path="/realms/master/protocol/openid-connect/token",
+        auth="oidc-silent-pkce",
+        client_id="security-admin-console",
+        auth_path="/realms/master/protocol/openid-connect/auth",
+        redirect_path="/admin/master/console/",
+        token_field=("id_token",),
+        bearer_field=("access_token",),
+        id_field=("preferred_username",),
+        claim_pins=(("azp", "security-admin-console"), ("typ", "ID")),
+        audience="security-admin-console",
+        issuer="https://custos.datascience.ch/realms/master",
+        exp_leeway_s=30,
+        admin_probe="/admin/realms/master/users/count",
+        admin_probe_true=(200,),
+        admin_probe_false=(403,),
+        admin_probe_true_integer=True,
+        admin_true_confirmed=True,
+        admin_false_confirmed=False,
+        allowed_sites=("custos-admin",),
+        origin="https://custos.datascience.ch",
+        live_confirmed=True,
+        forms=("email",),
+    ),
 }
 
 
@@ -1053,11 +1221,12 @@ def recipe_refusal(
     name: object, *, site: object, check_url: object, privilege: object
 ) -> str:
     """Why the item `site` (its check URL, its `agent_privilege`) may not
-    use recipe `name` ('' = it may): `recipe_config_problem`, or an admin
-    item while the recipe's "admin" answer is unconfirmed — a valid item
-    that stays unproven (``identity_unproven``) until the flag flips. One
-    rule for the broker's own proof, its login precheck and challenge gate,
-    and the client's proof."""
+    use recipe `name` ('' = it may): `recipe_config_problem`, an admin item
+    while the recipe's "admin" answer is unconfirmed, or any other item
+    while its "not admin" answer is unconfirmed — a valid item that stays
+    unproven (``identity_unproven``) until the flag flips. One rule for the
+    broker's own proof, its login precheck and challenge gate, and the
+    client's proof."""
     problem = recipe_config_problem(name, site=site, check_url=check_url)
     if problem:
         return problem
@@ -1065,6 +1234,11 @@ def recipe_refusal(
     if privilege == "admin" and not recipe.admin_true_confirmed:
         return (
             f"the {recipe.name} identity proof's admin answer is not live-confirmed yet"
+        )
+    if privilege != "admin" and not recipe.admin_false_confirmed:
+        return (
+            f"the {recipe.name} identity proof's not-admin answer is not "
+            "live-confirmed yet"
         )
     return ""
 
@@ -1133,7 +1307,9 @@ PROBE_BODY_MAX = 65536
 # fetches the fixed path on the page's own origin (no redirect at all, status
 # 200, JSON), reads the identity field and the admin bit, normalises, hashes
 # and returns only {state: found|logged_out|indeterminate, digest, admin,
-# why?, status?}: the raw value never leaves the page.
+# why?, status?}: the raw value never leaves the page. The one redirect it
+# follows is oidc-silent-pkce's authorization request, within the origin
+# only (`mode: 'same-origin'`), its final URL pinned to the redirect path.
 RECIPE_JS = r"""async (a) => {
   const out = (state, extra) => Object.assign({state: state}, extra || {});
   const get = (obj, path) => {
@@ -1231,6 +1407,14 @@ RECIPE_JS = r"""async (a) => {
   const probeBit = async (r) => {
     if (a.admin_probe_true.indexOf(r.status) >= 0) {
       if (!jsonType(r)) return null;
+      if (a.admin_probe_true_integer) {
+        // a count: ONE non-negative JSON integer (capped read)
+        const text = await readCapped(r, a.probe_body_max);
+        if (text === null) return null;
+        let v;
+        try { v = JSON.parse(text); } catch (e) { return null; }
+        return Number.isSafeInteger(v) && v >= 0 ? true : null;
+      }
       try { await r.json(); } catch (e) { return null; }
       return true;
     }
@@ -1270,20 +1454,132 @@ RECIPE_JS = r"""async (a) => {
       return out('indeterminate', {why: 'schema'});
     const t = get(body, a.token_field);
     if (typeof t !== 'string' || !t) return out('indeterminate', {why: 'token'});
+    return await found(origin, t, t);
+  };
+  // The identity of a JWT the server just returned (`t`): its claims
+  // pinned (claim_pins, the audience when the recipe has one, `nonce` when
+  // the request sent one, the exact issuer, an exp later than now minus
+  // the recipe's leeway), the identity claim; the admin bit from a fixed
+  // GET with `bearer`. Neither token leaves here.
+  const found = async (origin, t, bearer, nonce) => {
     const claims = jwt(t);
     if (claims === null) return out('indeterminate', {why: 'token'});
     for (const pin of a.claim_pins)
       if (get(claims, [pin[0]]) !== pin[1]) return out('indeterminate', {why: 'claim'});
+    if (nonce !== undefined && get(claims, ['nonce']) !== nonce)
+      return out('indeterminate', {why: 'claim'});
+    if (a.audience) {
+      const aud = get(claims, ['aud']);
+      if (!(aud === a.audience || (Array.isArray(aud) && aud.indexOf(a.audience) >= 0)))
+        return out('indeterminate', {why: 'claim'});
+    }
     if (get(claims, ['iss']) !== a.issuer) return out('indeterminate', {why: 'claim'});
     const exp = get(claims, ['exp']);
-    if (typeof exp !== 'number' || !isFinite(exp) || exp * 1000 <= Date.now())
+    if (typeof exp !== 'number' || !isFinite(exp)
+        || (exp + a.exp_leeway_s) * 1000 <= Date.now())
       return out('indeterminate', {why: 'expired'});
     const id = norm(get(claims, a.id_field));
     if (id === null) return out('indeterminate', {why: 'identity'});
     const probe = await call(origin, a.admin_probe, {method: 'GET',
-      headers: {Accept: 'application/json', Authorization: 'Bearer ' + t}});
+      headers: {Accept: 'application/json', Authorization: 'Bearer ' + bearer}});
     const admin = probe.err ? null : await probeBit(probe.r);
     return out('found', {digest: await digestOf(id), admin: admin});
+  };
+  // base64url without padding (RFC 7636).
+  const b64url = (bytes) => {
+    let s = '';
+    for (let i = 0; i < bytes.length; i++) s += String.fromCharCode(bytes[i]);
+    return btoa(s).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+  };
+  const randomB64 = (n) => b64url(crypto.getRandomValues(new Uint8Array(n)));
+  // oidc-silent-pkce (the Keycloak admin console): a silent authorization
+  // request (prompt=none) with this run's own random state and PKCE
+  // verifier and nonce, followed only within the origin; its final URL
+  // must be the redirect path with our state, an `iss` (when present) that
+  // is the issuer (RFC 9207, before anything else is read), then ONE code;
+  // `error=login_required` alone is logged out, any other error
+  // indeterminate (a server fault or a pending required action is no
+  // reason for a password login). The code goes to the token endpoint
+  // with the verifier; the ID token (its `nonce` ours) is the identity,
+  // the access token the admin probe's bearer. Nothing of either leaves
+  // here; the refresh token is never read.
+  const silentWork = async (origin) => {
+    const verifier = randomB64(32);
+    const state = randomB64(16);
+    const oidcNonce = randomB64(16);
+    const challenge = b64url(new Uint8Array(await crypto.subtle.digest('SHA-256',
+      new TextEncoder().encode(verifier))));
+    const redirect = new URL(a.redirect_path, origin);
+    const url = new URL(a.auth_path, origin);
+    if (url.origin !== origin || redirect.origin !== origin)
+      return out('indeterminate', {why: 'origin'});
+    const q = url.searchParams;
+    q.set('client_id', a.client_id);
+    q.set('redirect_uri', redirect.href);
+    q.set('response_type', 'code');
+    q.set('response_mode', 'query');
+    q.set('scope', 'openid');
+    q.set('prompt', 'none');
+    q.set('state', state);
+    q.set('nonce', oidcNonce);
+    q.set('code_challenge', challenge);
+    q.set('code_challenge_method', 'S256');
+    const ctl = new AbortController();
+    const timer = setTimeout(() => ctl.abort(), a.fetch_ms);
+    let r;
+    try {
+      // mode same-origin: a redirect to another origin is a network error,
+      // never a request (the code would travel in its URL).
+      r = await fetch(url.href, {credentials: 'same-origin', cache: 'no-store',
+        redirect: 'follow', mode: 'same-origin', signal: ctl.signal});
+    } catch (e) {
+      return out('indeterminate',
+        {why: e && e.name === 'AbortError' ? 'timeout' : 'network'});
+    } finally { clearTimeout(timer); }
+    try { if (r.body) await r.body.cancel(); } catch (e) { /* not needed */ }
+    let final = null;
+    try { final = new URL(r.url); } catch (e) { final = null; }
+    if (!final || final.origin !== origin || final.pathname !== redirect.pathname)
+      return out('indeterminate', {why: 'redirect'});
+    const p = final.searchParams;
+    if (p.getAll('state').length !== 1 || p.get('state') !== state)
+      return out('indeterminate', {why: 'state'});
+    const iss = p.getAll('iss');
+    if (iss.length > 1 || (iss.length === 1 && iss[0] !== a.issuer))
+      return out('indeterminate', {why: 'claim'});
+    if (p.has('error')) {
+      const errors = p.getAll('error');
+      if (errors.length === 1 && errors[0] === 'login_required')
+        return out('logged_out', {why: 'error'});
+      return out('indeterminate', {why: 'error'});
+    }
+    const codes = p.getAll('code');
+    if (codes.length !== 1 || !/^[A-Za-z0-9._~-]{1,4096}$/.test(codes[0]))
+      return out('indeterminate', {why: 'code'});
+    const form = new URLSearchParams();
+    form.set('grant_type', 'authorization_code');
+    form.set('code', codes[0]);
+    form.set('client_id', a.client_id);
+    form.set('redirect_uri', redirect.href);
+    form.set('code_verifier', verifier);
+    const tok = await call(origin, a.path, {method: 'POST',
+      headers: {Accept: 'application/json',
+        'Content-Type': 'application/x-www-form-urlencoded'},
+      body: form.toString()});
+    if (tok.err) return tok.err;
+    const tr = tok.r;
+    if (tr.status !== 200) return out('indeterminate', {why: 'status', status: tr.status});
+    if (!jsonType(tr)) return out('indeterminate', {why: 'content-type', status: tr.status});
+    let body;
+    try { body = await tr.json(); } catch (e) { return out('indeterminate', {why: 'body'}); }
+    if (body === null || typeof body !== 'object' || Array.isArray(body))
+      return out('indeterminate', {why: 'schema'});
+    const t = get(body, a.token_field);
+    const bearer = get(body, a.bearer_field);
+    if (typeof t !== 'string' || !t || typeof bearer !== 'string'
+        || !/^[A-Za-z0-9._~+\/-]+=*$/.test(bearer))
+      return out('indeterminate', {why: 'token'});
+    return await found(origin, t, bearer, oidcNonce);
   };
   const work = async () => {
     const origin = location.origin;
@@ -1292,6 +1588,7 @@ RECIPE_JS = r"""async (a) => {
     if (!/^[0-9a-f]{64}$/.test(a.nonce)) return out('indeterminate', {why: 'nonce'});
     if (!window.crypto || !crypto.subtle) return out('indeterminate', {why: 'crypto'});
     if (a.auth === 'token-endpoint') return await tokenWork(origin);
+    if (a.auth === 'oidc-silent-pkce') return await silentWork(origin);
     const headers = {Accept: 'application/json'};
     let path = a.path, claim = null;
     if (a.auth === 'bearer-local-storage' || a.auth === 'jwt-local-storage') {
@@ -1430,6 +1727,13 @@ def recipe_args(
         "admin_probe_true": list(recipe.admin_probe_true),
         "admin_probe_false": list(recipe.admin_probe_false),
         "admin_probe_error_shape": list(recipe.admin_probe_error_shape),
+        "admin_probe_true_integer": recipe.admin_probe_true_integer,
+        "exp_leeway_s": recipe.exp_leeway_s,
+        "client_id": recipe.client_id,
+        "auth_path": recipe.auth_path,
+        "redirect_path": recipe.redirect_path,
+        "audience": recipe.audience,
+        "bearer_field": opt(recipe.bearer_field),
         "probe_body_max": PROBE_BODY_MAX,
         "fetch_ms": FETCH_MS,
         "total_ms": TOTAL_MS,
