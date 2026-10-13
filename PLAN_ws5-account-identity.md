@@ -557,7 +557,7 @@ value.
 - [x] WS3's static validation uses `scope_conflicts`: a new item that conflicts with an
       existing one must declare `agent_instance`, `agent_privilege` and `agent_identity`
       (or `agent_same_account_as`). The broker's S1 refusal is the enforcement;
-      `agent-login.py -V` shows it before install. Built in WS3 (`PLAN_ws3-onboarding.md`):
+      `agent-login.py -V` shows it before install. Built in WS3 (`plans-done/PLAN_ws3-onboarding_DONE.md`):
       `account_unproven` (unusable) plus `displaced` / `made_unproven` for the established
       items a planned item would knock out (`-V -i`).
 

@@ -450,7 +450,7 @@ manual acceptance steps under the attempt policy below.
       item (sentinel present, fill origins, cookie scope, attempt group), a budgeted
       promotion test (`pending` → `usable`), and a removal path (`broker-add.py` remove or
       documented) that also prunes agent-login state
-  - [x] Plan `PLAN_ws3-onboarding.md`, Codex (gpt-5.6-sol) converged in round 2 (17
+  - [x] Plan `plans-done/PLAN_ws3-onboarding_DONE.md`, Codex (gpt-5.6-sol) converged in round 2 (17
         objections, all accepted; two parts of O6 rejected with evidence). Built 2026-10-12
         in a worktree; 3 security review rounds (blocker: digest drift across broker
         releases → vault-authored `config_canon` + `config_v`); released (c6730b4):

@@ -290,7 +290,7 @@ framework. It is a **provider**: other repos depend on it, not the reverse. See
   `SubmitTripwire` and `read_submit_buttons` do not apply: there is no form, so
   no default button to guess, no secondary form action to screen, and every
   request is the recipe's own to a fixed path.
-- **Onboarding guard (WS3, `PLAN_ws3-onboarding.md`)**: a new or changed broker
+- **Onboarding guard (WS3, `plans-done/PLAN_ws3-onboarding_DONE.md`)**: a new or changed broker
   item is reviewed BEFORE the vault write (`agent-login.py -V -i MANIFEST`,
   `broker/onboarding.py`: the broker's own `site_item_from_json` +
   `identity_rules` over the whole collection, displacement of established items
