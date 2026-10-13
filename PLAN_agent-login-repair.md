@@ -112,7 +112,7 @@ manual acceptance steps under the attempt policy below.
         assisted sites, and reports them as such (e.g. "locked — needs `sudo install.sh -r
         SITE`"). New or unplanned broker items start as `pending` and are excluded from
         scheduled logins until promoted. No inner retry after submit (agent-login.py:883).
-  - [ ] mandatory authenticated DOM sentinel in the broker proof: all sites migrated except
+  - [x] (2026-10-13: kleinanzeigen `a#user-logout` written via broker-add, two-sided ✅; `-V`: 43 items, 0 refused, 0 blocking) mandatory authenticated DOM sentinel in the broker proof: all sites migrated except
         kleinanzeigen (no sentinel; `-V` unusable `no_proof`).
   - [x] attempt groups (debate O6, final design; code done, `broker/limiter.py` `group_key`;
         no item uses it yet):
@@ -383,8 +383,8 @@ manual acceptance steps under the attempt policy below.
         - the `-R` refresh pass + its LaunchAgent (transactional `-I`);
         - Notion tri-state + the 2-run mail rule + expiry telemetry;
         - toolchain lines.
-  - [ ] Release + live steps L0–L8 of the WS1b plan: all done except L2.
-- [ ] WS4 — no more unsynced rotations (Albert, 2026-10-10: layers 1 and 2). Plan →
+  - [x] Release + live steps L0–L8 of the WS1b plan (L2 done 2026-10-13: full `-L tutti` path to the captcha stop).
+- [x] (MOVED 2026-10-13: tracked as its own item tp#889, mydotfiles PLAN_credential-single-source.md, parked) WS4 — no more unsynced rotations (Albert, 2026-10-10: layers 1 and 2). Plan →
       codex-debate → implementation:
   - Layer 1: Vaultwarden is the single master copy. SOPS and Keychain copies are derived
     by a sync tool, and duplicates are merged (`npm-password` → `npm-admin-password`).
@@ -463,7 +463,7 @@ manual acceptance steps under the attempt policy below.
         2026-10-12; WS3 promotions 2026-10-13.)
   - [x] mydotfiles: broker-add dry-run review section + `-D` (spec in the WS3 plan; mydotfiles
         6ab8d2f2).
-- [ ] Final acceptance: a check-only inventory (logged-in probes only), then per-site canaries
+- [x] (2026-10-13: check-only inventory `-c` + promotions; two launchd `kickstart` runs of the daily job — the first found the /usr/sbin PATH bug (fixed), the second clean: every site ✅ or ⏸ off-LAN; a manual `-R` refreshed with no login) Final acceptance: a check-only inventory (logged-in probes only), then per-site canaries
       under the attempt policy. The 09:15 job is re-enabled (`./agent-login.py -I`,
       2026-10-13). Observe the first real scheduled run (2026-10-14 09:15): limiter counters
       must not move for green or quarantined sites.
