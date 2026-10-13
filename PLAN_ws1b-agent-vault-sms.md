@@ -4,7 +4,7 @@ Resume: `c --resume 3871ad21-0f16-4b68-828e-f9eb1f7a6847`
 
 ## Status
 
-PARKED (Albert, 2026-10-13): resumes after plans-done/PLAN_ws1b-durability_DONE.md is done. Parent: plans-done/PLAN_ws1b-durability_DONE.md (tp#949) → PLAN_agent-login-repair.md (tp#880). Codex debate round 1 ran (below, unreconciled); next: write the round-1 ledger, judge, rounds 2-3, then Albert's open questions.
+WON'T DO (Albert, 2026-10-13): little gain today — the Safari vault locked twice in one day (one of them self-inflicted), and no recipe hit an SMS code. Cost: the agent-vault master password would be readable by any agent (breaks the vault-touchid promise), and adb SMS access is fragile. Plan and Codex round 1 are kept in browser-login/PLAN_ws1b-agent-vault-sms.md for a later revisit. Previously: PARKED (Albert, 2026-10-13): resumes after plans-done/PLAN_ws1b-durability_DONE.md is done. Parent: plans-done/PLAN_ws1b-durability_DONE.md (tp#949) → PLAN_agent-login-repair.md (tp#880). Codex debate round 1 ran (below, unreconciled); next: write the round-1 ledger, judge, rounds 2-3, then Albert's open questions.
 
 # WS1b follow-up (tp#955): agents unlock the agent vault and read SMS codes themselves
 
