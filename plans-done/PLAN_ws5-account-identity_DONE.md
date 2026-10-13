@@ -466,7 +466,7 @@ value.
       probes otherwise; a login only under the attempt policy.
 - [x] runai / custos-admin endpoints (d669be8, d808a8f): confirm at their WS2 candidate logins. Until then
       those groups stay `identity_unproven`. (navidrome: confirmed live 2026-10-11, S4a.)
-      - runai: done (S4c, `PLAN_ws5-s4c-runai-keycloak.md`). The `runai` recipe's "not
+      - runai: done (S4c, `plans-done/PLAN_ws5-s4c-runai-keycloak_DONE.md`). The `runai` recipe's "not
         admin" answer (403, runai-test3) and its "admin" answer (200
         `application/json`, runai-admin) are both live-confirmed 2026-10-12, so
         `admin_true_confirmed=True`; released, runai-admin ✅.
@@ -560,7 +560,7 @@ value.
       `agent-login.py -V` shows it before install. Built in WS3 (`plans-done/PLAN_ws3-onboarding_DONE.md`):
       `account_unproven` (unusable) plus `displaced` / `made_unproven` for the established
       items a planned item would knock out (`-V -i`).
-- [x] Child plan `PLAN_ws5-s4c-runai-keycloak.md` (tp#931) — feat: WS5 S4c: Run:ai page-claim identity + Keycloak realm-path scopes (tp#909)
+- [x] Child plan `plans-done/PLAN_ws5-s4c-runai-keycloak_DONE.md` (tp#931) — feat: WS5 S4c: Run:ai page-claim identity + Keycloak realm-path scopes (tp#909)
 
 ## Open questions for Albert (with recommendations)
 

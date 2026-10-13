@@ -288,7 +288,7 @@ manual acceptance steps under the attempt policy below.
         + a proof reason channel.
   - [x] dsm-readonly, authentik-glensk ✅ promoted 2026-10-13 (authentik: API recipe e578c67 +
         identity e2b0856; DSM: identity recipe 87e3722 + ad51414).
-- [x] WS5 — account identity (tp#833, hit 2026-10-10). Plan `PLAN_ws5-account-identity.md` (tp#909,
+- [x] WS5 — account identity (tp#833, hit 2026-10-10). Plan `plans-done/PLAN_ws5-account-identity_DONE.md` (tp#909,
       Codex converged in round 1). Albert's decisions 2026-10-11:
       - guard first (S0, "⚠ account unproven");
       - proposed defaults accepted (gitlab-sdsc→glensk, abs→albert, navidrome→albert,

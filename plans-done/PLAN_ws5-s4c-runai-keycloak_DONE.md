@@ -1,13 +1,13 @@
 ## Session
 
 Resume: `c --resume 3871ad21-0f16-4b68-828e-f9eb1f7a6847`
-Parent: PLAN_ws5-account-identity.md
+Parent: plans-done/PLAN_ws5-account-identity_DONE.md
 
 # WS5 S4c: Keycloak realm-path cookie scopes + a server-bound Run:ai identity (tp#909)
 
 ## Context
 
-WS5 (`PLAN_ws5-account-identity.md`, tp#909) refuses broker items that share one cookie
+WS5 (`plans-done/PLAN_ws5-account-identity_DONE.md`, tp#909) refuses broker items that share one cookie
 scope unless each one carries a usable server identity recipe. `broker/identity.py`
 `usable_recipe` requires a recipe that is reviewed, `live_confirmed`, and has an admin bit.
 The recipe runs in a CDP isolated world on both the broker side and the client side.
