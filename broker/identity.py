@@ -591,7 +591,8 @@ class IdentityRecipe:  # pylint: disable=too-many-instance-attributes  # one rev
     # "cookie" (the session cookie), "bearer-local-storage" (`token_key` of
     # the origin's localStorage), "jwt-local-storage" (the same, a JWT whose
     # `path_claim` names the endpoint's last path segment) or "syno-token"
-    # (DSM's in-page SynoToken).
+    # (DSM: the SynoToken from the server's own token endpoint, sent as
+    # `X-SYNO-TOKEN`).
     auth: str = "cookie"
     token_key: str = ""
     # The request header a localStorage token travels in: `auth_header:
@@ -610,8 +611,10 @@ class IdentityRecipe:  # pylint: disable=too-many-instance-attributes  # one rev
     admin_false: tuple[object, ...] = (False,)
     # GitLab exposes `is_admin` only to admins: absent means "not admin".
     absent_admin_is_false: bool = False
-    # DSM: `success` must be true; an error code in `logged_out_codes` is
-    # logged out, any other error indeterminate.
+    # DSM: `success` must be true. An error code in `logged_out_codes` is
+    # logged out — for syno-token only on the token request (the identity
+    # request answers 119 without the token even while logged in) —, any
+    # other error indeterminate.
     ok_field: tuple[str, ...] | None = None
     error_code_field: tuple[str, ...] | None = None
     logged_out_codes: tuple[int, ...] = ()
@@ -662,6 +665,17 @@ class IdentityRecipe:  # pylint: disable=too-many-instance-attributes  # one rev
     # The probe's "admin" answer is a count: ONE non-negative JSON integer
     # (read capped at PROBE_BODY_MAX); any other body is no bit.
     admin_probe_true_integer: bool = False
+    # syno-token (DSM): the SynoToken is the server's answer to a fixed
+    # same-origin GET (`syno_token_path`, the session cookie, no token),
+    # in the API envelope (`ok_field`, `error_code_field`), at
+    # `syno_token_field` — never a page global.
+    syno_token_path: str = ""
+    syno_token_field: tuple[str, ...] | None = None
+    # An admin probe answering in that envelope (DSM; HTTP 200 JSON either
+    # way, the statuses `admin_probe_true` / `admin_probe_false` unused):
+    # `ok_field` true = admin, false with an error code in these = not
+    # admin, anything else no bit. () = the probe's HTTP status decides.
+    admin_probe_false_codes: tuple[int, ...] = ()
     # Seconds a token's `exp` may lie in the past (clock skew against a
     # short-lived token); 0 = exp must be in the future.
     exp_leeway_s: int = 0
@@ -775,6 +789,9 @@ def recipe_problem(  # pylint: disable=too-many-return-statements,too-many-branc
         recipe.admin_field,
         recipe.claim_field,
         recipe.bearer_field,
+        recipe.ok_field,
+        recipe.error_code_field,
+        recipe.syno_token_field,
     ):
         if field_path is not None and not all(
             isinstance(k, str) and _FIELD_KEY.match(k) for k in field_path
@@ -871,6 +888,20 @@ def _token_recipe_problem(  # pylint: disable=too-many-return-statements,too-man
         recipe.audience,
         recipe.bearer_field,
     )
+    if recipe.auth == "syno-token":
+        # its admin probe is its own (the API envelope); the JWT fields not
+        jwt_fields = (*token_fields[:4], *token_fields[5:])
+        if any(jwt_fields):
+            return "token fields need auth token-endpoint or oidc-silent-pkce"
+        if any(oidc_fields):
+            return "oidc fields need auth oidc-silent-pkce"
+        return _syno_recipe_problem(recipe)
+    if (
+        recipe.syno_token_path
+        or recipe.syno_token_field
+        or recipe.admin_probe_false_codes
+    ):
+        return "syno fields need auth syno-token"
     if recipe.auth not in TOKEN_AUTHS:
         if any(token_fields):
             return "token fields need auth token-endpoint or oidc-silent-pkce"
@@ -935,6 +966,52 @@ def _token_recipe_problem(  # pylint: disable=too-many-return-statements,too-man
     if not recipe.allowed_sites or not recipe.origin:
         return f"{recipe.auth} needs allowed_sites and an origin (a fixed source)"
     return _oidc_recipe_problem(recipe) if recipe.auth == "oidc-silent-pkce" else ""
+
+
+def _api_codes(codes: object) -> bool:
+    """A non-empty tuple of non-negative integers (API error codes)."""
+    return (
+        isinstance(codes, tuple)
+        and bool(codes)
+        and all(
+            isinstance(c, int) and not isinstance(c, bool) and 0 <= c <= 65535
+            for c in codes
+        )
+    )
+
+
+# One return per rule of the syno-token spec, in the order they are checked.
+def _syno_recipe_problem(  # pylint: disable=too-many-return-statements
+    recipe: IdentityRecipe,
+) -> str:
+    """The syno-token rules (DSM): a fixed token GET and the token's field,
+    the API envelope (`ok_field`, `error_code_field`, `logged_out_codes`),
+    an admin probe on a fixed path whose "not admin" error codes are apart
+    from the logged-out ones (a session that ends between the requests is
+    no bit), and a recipe pinned to its sites AND its origin."""
+    problem = _fixed_path_problem(recipe.syno_token_path)
+    if problem:
+        return f"syno_token_path {problem}"
+    if not recipe.syno_token_field:
+        return "syno-token needs a syno_token_field"
+    if not recipe.ok_field or not recipe.error_code_field:
+        return "syno-token needs ok_field and error_code_field"
+    if not _api_codes(recipe.logged_out_codes):
+        return "syno-token needs logged_out_codes"
+    if recipe.admin_field is not None:
+        return "syno-token takes its admin bit from admin_probe"
+    problem = _fixed_path_problem(recipe.admin_probe)
+    if problem:
+        return f"admin_probe {problem}"
+    if not _api_codes(recipe.admin_probe_false_codes) or set(
+        recipe.admin_probe_false_codes
+    ) & set(recipe.logged_out_codes):
+        return "admin_probe_false_codes must be API codes apart from logged_out_codes"
+    if recipe.base_segments:
+        return "syno-token takes no base_segments"
+    if not recipe.allowed_sites or not recipe.origin:
+        return "syno-token needs allowed_sites and an origin (a fixed source)"
+    return ""
 
 
 _CLIENT_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
@@ -1023,17 +1100,55 @@ IDENTITIES: dict[str, IdentityRecipe] = {
         live_confirmed=True,
         forms=("username",),
     ),
-    # DSM Web API (logged out it answers success:false, code 119). This
-    # answer has no admin bit: an item using it stays indeterminate until S4
-    # confirms one (fail closed).
+    # DSM 7 Web API (synology.dom42.space, a DS218; the dsm-albert and
+    # dsm-readonly items). Live 2026-10-13, Albert's Safari logged in as
+    # the readonly account, value-free:
+    # - `GET /webapi/entry.cgi?api=SYNO.API.Auth&method=token&version=6`
+    #   with the session cookie (no token header) → 200 JSON {success:
+    #   true, data: {is_portal_port, synotoken}}: the recipe obtains the
+    #   SynoToken from the server itself, in the isolated world — never
+    #   `window.SYNO.SDS.Session.SynoToken`, a global the page could fake.
+    #   Only THIS request's envelope error in `logged_out_codes` (106
+    #   session timeout, 107 kicked by a duplicate login, 119 SID not
+    #   found) is logged out;
+    # - `GET …api=SYNO.Core.NormalUser&method=get&version=1` with
+    #   `X-SYNO-TOKEN` → 200 {success: true, data: {OTP_enable,
+    #   OTP_enforced, disallowchpasswd, editable, email, fullname,
+    #   password_last_change, username}}; `data.username` is the vault
+    #   username. WITHOUT the token header it answers {success: false,
+    #   error: {code: 119}} even while logged in — so once the token
+    #   request succeeded, any error here is indeterminate, never logged
+    #   out;
+    # - the admin bit (NormalUser has none): `GET …api=SYNO.Core.User&
+    #   method=list&version=1&limit=1` with the token. The readonly
+    #   (non-admin) account got 200 {success: false, error: {code: 105}}
+    #   (permission denied) — hence `admin_false_confirmed`. The admin
+    #   answer (success: true) is expected, NOT seen live yet (dsm-albert
+    #   not probed): `admin_true_confirmed` stays False, so a `privilege
+    #   admin` item stays unproven. Any other answer (another code, not
+    #   JSON, HTTP ≠ 200, a redirect) is no bit.
+    # The token never leaves the isolated world; only the digest and the
+    # bit cross CDP.
     "dsm": IdentityRecipe(
         name="dsm",
         path="/webapi/entry.cgi?api=SYNO.Core.NormalUser&method=get&version=1",
         id_field=("data", "username"),
         auth="syno-token",
+        syno_token_path="/webapi/entry.cgi?api=SYNO.API.Auth&method=token&version=6",
+        syno_token_field=("data", "synotoken"),
         ok_field=("success",),
         error_code_field=("error", "code"),
         logged_out_codes=(106, 107, 119),
+        admin_probe=(
+            "/webapi/entry.cgi?api=SYNO.Core.User&method=list&version=1&limit=1"
+        ),
+        admin_probe_false_codes=(105,),
+        admin_true_confirmed=False,
+        admin_false_confirmed=True,
+        allowed_sites=("dsm-albert", "dsm-readonly"),
+        origin="https://synology.dom42.space",
+        live_confirmed=True,
+        forms=("username",),
     ),
     # authentik (auth.dev.renku.ch, the authentik-glensk and
     # authentik-akadmin items), API docs (SessionUser / UserSelf):
@@ -1230,8 +1345,7 @@ def identity_form(value: object) -> str | None:
 def usable_recipe(name: object) -> IdentityRecipe | None:
     """The recipe an item may use: reviewed, live-confirmed, WITH an admin
     bit (the privilege check needs one: a response field or an admin
-    probe). None for anything else — dsm until S4 confirms it live; its
-    items stay unproven. Whether ONE item may use it is
+    probe). None for anything else. Whether ONE item may use it is
     `item_recipe`."""
     recipe = IDENTITIES.get(name) if isinstance(name, str) else None
     if recipe is None or not recipe.live_confirmed:
@@ -1477,6 +1591,28 @@ RECIPE_JS = r"""async (a) => {
         || typeof v[shape[1]] !== 'string') return null;
     return false;
   };
+  // DSM's API envelope: an HTTP 200 JSON object (capped read), else null.
+  const envelope = async (r) => {
+    if (r.status !== 200 || !jsonType(r)) return null;
+    const text = await readCapped(r, a.probe_body_max);
+    if (text === null) return null;
+    let v;
+    try { v = JSON.parse(text); } catch (e) { return null; }
+    return v !== null && typeof v === 'object' && !Array.isArray(v) ? v : null;
+  };
+  // The admin bit of an envelope probe (null = none): success true =
+  // admin; success false with an error code in admin_probe_false_codes =
+  // not admin; anything else says nothing about the account's rights.
+  const envelopeBit = async (r) => {
+    const env = await envelope(r);
+    if (env === null) return null;
+    const ok = get(env, a.ok_field);
+    if (ok === true) return true;
+    const code = get(env, a.error_code_field);
+    if (ok === false && typeof code === 'number'
+        && a.admin_probe_false_codes.indexOf(code) >= 0) return false;
+    return null;
+  };
   // token-endpoint (Run:ai): POST the fixed body, read the JWT the server
   // returns, pin its claims, read the identity claim; the admin bit from
   // a fixed GET with that token as bearer. The token never leaves here.
@@ -1648,9 +1784,25 @@ RECIPE_JS = r"""async (a) => {
       }
       headers[a.auth_header] = a.auth_scheme + t;
     } else if (a.auth === 'syno-token') {
-      let t = null;
-      try { t = window.SYNO.SDS.Session.SynoToken; } catch (e) { t = null; }
-      if (typeof t !== 'string' || !t) return out('indeterminate', {why: 'no token'});
+      // DSM: the SynoToken is the server's answer to its fixed token GET
+      // (the session cookie), never a page global. Only THIS envelope's
+      // error in logged_out_codes is logged out.
+      const tok = await call(origin, a.syno_token_path, {method: 'GET',
+        headers: {Accept: 'application/json'}});
+      if (tok.err) return tok.err;
+      const env = await envelope(tok.r);
+      if (env === null) return out('indeterminate', {why: 'token', status: tok.r.status});
+      const ok = get(env, a.ok_field);
+      if (ok !== true) {
+        const code = get(env, a.error_code_field);
+        if (ok === false && typeof code === 'number'
+            && a.logged_out_codes.indexOf(code) >= 0)
+          return out('logged_out', {why: 'api'});
+        return out('indeterminate', {why: 'token'});
+      }
+      const t = get(env, a.syno_token_field);
+      if (typeof t !== 'string' || !/^[A-Za-z0-9._~+\/=-]{1,512}$/.test(t))
+        return out('indeterminate', {why: 'token'});
       headers['X-SYNO-TOKEN'] = t;
     } else if (a.auth !== 'cookie') {
       return out('indeterminate', {why: 'auth'});
@@ -1672,6 +1824,9 @@ RECIPE_JS = r"""async (a) => {
     if (r.redirected || !final || final.origin !== origin || final.pathname !== url.pathname)
       return out('indeterminate', {why: 'redirect', status: r.status});
     if (r.status === 401 || r.status === 403) {
+      // syno-token: the token request said logged in; this is no answer
+      if (a.auth === 'syno-token')
+        return out('indeterminate', {why: 'status', status: r.status});
       if (a.logged_out_json && !jsonType(r))
         return out('indeterminate', {why: 'content-type', status: r.status});
       return out('logged_out', {status: r.status});
@@ -1686,9 +1841,10 @@ RECIPE_JS = r"""async (a) => {
       return out('indeterminate', {why: 'schema'});
     if (a.ok_field && get(body, a.ok_field) !== true) {
       const code = a.error_code_field ? get(body, a.error_code_field) : undefined;
-      if (typeof code === 'number' && a.logged_out_codes.indexOf(code) >= 0)
+      if (a.auth !== 'syno-token' && typeof code === 'number'
+          && a.logged_out_codes.indexOf(code) >= 0)
         return out('logged_out', {why: 'api'});
-      return out('indeterminate', {why: 'schema'});
+      return out('indeterminate', {why: 'api'});
     }
     if (a.must_be_null) {
       const v = get(body, a.must_be_null);
@@ -1705,6 +1861,10 @@ RECIPE_JS = r"""async (a) => {
       if (v === undefined && a.absent_admin_is_false) admin = false;
       else if (a.admin_true.indexOf(v) >= 0) admin = true;
       else if (a.admin_false.indexOf(v) >= 0) admin = false;
+    } else if (a.auth === 'syno-token' && a.admin_probe) {
+      // DSM: the probe answers in the API envelope, with the same token
+      const probe = await call(origin, a.admin_probe, {method: 'GET', headers: headers});
+      admin = probe.err ? null : await envelopeBit(probe.r);
     }
     return out('found', {digest: await digestOf(id), admin: admin});
   };
@@ -1780,6 +1940,9 @@ def recipe_args(
         "admin_probe_false": list(recipe.admin_probe_false),
         "admin_probe_error_shape": list(recipe.admin_probe_error_shape),
         "admin_probe_true_integer": recipe.admin_probe_true_integer,
+        "admin_probe_false_codes": list(recipe.admin_probe_false_codes),
+        "syno_token_path": recipe.syno_token_path,
+        "syno_token_field": opt(recipe.syno_token_field),
         "exp_leeway_s": recipe.exp_leeway_s,
         "client_id": recipe.client_id,
         "auth_path": recipe.auth_path,

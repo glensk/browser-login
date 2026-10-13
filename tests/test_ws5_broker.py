@@ -153,7 +153,7 @@ def test_recipes_are_reviewed_and_unconfirmed_ones_absent() -> None:
         == "/audiobookshelf/api/me"
     )
     assert identity.recipe_path(abs_, "https://a.example/other/x") == "/api/me"
-    # usable = live-confirmed AND an admin bit: dsm waits for S4
+    # usable = live-confirmed AND an admin bit (dsm: its envelope probe)
     assert identity.usable_recipe("gitlab") is identity.IDENTITIES["gitlab"]
     assert identity.usable_recipe("audiobookshelf") is not None
     assert identity.usable_recipe("navidrome") is identity.IDENTITIES["navidrome"]
@@ -163,7 +163,9 @@ def test_recipes_are_reviewed_and_unconfirmed_ones_absent() -> None:
     assert identity.usable_recipe("keycloak-admin") is keycloak
     # authentik (live 2026-10-13): usable; admin items only (`item_recipe`)
     assert identity.usable_recipe("authentik") is identity.IDENTITIES["authentik"]
-    for name in ("dsm", "nope", None):
+    # dsm (live 2026-10-13): usable; readonly items only (`item_recipe`)
+    assert identity.usable_recipe("dsm") is identity.IDENTITIES["dsm"]
+    for name in ("nope", None):
         assert identity.usable_recipe(name) is None
 
 
@@ -179,7 +181,7 @@ def test_recipes_are_reviewed_and_unconfirmed_ones_absent() -> None:
         ({"instance": "admin", "privilege": "root"}, "bad agent_privilege"),
         ({"identity": "nope", "privilege": "user"}, "bad agent_identity"),
         ({"identity": "gitlab"}, "agent_identity needs agent_privilege"),
-        ({"identity": "dsm", "privilege": "readonly"}, "not live-confirmed"),
+        ({"identity": "dsm", "privilege": "readonly"}, "dsm-readonly only"),
         ({"same_account_as": "Bad Id!"}, "bad agent_same_account_as"),
         ({"same_account_as": "solo"}, "bad agent_same_account_as"),
         ({"alias": "cscs"}, "collides with a site name"),
@@ -1515,21 +1517,3 @@ def test_js_audiobookshelf_bearer_from_local_storage(chrome: tuple[Any, _Api]) -
         identity.local_verdict(got, got["_nonce"], name, "user")
         == identity.INDETERMINATE
     )
-
-
-@pytest.mark.launches_chrome
-@CHROME
-def test_js_dsm_isolation(chrome: tuple[Any, _Api]) -> None:
-    # (authentik is pinned to its origin since its login recipe: its
-    # RECIPE_JS tests run against a fixture of that origin, with every
-    # other host unresolvable, in tests/test_authentik.py)
-    page, api = chrome
-    name = _user()
-    # DSM's SynoToken is a page global: the isolated world does not see it,
-    # so dsm stays indeterminate (and unusable) until S4 picks another source
-    dsm = "https://nas.ws5.example/"
-    page.goto(dsm)
-    page.evaluate("t => { window.SYNO = {SDS: {Session: {SynoToken: t}}}; }", "tok")
-    api.body = {"success": True, "data": {"username": name}}
-    got = _run(page, "dsm", dsm, goto=False)
-    assert got["state"] == "indeterminate" and got["why"] == "no token"

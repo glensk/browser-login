@@ -190,7 +190,7 @@ def test_foreign_storage_keys_of_a_storage_token_item() -> None:
     "entry",
     [
         _entry("gitlab"),  # a cookie session: nothing in storage
-        _entry("dsm"),  # not usable
+        _entry("dsm"),  # a cookie + server SynoToken session: nothing in storage
         _entry("runai"),  # unknown
         _entry(
             "navidrome", check_url="http://music.ws5nd.example/app/", fill_origins=[]
