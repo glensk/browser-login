@@ -528,7 +528,7 @@ value.
     `_broker_clear_foreign_storage` against a disposable Chromium attached with
     `connect_over_cdp` (default context, owned tabs, registry, lease), with and
     without an installed worker).
-- [ ] Update README (item fields, "Accounts that share a site", instances), AGENTS.md
+- [x] (2026-10-13: docs done; tp#833 closed with acceptance A1/A2) Update README (item fields, "Accounts that share a site", instances), AGENTS.md
       (invariant: one account per conflict group per instance; a multi-account item passes
       only with the server identity proof; values never leave page or broker) and the
       parent plan's WS5 box. Close tp#833 through the review flow.
