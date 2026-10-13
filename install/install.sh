@@ -584,7 +584,11 @@ do_install() {
 		run /bin/ln -sfn "$previous" "${LIBEXEC}/previous"
 	fi
 	audit_install "$head" "$previous"
-	echo "✅ login broker installed: ${rel}"
+	if ((DRY)); then
+		echo "ℹ️ dry run — nothing installed (would install ${rel})"
+	else
+		echo "✅ login broker installed: ${rel}"
+	fi
 }
 
 do_uninstall() {
