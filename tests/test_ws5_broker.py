@@ -153,7 +153,7 @@ def test_recipes_are_reviewed_and_unconfirmed_ones_absent() -> None:
         == "/audiobookshelf/api/me"
     )
     assert identity.recipe_path(abs_, "https://a.example/other/x") == "/api/me"
-    # usable = live-confirmed AND an admin bit: dsm / authentik wait for S4
+    # usable = live-confirmed AND an admin bit: dsm waits for S4
     assert identity.usable_recipe("gitlab") is identity.IDENTITIES["gitlab"]
     assert identity.usable_recipe("audiobookshelf") is not None
     assert identity.usable_recipe("navidrome") is identity.IDENTITIES["navidrome"]
@@ -161,7 +161,9 @@ def test_recipes_are_reviewed_and_unconfirmed_ones_absent() -> None:
     assert identity.usable_recipe("runai") is identity.IDENTITIES["runai"]
     keycloak = identity.IDENTITIES["keycloak-admin"]
     assert identity.usable_recipe("keycloak-admin") is keycloak
-    for name in ("dsm", "authentik", "nope", None):
+    # authentik (live 2026-10-13): usable; admin items only (`item_recipe`)
+    assert identity.usable_recipe("authentik") is identity.IDENTITIES["authentik"]
+    for name in ("dsm", "nope", None):
         assert identity.usable_recipe(name) is None
 
 
@@ -178,7 +180,6 @@ def test_recipes_are_reviewed_and_unconfirmed_ones_absent() -> None:
         ({"identity": "nope", "privilege": "user"}, "bad agent_identity"),
         ({"identity": "gitlab"}, "agent_identity needs agent_privilege"),
         ({"identity": "dsm", "privilege": "readonly"}, "not live-confirmed"),
-        ({"identity": "authentik", "privilege": "user"}, "not live-confirmed"),
         ({"same_account_as": "Bad Id!"}, "bad agent_same_account_as"),
         ({"same_account_as": "solo"}, "bad agent_same_account_as"),
         ({"alias": "cscs"}, "collides with a site name"),

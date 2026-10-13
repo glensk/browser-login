@@ -1044,26 +1044,30 @@ IDENTITIES: dict[str, IdentityRecipe] = {
     # under JSON (`logged_out_json`): an HTML 403 is no answer.
     # authentik 2026.8.1's sources leave `original` OUT when nobody
     # impersonates (`SessionUserSerializer`, required=False; the view sets
-    # it only then), so `null_may_be_absent` must flip with the live check
-    # if the live answer has no `original` key.
+    # it only then).
     #
-    # Unusable until the main session confirms it live (value-free: status
-    # and key names): `live_confirmed` (a 200 JSON answer with `user` and
-    # its keys), `admin_false_confirmed` (as authentik-glensk:
-    # `user.is_superuser` false) and `admin_true_confirmed` (as
-    # authentik-akadmin: true).
+    # Live 2026-10-13 as authentik-glensk (Albert's Safari, value-free):
+    # 200 `application/json`, top-level keys `user` and `users`, NO
+    # `original` key (nobody impersonating) — hence `null_may_be_absent`;
+    # `user` has avatar, email, groups, is_active, is_current,
+    # is_superuser, name, pk, roles, settings, system_permissions, type,
+    # uid, username; `user.username` is the vault username and
+    # `user.is_superuser` true — hence `admin_true_confirmed`. glensk is a
+    # superuser too, so both items are `privilege admin`, told apart by
+    # username only. No non-admin account exists: `admin_false_confirmed`
+    # stays False, so a `privilege user` / `readonly` item stays unproven.
     "authentik": IdentityRecipe(
         name="authentik",
         path="/api/v3/core/users/me/",
         id_field=("user", "username"),
         admin_field=("user", "is_superuser"),
         must_be_null=("original",),
-        null_may_be_absent=False,
+        null_may_be_absent=True,
         logged_out_json=True,
         allowed_sites=("authentik-akadmin", "authentik-glensk"),
         origin="https://auth.dev.renku.ch",
-        live_confirmed=False,
-        admin_true_confirmed=False,
+        live_confirmed=True,
+        admin_true_confirmed=True,
         admin_false_confirmed=False,
         forms=("username",),
     ),
@@ -1226,8 +1230,8 @@ def identity_form(value: object) -> str | None:
 def usable_recipe(name: object) -> IdentityRecipe | None:
     """The recipe an item may use: reviewed, live-confirmed, WITH an admin
     bit (the privilege check needs one: a response field or an admin
-    probe). None for anything else — dsm and authentik until S4 confirms
-    them live; their items stay unproven. Whether ONE item may use it is
+    probe). None for anything else — dsm until S4 confirms it live; its
+    items stay unproven. Whether ONE item may use it is
     `item_recipe`."""
     recipe = IDENTITIES.get(name) if isinstance(name, str) else None
     if recipe is None or not recipe.live_confirmed:

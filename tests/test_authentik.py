@@ -58,15 +58,18 @@ CHECK_URL = f"{ORIGIN}/if/user/"
 EXECUTOR = f"/api/v3/flows/executor/{SLUG}/"
 ME = "/api/v3/core/users/me/"
 RECIPE = identity.IDENTITIES["authentik"]
-# the recipe once the main session confirmed it live (both admin answers,
-# and `original` absent when nobody impersonates)
-CONFIRMED = dataclasses.replace(
+# the spec as reviewed before the live check: `original` present and null,
+# nothing confirmed
+REVIEWED = dataclasses.replace(
     RECIPE,
-    live_confirmed=True,
-    admin_true_confirmed=True,
-    admin_false_confirmed=True,
-    null_may_be_absent=True,
+    live_confirmed=False,
+    admin_true_confirmed=False,
+    admin_false_confirmed=False,
+    null_may_be_absent=False,
 )
+# the live recipe plus a confirmed "not admin" answer (no non-admin
+# authentik account exists to confirm it for real)
+CONFIRMED = dataclasses.replace(RECIPE, admin_false_confirmed=True)
 _PW_KEY = "pass" + "word"
 CHROME = pytest.mark.skipif(
     not chromium_available() or shutil.which("openssl") is None,
@@ -1069,7 +1072,7 @@ def test_identity_impersonation_is_indeterminate(run_recipe: Any) -> None:
     run, ak, ctx = run_recipe
     ak.original = "set"
     user = _log_in(ak, ctx, superuser=True)
-    for recipe in (RECIPE, CONFIRMED):
+    for recipe in (REVIEWED, RECIPE):
         got = run(recipe)
         assert (got["state"], got["why"]) == ("indeterminate", "impersonation")
         assert _verdict(got, user["name"], "user") == identity.INDETERMINATE
@@ -1078,16 +1081,17 @@ def test_identity_impersonation_is_indeterminate(run_recipe: Any) -> None:
 @pytest.mark.launches_chrome
 @CHROME
 def test_identity_original_absent_needs_the_flag(run_recipe: Any) -> None:
-    """authentik 2026.8.1 leaves `original` out unless impersonating: the
-    reviewed spec (present and null) is indeterminate then; the flag the
-    live check flips accepts it."""
+    """authentik 2026.8.1 leaves `original` out unless impersonating (seen
+    live 2026-10-13): the reviewed spec (present and null) is indeterminate
+    then; the live recipe's `null_may_be_absent` accepts it."""
     run, ak, ctx = run_recipe
     ak.original = "absent"
-    user = _log_in(ak, ctx)
-    got = run(RECIPE)
+    user = _log_in(ak, ctx, superuser=True)
+    got = run(REVIEWED)
     assert (got["state"], got["why"]) == ("indeterminate", "impersonation")
-    got = run(CONFIRMED)
-    assert _verdict(got, user["name"], "user") == identity.MATCH
+    got = run(RECIPE)
+    assert got["state"] == "found" and got["admin"] is True
+    assert _verdict(got, user["name"], "admin") == identity.MATCH
 
 
 @pytest.mark.launches_chrome
@@ -1116,16 +1120,53 @@ def test_identity_another_origin_is_refused(run_recipe: Any) -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_the_spec_is_reviewed_but_not_usable_yet() -> None:
+def test_the_spec_is_live_confirmed_for_admin_items_only() -> None:
     assert identity.recipe_problem(RECIPE) == ""
     assert RECIPE.id_field == ("user", "username")
     assert RECIPE.admin_field == ("user", "is_superuser")
-    assert RECIPE.must_be_null == ("original",) and not RECIPE.null_may_be_absent
+    assert RECIPE.must_be_null == ("original",) and RECIPE.null_may_be_absent
     assert RECIPE.logged_out_json and RECIPE.origin == ORIGIN
-    assert identity.usable_recipe("authentik") is None
+    # live 2026-10-13: the 200 answer and `is_superuser` true; no non-admin
+    # account exists, so the "not admin" side stays unconfirmed
+    assert RECIPE.live_confirmed and RECIPE.admin_true_confirmed
+    assert not RECIPE.admin_false_confirmed
+    assert identity.usable_recipe("authentik") is RECIPE
     args = identity.recipe_args(RECIPE, CHECK_URL, "0" * 64)
     assert args["origin"] == ORIGIN and args["path"] == ME
-    assert args["logged_out_json"] is True and args["null_may_be_absent"] is False
+    assert args["logged_out_json"] is True and args["null_may_be_absent"] is True
+
+
+def test_only_privilege_admin_items_may_use_it() -> None:
+    for site in RECIPE.allowed_sites:
+        assert (
+            identity.recipe_refusal(
+                "authentik", site=site, check_url=CHECK_URL, privilege="admin"
+            )
+            == ""
+        )
+        assert (
+            identity.item_recipe(
+                "authentik", site=site, check_url=CHECK_URL, privilege="admin"
+            )
+            is RECIPE
+        )
+        assert identity.proof_ready(_entry(site, "admin"))
+        for privilege in ("user", "readonly"):
+            assert "not-admin answer is not live-confirmed" in (
+                identity.recipe_refusal(
+                    "authentik", site=site, check_url=CHECK_URL, privilege=privilege
+                )
+            )
+            assert (
+                identity.item_recipe(
+                    "authentik", site=site, check_url=CHECK_URL, privilege=privilege
+                )
+                is None
+            )
+            assert not identity.proof_ready(_entry(site, privilege))
+    assert "reviewed for" in identity.recipe_refusal(
+        "authentik", site="authentik-other", check_url=CHECK_URL, privilege="admin"
+    )
 
 
 @pytest.mark.parametrize(
@@ -1180,7 +1221,7 @@ def test_the_live_confirmed_toggles(
     monkeypatch: pytest.MonkeyPatch, flags: dict, glensk: bool, akadmin: bool
 ) -> None:
     monkeypatch.setitem(
-        identity.IDENTITIES, "authentik", dataclasses.replace(RECIPE, **flags)
+        identity.IDENTITIES, "authentik", dataclasses.replace(REVIEWED, **flags)
     )
     assert identity.proof_ready(_entry("authentik-glensk", "user")) is glensk
     assert identity.proof_ready(_entry("authentik-akadmin", "admin")) is akadmin
@@ -1240,13 +1281,31 @@ def test_the_vault_pair_before_and_after_the_live_check(
 ) -> None:
     glensk, akadmin = _name(), _name()
     # before: without agent_identity the pair is valid (multi-account,
-    # unproven); WITH it, refused until the recipe is confirmed
+    # unproven); WITH it, refused while the recipe is unconfirmed
     items = {it.site: it for it in vault.build_items(_pair(glensk, akadmin, False))}
     for it in items.values():
         assert it.refused is None and it.multi_account and it.identity_recipe is None
+    with monkeypatch.context() as mp:
+        mp.setitem(identity.IDENTITIES, "authentik", REVIEWED)
+        items = {it.site: it for it in vault.build_items(_pair(glensk, akadmin))}
+        assert all("not live-confirmed" in str(it.refused) for it in items.values())
+    # the live recipe: valid; the admin item is proof-ready, the user item
+    # stays unproven (its "not admin" answer is unconfirmed)
     items = {it.site: it for it in vault.build_items(_pair(glensk, akadmin))}
-    assert all("not live-confirmed" in str(it.refused) for it in items.values())
-    # after the flags flip: both valid and proof-ready
+    for it in items.values():
+        assert it.refused is None and it.multi_account
+    assert items["authentik-akadmin"].identity_recipe is RECIPE
+    assert items["authentik-glensk"].identity_recipe is None
+    # glensk is a superuser too: as `privilege admin` it is proof-ready
+    raws = _pair(glensk, akadmin)
+    raws[0]["fields"] = [
+        dict(f, value="admin") if f["name"] == "agent_privilege" else f
+        for f in raws[0]["fields"]
+    ]
+    items = {it.site: it for it in vault.build_items(raws)}
+    for it in items.values():
+        assert it.refused is None and it.identity_recipe is RECIPE
+    # with a confirmed "not admin" answer: both valid and proof-ready
     monkeypatch.setitem(identity.IDENTITIES, "authentik", CONFIRMED)
     items = {it.site: it for it in vault.build_items(_pair(glensk, akadmin))}
     for site, privilege in (
