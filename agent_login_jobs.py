@@ -83,6 +83,9 @@ def launchagent_plist(
             "/usr/local/bin",
             "/usr/bin",
             "/bin",
+            # lsof (role-browser client check) and ioreg live here
+            "/usr/sbin",
+            "/sbin",
         ]
     )
     return f"""<?xml version="1.0" encoding="UTF-8"?>
