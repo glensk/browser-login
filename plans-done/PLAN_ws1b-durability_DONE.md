@@ -6,7 +6,7 @@ Resume: `c --resume 3871ad21-0f16-4b68-828e-f9eb1f7a6847`
 
 ## Context
 
-Part of `PLAN_agent-login-repair.md` (box WS1b). Goal: every site in `./agent-login.py` stays
+Part of `plans-done/PLAN_agent-login-repair_DONE.md` (box WS1b). Goal: every site in `./agent-login.py` stays
 ✅ for agents with no human to-do. Only four things stay with Albert: a CAPTCHA, a locked
 vault, a hardware-key or push approval, and an SMS code.
 

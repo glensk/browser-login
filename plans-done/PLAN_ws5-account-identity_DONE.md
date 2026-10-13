@@ -1,7 +1,7 @@
 ## Session
 
 Resume: `c --resume 3871ad21-0f16-4b68-828e-f9eb1f7a6847`
-Parent: PLAN_agent-login-repair.md
+Parent: plans-done/PLAN_agent-login-repair_DONE.md
 
 # WS5 — account identity for broker sites that share one cookie scope (tp#833)
 
@@ -84,14 +84,14 @@ around its check. Session cookies lost on an instance restart are re-injected by
 
 **Why the Verification block is not strict-eligible (intended).** It runs pytest, mypy,
 pylint and pre-commit, which execute repository code. Live steps are manual acceptance
-steps under the parent plan's attempt policy (PLAN_agent-login-repair.md): broker install,
+steps under the parent plan's attempt policy (plans-done/PLAN_agent-login-repair_DONE.md): broker install,
 vault field edits (Albert's Touch ID via broker-add), instance launches, `browser.py
 doctor` on a disposable instance, shared-browser probes, and one positive plus one
 wrong-sibling proof per pair.
 
 **Dependencies.** S0 (client guard) can land at once: it is client-only and fail-closed.
 S1 (broker) waits for the WS1a broker release in the integration queue
-(PLAN_agent-login-repair.md, "WS1a release order"). browser.py changes land only when
+(plans-done/PLAN_agent-login-repair_DONE.md, "WS1a release order"). browser.py changes land only when
 `browser.py clients` shows no registered exec client and no maintenance record is live.
 WS3 (the onboarding guard) takes over S5's rule.
 

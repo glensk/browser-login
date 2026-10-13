@@ -6,7 +6,7 @@ Resume: `c --resume 3871ad21-0f16-4b68-828e-f9eb1f7a6847`
 
 ## Context
 
-Part of `PLAN_agent-login-repair.md` (section WS1a, the hard gate before any secret-submitting
+Part of `plans-done/PLAN_agent-login-repair_DONE.md` (section WS1a, the hard gate before any secret-submitting
 site retry). Albert: "we need every time to see from the ./agent-login.py script what broke
 exactly ... where the error was; as granular as possible"; the daily check must never burn the
 broker limiter again; a ✅ must be a proven, fresh ✅. Plan debated with Codex (gpt-5.6-sol),

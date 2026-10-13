@@ -525,5 +525,5 @@ cd /Users/albert/obsidian/42-Git/home/browser-login && bin/browser.py -h
   `KEYCLOAK_IDENTITY`; with it the broker never reuses a refresh token, so the rotation gate is
   moot on the broker side; two client checks in a row passed.
 - Still open: the full live-acceptance matrix (restart, logout, out-of-band switch) runs with
-  the daily job at final acceptance (PLAN_agent-login-repair.md); the 403 side of
+  the daily job at final acceptance (plans-done/PLAN_agent-login-repair_DONE.md); the 403 side of
   keycloak-admin waits for a non-admin master user.

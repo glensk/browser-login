@@ -6,7 +6,7 @@ Resume: `c --resume 3871ad21-0f16-4b68-828e-f9eb1f7a6847`
 
 ## Context
 
-Part of `PLAN_agent-login-repair.md` (box WS3). Between 2026-10-09 and 2026-10-11 most broker
+Part of `plans-done/PLAN_agent-login-repair_DONE.md` (box WS3). Between 2026-10-09 and 2026-10-11 most broker
 failures came from items that were added without a validated setup:
 
 - batch-added items with no sentinel;
