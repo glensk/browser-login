@@ -183,11 +183,13 @@ from broker import safari_cookies as _safari  # noqa: E402
 from broker.bundle import IDP_HOSTS as BROKER_IDP_HOSTS  # noqa: E402
 from broker.bundle import IDP_LABELS as BROKER_IDP_LABELS  # noqa: E402
 from broker.origins import access_gated as _access_gated  # noqa: E402
+from broker.origins import access_gated_via as _access_gated_via  # noqa: E402
 from broker.page_state import await_sentinel as _broker_await_sentinel  # noqa: E402
 from broker.page_state import page_blank as _broker_page_blank  # noqa: E402
 from broker.recipes import CSCS_EXPIRES_KEY as BROKER_CSCS_EXPIRES_KEY  # noqa: E402
 from broker.recipes import CSCS_TOKEN_KEY as BROKER_CSCS_TOKEN_KEY  # noqa: E402
 from broker.recipes import REFRESH_MIN_LEFT_S as BROKER_REFRESH_MIN_LEFT_S  # noqa: E402
+from broker.recipes import NavTrail as _NavTrail  # noqa: E402
 from broker.recipes import click_keycloak_submit as _click_keycloak_submit  # noqa: E402
 from broker.recipes import cscs_token_proof as _broker_cscs_token_proof  # noqa: E402
 from broker.recipes import fresh_totp as _broker_fresh_totp  # noqa: E402
@@ -10558,6 +10560,9 @@ def _background_page_run(
                 finally:
                     _BG_STATUS.pop(id(page), None)
                     _BG_NOCACHE.pop(id(page), None)
+                    trail = _BG_TRAIL.pop(id(page), None)
+                    if trail is not None:
+                        trail.stop()
         except BrowserAttachTimeout:
             raise
         except Exception:  # pylint: disable=broad-exception-caught
@@ -11627,15 +11632,32 @@ def _broker_password_shown(page) -> bool:
         return False
 
 
+def _broker_own_origins(entry: dict) -> list[str]:
+    """The site's own origins for the Access rule: fill origins, the check
+    and login pages' origins and the proof origins."""
+    out = [str(o) for o in entry.get("fill_origins") or []]
+    out += _proof_origins(entry)
+    login = _url_origin(str(entry.get("login_url") or ""))
+    return out + ([login] if login else [])
+
+
 def _broker_probe(page, entry: dict, sentinel: str | None = None) -> str:
     """`_broker_probe_page`, or ``access_gated`` when the check page is — or
     ends on, after the proof's waits (a script redirect) — a Cloudflare Access
-    login (off-LAN: unreachable, neither logged in nor out). Checked around
-    the proof because the old proof of a sentinel-less item passes on such a
-    page (off the fill origins, no password field)."""
+    login (off-LAN: unreachable, neither logged in nor out), or when its
+    navigation trail (`_BG_TRAIL`, from `_broker_probe_prepare`) passed an
+    Access hop and ended off the site: a single-IdP Access sends the tab
+    straight on to github.com/login (``origins.access_gated_via``). Checked
+    around the proof because the old proof of a sentinel-less item passes on
+    such a page (off the fill origins, no password field)."""
+    own = _broker_own_origins(entry)
 
     def gated() -> bool:
-        return _access_gated(str(getattr(page, "url", "") or ""))
+        url = str(getattr(page, "url", "") or "")
+        trail = _BG_TRAIL.get(id(page))
+        if trail is None:
+            return _access_gated(url)
+        return _access_gated_via(trail.urls, url, own)
 
     if not gated():
         answer = _broker_probe_page(page, entry, sentinel)
@@ -11737,11 +11759,18 @@ def _broker_probe_viewport(page) -> None:
     page.set_viewport_size(BROKER_PROBE_VIEWPORT)
 
 
+# The main-frame navigation trail of a broker probe tab, by id(page): every
+# redirect hop of its check-URL load (`_broker_probe`'s Access rule).
+_BG_TRAIL: dict[int, Any] = {}
+
+
 def _broker_probe_prepare(page) -> None:
-    """The broker-site proof tab: the broker's size, and the site's current
-    build (`_broker_bypass_cache`)."""
+    """The broker-site proof tab: the broker's size, the site's current
+    build (`_broker_bypass_cache`), and its navigation trail (`_BG_TRAIL`),
+    started before the check URL loads."""
     _broker_probe_viewport(page)
     _broker_bypass_cache(page)
+    _BG_TRAIL[id(page)] = _NavTrail(page).start()
 
 
 # Sites whose weak-proof warning this process already printed (consumers such

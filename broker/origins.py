@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import re
 import urllib.parse
+from collections.abc import Iterable
 
 DEV_HOST = "127.0.0.1"
 _HOST_RE = re.compile(
@@ -144,3 +145,40 @@ def access_gated(url: str) -> bool:
     if parts.path.startswith(ACCESS_GATE_PATH):
         return True
     return host.endswith(ACCESS_GATE_SUFFIX) and len(host) > len(ACCESS_GATE_SUFFIX)
+
+
+def _loose_origin(url: str) -> str:
+    """``scheme://host[:port]`` of `url` (lowercase, default port dropped), ''
+    when unparsable — a comparison key only, never an allow decision."""
+    try:
+        parts = urllib.parse.urlsplit(str(url or "").strip())
+        host, port = (parts.hostname or "").lower(), parts.port
+    except ValueError:
+        return ""
+    scheme = parts.scheme.lower()
+    if not host or not scheme:
+        return ""
+    suffix = "" if port in (None, _DEFAULT_PORTS.get(scheme)) else f":{port}"
+    return f"{scheme}://{host}{suffix}"
+
+
+def access_gated_via(
+    trail: Iterable[str], final_url: str, own_origins: Iterable[str]
+) -> bool:
+    """True iff the page is behind Cloudflare Access: its `final_url` is an
+    Access login (``access_gated``), or a main-frame hop of its navigation
+    `trail` (every redirect and navigation the page made, in order) was one
+    and the page did NOT come back to one of the site's `own_origins`.
+
+    The second rule is Access with a single identity provider: it sends the
+    browser straight on to that IdP (``github.com/login``), so the final page
+    is neither ``*.cloudflareaccess.com`` nor ``/cdn-cgi/access/``. Nothing
+    is ever judged gated without an observed Access hop, and a chain that
+    passed Access and ended back on the site (Access let it through) is
+    not gated."""
+    if access_gated(final_url):
+        return True
+    if not any(access_gated(u) for u in trail):
+        return False
+    own = {_loose_origin(o) for o in own_origins} - {""}
+    return _loose_origin(final_url) not in own

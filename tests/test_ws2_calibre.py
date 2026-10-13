@@ -36,6 +36,9 @@ import http.server
 import importlib.util
 import json
 import secrets
+import shutil
+import ssl
+import subprocess
 import sys
 import threading
 import time
@@ -845,6 +848,89 @@ def test_tripwire_aborts_a_forgot_post(  # pylint: disable=too-many-arguments,to
     assert want in resp["detail"]
 
 
+ACCESS_HOST = "team.cloudflareaccess.com"
+
+
+@dataclass
+class _AccessGate:
+    """The fixture Cloudflare Access team domain: an HTTPS loopback server
+    the broker's Chromium reaches for ``ACCESS_HOST`` (host-resolver rule),
+    never the real one. ``redirect_to`` set: a single-IdP Access (302 on to
+    the IdP); unset: Access's own login page."""
+
+    redirect_to: str = ""
+    hits: list[str] = field(default_factory=list)
+
+
+class _AccessServer(http.server.ThreadingHTTPServer):
+    gate: _AccessGate
+
+
+class _AccessHandler(http.server.BaseHTTPRequestHandler):
+    server: _AccessServer
+
+    def log_message(self, *args: Any) -> None:
+        return
+
+    def do_GET(self) -> None:  # noqa: N802
+        gate = self.server.gate
+        gate.hits.append(self.path)
+        if gate.redirect_to:
+            self.send_response(302)
+            self.send_header("Location", gate.redirect_to)
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            return
+        data = _ACCESS_HTML.encode()
+        self.send_response(200)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Content-Length", str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
+
+
+@pytest.fixture(name="access")
+def _access(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[_AccessGate]:
+    """`_AccessGate` behind a throwaway self-signed certificate. A route
+    cannot stand in for it: Playwright routes only the FIRST request of a
+    redirect chain, so the app's 302 to Access would leave for the real
+    Cloudflare and a routed 302 is never routed on."""
+    openssl = shutil.which("openssl")
+    if openssl is None:
+        pytest.skip("openssl missing")
+    key, cert = tmp_path / "access.key", tmp_path / "access.crt"
+    subprocess.run(
+        [
+            openssl, "req", "-x509", "-newkey", "rsa:2048", "-nodes",
+            "-keyout", str(key), "-out", str(cert), "-days", "1",
+            "-subj", f"/CN={ACCESS_HOST}",
+        ],
+        check=True,
+        capture_output=True,
+    )  # fmt: skip
+    tls = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    tls.load_cert_chain(cert, key)
+    httpd = _AccessServer(("127.0.0.1", 0), _AccessHandler)
+    httpd.socket = tls.wrap_socket(httpd.socket, server_side=True)
+    httpd.gate = _AccessGate()
+    threading.Thread(target=httpd.serve_forever, daemon=True).start()
+    port = httpd.server_address[1]
+    monkeypatch.setattr(
+        daemon,
+        "CHROME_ARGS",
+        [
+            *daemon.CHROME_ARGS,
+            f"--host-resolver-rules=MAP {ACCESS_HOST} 127.0.0.1:{port}",
+            "--ignore-certificate-errors",
+        ],
+    )
+    try:
+        yield httpd.gate
+    finally:
+        httpd.shutdown()
+        httpd.server_close()
+
+
 @pytest.mark.launches_chrome
 @CHROME
 @pytest.mark.usefixtures("fast")
@@ -852,26 +938,14 @@ def test_tripwire_aborts_a_forgot_post(  # pylint: disable=too-many-arguments,to
 def test_an_access_redirect_is_gated_without_a_submit(
     tmp_path: Path,
     cwa: tuple[_Cwa, str],
-    monkeypatch: pytest.MonkeyPatch,
+    access: _AccessGate,
     fresh: bool,
 ) -> None:
     app, origin = cwa
     app.access_gate = True
-    real = daemon.PlaywrightRunner._launch
-
-    def launch(self: Any, pw: Any, profile: Path, item: Any = None) -> Any:
-        ctx = real(self, pw, profile, item)
-        ctx.route(
-            "https://team.cloudflareaccess.com/**",
-            lambda route: route.fulfill(
-                status=200, content_type="text/html", body=_ACCESS_HTML
-            ),
-        )
-        return ctx
-
-    monkeypatch.setattr(daemon.PlaywrightRunner, "_launch", launch)
     rig = _rig(tmp_path, origin, fresh=fresh)
     resp = rig.login()
+    assert access.hits  # the fixture Access answered, not Cloudflare
     assert not resp.get("ok")
     assert resp["error"] == "access_gated" and resp["phase"] == "precheck"
     assert resp["submitted"] is False
@@ -1762,3 +1836,249 @@ def test_an_attempt_time_rounded_up_still_holds_off(result: Path) -> None:
     browser._broker_note_session_age(SITE, ENTRY)
     assert browser._SESSION_DUE[SITE] is False
     del result
+
+
+# ---------------------------------------------------------------------------
+# E. single-IdP Cloudflare Access (2026-10-13): Access sends the browser
+#    straight on to its only identity provider, github.com/login — the final
+#    page is no Access page, only the redirect chain shows the Access hop.
+# ---------------------------------------------------------------------------
+
+GITHUB_LOGIN = "https://github.com/login?client_id=x&return_to=%2Flogin%2Foauth"
+_GITHUB_HTML = """<!doctype html><html><body>
+<h1>Sign in to GitHub to continue to Cloudflare Access dom42</h1>
+<form action="/session" method=post><input name=login>
+<input type=password name=password><button type=submit>Sign in</button>
+</form></body></html>"""
+SINGLE_IDP_CHAIN = [
+    "https://calibre.example/me",
+    ACCESS_URL,
+    "https://team.cloudflareaccess.com/cdn-cgi/access/oauth/github",
+    GITHUB_LOGIN,
+]
+
+
+@pytest.mark.parametrize(
+    ("trail", "final", "gated"),
+    [
+        (SINGLE_IDP_CHAIN, GITHUB_LOGIN, True),
+        # the Access login on the app's own host, then on to the IdP
+        (
+            [
+                "https://calibre.example/me",
+                "https://calibre.example/cdn-cgi/access/login",
+            ],
+            GITHUB_LOGIN,
+            True,
+        ),
+        # the final page itself is an Access page: gated with no trail at all
+        ([], ACCESS_URL, True),
+        # no Access hop observed: never gated, wherever it ends
+        (["https://calibre.example/me", GITHUB_LOGIN], GITHUB_LOGIN, False),
+        ([], GITHUB_LOGIN, False),
+        # a look-alike host is no Access hop
+        (
+            ["https://team.cloudflareaccess.com.evil.example/x", GITHUB_LOGIN],
+            GITHUB_LOGIN,
+            False,
+        ),
+        # Access let it through (its IdP session held): back on the site
+        (
+            [*SINGLE_IDP_CHAIN, "https://calibre.example/me"],
+            "https://calibre.example/me",
+            False,
+        ),
+    ],
+)
+def test_access_gated_via_the_redirect_chain(
+    trail: list[str], final: str, gated: bool
+) -> None:
+    own = ["https://calibre.example"]
+    assert origins.access_gated_via(trail, final, own) is gated
+
+
+class _NavReq:
+    def __init__(self, url: str, frame: object, nav: bool = True) -> None:
+        self.url, self.frame, self._nav = url, frame, nav
+
+    def is_navigation_request(self) -> bool:
+        return self._nav
+
+
+class _ChainPage:
+    """A page double whose goto walks a redirect chain: one main-frame
+    navigation request per hop (as Playwright emits one per redirect), then
+    the page sits on the chain's last URL. No Chrome, no network."""
+
+    def __init__(self, chain: list[str]) -> None:
+        self.chain = chain
+        self.url = "about:blank"
+        self.main_frame = object()
+        self.handlers: list[Any] = []
+
+    def on(self, event: str, fn: Any) -> None:
+        assert event == "request"
+        self.handlers.append(fn)
+
+    def remove_listener(self, event: str, fn: Any) -> None:
+        assert event == "request"
+        self.handlers.remove(fn)
+
+    def _emit(self, req: _NavReq) -> None:
+        for fn in list(self.handlers):
+            fn(req)
+
+    def goto(self, url: str, **_kw: Any) -> Any:
+        self._emit(_NavReq("https://cdn.example/app.js", self.main_frame, nav=False))
+        self._emit(_NavReq("https://ads.example/frame", object()))  # a sub-frame
+        hops = self.chain if url == self.chain[0] else [url]
+        for hop in hops:
+            self._emit(_NavReq(hop, self.main_frame))
+        self.url = hops[-1]
+        return SimpleNamespace(status=200, headers={})
+
+    def set_viewport_size(self, _size: Any) -> None:  # the probe tab's prepare
+        return
+
+
+def test_nav_trail_records_main_frame_navigations_only() -> None:
+    page = _ChainPage(SINGLE_IDP_CHAIN)
+    with recipes.NavTrail(page) as trail:
+        page.goto(SINGLE_IDP_CHAIN[0])
+    assert trail.urls == SINGLE_IDP_CHAIN
+    assert not page.handlers  # the listener is removed again
+    page.goto(SINGLE_IDP_CHAIN[0])
+    assert trail.urls == SINGLE_IDP_CHAIN  # stopped: nothing more recorded
+
+
+def _single_idp_item() -> Any:
+    return vault.site_item_from_json(
+        _cwa_item(agent_login_url="https://calibre.example/me")
+    )
+
+
+@pytest.mark.parametrize("proof", [None, "invalid", "valid"])
+def test_broker_precheck_sees_the_access_hop(proof: str | None) -> None:
+    """Broker side: the precheck's own load (fresh login / after a failed
+    proof), or the profile proof's chain (a valid one), passed Access and
+    ended on github.com — AccessGated, phase precheck, before any secret."""
+    page = _ChainPage(SINGLE_IDP_CHAIN)
+    item = _single_idp_item()
+    seen: list[str] = []
+    if proof == "valid":  # the proof loaded the check page, no reload follows
+        with recipes.NavTrail(page) as trail:
+            page.goto(SINGLE_IDP_CHAIN[0])
+        seen = trail.urls
+    with pytest.raises(recipes.AccessGated) as err:
+        daemon.PlaywrightRunner._access_precheck(page, item, proof, seen)
+    assert err.value.phase == "precheck" and err.value.code == "access_gated"
+    assert page.url == GITHUB_LOGIN
+
+
+def test_broker_precheck_without_an_access_hop_goes_on() -> None:
+    page = _ChainPage(["https://calibre.example/me", GITHUB_LOGIN])
+    daemon.PlaywrightRunner._access_precheck(page, _single_idp_item(), None, [])
+    assert page.url == GITHUB_LOGIN  # not gated: the recipe decides
+
+
+def test_open_login_page_sees_the_access_hop() -> None:
+    page = _ChainPage(SINGLE_IDP_CHAIN)
+    with pytest.raises(recipes.AccessGated):
+        recipes.open_login_page(page, SINGLE_IDP_CHAIN[0], _single_idp_item())
+
+
+def test_client_probe_after_a_single_idp_chain_is_gated(
+    monkeypatch: pytest.MonkeyPatch, result: Path
+) -> None:
+    """Client side (any instance): the probe tab's trail starts in its
+    prepare, before the check URL loads; the chain passed Access and the tab
+    sits on github.com/login — ``precheck`` · ``access_gated``, not
+    ``logged_out`` (which sent abs-root to the broker)."""
+    page = _ChainPage(SINGLE_IDP_CHAIN)
+    monkeypatch.setattr(browser, "_broker_probe_page", _no_broker)
+
+    def run(_port: int, url: str, prep: Any, verify: Any) -> Any:
+        prep(page)
+        try:
+            page.goto(url)
+            return verify(page)
+        finally:
+            browser._BG_TRAIL.pop(id(page)).stop()
+
+    monkeypatch.setattr(browser, "_with_prepared_background_page", run)
+    assert browser._broker_check_entry(9224, SITE, ENTRY) == 2
+    browser._result_write(2)
+    rec = json.loads(result.read_text())
+    assert rec["phase"] == "precheck" and rec["code"] == "access_gated"
+    assert not page.handlers
+
+
+def test_client_probe_without_an_access_hop_is_not_gated(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    page = _ChainPage(["https://calibre.example/me", GITHUB_LOGIN])
+    monkeypatch.setattr(
+        browser, "_broker_probe_page", lambda *_a, **_k: browser.PROOF_INVALID
+    )
+    browser._broker_probe_prepare(page)
+    try:
+        page.goto("https://calibre.example/me")
+        assert browser._broker_probe(page, ENTRY) == browser.PROOF_INVALID
+    finally:
+        browser._BG_TRAIL.pop(id(page)).stop()
+
+
+class _IdpHandler(http.server.BaseHTTPRequestHandler):
+    """The single IdP's login page (github.com/login) on its own loopback
+    origin: off the item's fill origins, with a password field."""
+
+    def log_message(self, *args: Any) -> None:
+        return
+
+    def do_GET(self) -> None:  # noqa: N802
+        data = _GITHUB_HTML.encode()
+        self.send_response(200)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Content-Length", str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
+
+
+@pytest.fixture(name="idp")
+def _idp() -> Iterator[str]:
+    httpd = http.server.ThreadingHTTPServer(("127.0.0.1", 0), _IdpHandler)
+    threading.Thread(target=httpd.serve_forever, daemon=True).start()
+    try:
+        yield f"http://127.0.0.1:{httpd.server_address[1]}/login?client_id=x"
+    finally:
+        httpd.shutdown()
+        httpd.server_close()
+
+
+@pytest.mark.launches_chrome
+@CHROME
+@pytest.mark.usefixtures("fast")
+@pytest.mark.parametrize("fresh", [True, False], ids=["fresh-login", "profile"])
+def test_a_single_idp_access_chain_is_gated_without_a_submit(
+    tmp_path: Path,
+    cwa: tuple[_Cwa, str],
+    access: _AccessGate,
+    idp: str,
+    fresh: bool,
+) -> None:
+    """The real runner, the 2026-10-13 abs-root chain: the app → 302 Access
+    → 302 the IdP's login page (its own loopback origin, a password field,
+    off the fill origins). Before the fix: the recipe's ``origin_violation``
+    ("the login page left the fill origins")."""
+    app, origin = cwa
+    app.access_gate = True
+    access.redirect_to = idp
+    rig = _rig(tmp_path, origin, fresh=fresh)
+    resp = rig.login()
+    assert access.hits  # the chain passed the (fixture) Access hop
+    assert not resp.get("ok")
+    assert resp["error"] == "access_gated" and resp["phase"] == "precheck"
+    assert resp["submitted"] is False
+    assert rig.vault.secret_calls == 0  # nothing reserved, no secret read
+    assert rig.attempts() == []
+    assert app.posts == []

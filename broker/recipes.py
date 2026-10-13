@@ -60,6 +60,7 @@ from broker.login_form import (
 )
 from broker.origins import (
     access_gated,
+    access_gated_via,
     form_action_allowed,
     origin_allowed,
     origin_hint,
@@ -282,6 +283,71 @@ class AccessGated(RecipeError):
             "off-LAN, nothing typed",
             phase="precheck",
         )
+
+
+class NavTrail:
+    """The URLs of every main-frame navigation request of `page` while the
+    trail is open — each HTTP redirect hop is a request of its own — so a
+    Cloudflare Access hop is seen even when Access sends the browser straight
+    on to its single identity provider (``origins.access_gated_via``).
+    Best effort: a page without ``on``/``remove_listener`` (a test double)
+    records nothing."""
+
+    def __init__(self, page: Any) -> None:
+        self.page = page
+        self.urls: list[str] = []
+        self._on = False
+
+    def _record(self, request: Any) -> None:
+        try:
+            if not request.is_navigation_request():
+                return
+            if request.frame != self.page.main_frame:
+                return
+            self.urls.append(str(request.url or ""))
+        except Exception:  # pylint: disable=broad-exception-caught
+            return
+
+    def start(self) -> NavTrail:
+        """Listen from now on; idempotent."""
+        if not self._on:
+            with contextlib.suppress(Exception):
+                self.page.on("request", self._record)
+                self._on = True
+        return self
+
+    def stop(self) -> None:
+        """Stop listening (the URLs seen so far stay)."""
+        if self._on:
+            with contextlib.suppress(Exception):
+                self.page.remove_listener("request", self._record)
+            self._on = False
+
+    def __enter__(self) -> NavTrail:
+        return self.start()
+
+    def __exit__(self, *_exc: object) -> None:
+        self.stop()
+
+
+def _access_own_origins(item: SiteItem) -> list[str]:
+    """The site's own origins for the Access rule: its fill and proof
+    origins and the origins of its login and check URLs."""
+    fill = getattr(item, "fill_origins", None) or []
+    proof = getattr(item, "proof_origins", None) or []
+    out = [str(o) for o in [*fill, *proof]]
+    for url in (getattr(item, "login_url", ""), getattr(item, "check_url", "")):
+        origin = url_origin(url, dev=True) if url else None
+        if origin:
+            out.append(origin)
+    return out
+
+
+def page_access_gated(page: Any, item: SiteItem, trail: list[str]) -> bool:
+    """``origins.access_gated_via`` for `item` on `page` after `trail`."""
+    return access_gated_via(
+        trail, str(getattr(page, "url", "") or ""), _access_own_origins(item)
+    )
 
 
 class OriginViolation(RecipeError):
@@ -1901,13 +1967,18 @@ def _needs_fill(field: Any, username: str) -> bool:
     return editable
 
 
-def open_login_page(page: Any, url: str) -> None:
+def open_login_page(page: Any, url: str, item: SiteItem | None = None) -> None:
     """Load the login page as a fresh document (a hash-only goto has no
     Response, and ``raise_if_blocked`` would be blind to a 401/403):
-    a Cloudflare Access login → ``AccessGated``, HTTP 401/403 →
+    a Cloudflare Access login — with `item`, also a load whose redirect chain
+    passed Access and ended off the site (``page_access_gated``) — →
+    ``AccessGated``, HTTP 401/403 →
     ``LoginBlocked``, a challenge page → ``NeedsHuman`` — nothing typed."""
-    resp = load_document(page, url)
-    if access_gated(page.url):
+    with NavTrail(page) as trail:
+        resp = load_document(page, url)
+    if access_gated(page.url) or (
+        item is not None and page_access_gated(page, item, trail.urls)
+    ):
         raise AccessGated()
     raise_if_blocked(page, resp)
     _check_challenge(page, submitted=False)
@@ -1938,7 +2009,7 @@ def generic_login(
     any request that names a secondary form action.
     """
     allowed = list(item.fill_origins)
-    open_login_page(page, item.login_url)
+    open_login_page(page, item.login_url, item)
     if item.pre_click:
         _pre_click(page, item.pre_click, allowed, dev=dev)
     if secret.mode == USERNAME_ONLY_MODE:

@@ -168,6 +168,7 @@ from broker.recipes import (  # noqa: E402
     BundleExportError,
     ExportFailed,
     LoginFailed,
+    NavTrail,
     NeedsHuman,
     OriginViolation,
     RecipeError,
@@ -175,6 +176,7 @@ from broker.recipes import (  # noqa: E402
     check_proof_reason,
     cscs_export_storage,
     load_document,
+    page_access_gated,
     proof_reason_text,
     raise_if_blocked,
     recipe_for,
@@ -1094,10 +1096,13 @@ class PlaywrightRunner:
             secret = get_secret()
             self.clear_site_cookies(ctx, item)
         else:
-            proof = self._profile_proof(page, item)
+            # The proof's own redirect chain counts for the Access precheck
+            # (a single-IdP Access sends it on to github.com/login).
+            with NavTrail(page) as trail:
+                proof = self._profile_proof(page, item)
             # Even after a VALID one: the old proof of a sentinel-less item
             # passes on an Access page (off the fill origins, no password).
-            self._access_precheck(page, item, proof)
+            self._access_precheck(page, item, proof, trail.urls)
             # WS5: [True] once the profile holds ANOTHER account: its cookies
             # and site storage go before the one fresh login.
             reset = [False]
@@ -1205,7 +1210,9 @@ class PlaywrightRunner:
         )
 
     @staticmethod
-    def _access_precheck(page: Any, item: SiteItem, proof: str | None) -> None:
+    def _access_precheck(
+        page: Any, item: SiteItem, proof: str | None, seen: list[str] | None = None
+    ) -> None:
         """Before anything is reserved: raise ``AccessGated`` (phase
         ``precheck``) when the site's page is a Cloudflare Access login —
         off-LAN the app is unreachable, and that login is not the site's —
@@ -1219,15 +1226,24 @@ class PlaywrightRunner:
         its own preflight, which loads it itself; a ``fresh_login`` always)
         and judged by URL — even after a failed load — and status; a
         ``valid`` proof's own page is judged by URL (the old proof of a
-        sentinel-less item passes on an Access page)."""
+        sentinel-less item passes on an Access page).
+
+        Judged by the navigation trail too (`seen`: the profile proof's, plus
+        this load's): a chain that passed a Cloudflare Access hop and ended
+        off the site is gated even when Access sent it straight on to its
+        single identity provider (``recipes.page_access_gated``)."""
         resp = None
+        trail = list(seen or [])
         if proof is None or (proof != VALID and item.site not in PREFLIGHTS):
             # a failed load may still have ended on the Access page
-            with contextlib.suppress(Exception):
+            with NavTrail(page) as nav, contextlib.suppress(Exception):
                 # a fresh document load: a hash-only goto (an SPA's check
                 # page -> its login route) has no Response to judge
                 resp = load_document(page, item.login_url)
-        if access_gated(str(getattr(page, "url", "") or "")):
+            trail += nav.urls
+        if access_gated(str(getattr(page, "url", "") or "")) or page_access_gated(
+            page, item, trail
+        ):
             raise AccessGated()
         raise_if_blocked(page, resp)
 

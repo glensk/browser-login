@@ -511,6 +511,6 @@ def authentik_login(  # pylint: disable=too-many-arguments
         raise OriginViolation("the authentik login URL is not on a fill origin")
     if executor_path(item.login_url) is None:
         raise LoginFailed("the authentik login URL is not a flow page (/if/flow/…/)")
-    open_login_page(page, item.login_url)
+    open_login_page(page, item.login_url, item)
     page.wait_for_timeout(SETTLE_PAGE_MS)
     _Flow(page, item, secret, dev=dev, attempt=attempt or NO_ATTEMPT).run(settle_s)
