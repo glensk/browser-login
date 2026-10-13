@@ -230,7 +230,7 @@ Verification is not strict-eligible on purpose: it needs the test suite, mypy an
       Switching the recipe to the `email` claim would then also need `email_verified ===
       true`, and a master realm that forbids duplicate e-mails and does not let users
       edit their own e-mail. Otherwise an account could claim another's address.
-- [ ] **403 side:** once a non-admin master-realm user exists, record the probe's
+- [x] (DROPPED — Albert 2026-10-13: no non-admin master-realm user is created on the production Keycloak; `admin_false_confirmed` stays False, so only `privilege admin` keycloak-admin items are usable) **403 side:** once a non-admin master-realm user exists, record the probe's
       status and content type. Then flip `admin_false_confirmed`, or adjust the
       false-side rule.
 
