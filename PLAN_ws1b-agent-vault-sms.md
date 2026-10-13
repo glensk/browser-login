@@ -4,13 +4,13 @@ Resume: `c --resume 3871ad21-0f16-4b68-828e-f9eb1f7a6847`
 
 ## Status
 
-PARKED (Albert, 2026-10-13): resumes after PLAN_ws1b-durability.md is done. Parent: PLAN_ws1b-durability.md (tp#949) → PLAN_agent-login-repair.md (tp#880). Codex debate round 1 ran (below, unreconciled); next: write the round-1 ledger, judge, rounds 2-3, then Albert's open questions.
+PARKED (Albert, 2026-10-13): resumes after plans-done/PLAN_ws1b-durability_DONE.md is done. Parent: plans-done/PLAN_ws1b-durability_DONE.md (tp#949) → PLAN_agent-login-repair.md (tp#880). Codex debate round 1 ran (below, unreconciled); next: write the round-1 ledger, judge, rounds 2-3, then Albert's open questions.
 
 # WS1b follow-up (tp#955): agents unlock the agent vault and read SMS codes themselves
 
 ## Context
 
-`PLAN_ws1b-durability.md` (D3, closure matrix) and AGENTS.md's WS1b section keep five stops
+`plans-done/PLAN_ws1b-durability_DONE.md` (D3, closure matrix) and AGENTS.md's WS1b section keep five stops
 for Albert: `needs_albert_captcha|sms|push|hardware_key|vault_locked`. Albert, 2026-10-13,
 narrowed that list:
 
@@ -321,7 +321,7 @@ The unlock lives in safari.py, because safari.py owns the vault tab, its flock a
         quarantine) and an "SMS codes" bullet (adb source, sender + phone-clock
         freshness + two polls, value never logged);
       - README (`-L`, `-K`, `-Q vault`, the stop list ~line 819);
-      - `PLAN_ws1b-durability.md` D3 + closure matrix + line 11, with a pointer to this
+      - `plans-done/PLAN_ws1b-durability_DONE.md` D3 + closure matrix + line 11, with a pointer to this
         plan.
 - [ ] D2 lint (ruff format/check, mypy, pylint, shellcheck n/a) + full suite + `lint-gate.py
       -c -M -b HEAD <files>`.

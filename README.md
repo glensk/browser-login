@@ -835,7 +835,7 @@ on its line.
 The sites that live on Albert's session do not wait for him: the Safari
 marketplace sites, galaxus, galaxus-de, Notion, Slack, OpenAI and claude.ai. An
 agent that needs one runs `./agent-login.py -L SITE`. Plan, debate and the
-security review: `PLAN_ws1b-durability.md`.
+security review: `plans-done/PLAN_ws1b-durability_DONE.md`.
 
 1. **Free check** in the shared Chromium. ✅ → nothing to do. Only a DEFINITE
    "logged out" (code `logged_out`; for Notion also `wrong_account`) goes on;

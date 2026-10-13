@@ -313,7 +313,7 @@ framework. It is a **provider**: other repos depend on it, not the reverse. See
   `install.sh -r`). Client state is same-uid policy, not a security
   boundary — the broker limiter is.
 - **Agents renew Albert's own sessions through his Safari (WS1b,
-  `PLAN_ws1b-durability.md`)**:
+  `plans-done/PLAN_ws1b-durability_DONE.md`)**:
   - **Who runs it:** `agent-login.py -L SITE` is agent-invoked ONLY. Every
     LaunchAgent sets `AGENT_LOGIN_SCHEDULED=1` and `-L` refuses with it. Never
     call it from `-c`, `-S` or `-R`.

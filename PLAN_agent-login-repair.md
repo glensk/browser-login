@@ -370,10 +370,10 @@ manual acceptance steps under the attempt policy below.
         server-side tri-state probe, tri-state through to the mail (2× invalid before
         "log in once"), expiry telemetry (warn < 30 days), `_record_login_event` for guided
         logins, logout tests only on throwaway instances.
-- [ ] WS1b — durability per flow, after WS2's root causes. Albert 2026-10-11: assisted/guided logins (galaxus-de, notion, openai, slack, Safari sites) are done by AGENTS in Albert's Safari (`safari.py -L/-O` from the Vaultwarden tab) plus a Safari cookie import into the shared Chromium — never a `-g` to-do for Albert (only CAPTCHA / locked vault / hardware or push approval / SMS stay his). `agent-login.py -L` released (62e3128); the guided-login confirm is 'press Enter'. Scope: broker re-export before expiry,
+- [x] (tp#949 closed 2026-10-13) WS1b — durability per flow, after WS2's root causes. Albert 2026-10-11: assisted/guided logins (galaxus-de, notion, openai, slack, Safari sites) are done by AGENTS in Albert's Safari (`safari.py -L/-O` from the Vaultwarden tab) plus a Safari cookie import into the shared Chromium — never a `-g` to-do for Albert (only CAPTCHA / locked vault / hardware or push approval / SMS stay his). `agent-login.py -L` released (62e3128); the guided-login confirm is 'press Enter'. Scope: broker re-export before expiry,
       credential-change handling, Safari-cookie expiry, monitoring of assisted sessions with
       an alert to Albert. Plan → codex-debate → implement.
-  - [x] Plan `PLAN_ws1b-durability.md`, Codex (gpt-5.6-sol) converged in round 3 (19
+  - [x] Plan `plans-done/PLAN_ws1b-durability_DONE.md`, Codex (gpt-5.6-sol) converged in round 3 (19
         objections, 18 accepted, the non-strict Verification block kept). Released (62e3128):
         - `-L SITE` (agent-invoked Safari login + import, claude.ai via the magic link);
         - `agent_login_safari.py` (recipes, window-handle step machine, hard stops, mail
