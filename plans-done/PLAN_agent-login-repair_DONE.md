@@ -394,7 +394,7 @@ manual acceptance steps under the attempt policy below.
     objections accepted). Albert accepted Q1–Q6 on 2026-10-10. WS1a is merged, so S2
     (broker) is unblocked; about 20 boxes stay open there.
 - [x] calibre account (Albert, 2026-10-10):
-  - [x] Non-admin CWA user `agent` created (role 258, no e-mail). Password (len 32 `47b0`)
+  - [x] Non-admin CWA user `agent` created (role 258, no e-mail). Password
         in Keychain `CALIBRE_AGENT_PASSWORD`. Verified: `#top_tasks` visible after login,
         `/me` 200. Backups `app.db.bak-20261010-000354-pre-agent-user`.
   - [x] tp#886 part 1: Guest role 430 → 290 (browse + download). Docs committed.
