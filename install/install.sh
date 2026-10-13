@@ -73,7 +73,8 @@ Install (default), update, uninstall or enrol the login broker LaunchDaemon.
 Refuses unless the repo is clean and HEAD is contained in origin/main; installs
 `git archive HEAD` into a NEW release dir, swaps the `current` symlink
 atomically, restarts the daemon and runs the boundary selfcheck as $SUDO_USER
-(a failing selfcheck rolls back). The installed commit and the diffstat since
+(a failing selfcheck rolls back), then the informational PAC-route probe
+(selfcheck.py -R as the role account; never fails the install). The installed commit and the diffstat since
 the previous one are appended to /var/log/login-broker.log. The release also
 ships the `secret-run` client; /usr/local/bin/secret-run becomes a root-owned
 symlink to it (refused when /usr/local/bin is not root-owned).
@@ -506,6 +507,19 @@ run_selfcheck() {
 		run "$py" "$check" -P -H "$HOME_DIR"
 }
 
+# run_route_probe — i) the credential-free PAC-route probe, as the role account
+# with the daemon's browsers (selfcheck.py -R: the broker's own Chromium and the
+# release's home-proxy PAC load komga.dom42.space, ≤ 20 s). INFORMATIONAL: it
+# never fails or rolls back an install (access_gated = homeproxy down or the Mac
+# off-LAN without the tunnel).
+run_route_probe() {
+	local py="${LIBEXEC}/current/venv/bin/python" check="${LIBEXEC}/current/broker/selfcheck.py"
+	run /usr/bin/sudo -u "$ROLE" /usr/bin/env HOME="$HOME_DIR" \
+		PLAYWRIGHT_BROWSERS_PATH="${LIBEXEC}/browsers" \
+		PATH="${LIBEXEC}/bin:/usr/bin:/bin" "$py" "$check" -R ||
+		echo "ℹ️ PAC-route probe did not run (informational only)" >&2
+}
+
 # check_link_dir — /usr/local/bin must be root-owned, or the agent uid could
 # swap the secret-run symlink.
 check_link_dir() {
@@ -580,6 +594,7 @@ do_install() {
 		audit "install of ${head} FAILED its selfcheck (rolled back: ${previous:-nothing})"
 		die "install of ${rel} failed its selfcheck"
 	fi
+	run_route_probe
 	if [[ -n "$previous" ]]; then
 		run /bin/ln -sfn "$previous" "${LIBEXEC}/previous"
 	fi

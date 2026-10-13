@@ -45,6 +45,24 @@ EPFL = {
     "groups.epfl.ch": "SOCKS5 127.0.0.1:1081",
     "api.epfl.ch": "SOCKS5 127.0.0.1:1081",
 }
+# The Access-gated dom42 hosts (= nixos `accessGatedNames`) via `vpn.sh homeproxy`.
+DOM42 = {
+    f"{name}.dom42.space": "SOCKS5 127.0.0.1:1082"
+    for name in (
+        "audiobookshelf",
+        "booklore",
+        "books",
+        "calibre",
+        "homepage",
+        "jellyfin",
+        "kavita",
+        "kindle-history",
+        "komga",
+        "music",
+        "vaultwarden",
+    )
+}
+COMMITTED = {**EPFL, **DOM42}
 
 
 def _load(name: str, path: Path):
@@ -80,9 +98,10 @@ def _hosts_file(tmp_path: Path, monkeypatch, data) -> Path:
 # --- the host map -----------------------------------------------------------------
 
 
-def test_committed_host_map_is_groups_epfl_only():
+def test_committed_host_map_is_epfl_and_the_gated_dom42_hosts():
     assert browser.PAC_HOSTS_FILE == _REPO / "bin" / "pac_hosts.json"
-    assert browser._load_pac_hosts() == (EPFL, [])
+    assert browser._load_pac_hosts() == (COMMITTED, [])
+    assert not any(h.startswith(".") for h in COMMITTED)  # exact hosts only
 
 
 def test_env_override_replaces_the_committed_map(tmp_path, monkeypatch):
@@ -224,7 +243,7 @@ def test_summary_line():
 
 def test_proxy_flags_write_the_0600_copy(cache, capsys):
     flags = browser._proxy_flags()
-    pac = browser._render_pac(EPFL)
+    pac = browser._render_pac(COMMITTED)
     assert flags == [f"--proxy-pac-url={browser._pac_url(pac)}"]
     assert browser.PAC_FILE.read_text() == pac
     assert stat.S_IMODE(browser.PAC_FILE.stat().st_mode) == 0o600
@@ -276,7 +295,7 @@ def test_launch_passes_only_the_pac(cache, monkeypatch):
     flags = _launch(monkeypatch)
     pac_flags = [f for f in flags if f.startswith("--proxy")]
     assert pac_flags == [
-        f"--proxy-pac-url={browser._pac_url(browser._render_pac(EPFL))}"
+        f"--proxy-pac-url={browser._pac_url(browser._render_pac(COMMITTED))}"
     ]
     assert not any("ALL_PROXY" in f or "socks" in f.lower() for f in flags)
     assert browser.PAC_FILE.exists()
@@ -296,7 +315,7 @@ def _running(monkeypatch, up: bool, cmd: str | None, pids=(777,)):
     monkeypatch.setattr(browser, "_proc_command", lambda pid: cmd)
 
 
-_SUMMARY = "Proxy PAC: " + browser._pac_summary(EPFL)
+_SUMMARY = "Proxy PAC: " + browser._pac_summary(COMMITTED)
 
 
 def test_status_line_when_down(monkeypatch):
@@ -307,7 +326,7 @@ def test_status_line_when_down(monkeypatch):
 
 
 def test_status_line_active(monkeypatch):
-    url = browser._pac_url(browser._render_pac(EPFL))
+    url = browser._pac_url(browser._render_pac(COMMITTED))
     _running(monkeypatch, up=True, cmd=f"/x/Chrome --a --proxy-pac-url={url} --b")
     assert browser._pac_status_line(PORT) == (
         f"{_SUMMARY} (active; DIRECT when the proxy is down)"

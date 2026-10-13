@@ -1,4 +1,15 @@
 {
   "groups.epfl.ch": "SOCKS5 127.0.0.1:1081",
-  "api.epfl.ch": "SOCKS5 127.0.0.1:1081"
+  "api.epfl.ch": "SOCKS5 127.0.0.1:1081",
+  "audiobookshelf.dom42.space": "SOCKS5 127.0.0.1:1082",
+  "booklore.dom42.space": "SOCKS5 127.0.0.1:1082",
+  "books.dom42.space": "SOCKS5 127.0.0.1:1082",
+  "calibre.dom42.space": "SOCKS5 127.0.0.1:1082",
+  "homepage.dom42.space": "SOCKS5 127.0.0.1:1082",
+  "jellyfin.dom42.space": "SOCKS5 127.0.0.1:1082",
+  "kavita.dom42.space": "SOCKS5 127.0.0.1:1082",
+  "kindle-history.dom42.space": "SOCKS5 127.0.0.1:1082",
+  "komga.dom42.space": "SOCKS5 127.0.0.1:1082",
+  "music.dom42.space": "SOCKS5 127.0.0.1:1082",
+  "vaultwarden.dom42.space": "SOCKS5 127.0.0.1:1082"
 }

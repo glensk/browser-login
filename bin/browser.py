@@ -2719,9 +2719,12 @@ def _apply_profile_prefs() -> str | None:
 
 
 # Proxy auto-config (PAC): a few hosts are reachable only from inside a campus
-# network (groups.epfl.ch times out from home). The shared browser routes ONLY
-# the hosts listed in `bin/pac_hosts.json` through their SOCKS5 proxy (run by
-# `vpn.sh epflproxy` / `ethproxy`) and every other host DIRECT — no global
+# network (groups.epfl.ch times out from home), and the Cloudflare-Access-gated
+# *.dom42.space hosts answer without Access only from the home LAN. The shared
+# browser routes ONLY the hosts listed in `bin/pac_hosts.json` through their
+# SOCKS5 proxy (run by `vpn.sh epflproxy` / `ethproxy` / `homeproxy`; the
+# broker keeps its own constant copy of the dom42 rule, `broker/pac.py`) and
+# every other host DIRECT — no global
 # proxy, never $ALL_PROXY. CDP is unaffected: clients connect TO Chrome on
 # 127.0.0.1, the PAC only steers Chrome's own outgoing requests. Each rule ends
 # in `; DIRECT`, so a stopped proxy degrades to the old direct attempt instead

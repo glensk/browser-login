@@ -937,9 +937,13 @@ global proxy, and never `$ALL_PROXY`:
 ```json
 {
   "groups.epfl.ch": "SOCKS5 127.0.0.1:1081",
-  "api.epfl.ch": "SOCKS5 127.0.0.1:1081"
+  "api.epfl.ch": "SOCKS5 127.0.0.1:1081",
+  "komga.dom42.space": "SOCKS5 127.0.0.1:1082"
 }
 ```
+
+(abridged: the committed file has one `:1082` line per Access-gated dom42 host,
+see "Home-only hosts" below.)
 
 - A key is an exact host; a leading dot (`.epfl.ch`) also matches every
   subdomain. A value is one `SOCKS5|SOCKS4|SOCKS|PROXY|HTTPS HOST:PORT`. An entry
@@ -975,6 +979,60 @@ browser.py down
 browser.py up
 browser.py status
 ```
+
+### Home-only hosts: the dom42 route (`vpn homeproxy`)
+
+The `*.dom42.space` sites behind Cloudflare Access answer without Access only
+from the home LAN; off-LAN they land on the Access login page and
+`agent-login.py` reports them `unreachable off-LAN (Cloudflare Access)`.
+`vpn homeproxy` (mydotfiles `bin/vpn.sh`) runs a restricted SSH dynamic forward
+to nixos on `127.0.0.1:1082`: through it the names resolve at nixos' dnsmasq and
+reach NPM directly. It only rides an existing path to the home host (the LAN,
+or the home WireGuard split tunnel) and never toggles a VPN itself.
+
+`bin/pac_hosts.json` lists exactly the Access-gated hosts nixos' dnsmasq answers
+authoritatively (nixos `accessGatedNames`), each as an EXACT host on
+`SOCKS5 127.0.0.1:1082` — no `.dom42.space` suffix rule:
+`audiobookshelf`, `booklore`, `books`, `calibre`, `homepage`, `jellyfin`,
+`kavita`, `kindle-history`, `komga`, `music`, `vaultwarden` (`.dom42.space`).
+`homeassistant.dom42.space` is deliberately absent (Access stays mandatory
+there) and LAN-only names such as `navidrome.dom42.space` stay DIRECT. With
+homeproxy down, the `; DIRECT` fallback gives today's behaviour (Access).
+
+- **The broker keeps its own constant copy.** The login broker's headless
+  Chromium (`_loginbroker`, `broker/daemon.py`) launches with
+  `--proxy-pac-url=data:…` rendered from `HOMEPROXY_PAC_HOSTS` /
+  `HOMEPROXY_PROXY` in `broker/pac.py` — a constant of the installed release,
+  never `bin/pac_hosts.json`: that file is agent-writable, and the broker types
+  passwords, so it must not let an agent re-route a login (the broker is the
+  security boundary). TLS validation is unchanged, so a hostile listener on
+  1082 still cannot read a typed password. Playwright adds no proxy switch of
+  its own while `proxy` is unset (checked against Playwright 1.60's Chromium
+  launcher; a local run with a dummy SOCKS port saw the SOCKS5 greeting for
+  the listed host only), so the command-line PAC is the one in force.
+- **Parity test.** `tests/test_broker_pac.py` fails unless the broker constant
+  equals the set of `:1082` entries in `bin/pac_hosts.json`, both on port 1082,
+  rendering the same PAC bytes; it also pins `homeassistant` / `navidrome` as
+  DIRECT. Change both together (and nixos `accessGatedNames`; `vpn homeproxy
+  -s -A` probes every `:1082` host of this file through the proxy against the
+  server's `PermitOpen`).
+- **Broker self-check.** `install.sh` runs `selfcheck.py -R` as the role account
+  after the boundary checks: the broker's own Chromium, with the release PAC, in
+  a throwaway profile, loads `https://komga.dom42.space/` (≤ 20 s, no
+  reservation, no secret, no typing) and prints `routed` (✅),
+  `access_gated` (homeproxy down, or off-LAN without the tunnel) or
+  `unreachable` (ℹ️). It is informational: it never fails or rolls back an
+  install.
+- **Bad-proxy cache.** After a DIRECT fallback Chromium marks the proxy bad for
+  about 5 minutes
+  ([proxy docs](https://chromium.googlesource.com/chromium/src/net/+/HEAD/docs/proxy.md)):
+  after a homeproxy outage the shared browser may keep going DIRECT (→ Access)
+  for up to 5 min. `browser.py down && browser.py up` resets it at once.
+- **When it applies.** Like every PAC change: at the next `browser.py up` of
+  each instance (default, `private`, `admin`, `alt` — all launch through the
+  same PAC flag); a running browser keeps its old PAC (`status` says
+  `NOT in the running browser`). The broker picks its constant up with the next
+  `install.sh` (each login run launches a fresh Chromium).
 
 ## Troubleshooting
 

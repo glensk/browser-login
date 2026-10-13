@@ -3059,7 +3059,13 @@ def test_install_sh_dry_run_ships_secret_run_and_links_it():
     assert "selfcheck.py -b" in out
     assert "/usr/bin/sudo -u nobody" in out and "selfcheck.py -F" in out
     assert "selfcheck.py -P" in out
+    # i) the informational PAC-route probe runs after the checks, as the role
+    # account with the daemon's browsers, and can never fail the install.
+    assert "selfcheck.py -R" in out
+    assert out.index("selfcheck.py -R") > out.index("selfcheck.py -P")
+    assert "PLAYWRIGHT_BROWSERS_PATH=/usr/local/libexec/login-broker/browsers" in out
     text = INSTALL_SH.read_text()
+    assert '"$check" -R ||' in text
     assert '/usr/bin/stat -f %u "$LINK_DIR"' in text  # refuses a user-owned dir
     assert "/bin/rm -f /usr/local/bin/secret-run" in _dry("-U")
 

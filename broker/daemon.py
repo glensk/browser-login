@@ -149,6 +149,7 @@ from broker.limiter import (  # noqa: E402
     proc_start,
 )
 from broker.origins import access_gated, origin_allowed  # noqa: E402
+from broker.pac import pac_flag  # noqa: E402
 from broker.page_state import (  # noqa: E402
     diagnose,
     redacted_snapshot,
@@ -226,6 +227,28 @@ PER_DAY = 10
 # when the engine's version cannot be read.
 FALLBACK_CHROME_UA = CHROME_UA_TEMPLATE.format(major=141)
 CHROME_ARGS = ["--use-mock-keychain", "--disable-blink-features=AutomationControlled"]
+
+
+def launch_args() -> list[str]:
+    """The broker Chromium's command-line switches: CHROME_ARGS plus the
+    release's home-proxy PAC (``broker/pac.py`` — a constant, never the
+    agent-writable ``bin/pac_hosts.json``). Playwright adds no proxy switch of
+    its own while ``proxy`` is unset, so this PAC is the one in force."""
+    return [*CHROME_ARGS, pac_flag()]
+
+
+def launch_kwargs(pw: Any, profile: Path) -> dict[str, Any]:
+    """``launch_persistent_context`` keyword arguments for a broker Chromium
+    on `profile` (no ``channel``; the caller picks it)."""
+    return {
+        "user_data_dir": str(profile),
+        "headless": True,
+        "args": launch_args(),
+        "user_agent": broker_user_agent(pw),
+        "chromium_sandbox": True,
+    }
+
+
 _BLANK_PASSWORDS_JS = (
     "() => document.querySelectorAll('input[type=password]').forEach(i => i.value = '')"
 )
@@ -711,13 +734,7 @@ class PlaywrightRunner:
         return self.home / "profiles" / site
 
     def _launch(self, pw: Any, profile: Path, item: SiteItem | None = None) -> Any:
-        kwargs: dict[str, Any] = {
-            "user_data_dir": str(profile),
-            "headless": True,
-            "args": CHROME_ARGS,
-            "user_agent": broker_user_agent(pw),
-            "chromium_sandbox": True,
-        }
+        kwargs = launch_kwargs(pw, profile)
         try:
             ctx = pw.chromium.launch_persistent_context(channel="chromium", **kwargs)
         except Exception:  # pylint: disable=broad-exception-caught
