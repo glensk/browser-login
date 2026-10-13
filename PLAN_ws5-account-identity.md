@@ -1,6 +1,7 @@
 ## Session
 
 Resume: `c --resume 3871ad21-0f16-4b68-828e-f9eb1f7a6847`
+Parent: PLAN_agent-login-repair.md
 
 # WS5 — account identity for broker sites that share one cookie scope (tp#833)
 

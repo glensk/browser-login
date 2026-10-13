@@ -1,6 +1,7 @@
 ## Session
 
 Resume: `c --resume 3871ad21-0f16-4b68-828e-f9eb1f7a6847`
+Parent: PLAN_ws5-account-identity.md
 
 # WS5 S4c: Keycloak realm-path cookie scopes + a server-bound Run:ai identity (tp#909)
 
