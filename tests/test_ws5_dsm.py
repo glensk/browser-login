@@ -6,9 +6,9 @@ The recipe obtains the SynoToken from DSM itself (``SYNO.API.Auth`` method
 with that token, and takes the admin bit from ``SYNO.Core.User`` ``list``
 in DSM's API envelope (success true = admin, error 105 = not admin, anything
 else no bit). Only the token request's error 106/107/119 is logged out; once
-it succeeded, any error is indeterminate. The "not admin" answer is
-live-confirmed (2026-10-13), the "admin" one is not: a ``privilege admin``
-item stays unproven.
+it succeeded, any error is indeterminate. Both the "not admin" and the
+"admin" answer are live-confirmed (2026-10-13): readonly, user and admin
+items are all proof-ready.
 
 The recipe runs in a throwaway headless Chromium against a routed fixture
 DSM (no network), through BOTH isolated-world evaluators. Account names and
@@ -64,7 +64,7 @@ def _user() -> str:
 def test_the_dsm_recipe_is_reviewed() -> None:
     assert identity.usable_recipe("dsm") is RECIPE
     assert RECIPE.live_confirmed and RECIPE.auth == "syno-token"
-    assert RECIPE.admin_false_confirmed and not RECIPE.admin_true_confirmed
+    assert RECIPE.admin_false_confirmed and RECIPE.admin_true_confirmed
     assert RECIPE.allowed_sites == ("dsm-albert", "dsm-readonly")
     assert RECIPE.origin == ORIGIN and RECIPE.admin_field is None
     assert RECIPE.forms == ("username",)
@@ -181,12 +181,15 @@ def test_recipe_refusal_and_proof_ready() -> None:
     assert identity.entry_recipe(_entry()) is RECIPE
     # a user item of either site: the "not admin" answer is confirmed
     assert identity.proof_ready(_entry("dsm-albert", "user"))
-    # the admin answer is not live-confirmed: the admin item stays unproven
-    assert "admin answer is not live-confirmed" in identity.recipe_refusal(
-        "dsm", site="dsm-albert", check_url=CHECK, privilege="admin"
+    # the admin answer is live-confirmed too: the admin item is proof-ready
+    assert (
+        identity.recipe_refusal(
+            "dsm", site="dsm-albert", check_url=CHECK, privilege="admin"
+        )
+        == ""
     )
-    assert not identity.proof_ready(_entry("dsm-albert", "admin"))
-    assert identity.entry_recipe(_entry("dsm-albert", "admin")) is None
+    assert identity.proof_ready(_entry("dsm-albert", "admin"))
+    assert identity.entry_recipe(_entry("dsm-albert", "admin")) is RECIPE
     refusals = [
         ("dsm-x", CHECK, "reviewed for dsm-albert, dsm-readonly only"),
         ("dsm-readonly", f"{OTHER}/", f"runs on {ORIGIN} only"),
@@ -228,7 +231,7 @@ def _items(*raws: dict) -> dict[str, vault.SiteItem]:
     return {it.site: it for it in vault.build_items(list(raws))}
 
 
-def test_the_vault_admits_readonly_and_keeps_admin_unproven() -> None:
+def test_the_vault_admits_readonly_and_admin() -> None:
     items = _items(
         _raw("dsm-readonly"),
         _raw("dsm-albert", privilege="admin", instance="admin"),
@@ -239,8 +242,8 @@ def test_the_vault_admits_readonly_and_keeps_admin_unproven() -> None:
     assert identity.proof_ready(ro.public())
     admin = items["dsm-albert"]
     assert not admin.refused, admin.refused
-    assert admin.multi_account and admin.identity_recipe is None
-    assert not identity.proof_ready(admin.public())
+    assert admin.multi_account and admin.identity_recipe is RECIPE
+    assert identity.proof_ready(admin.public())
 
 
 @pytest.mark.parametrize(
@@ -420,12 +423,12 @@ def test_js_admin_bit_from_the_envelope(ds: tuple[Any, _Dsm, Evaluator]) -> None
     _no_leak(got, api)
     assert _verdict(got, api.name, "admin") == identity.MATCH
     assert _verdict(got, api.name, "readonly") == identity.PRIVILEGE_MISMATCH
-    # ... and still the admin ITEM stays unproven: its answer is unconfirmed
+    # ... and the admin ITEM may use the recipe: its answer is confirmed
     assert (
         identity.item_recipe(
             "dsm", site="dsm-albert", check_url=CHECK, privilege="admin"
         )
-        is None
+        is RECIPE
     )
 
 

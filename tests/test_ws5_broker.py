@@ -163,7 +163,7 @@ def test_recipes_are_reviewed_and_unconfirmed_ones_absent() -> None:
     assert identity.usable_recipe("keycloak-admin") is keycloak
     # authentik (live 2026-10-13): usable; admin items only (`item_recipe`)
     assert identity.usable_recipe("authentik") is identity.IDENTITIES["authentik"]
-    # dsm (live 2026-10-13): usable; readonly items only (`item_recipe`)
+    # dsm (live 2026-10-13): usable; readonly, user and admin items
     assert identity.usable_recipe("dsm") is identity.IDENTITIES["dsm"]
     for name in ("nope", None):
         assert identity.usable_recipe(name) is None

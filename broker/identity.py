@@ -1102,7 +1102,8 @@ IDENTITIES: dict[str, IdentityRecipe] = {
     ),
     # DSM 7 Web API (synology.dom42.space, a DS218; the dsm-albert and
     # dsm-readonly items). Live 2026-10-13, Albert's Safari logged in as
-    # the readonly account, value-free:
+    # each account in turn, value-free; every answer below was
+    # `application/json`:
     # - `GET /webapi/entry.cgi?api=SYNO.API.Auth&method=token&version=6`
     #   with the session cookie (no token header) → 200 JSON {success:
     #   true, data: {is_portal_port, synotoken}}: the recipe obtains the
@@ -1122,11 +1123,11 @@ IDENTITIES: dict[str, IdentityRecipe] = {
     # - the admin bit (NormalUser has none): `GET …api=SYNO.Core.User&
     #   method=list&version=1&limit=1` with the token. The readonly
     #   (non-admin) account got 200 {success: false, error: {code: 105}}
-    #   (permission denied) — hence `admin_false_confirmed`. The admin
-    #   answer (success: true) is expected, NOT seen live yet (dsm-albert
-    #   not probed): `admin_true_confirmed` stays False, so a `privilege
-    #   admin` item stays unproven. Any other answer (another code, not
-    #   JSON, HTTP ≠ 200, a redirect) is no bit.
+    #   (permission denied) — hence `admin_false_confirmed`; the admin
+    #   account (dsm-albert, whose NormalUser `data.username` is its vault
+    #   username) got 200 {success: true} — hence `admin_true_confirmed`.
+    #   Any other answer (another code, not JSON, HTTP ≠ 200, a redirect)
+    #   is no bit.
     # The token never leaves the isolated world; only the digest and the
     # bit cross CDP.
     "dsm": IdentityRecipe(
@@ -1143,7 +1144,7 @@ IDENTITIES: dict[str, IdentityRecipe] = {
             "/webapi/entry.cgi?api=SYNO.Core.User&method=list&version=1&limit=1"
         ),
         admin_probe_false_codes=(105,),
-        admin_true_confirmed=False,
+        admin_true_confirmed=True,
         admin_false_confirmed=True,
         allowed_sites=("dsm-albert", "dsm-readonly"),
         origin="https://synology.dom42.space",
