@@ -599,13 +599,13 @@ On SIGTERM safari.py clears the clipboard (feature `sigterm_clear`).
       console the same way, and Slack's team and user ids (`expected_team_id`,
       `expected_user_id`) from the workspace's admin pages. Once a 401 is seen logged
       out and 200 logged in, set `"notion": {"notion_probe_verified": true}`.
-- [ ] L1 Disposable instance (`CLAUDE_BROWSER_CACHE_DIR=<tmp> browser.py --cdp-port <free>
+- [x] L1 (2026-10-13: cold import ✅ account proven; wrong expected e-mail → mismatch in the throwaway context, nothing imported — the jar holds only the anonymous cookies of Notion's own logged-out check, no session cookie) Disposable instance (`CLAUDE_BROWSER_CACHE_DIR=<tmp> browser.py --cdp-port <free>
       up`): cold `import-safari notion` ✅. A wrong expected e-mail → `wrong_account` and the
       cookies are gone. Then `down`.
-- [ ] L2 Per recipe, in Albert's Safari (after M0/M1/M2/M4): confirm the hosts and labels
+- [ ] L2 (waits for a Safari site's session to lapse: notion/slack/openai/galaxus are ✅ today, and `-L` starts only from a definite logged-out) Per recipe, in Albert's Safari (after M0/M1/M2/M4): confirm the hosts and labels
       (`safari.py -r`), fix the table, one `-L SITE` where a session is due.
-- [ ] L3 (dry run ✅ 2026-10-12: features complete, gate closes when the Mac is idle, Safari session present → import first) `-L notion -n`, then `-L notion` (import path).
-- [ ] L4 Final acceptance: `./agent-login.py -I`, then one observed refresh pass.
+- [ ] L3 (waits like L2; dry run ✅ 2026-10-12: features complete, gate closes when the Mac is idle, Safari session present → import first) `-L notion -n`, then `-L notion` (import path).
+- [ ] L4 Final acceptance: `./agent-login.py -I`, then one observed refresh pass. (2026-10-13: `-I` ✅ — check daily 09:15, snapshot 10 min, refresh 6 h; a manual `-R` refreshed cscs/npm-nixos/npm-raspi with no login. Open: the first SCHEDULED 09:15 run, read from its log.)
 - [x] L5 (tp#935, done 2026-10-12) Portainer NPM change + the header proof (fails before, passes after).
 - [x] L6 (M0–M4 released 2026-10-12; M6 not needed: himalaya `epfl` reads the Notion mails) mydotfiles M0–M4, M6 (builders in mydotfiles, their own plan).
 - [x] L7 (2026-10-13) edu-ID: sentinel `a[href="/account/security"]` (the account tabs; the
