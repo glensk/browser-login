@@ -783,6 +783,53 @@ that actually happened in October 2026.
 | Path-scoped Keycloak realms     | two realms on one host clear each other (custos-admin vs runai)            | `agent_cookie_scopes` (`[{"host": H, "path": "/realms/R/"}]`) instead of a host-wide scope.                                                                                                                              |
 | Enter-key forgot-password trap  | a submit pressed `forgot` and reset the password (calibre)                 | Submits read the form's buttons first and fail closed; the tripwire aborts a secondary action. A new recipe uses the same helpers; audit a form with secondary buttons before its first login.                          |
 
+### Accounts that share a site (WS5)
+
+One cookie scope holds one account per browser. Two items that log into
+different accounts on the same site (gitlab-sdsc glensk vs admin, dsm albert
+vs readonly) would silently overwrite each other's session while both still
+read ✅ (tp#833). So each such account lives in its own browser instance:
+
+| Instance  | CDP port | Holds                                                               |
+| :-------- | :------- | :------------------------------------------------------------------ |
+| (default) | 9222     | the default account of every site                                   |
+| `private` | 9223     | Albert's private claude.ai account                                  |
+| `admin`   | 9224     | admin accounts (`gitlab-sdsc-admin`, `runai-admin`, `dsm-albert` …) |
+| `alt`     | 9225     | a further account that conflicts with both (`custos-admin`)         |
+
+Item fields (`broker/vault.py`; written with mydotfiles `broker-add.py`):
+
+| Field                   | Meaning                                                                                               |
+| :---------------------- | :---------------------------------------------------------------------------------------------------- |
+| `agent_instance`        | the instance the item lives in (`""` = 9222, `admin`, `alt`)                                          |
+| `agent_privilege`       | `admin` / `user` / `readonly`; mandatory on a multi-account item and with `agent_identity`            |
+| `agent_identity`        | the reviewed recipe (`identity.IDENTITIES`) that proves WHICH account a session holds                 |
+| `agent_same_account_as` | the site id of an item that logs into the SAME account; declared on both items, else both are refused |
+| `agent_alias`           | a short name the group's default member also answers to (`gitlab-sdsc` → `gitlab-sdsc-glensk`)        |
+| `agent_cookie_scopes`   | path-scoped cookies (`[{"host": H, "path": "/realms/R/"}]`) for realms that share a host              |
+
+The broker refuses an item that would put a second account into a scope of
+the same instance (`identity_rules`). A multi-account item passes `browser.py logged-in`
+only with the **server identity proof**: the item's reviewed recipe (gitlab,
+audiobookshelf, navidrome, dsm, authentik, runai, keycloak-admin) asks the
+site's own API in an isolated world of the probe tab, against a one-use broker
+challenge; only a digest crosses CDP or the socket, never a username or token.
+Without a usable recipe the item reads `identity_unproven` and is never logged
+in. A check that finds a foreign account's session in the item's instance
+(`wrong_account`) clears that session's cookies (and, for storage-token apps,
+its declared storage keys) in that instance only, never the broker's profile;
+the next login then starts logged out.
+
+`login` / `logged-in` of an item re-run themselves in its instance; a run
+pinned to another instance or port refuses (`wrong_instance`). Role instances
+start on demand (`CLAUDE_BROWSER_INSTANCE=admin browser.py up`, then `down`);
+the Playwright MCP reaches `admin` only through the opt-in `playwright-admin`
+config. `agents.md` groups such items under "one site, several accounts —
+never two in one browser; pick the account the task needs (ADMIN = admin
+rights)": the default member (or its alias) for ordinary work, the ADMIN
+member only when the task needs admin rights, with the instance prefix shown
+on its line.
+
 ### Agents renew Albert's own sessions through his Safari (WS1b)
 
 The sites that live on Albert's session do not wait for him: the Safari

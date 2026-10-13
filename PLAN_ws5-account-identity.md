@@ -132,7 +132,7 @@ value.
       sentinels visible → every one exits 2 `identity_unproven`); parent-domain overlap;
       storage-only overlap; disjoint hosts pass as before; a pre-WS5 `sites` view (no
       `identity_v`) stays closed.
-- [x] Built 2026-10-11 (worktree, not yet released). Additions beyond the boxes above,
+- [x] Built 2026-10-11, released (S0, 919da8f). Additions beyond the boxes above,
       per the overseer's S0 brief: fill-origin hosts join the scope too (conservative; no
       live difference); same-account needs BOTH items to name each other; refused items
       take part. `login` (broker, Safari import and Safari login) refuses at its start,
@@ -210,7 +210,7 @@ value.
       the `sites` view; RECIPE_JS in a real headless Chromium in an isolated world
       (incl. a page that hooks `Response.json` and `crypto.subtle`).
 - [x] Built 2026-10-11, revised after the overseer's security review the same day
-      (worktree, not yet released; needs `install.sh` + selfcheck). Decisions, each
+      (released bea6b32, broker bea6b327b2ed). Decisions, each
       fail closed:
   - **Tag key created by the broker on first use**, not by `install.sh`
     (`<home>/account-tag.key`: temp file + link, `O_NOFOLLOW` read, a regular 0600 file
@@ -325,12 +325,12 @@ value.
       any browser between uses. `identity_unproven` items are never logged in by `-c`.
 - [x] `-x` matrix: columns `instance`, `multi`, `identity`, `privilege`, `alias`,
       `same-account`.
-- [ ] ~~`-s A B`~~ dropped (security review M2): the same-account question is the root-only `sudo install/install.sh -S A B`.
+- [x] OBSOLETE: ~~`-s A B`~~ dropped (security review M2): the same-account question is the root-only `sudo install/install.sh -S A B`.
 - [x] Tests in `tests/test_agent_login.py`: grouped rendering (no username, fixed
       vocabulary); instance prefix in agents.md; `-c` starts and stops only instances
       that were down; a stale row after an instance change; unproven rows never ✅ and
       never logged in.
-- [x] S2 + S3 built 2026-10-11 (one worktree, not yet released; CLIENT-ONLY: no broker
+- [x] S2 + S3 built 2026-10-11 (released 859c785; CLIENT-ONLY: no broker
       behaviour change, no `install.sh` needed — `broker/identity.py` gains the pure
       `proof_ready`, `connected_groups`, `ROLE_INSTANCE_PORTS`, `broker/phases.py` two code
       texts; the next broker install ships them unchanged in effect). Decisions:
@@ -448,38 +448,37 @@ value.
 
 ### S4 — migration and live acceptance (main session; Albert's Touch ID for vault writes)
 
-- [ ] mydotfiles `bin/broker-add.py`: add columns for `agent_instance`, `agent_privilege`,
+- [x] mydotfiles `bin/broker-add.py`: add columns for `agent_instance`, `agent_privilege`,
       `agent_identity`, `agent_same_account_as` and `agent_alias` (short options without
       collisions), with validation reused from broker/vault.py. Separate commit in
-      mydotfiles.
-- [ ] `sudo install/install.sh -S docker docker-hub` and `-S custos-admin runai-admin`: same →
-      Albert merges or declares same-account; different → separate instances.
-- [ ] Set the fields per item (proposal in the table above, after Albert's answers), then
-      `agent-login.py -x`: no in-instance conflict, no refusal.
-- [ ] Disposable-instance doctor after the instance change:
+      mydotfiles (b1aece79).
+- [x] `sudo install/install.sh -S docker docker-hub` and `-S custos-admin runai-admin`: same →
+      Albert merges or declares same-account; different → separate instances. (Both
+      answered different; custos-admin went to `alt`, the docker pair was removed.)
+- [x] Set the fields per item (proposal in the table above, after Albert's answers), then
+      `agent-login.py -x`: no in-instance conflict, no refusal. (Vault fields 2026-10-12;
+      `-V`: 0 refused.)
+- [x] (2026-10-13: 16 ✅, 0 ⚠ on CDP 9297) Disposable-instance doctor after the instance change:
       `CLAUDE_BROWSER_CACHE_DIR=<tmp> bin/browser.py --cdp-port <free port> up`, `doctor`,
       `down`.
-- [ ] Per pair: one positive proof in the item's own instance, and one wrong-sibling proof
+- [x] (2026-10-13: positives ✅ for every pair in its own instance — gitlab, runai, abs, navidrome, dsm, authentik, custos; the wrong-sibling side is NOT forced live on purpose: a deliberate mismatch clears the item's session and arms the 1 h IdentityGuard cooldown. It is covered by the recipe tests (`mismatch` per recipe) and was seen live once — gitlab-sdsc-glensk cleared tp#833's foreign admin session.) Per pair: one positive proof in the item's own instance, and one wrong-sibling proof
       (the recipe in instance A against item B's challenge must answer `mismatch`). Free
       probes otherwise; a login only under the attempt policy.
-- [ ] runai / custos-admin endpoints: confirm at their WS2 candidate logins. Until then
+- [x] runai / custos-admin endpoints (d669be8, d808a8f): confirm at their WS2 candidate logins. Until then
       those groups stay `identity_unproven`. (navidrome: confirmed live 2026-10-11, S4a.)
       - runai: done (S4c, `PLAN_ws5-s4c-runai-keycloak.md`). The `runai` recipe's "not
         admin" answer (403, runai-test3) and its "admin" answer (200
         `application/json`, runai-admin) are both live-confirmed 2026-10-12, so
-        `admin_true_confirmed=True`: runai-admin no longer stays unproven once the
-        broker and client are released.
-      - custos-admin: recipe `keycloak-admin` built 2026-10-12 (worktree, not yet
-        released; S4c plan, "Part C"). A silent OIDC authorization-code request
+        `admin_true_confirmed=True`; released, runai-admin ✅.
+      - custos-admin: recipe `keycloak-admin` (d808a8f, released; S4c plan, "Part C"). A silent OIDC authorization-code request
         with PKCE in the isolated world; the ID token's `preferred_username` is the
         identity, `GET /admin/realms/master/users/count` (master-realm user rights,
         one JSON integer) the admin bit. Only `error=login_required` reads as
         logged out. Its "admin" answer is
-        live-confirmed, so custos-admin (`-p admin`) is provable once broker and
-        client are released. The 403 side is not confirmed (no non-admin master
+        live-confirmed: custos-admin (`-p admin`) is ✅ in the `alt` browser. The 403 side is not confirmed (no non-admin master
         user exists), so a `privilege user` item would stay unproven
         (`admin_false_confirmed=False`).
-- [x] **S4a** built 2026-10-11 (worktree, not yet released; BROKER + client:
+- [x] **S4a** built 2026-10-11 (released 1d54bd3, broker 1d54bd358b31; BROKER + client:
       `broker/identity.py` changes what the broker accepts and proves, so `install.sh`):
   - **`navidrome` recipe** (`live_confirmed`): auth `jwt-local-storage` — localStorage
     `token` is a JWT; its payload (base64url, no signature check, the server validates)
@@ -533,9 +532,12 @@ value.
       (invariant: one account per conflict group per instance; a multi-account item passes
       only with the server identity proof; values never leave page or broker) and the
       parent plan's WS5 box. Close tp#833 through the review flow.
+      Docs part done 2026-10-13 (README "Accounts that share a site", AGENTS.md instances
+      bullet); left: the parent WS5 box and closing tp#833.
 
 - Live findings 2026-10-11 (main session, Albert's Safari, schema only, no values printed):
-  - `install.sh -S docker docker-hub` → different; `-S custos-admin runai-admin` → different.
+  - `install.sh -S docker docker-hub` → different (both items later removed); `-S custos-admin
+    runai-admin` → different.
   - navidrome: `GET /api/user/<jwt.uid>` with `x-nd-authorization: Bearer <localStorage token>` →
     200 JSON `userName`, `isAdmin` (navidrome-albert: not admin). Recipe → S4b builder.
   - audiobookshelf albert: `type` = user.

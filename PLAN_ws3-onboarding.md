@@ -456,8 +456,8 @@ the vault write.
 
 1. Commit, push, `sudo install/install.sh` + selfcheck.
 2. `./agent-login.py -V -r`: no `bad agent_storage_keys` refusal, else roll back (D8).
-3. Digest adoption of the six promoted sites. The daily check LaunchAgent is unloaded
-   today, so nothing refreshes their checks on its own.
+3. Digest adoption of the six promoted sites. The daily check LaunchAgent is loaded
+   (reinstalled 2026-10-13), so its 09:15 run refreshes their checks.
    - The first `-S` after the install (the 10-minute snapshot) adopts each of the six whose
      current check is still a fresh strict ✅, i.e. at most 36 h old.
    - A site whose check is older than 36 h needs a manual `./agent-login.py -c`, `-t SITE`

@@ -182,7 +182,7 @@ framework. It is a **provider**: other repos depend on it, not the reverse. See
   Runner calls (`agent_login_jobs.run_browser`/`_browser`) always pass an
   explicit `timeout_s` — `None` only for the two guided calls; the AST test in
   `tests/test_agent_login.py` enforces it.
-- **Login phases and limiter safety (WS1a, `PLAN_ws1a-diagnostics.md`)**: every
+- **Login phases and limiter safety (WS1a, `plans-done/PLAN_ws1a-diagnostics_DONE.md`)**: every
   broker/client exit records a phase from `broker/phases.py` (never free page
   text into `agents.md`). The broker limiter is admitted only inside
   `get_secret`; recipes call `attempt.entered()` before typing the password and
@@ -391,7 +391,10 @@ framework. It is a **provider**: other repos depend on it, not the reverse. See
   claude.ai session. Known instances: `INSTANCE_PORTS` in `bin/browser.py`.
   WS5 role instances `admin` (CDP 9224) and `alt` (9225) hold the accounts of a
   site that must not share a cookie jar with its default account (a broker
-  item's `instance`): `login`/`logged-in` of such an item re-run themselves in
+  item's `instance`; README "Accounts that share a site"). **Invariant**: one
+  cookie scope in one instance holds at most one account (`identity_rules`
+  refuses a second), and a multi-account item passes `logged-in` only with the
+  server identity proof (below): `login`/`logged-in` of such an item re-run themselves in
   its instance when `CLAUDE_BROWSER_INSTANCE` is unset, and refuse
   (`wrong_instance`) when a run is pinned to another one (an explicit instance,
   ANY `--cdp-port`, or a port that is not the instance's); `logout` and

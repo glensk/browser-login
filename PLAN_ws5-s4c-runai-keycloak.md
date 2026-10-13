@@ -193,7 +193,7 @@ Verification is not strict-eligible on purpose: it needs the test suite, mypy an
           prove the admin item as `match` (both evaluators, and end to end).
   - [x] **Main session:** release the broker and the client again (`install.sh`) so
         runai-admin becomes usable.
-- [ ] **Live acceptance**, for both accounts: fresh login, profile reuse, restart, logout,
+- [x] (2026-10-13: fresh login + reuse + side by side b0906df; restart: admin browser down/up → runai-admin ✅; logout: `browser.py logout runai-test3` → logged out → `-t` re-login ✅; out-of-band account switch seen live on gitlab (tp#833); forged/stale artifacts covered by tests_ws5_runai) **Live acceptance**, for both accounts: fresh login, profile reuse, restart, logout,
       a switch made outside the broker, a forged or stale artifact, and a role change
       where that can be tested.
 
@@ -219,7 +219,7 @@ Verification is not strict-eligible on purpose: it needs the test suite, mypy an
     review round) and `/admin/serverinfo`. A non-admin's 403 is expected, but not seen
     live: no such account exists.
 - [x] **C2 recipe `keycloak-admin`** built (builder, worktree, 2026-10-12; build notes
-      "Part C"). Not released.
+      "Part C"). Released (d808a8f); custos-admin ✅ in the `alt` browser.
 - [x] **Main session:** the broker-add mirror (mydotfiles; spec in "Part C"), then
       release the broker and the client (`install.sh`), then set custos-admin's vault
       fields (table below).
