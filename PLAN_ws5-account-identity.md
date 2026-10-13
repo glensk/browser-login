@@ -560,7 +560,7 @@ value.
       `agent-login.py -V` shows it before install. Built in WS3 (`plans-done/PLAN_ws3-onboarding_DONE.md`):
       `account_unproven` (unusable) plus `displaced` / `made_unproven` for the established
       items a planned item would knock out (`-V -i`).
-- [ ] Child plan `PLAN_ws5-s4c-runai-keycloak.md` (tp#931) — feat: WS5 S4c: Run:ai page-claim identity + Keycloak realm-path scopes (tp#909)
+- [x] Child plan `PLAN_ws5-s4c-runai-keycloak.md` (tp#931) — feat: WS5 S4c: Run:ai page-claim identity + Keycloak realm-path scopes (tp#909)
 
 ## Open questions for Albert (with recommendations)
 
