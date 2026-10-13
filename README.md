@@ -1047,8 +1047,9 @@ from the home LAN; off-LAN they land on the Access login page and
 `agent-login.py` reports them `unreachable off-LAN (Cloudflare Access)`.
 `vpn homeproxy` (mydotfiles `bin/vpn.sh`) runs a restricted SSH dynamic forward
 to nixos on `127.0.0.1:1082`: through it the names resolve at nixos' dnsmasq and
-reach NPM directly. It only rides an existing path to the home host (the LAN,
-or the home WireGuard split tunnel) and never toggles a VPN itself.
+reach NPM directly. On the home LAN it connects direct; elsewhere it rides its
+own FritzBox WireGuard peer through a userspace wireproxy, independent of the
+home split tunnel, Cisco EPFL and Mullvad, and it never toggles a VPN itself.
 
 `bin/pac_hosts.json` lists exactly the Access-gated hosts nixos' dnsmasq answers
 authoritatively (nixos `accessGatedNames`), each as an EXACT host on
