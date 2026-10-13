@@ -8577,10 +8577,33 @@ def _page_challenged(page) -> bool:
         return False
 
 
+# chatgpt.com serves a non-interactive Cloudflare "Just a moment..." page on
+# most loads of the shared (headless) browser; it clears by itself within a
+# few seconds. A check waits up to this long for it to go before it says
+# "cannot tell" — a challenge that stays is still never "logged out".
+CHALLENGE_CLEAR_WAIT_S = 15.0
+CHALLENGE_CLEAR_POLL_S = 1.0
+
+
+def _challenge_persists(page) -> bool:
+    """True when `page` still shows a Cloudflare challenge after up to
+    ``CHALLENGE_CLEAR_WAIT_S`` of polling (False as soon as it is gone)."""
+    deadline = time.monotonic() + CHALLENGE_CLEAR_WAIT_S
+    while _page_challenged(page):
+        if time.monotonic() >= deadline:
+            return True
+        try:
+            page.wait_for_timeout(CHALLENGE_CLEAR_POLL_S * 1000)
+        except Exception:  # pylint: disable=broad-exception-caught
+            return True
+    return False
+
+
 def _chatgpt_state(page) -> str:
     """WS1b B1/SF3: valid / invalid / indeterminate from chatgpt.com's own
     session endpoint (``CHATGPT_SESSION_JS``) — the landing URL is not the
-    signal. A navigation error or a Cloudflare challenge cannot tell."""
+    signal. A navigation error or a Cloudflare challenge that does not clear
+    within ``CHALLENGE_CLEAR_WAIT_S`` cannot tell."""
     from playwright.sync_api import Error as PlaywrightError
 
     try:
@@ -8588,7 +8611,7 @@ def _chatgpt_state(page) -> str:
         page.wait_for_timeout(1500)
     except PlaywrightError:
         return "indeterminate"
-    if _page_challenged(page):
+    if _challenge_persists(page):
         return "indeterminate"
     try:
         got = page.evaluate(CHATGPT_SESSION_JS)
@@ -13989,7 +14012,7 @@ def _openai_identity(page: Any, expected: dict[str, str]) -> str:
         page.wait_for_timeout(2000)
     except PlaywrightError:
         return "indeterminate"
-    if _page_challenged(page):
+    if _challenge_persists(page):
         return "indeterminate"
     want = {
         "workspace": expected["expected_workspace_id"],

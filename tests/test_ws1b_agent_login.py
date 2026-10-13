@@ -817,14 +817,74 @@ class FakePage:
             "indeterminate",
         ),
         (FakePage("x", raise_on_goto=True, session="valid"), "indeterminate"),
-        (
-            FakePage("https://chatgpt.com/", challenged=True, session="valid"),
-            "indeterminate",
-        ),
     ],
 )
 def test_chatgpt_state(page: FakePage, state: str) -> None:
     assert browser._chatgpt_state(page) == state
+
+
+class ChallengedChatgpt(FakePage):
+    """chatgpt.com behind a Cloudflare "Just a moment..." page that clears
+    after `clear_s` of (fake) time; `wait_for_timeout` advances the clock."""
+
+    def __init__(self, clear_s: float, clock: list[float], session: str) -> None:
+        super().__init__("https://chatgpt.com/", session=session)
+        self.clear_s = clear_s
+        self.clock = clock
+        self.session_asked = False
+
+    def wait_for_timeout(self, ms: float) -> None:
+        self.clock[0] += ms / 1000
+
+    def evaluate(self, js: str, *args: Any) -> Any:
+        if js == browser.CHALLENGE_JS:
+            return self.clock[0] < self.clear_s
+        if js == browser.CHATGPT_SESSION_JS:
+            self.session_asked = True
+        return super().evaluate(js, *args)
+
+
+@pytest.mark.parametrize(
+    ("clear_s", "session", "state", "asked"),
+    [
+        # the interstitial clears by itself (2026-10-13: ~3 s) → the session
+        # endpoint decides, logged in or not
+        (4.0, "valid", "valid", True),
+        (4.0, "invalid", "invalid", True),
+        # never clears (a real block) → cannot tell, the endpoint is not asked
+        (999.0, "valid", "indeterminate", False),
+    ],
+)
+def test_chatgpt_state_waits_for_a_challenge_to_clear(
+    monkeypatch: pytest.MonkeyPatch,
+    clear_s: float,
+    session: str,
+    state: str,
+    asked: bool,
+) -> None:
+    clock = [0.0]
+    monkeypatch.setattr(browser.time, "monotonic", lambda: clock[0])
+    page = ChallengedChatgpt(clear_s, clock, session)
+    assert browser._chatgpt_state(page) == state
+    assert page.session_asked is asked
+    # bounded: the 1.5 s settle + at most CHALLENGE_CLEAR_WAIT_S of polling
+    assert clock[0] <= 1.5 + browser.CHALLENGE_CLEAR_WAIT_S + 1.0
+
+
+def test_openai_identity_waits_for_a_challenge_to_clear(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    clock = [0.0]
+    monkeypatch.setattr(browser.time, "monotonic", lambda: clock[0])
+    monkeypatch.setattr(browser, "_eval_enum", lambda *_a: "match")
+    page = ChallengedChatgpt(5.0, clock, "valid")
+    assert browser._openai_identity(page, {"expected_workspace_id": "W1"}) == "match"
+    clock[0] = 0.0
+    stuck = ChallengedChatgpt(999.0, clock, "valid")
+    assert (
+        browser._openai_identity(stuck, {"expected_workspace_id": "W1"})
+        == "indeterminate"
+    )
 
 
 def test_chatgpt_session_probe_shape() -> None:

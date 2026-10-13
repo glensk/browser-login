@@ -361,7 +361,7 @@ framework. It is a **provider**: other repos depend on it, not the reverse. See
       `browserContextId` in this source). It is closed in a `finally` right
       after the prover answers, and disposed when the process detaches.
     - The proof window is as short as the prover: Notion one server fetch (≤ 10
-      s, no sidebar wait), OpenAI two fetches (≤ 10 s), Slack its boot poll (≤ 20
+      s, no sidebar wait), OpenAI two fetches (≤ 10 s) after a self-clearing Cloudflare challenge (≤ 15 s), Slack its boot poll (≤ 20
       s) + `auth.test` (≤ 10 s), each plus the page load.
     - Residual: for up to ~45 s, another Playwright client attached to the
       shared browser (an agent's MCP, `browser.py eval`) can LIST the proof
