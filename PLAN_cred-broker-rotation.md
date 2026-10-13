@@ -79,50 +79,50 @@ which execute repository code; the broker install is a main-session step (root o
 
 ### S1 — remove the `fingerprint` oracle (first)
 
-- [ ] `broker/daemon.py`: the `fingerprint` op answers `removed`; `secret_check` /
+- [x] `broker/daemon.py`: the `fingerprint` op answers `removed`; `secret_check` /
       `password_fingerprint` deleted; `_record_failure` no longer writes `password_check`
       (username-only length note removed too); module docstring updated.
-- [ ] `broker/vault.py`: `fingerprint_secret` removed from `Vault`, `BwVault`, the dev
+- [x] `broker/vault.py`: `fingerprint_secret` removed from `Vault`, `BwVault`, the dev
       fixture vault and the daemon's vault proxy.
-- [ ] `agent-login.py -f/--fingerprint` removed (help text says: compare with
+- [x] `agent-login.py -f/--fingerprint` removed (help text says: compare with
       `credctl.py check -T` in mydotfiles); `bin/browser.py` drops the `password_check`
       diagnostic label.
-- [ ] Tests: the fingerprint cases in `tests/test_login_broker.py`,
+- [x] Tests: the fingerprint cases in `tests/test_login_broker.py`,
       `tests/test_username_only.py` and `tests/test_ws2_galaxus.py` rewritten to assert
       `removed` and the absence of `password_check`; new leak test: no broker reply,
       diagnostic file or audit line matches `len=\d+` or `sha256:[0-9a-f]{4}`.
 
 ### S2 — one item, one collection (dual membership by item id)
 
-- [ ] `broker/vault.py`: `collection_membership(raw, login_coll, secrets_coll)` → `ok` |
+- [x] `broker/vault.py`: `collection_membership(raw, login_coll, secrets_coll)` → `ok` |
       `unreadable` | `dual`; applied in `items()`/`secret()` (login side) and in the
       secrets read (`build_secret_items` path), dev fixture vault included; `dual` and
       `unreadable` refused with fixed reasons on both sides, keyed by item id.
-- [ ] `broker/onboarding.py` calls `collection_membership` for a new or changed item
+- [x] `broker/onboarding.py` calls `collection_membership` for a new or changed item
       (refused level) instead of any name rule.
-- [ ] Root-only CLI on `daemon.py` (letter chosen at build, documented in `-h`): list the
+- [x] Root-only CLI on `daemon.py` (letter chosen at build, documented in `-h`): list the
       dual-member and unreadable items of the live vault by safe name + item id, run as
       the broker uid; used once before the S5 install.
-- [ ] `tests/test_cred_rotation.py`: dual item refused on both sides (also with different
+- [x] `tests/test_cred_rotation.py`: dual item refused on both sides (also with different
       `agent_site`/`agent_secret_id`/names), missing / non-list / non-string
       `collectionIds` refused, a login-only and a secrets-only item served, the refused
       dual item still takes part in the scope conflict check, onboarding refuses it.
 
 ### S3 — rotation lease, drain and `held`
 
-- [ ] `broker/daemon.py`: ops `rotation_lease` / `rotation_release` (design above),
+- [x] `broker/daemon.py`: ops `rotation_lease` / `rotation_release` (design above),
       persisted lease file (0600, broker home, atomic write), TTL expiry, drain over
       `_site_lock` with a bounded wait, `busy` on drain timeout with the lease rolled
       back; `held` answered by login, scheduled login, sentinel probe and identity
       challenge of a leased site; limiter untouched by `held`.
-- [ ] `broker/vault.py`: `SiteItem.hold` from `agent_hold` (txid shape checked; malformed
+- [x] `broker/vault.py`: `SiteItem.hold` from `agent_hold` (txid shape checked; malformed
       = held, fail closed); `secret()` of a held item raises the `held` refusal; the
       `sites` view carries `held` + txid.
-- [ ] Clients: `bin/browser.py login` maps `held` to exit 75 with
+- [x] Clients: `bin/browser.py login` maps `held` to exit 75 with
       `held: rotation TXID in progress`; `agent-login.py` shows `⏸ held (rotation TXID)`,
       treats it like busy in `-c` (no login, no failure mail, no quarantine) and in
       `agents.md`.
-- [ ] `tests/test_cred_rotation.py`: a fake login paused right before its submit while
+- [x] `tests/test_cred_rotation.py`: a fake login paused right before its submit while
       `rotation_lease` arrives → the lease waits for it, then `leased`; a login started
       after the lease → `held` without a secret read; drain timeout → `busy`, lease gone,
       later logins proceed; `held` leaves limiter state byte-identical; broker restart
@@ -132,22 +132,22 @@ which execute repository code; the broker install is a main-session step (root o
 
 ### S4 — item id and revision in the metadata views
 
-- [ ] `sites` and `secrets` views: `item_id` + `revision` per item (refused items too);
+- [x] `sites` and `secrets` views: `item_id` + `revision` per item (refused items too);
       `bin/secret_run.py -l -j` prints them; the leak canaries stay green.
-- [ ] Tests in `tests/test_cred_rotation.py`: both fields present, no value-shaped string
+- [x] Tests in `tests/test_cred_rotation.py`: both fields present, no value-shaped string
       added, a `bw sync` that changes `revisionDate` changes `revision`.
 
 ### S5 — docs and install
 
-- [ ] README: broker op table (fingerprint removed, lease ops, `held`), the dual-membership
+- [x] README: broker op table (fingerprint removed, lease ops, `held`), the dual-membership
       refusal, `agent-login.py` options; AGENTS.md: one convention bullet (no password
       oracle; dual membership is refused by item id; `held` is a skip, never a failure).
-- [ ] Main session, before the install: the S2 root-only listing against the live vault;
+- [x] (2026-10-13: the root-only listing as `_loginbroker` is blocked by the secret-dump guard; done instead by comparing the broker's `sites` view (43 login items) with `secret-run -l` (28 secret items): no shared name/site — no dual member; after the install no site is refused) Main session, before the install: the S2 root-only listing against the live vault;
       no dual-member item → install, else the NOTE below first.
 
-NOTE (albert, approve): only if the pre-install listing names a dual-member item (e.g. the `cloudflare` name pair): approve which collection it leaves; the agent splits it into a login item and a secrets item through `broker-add.py` before the install.
+NOTE (albert, approve, done 2026-10-13 — not needed: no dual-member item): only if the pre-install listing names a dual-member item (e.g. the `cloudflare` name pair): approve which collection it leaves; the agent splits it into a login item and a secrets item through `broker-add.py` before the install.
 
-- [ ] Main session: `sudo install/install.sh` (broker + clients), then
+- [x] (2026-10-13: installed 4f58ce8115b0; `fingerprint` → removed; 43 sites, none refused, all with item_id; calibre, gitlab-sdsc-glensk, npm-nixos logged-in ✅) Main session: `sudo install/install.sh` (broker + clients), then
       `browser.py logged-in` of every previously ✅ site still passes, `agent-login.py`
       shows no new ❌, and a `fingerprint` request answers `removed`.
 
