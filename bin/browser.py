@@ -9771,6 +9771,7 @@ BROKER_ERRORS = {
     "idp_unknown": "the identity provider refused the password without a reason "
     "(often its bot check)",
     "captcha_required": "the identity provider wants a captcha",
+    "held": "a credential rotation holds this site — skip, re-check later",
 }
 # Broker refusals that need Albert (exit NEEDS_ALBERT_RC, 4).
 BROKER_NEEDS_ALBERT = frozenset({"needs_human", "captcha_required", "submit_disabled"})
@@ -9912,7 +9913,6 @@ def _print_broker_diag(diag: object) -> None:
         ("inputs", "visible fields"),
         ("buttons", "buttons"),
         ("frames", "frames"),
-        ("password_check", "password used (compare with your vault copy)"),
         ("screenshot", "screenshot"),
         ("screenshot_withheld", "no screenshot"),
         ("before_check", "page before the final check"),
@@ -11396,6 +11396,16 @@ def _broker_entry_or_rc(site: str) -> tuple[dict | None, int]:
     return entry, 0
 
 
+def _broker_login_entry(site: str) -> tuple[dict | None, int]:
+    """`_broker_entry_or_rc` for a LOGIN: a site a credential rotation holds
+    (its entry's ``held``, tp#965) makes no broker request — exit
+    ``BUSY_RC``. (The logged-in check still runs on a held site.)"""
+    entry, rc = _broker_entry_or_rc(site)
+    if entry is not None and entry.get("held"):
+        return None, _broker_held(site, entry.get("held_txid"))
+    return entry, rc
+
+
 # How long the client's proof gives a check page to show its sentinel.
 BROKER_SENTINEL_WAIT_S = 8.0
 
@@ -12516,6 +12526,8 @@ def _broker_refused(site: str, resp: dict) -> int:
     code = str(resp.get("error"))
     detail = str(resp.get("detail") or "")
     _BROKER_REFUSALS[site] = (code, detail)
+    if code == "held":
+        return _broker_held(site, resp.get("txid"))
     phase = _phases.phase_for_error(code, resp.get("phase"), detail)
     submitted = resp.get("submitted")
     raw_diag = resp.get("diag")
@@ -12543,6 +12555,23 @@ def _broker_refused(site: str, resp: dict) -> int:
         4 if code in BROKER_NEEDS_ALBERT else 2,
         msg + (f" ({detail})" if detail else "") + f" [phase {phase}]",
     )
+
+
+_TXID_RE = re.compile(r"^[0-9]{8}T[0-9]{6}Z-[0-9a-f]{6}$")
+
+
+def _broker_held(site: str, txid: object) -> int:
+    """A credential rotation holds `site` (the broker's ``held``, or the
+    ``held`` flag of its ``sites`` entry): exit ``BUSY_RC`` — skip and
+    re-check later. Never a quarantine, never a failure: nothing was read,
+    reserved or typed."""
+    shown = txid if isinstance(txid, str) and _TXID_RE.match(txid) else "?"
+    _result_fail("precheck", "held", f"rotation {shown}", submitted=False, txid=shown)
+    print(
+        f"⏸ held: rotation {shown} in progress — {site} skipped, re-check later",
+        file=sys.stderr,
+    )
+    return BUSY_RC
 
 
 def _broker_unavailable(site: str, exc: BrokerUnavailable) -> int:
@@ -13148,7 +13177,7 @@ def _broker_login_gated(  # pylint: disable=too-many-return-statements
     rc_gate = _broker_gate(site)  # only before a broker login
     if rc_gate is not None:
         return rc_gate
-    entry, rc = _broker_entry_or_rc(site)
+    entry, rc = _broker_login_entry(site)
     if entry is None:
         return rc
     # `-G`: value-free diagnostics of the bundle and the injection

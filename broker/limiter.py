@@ -660,6 +660,37 @@ class Limiter:  # pylint: disable=too-many-instance-attributes,too-many-public-m
         now on. Raises on a state error — the caller must not submit then."""
         self._advance(grant, "submitted")
 
+    def withdraw(self, grant: AttemptGrant) -> None:
+        """Take back a reservation nothing was typed for — its secret read
+        found the item held by a credential rotation (tp#965: ``held`` is
+        never counted): the pending attempt and the in-flight mark go, no
+        outcome is stored and no streak rule runs. Only while every key's
+        mark is still ``reserved``; otherwise LimiterStateError and nothing
+        changes (the caller then finishes it as usual)."""
+        with self._locked():
+            data = self._load()
+            marked: list[dict[str, Any]] = []
+            for key in grant.keys:
+                entry = data["sites"].get(key)
+                inflight = entry.get("inflight") if isinstance(entry, dict) else None
+                if (
+                    isinstance(inflight, dict)
+                    and inflight.get("id") == grant.attempt_id
+                ):
+                    if inflight.get("state") != "reserved":
+                        raise LimiterStateError("the attempt went past its reservation")
+                    marked.append(entry)
+            for entry in marked:
+                entry.pop("inflight", None)
+                entry["attempts"] = [
+                    a
+                    for a in entry.get("attempts", [])
+                    if not (
+                        isinstance(a, list) and len(a) >= 3 and a[2] == grant.attempt_id
+                    )
+                ]
+            self._save(data)
+
     def finish(self, grant: AttemptGrant, outcome: str, now: float) -> None:
         """Close the attempt on every key with `outcome` (see FINISH_OUTCOMES)."""
         stored = FINISH_OUTCOMES.get(outcome)

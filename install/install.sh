@@ -67,7 +67,7 @@ usage() {
 	/bin/cat <<'EOF'
 Usage: sudo install/install.sh [-n] [-U [-P]] [-e] [-r KEY [-G]] [-c]
                                [-C ORG_ID:COLL_ID] [-X ORG_ID:COLL_ID] [-B]
-                               [-S SITE_A SITE_B] [-h]
+                               [-S SITE_A SITE_B] [-M] [-h]
 
 Install (default), update, uninstall or enrol the login broker LaunchDaemon.
 Refuses unless the repo is clean and HEAD is contained in origin/main; installs
@@ -111,6 +111,11 @@ Options:
                           name? prints same / different / unknown (the broker's
                           account tags, never a name; runs the installed daemon
                           as the role account; audited)
+  -M, --membership        list every item of the login and secrets collections
+                          whose collection membership is dual (in both: refused
+                          on both sides) or unreadable, by safe name + item id
+                          (runs the installed daemon as the role account;
+                          audited). Exit 0 none, 3 some listed
   -h, --help              show this help and exit
 
 Examples:
@@ -125,6 +130,7 @@ Examples:
   sudo install/install.sh -C ORG:COLL -X ORG:COLL  # switch collections by ID
   sudo install/install.sh -B     # roll the last switch back
   sudo install/install.sh -S docker docker-hub  # one account or two?
+  sudo install/install.sh -M     # items in both collections (split them)
   sudo install/install.sh -U     # uninstall, keep state
   sudo install/install.sh -U -P  # uninstall and purge state + role account
 EOF
@@ -196,6 +202,7 @@ while (($#)); do
 			die "-S needs two site ids (e.g. -S docker docker-hub)"
 		shift 2
 		;;
+	-M | --membership) MODE="membership" ;;
 	*)
 		usage >&2
 		exit 2
@@ -736,6 +743,18 @@ do_same() {
 	audit "same-account check ${SAME_A} ${SAME_B}"
 }
 
+# do_membership — `daemon.py -M` as the role account (it owns the bw state):
+# the dual-member and unreadable items of both collections, never a value.
+do_membership() {
+	local py="${LIBEXEC}/current/venv/bin/python" rc=0
+	[[ -x "$py" ]] || ((DRY)) || die "install the broker first (no ${py})"
+	run /usr/bin/sudo -u "$ROLE" /usr/bin/env HOME="$HOME_DIR" \
+		PATH="${LIBEXEC}/bin:/usr/bin:/bin" "$py" \
+		"${LIBEXEC}/current/broker/daemon.py" -H "$HOME_DIR" -M || rc=$?
+	audit "collection membership listing (exit ${rc})"
+	return "$rc"
+}
+
 # do_rollback — restore the newest bootstrap.json.prev-*, then reload.
 do_rollback() {
 	local py="${LIBEXEC}/current/venv/bin/python"
@@ -755,4 +774,5 @@ collections) do_collections ;;
 switch) do_switch ;;
 rollback) do_rollback ;;
 same) do_same ;;
+membership) do_membership ;;
 esac

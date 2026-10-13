@@ -611,12 +611,12 @@ def _fixture_vault(tmp_path: Path, *items: dict) -> vault.FixtureVault:
 
 def test_fresh_read_refuses_a_no_submit_login_secret(tmp_path: Path) -> None:
     """S3: `secret()` re-judges the FRESH item: an item flagged no-submit after
-    the site list was cached never yields a login secret; the fingerprint op
-    keeps its own read."""
+    the site list was cached never yields a login secret (and the removed
+    `fingerprint` op, tp#965, reads nothing)."""
     fv = _fixture_vault(tmp_path, _raw("shop", agent_no_submit="true"))
     with pytest.raises(vault.VaultError, match="no-submit"):
         fv.secret("shop")
-    assert fv.fingerprint_secret("shop").password == PASSWORD
+    assert not hasattr(fv, "fingerprint_secret")
     # a stale cached item (not no-submit) still cannot reach the password
     stale = vault.site_item_from_json(_raw("shop"))
     assert not stale.no_submit
@@ -637,7 +637,8 @@ def test_fresh_read_refuses_a_no_submit_login_secret(tmp_path: Path) -> None:
     with pytest.raises(vault.VaultError, match="no-submit"):
         gate()
     resp = brk.handle({"op": "fingerprint", "site": "shop"})
-    assert resp["ok"] and resp["password_check"].startswith("len=")
+    assert resp["ok"] is False and resp["error"] == "removed"
+    assert "password_check" not in resp
     plain = _fixture_vault(tmp_path, _raw("shop"))
     assert plain.secret("shop").password == PASSWORD
 
@@ -868,7 +869,7 @@ def test_recipe_failure_carries_the_idp_reason(tmp_path: Path, monkeypatch) -> N
         raise recipes.LoginFailed("still on the password page", phase="submit")
 
     def record(_page, item, _secret):
-        runner.last_diag[item.site] = {"password_check": "len=1 sha256:0000"}
+        runner.last_diag[item.site] = {"title": "Sign in"}
 
     monkeypatch.setattr(runner, "_profile_proof", lambda _p, _i: recipes.INVALID)
     monkeypatch.setattr(runner, "_record_failure", record)

@@ -312,6 +312,17 @@ framework. It is a **provider**: other repos depend on it, not the reverse. See
   never lifts a limiter block or an identity lockout (`left`, for
   `install.sh -r`). Client state is same-uid policy, not a security
   boundary — the broker limiter is.
+- **Credential rotation safety (tp#965, `PLAN_cred-broker-rotation.md`)**: the
+  broker has NO password oracle — never add an op, report field or CLI that
+  answers a secret's length, a hash or any comparison of it (`fingerprint`
+  answers `removed`; comparisons are mydotfiles `credctl.py check -T`). An
+  item in BOTH the login and the secrets collection is refused on both sides
+  by its OWN `collectionIds` (`vault.collection_membership`, unreadable =
+  refused too), never by its fields or name; the onboarding review calls that
+  function. `held` (a `rotation_lease` or `agent_hold`) is a skip, never a
+  failure: checked before any vault read, never counted by the limiter (a
+  hold found on the fresh secret read withdraws the reservation), never a
+  quarantine or a failure mail; clients map it to exit 75 / `⏸ held`.
 - **Agents renew Albert's own sessions through his Safari (WS1b,
   `plans-done/PLAN_ws1b-durability_DONE.md`)**:
   - **Who runs it:** `agent-login.py -L SITE` is agent-invoked ONLY. Every

@@ -24,6 +24,20 @@ Every ``bw`` read (unlock + sync + list + lock) runs under ONE process-wide
 lock, ``BW_LOCK``: the CLI's appdata dir is shared state, and concurrent misses
 of the secret cache wait for the read in flight and reuse its result.
 
+One item, one collection (tp#965 S2): every raw item of either read must
+carry ``collectionIds`` as a list of strings (else it is refused on that
+side, ``collection membership unreadable``), and an item listed in BOTH the
+login collection and the configured secrets collection is refused on both
+sides by its item id, whatever its fields or name say
+(``collection_membership``) — a website password must never become a
+``secret-run`` value. A refused login item keeps its scope for the conflict
+check.
+
+A credential rotation (mydotfiles ``credctl rotate``) writes ``agent_hold =
+<txid>`` on the login copies it is about to change: the item is ``held`` (a
+skip, never a failure) until the field is removed; a malformed value holds
+too (fail closed). ``secret()`` of a held item raises ``Held``.
+
 Secrets for agents (``secret-run``) come from a SECOND collection,
 ``secrets_collection_id`` in the bootstrap: ``SecretItem`` is the metadata
 (id, exposed field names, TOTP present) and ``SecretValues`` the values, kept in
@@ -126,6 +140,24 @@ BW_TIMEOUT_S = 120.0
 SHORT_BELOW_BYTES = 8
 MIN_SECRET_BYTES = 6
 NO_SECRETS_COLLECTION = "no secrets collection configured"
+# tp#965 S2: the fixed refusals of `collection_membership` (both sides).
+MEMBERSHIP_OK = "ok"
+MEMBERSHIP_UNREADABLE = "unreadable"
+MEMBERSHIP_DUAL = "dual"
+MEMBERSHIP_REASONS = {
+    MEMBERSHIP_UNREADABLE: "collection membership unreadable",
+    MEMBERSHIP_DUAL: "in both agent-login and agent-secrets: split it",
+}
+# tp#965 S3: a rotation's transaction id (mydotfiles cred_lib.journal.TXID_RE)
+# in `agent_hold`; any other non-empty value holds the item too (fail closed).
+TXID_RE = re.compile(r"^[0-9]{8}T[0-9]{6}Z-[0-9a-f]{6}$")
+HOLD_MALFORMED = "malformed"
+# A Bitwarden item id (a UUID) and revisionDate as the metadata views show
+# them; anything else is shown as "".
+_ITEM_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
+_REVISION_RE = re.compile(
+    r"^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9:.]{1,20}(Z|[+-][0-9:]{1,6})?$"
+)
 # Every `bw` CLI read of this process (one appdata dir) is serialised here.
 # Re-entrant: a secret-cache fill holds it across its own `bw` read.
 BW_LOCK = threading.RLock()
@@ -147,6 +179,17 @@ class MissingSecret(VaultError):
         self.code = code
 
 
+class Held(VaultError):
+    """The item is held by a credential rotation (``agent_hold``): a skip,
+    never a failure. `txid` is the rotation's id, or ``HOLD_MALFORMED``."""
+
+    code = "held"
+
+    def __init__(self, txid: str) -> None:
+        super().__init__(f"held: rotation {txid} in progress")
+        self.txid = txid
+
+
 class SecretsNotConfigured(VaultError):
     """The bootstrap names no secrets collection (``secret``/``totp`` refuse)."""
 
@@ -156,10 +199,9 @@ class Secret:
     """Login secret for one site. ``repr`` is redacted on purpose.
 
     `mode` ``username-only``: the item's username IS the credential (an
-    account number). It is carried as `password` — the fingerprint, the
-    diagnostics' masking, the field checks and the tripwire treat it as the
-    secret — and `username` stays empty, so no path types or shows it as a
-    user name."""
+    account number). It is carried as `password` — the diagnostics' masking,
+    the field checks and the tripwire treat it as the secret — and `username`
+    stays empty, so no path types or shows it as a user name."""
 
     username: str = field(repr=False)
     password: str = field(repr=False)
@@ -220,8 +262,7 @@ class SiteItem:  # pylint: disable=too-many-instance-attributes
     # `agent_no_submit`, the site in ``NO_SUBMIT_SITES`` or a fill origin on
     # ``NO_SUBMIT_DOMAINS``: the login runner never asks for the secret, so it
     # never types or submits a password for this site (``submit_disabled``); a
-    # reusable broker profile is still exported. (The `fingerprint` op still
-    # hashes the password: it never logs in.)
+    # reusable broker profile is still exported.
     no_submit: bool = False
     # `agent_max_session_days`: the server ends a session this many days after
     # its login, however much it is used (Calibre-Web Automated: 31 days, the
@@ -235,6 +276,10 @@ class SiteItem:  # pylint: disable=too-many-instance-attributes
     login_mode: str = PASSWORD_MODE
     refused: str | None = None
     item_id: str = ""
+    # Bitwarden `revisionDate` (ISO string, "" when absent or malformed).
+    revision: str = ""
+    # `agent_hold` (tp#965): a rotation's txid, ``HOLD_MALFORMED``, or "".
+    hold: str = ""
     # --- WS5 (tp#833, broker/identity.py): accounts sharing one cookie scope.
     # `agent_instance`: the browser instance the item lives in ("" = the
     # shared 9222 browser, else identity.ROLE_INSTANCES).
@@ -350,7 +395,67 @@ class SiteItem:  # pylint: disable=too-many-instance-attributes
             "username_only": self.login_mode == USERNAME_ONLY,
             "refused": self.refused is not None,
             "reason": self.refused or "",
+            # tp#965: non-secret metadata for credctl's guard index / tail
+            "item_id": view_item_id(self.item_id),
+            "revision": self.revision,
+            **hold_view(self.hold),
         }
+
+
+def view_item_id(item_id: str) -> str:
+    """A Bitwarden item id as the views show it ("" unless id-shaped)."""
+    return item_id if _ITEM_ID_RE.match(item_id) else ""
+
+
+def hold_view(hold: str) -> dict[str, Any]:
+    """``held`` + ``held_txid`` (a validated txid, else None) of the views."""
+    return {
+        "held": bool(hold),
+        "held_txid": hold if TXID_RE.match(hold) else None,
+    }
+
+
+def item_hold(fields: Mapping[str, str]) -> str:
+    """`agent_hold` of an item: "" (none), its txid, or ``HOLD_MALFORMED``."""
+    raw = fields.get("agent_hold", "").strip()
+    if not raw:
+        return ""
+    return raw if TXID_RE.match(raw) else HOLD_MALFORMED
+
+
+def item_revision(item: Mapping[str, Any]) -> str:
+    """The item's Bitwarden ``revisionDate`` ("" when absent or malformed)."""
+    raw = item.get("revisionDate")
+    return raw if isinstance(raw, str) and _REVISION_RE.match(raw) else ""
+
+
+# (login collection id, secrets collection id or None)
+Membership = tuple[str, str | None]
+
+
+def collection_membership(
+    raw: Mapping[str, Any], login_coll: str, secrets_coll: str | None
+) -> str:
+    """``ok`` | ``unreadable`` | ``dual`` for one raw Bitwarden item, by ITS
+    OWN ``collectionIds`` (never its fields or name): not a list of non-empty
+    strings = unreadable; naming both the login collection and the
+    configured secrets collection = dual. The broker refuses both on both
+    sides; the onboarding review calls this same function."""
+    colls = raw.get("collectionIds") if isinstance(raw, Mapping) else None
+    if not isinstance(colls, list) or not all(isinstance(c, str) and c for c in colls):
+        return MEMBERSHIP_UNREADABLE
+    if login_coll and secrets_coll and login_coll in colls and secrets_coll in colls:
+        return MEMBERSHIP_DUAL
+    return MEMBERSHIP_OK
+
+
+def membership_refusal(raw: Mapping[str, Any], membership: Membership | None) -> str:
+    """The fixed refusal of `raw`'s collection membership, or '' (also when
+    `membership` is None: no collection ids known, e.g. a legacy fixture)."""
+    if membership is None:
+        return ""
+    status = collection_membership(raw, membership[0], membership[1])
+    return MEMBERSHIP_REASONS.get(status, "")
 
 
 class Vault(Protocol):
@@ -362,10 +467,6 @@ class Vault(Protocol):
     def secret(self, site: str) -> Secret:
         """The LOGIN secret of a non-refused site (VaultError otherwise, and for
         a no-submit site)."""
-
-    def fingerprint_secret(self, site: str) -> Secret:
-        """The secret for the `fingerprint` op only (no-submit sites too: it
-        never logs in)."""
 
     def secret_items(self) -> list[SecretItem]:
         """Items of the secrets collection (SecretsNotConfigured without one)."""
@@ -420,6 +521,7 @@ class SecretItem:  # pylint: disable=too-many-instance-attributes
     short: bool = False
     refused: str | None = None
     item_id: str = ""
+    revision: str = ""
 
     def public(self) -> dict[str, Any]:
         """The ``secrets`` view: ids and field NAMES — never a value or seed."""
@@ -431,6 +533,8 @@ class SecretItem:  # pylint: disable=too-many-instance-attributes
             "short": self.short,
             "refused": self.refused is not None,
             "reason": self.refused or "",
+            "item_id": view_item_id(self.item_id),
+            "revision": self.revision,
         }
 
 
@@ -534,11 +638,17 @@ def secret_item_from_json(
     name = safe_name(raw_name, n)
     fields = _fields(item)
     item_id = str(item.get("id") or "")
+    revision = item_revision(item)
     raw_id = (fields.get("agent_secret_id") or "").strip().lower() or slugify(raw_name)
     secret_id = raw_id if SITE_ID_RE.match(raw_id) else f"item-{n}"
 
     def refused(reason: str) -> tuple[SecretItem, None]:
-        return SecretItem(secret_id, name, item_id=item_id, refused=reason), None
+        return (
+            SecretItem(
+                secret_id, name, item_id=item_id, revision=revision, refused=reason
+            ),
+            None,
+        )
 
     if not SITE_ID_RE.match(raw_id):
         return refused("invalid agent_secret_id")
@@ -607,15 +717,18 @@ def secret_item_from_json(
         allow_short=allow_short,
         short=short,
         item_id=item_id,
+        revision=revision,
     )
     return public, SecretValues(fields=values, totp_seed=seed)
 
 
 def build_secret_items(
-    raw_items: list[Any],
+    raw_items: list[Any], *, membership: Membership | None = None
 ) -> tuple[list[SecretItem], dict[str, SecretValues]]:
     """All secrets items (a second item claiming a taken id is refused) and the
-    values of the non-refused ones, keyed by id."""
+    values of the non-refused ones, keyed by id. `membership` (login and
+    secrets collection ids): an item whose ``collectionIds`` are unreadable
+    or name both collections is refused (``collection_membership``)."""
     items: list[SecretItem] = []
     values: dict[str, SecretValues] = {}
     seen: set[str] = set()
@@ -625,12 +738,14 @@ def build_secret_items(
             continue
         n += 1
         it, vals = secret_item_from_json(raw, n)
-        if it.secret_id in seen:
+        why = membership_refusal(raw, membership)
+        if why or it.secret_id in seen:
             it = SecretItem(
                 it.secret_id,
                 it.name,
                 item_id=it.item_id,
-                refused="duplicate agent_secret_id",
+                revision=it.revision,
+                refused=why or "duplicate agent_secret_id",
             )
             vals = None
         seen.add(it.secret_id)
@@ -642,20 +757,19 @@ def build_secret_items(
 
 def filter_org(raw_items: list[Any], org_id: str | None, coll_id: str) -> list[Any]:
     """With `org_id` set: only items of that organisation that list `coll_id`
-    (a collection id is only unique together with its organisation)."""
+    (a collection id is only unique together with its organisation). An item
+    of the organisation whose ``collectionIds`` is not a list stays: the
+    membership rule refuses it visibly instead of dropping it silently."""
     if not org_id:
         return list(raw_items)
     out = []
     for raw in raw_items:
-        if not isinstance(raw, Mapping):
+        if not isinstance(raw, Mapping) or raw.get("organizationId") != org_id:
             continue
-        colls = raw.get("collectionIds") or []
-        if (
-            raw.get("organizationId") == org_id
-            and isinstance(colls, list)
-            and coll_id in colls
-        ):
-            out.append(raw)
+        colls = raw.get("collectionIds")
+        if isinstance(colls, list) and coll_id not in colls:
+            continue
+        out.append(raw)
     return out
 
 
@@ -672,6 +786,11 @@ class _SecretSource:
     def _secrets_key(self) -> tuple[str, ...]:
         raise SecretsNotConfigured(NO_SECRETS_COLLECTION)
 
+    def _membership(self) -> Membership | None:
+        """(login, secrets) collection ids for `collection_membership`;
+        None = unknown (no membership rule)."""
+        return None
+
     def _load_secrets(self, key: tuple[str, ...]) -> list[Any]:
         raise SecretsNotConfigured(NO_SECRETS_COLLECTION)
 
@@ -684,7 +803,7 @@ class _SecretSource:
                 return hit
             raw = self._load_secrets(key)
             gen = self.cache.generation
-            items, values = build_secret_items(raw)
+            items, values = build_secret_items(raw, membership=self._membership())
             for sid, vals in values.items():
                 self.cache.put(
                     ("values", *key, sid), vals, size=vals.nbytes(), generation=gen
@@ -853,6 +972,8 @@ def site_item_from_json(item: Mapping[str, Any], *, dev: bool = False) -> SiteIt
     fields = _fields(item)
     site = (fields.get("agent_site") or "").strip().lower() or slugify(name)
     item_id = str(item.get("id") or "")
+    revision = item_revision(item)
+    hold = item_hold(fields)
 
     def refused(reason: str) -> SiteItem:
         # WS3: a refused item keeps a VALID attempt group (one that does not
@@ -860,7 +981,13 @@ def site_item_from_json(item: Mapping[str, Any], *, dev: bool = False) -> SiteIt
         # key an item still declares, refused or not.
         group, _problem = _attempt_group(fields.get("agent_attempt_group", ""), item)
         return SiteItem(
-            site=site, name=name, item_id=item_id, refused=reason, attempt_group=group
+            site=site,
+            name=name,
+            item_id=item_id,
+            revision=revision,
+            hold=hold,
+            refused=reason,
+            attempt_group=group,
         )
 
     if not SITE_ID_RE.match(site):
@@ -991,6 +1118,8 @@ def site_item_from_json(item: Mapping[str, Any], *, dev: bool = False) -> SiteIt
         site=site,
         name=name,
         item_id=item_id,
+        revision=revision,
+        hold=hold,
     )
     return _with_identity_fields(built, item, fields)
 
@@ -1304,9 +1433,13 @@ def identity_rules(  # pylint: disable=too-many-branches
     return out
 
 
-def build_items(raw_items: list[Any], *, dev: bool = False) -> list[SiteItem]:
+def build_items(
+    raw_items: list[Any], *, dev: bool = False, membership: Membership | None = None
+) -> list[SiteItem]:
     """All items; a second item claiming an already-taken site id is refused;
-    then the collection-wide WS5 rules (`identity_rules`)."""
+    an item whose collection membership is unreadable or dual (`membership`:
+    the login and secrets collection ids) is refused, its scope kept; then
+    the collection-wide WS5 rules (`identity_rules`)."""
     out: list[SiteItem] = []
     raws: list[Mapping[str, Any]] = []
     seen: set[str] = set()
@@ -1314,11 +1447,16 @@ def build_items(raw_items: list[Any], *, dev: bool = False) -> list[SiteItem]:
         if not isinstance(raw, Mapping):
             continue
         it = site_item_from_json(raw, dev=dev)
+        why = membership_refusal(raw, membership)
+        if why:
+            it = _refuse(it, why)
         if it.site in seen:
             it = SiteItem(
                 site=it.site,
                 name=it.name,
                 item_id=it.item_id,
+                revision=it.revision,
+                hold=it.hold,
                 refused="duplicate agent_site",
             )
         seen.add(it.site)
@@ -1359,23 +1497,53 @@ def secret_from_json(item: Mapping[str, Any]) -> Secret:
 
 
 def _find(
-    raw_items: list[Any], site: str, *, dev: bool, login: bool = True
+    raw_items: list[Any],
+    site: str,
+    *,
+    dev: bool,
+    membership: Membership | None = None,
 ) -> Mapping[str, Any]:
-    """The raw item of `site` from a FRESH read. `login`: the secret is for a
-    login, so a no-submit item (``SiteItem.no_submit``, judged on this fresh
-    read, not on a cached list) is refused; the fingerprint passes False."""
-    items = build_items(raw_items, dev=dev)
+    """The raw item of `site` from a FRESH read, for a login: a held item
+    (``agent_hold``) raises ``Held``; a refused one (its collection
+    membership included) and a no-submit one (``SiteItem.no_submit``) are
+    refused — judged on this fresh read, not on a cached list."""
+    items = build_items(raw_items, dev=dev, membership=membership)
     for it, raw in zip(items, [r for r in raw_items if isinstance(r, Mapping)]):
         if it.site == site:
+            if it.hold:
+                raise Held(it.hold)
             if it.refused:
                 raise VaultError(f"site {site!r} is refused: {it.refused}")
-            if login and it.no_submit:
+            if it.no_submit:
                 raise VaultError(
                     f"site {site!r} is no-submit: the broker never logs in with "
                     "its password"
                 )
             return raw
     raise VaultError(f"unknown site {site!r}")
+
+
+def membership_rows(
+    logins: list[Any], secrets_raw: list[Any], membership: Membership
+) -> list[tuple[str, str, str, str]]:
+    """``(side, status, safe name, item id)`` of every raw item of either
+    read whose `collection_membership` is not ``ok`` — side ``login`` or
+    ``secrets``, the name through ``safe_name``, the id only when id-shaped
+    (else ``?``). Never a field or a value."""
+    rows: list[tuple[str, str, str, str]] = []
+    for side, raws in (("login", logins), ("secrets", secrets_raw)):
+        n = 0
+        for raw in raws:
+            if not isinstance(raw, Mapping):
+                continue
+            n += 1
+            status = collection_membership(raw, membership[0], membership[1])
+            if status == MEMBERSHIP_OK:
+                continue
+            item_id = view_item_id(str(raw.get("id") or "")) or "?"
+            name = safe_name(str(raw.get("name") or ""), n)
+            rows.append((side, status, name, item_id))
+    return rows
 
 
 class FixtureVault(_SecretSource):
@@ -1385,7 +1553,10 @@ class FixtureVault(_SecretSource):
     ``{"logins": [...], "secrets": [...], "collections": [...]}`` — ``secrets``
     (optional) is the secrets collection, optionally filtered like ``bw`` by
     ``secrets_organization_id`` + ``secrets_collection_id``; ``collections``
-    (optional) is what ``daemon.py -C`` lists.
+    (optional) is what ``daemon.py -C`` lists. With ``collection_id`` (the
+    login collection) set, both reads apply the membership rule
+    (``collection_membership``) like ``BwVault``; without it (older
+    fixtures) no item's membership is judged.
     """
 
     def __init__(
@@ -1418,17 +1589,37 @@ class FixtureVault(_SecretSource):
         data = self._data()
         return list(data.get("logins", [])) if isinstance(data, dict) else data
 
+    def _membership(self) -> Membership | None:
+        data = self._data()
+        if not isinstance(data, dict) or not data.get("collection_id"):
+            return None
+        return (
+            str(data["collection_id"]),
+            str(data.get("secrets_collection_id") or "") or None,
+        )
+
     def items(self) -> list[SiteItem]:
         """Every fixture item, refused ones included."""
-        return build_items(self._raw(), dev=self.dev)
+        return build_items(self._raw(), dev=self.dev, membership=self._membership())
 
     def secret(self, site: str) -> Secret:
         """The fixture LOGIN secret of `site` (never for a no-submit site)."""
-        return secret_from_json(_find(self._raw(), site, dev=self.dev))
+        return secret_from_json(
+            _find(self._raw(), site, dev=self.dev, membership=self._membership())
+        )
 
-    def fingerprint_secret(self, site: str) -> Secret:
-        """The fixture secret of `site` for the `fingerprint` op."""
-        return secret_from_json(_find(self._raw(), site, dev=self.dev, login=False))
+    def membership_problems(self) -> list[tuple[str, str, str, str]]:
+        """See ``BwVault.membership_problems`` (a fixture needs collection_id)."""
+        membership = self._membership()
+        if membership is None:
+            raise VaultError("fixture vault: no collection_id, no membership to judge")
+        data = self._data()
+        secrets_raw = data.get("secrets", []) if isinstance(data, dict) else []
+        return membership_rows(
+            self._raw(),
+            secrets_raw if isinstance(secrets_raw, list) else [],
+            membership,
+        )
 
     def _secrets_key(self) -> tuple[str, ...]:
         data = self._data()
@@ -1651,23 +1842,37 @@ class BwVault(_SecretSource):
             out = self._run(["list", "items", "--collectionid", coll_id], env)
         return filter_org(self._json_list(out, "items"), org_id, coll_id)
 
+    def _membership(self) -> Membership:
+        return (self.boot.collection_id, self.boot.secrets_collection_id)
+
     def items(self) -> list[SiteItem]:
         """Every item of the ``agent-logins`` collection."""
         return build_items(
-            self._raw(self.boot.organization_id, self.boot.collection_id)
+            self._raw(self.boot.organization_id, self.boot.collection_id),
+            membership=self._membership(),
         )
 
     def secret(self, site: str) -> Secret:
         """Username, password and TOTP seed of `site` for a LOGIN (fresh unlock,
-        then lock); a no-submit item is refused on this fresh read, so an item
-        flagged since the cached site list was filled never reaches a login."""
+        then lock); a held, refused or no-submit item is refused on this fresh
+        read, so an item changed since the cached site list was filled never
+        reaches a login."""
         raw = self._raw(self.boot.organization_id, self.boot.collection_id)
-        return secret_from_json(_find(raw, site, dev=False))
+        return secret_from_json(
+            _find(raw, site, dev=False, membership=self._membership())
+        )
 
-    def fingerprint_secret(self, site: str) -> Secret:
-        """`secret` for the `fingerprint` op (no-submit sites too)."""
-        raw = self._raw(self.boot.organization_id, self.boot.collection_id)
-        return secret_from_json(_find(raw, site, dev=False, login=False))
+    def membership_problems(self) -> list[tuple[str, str, str, str]]:
+        """``daemon.py -M``: every item of either collection whose membership
+        is unreadable or dual, as ``(side, status, safe name, item id)`` rows
+        (`membership_rows`) — no field, no value."""
+        logins = self._raw(self.boot.organization_id, self.boot.collection_id)
+        secrets_raw: list[Any] = []
+        if self.boot.secrets_collection_id:
+            secrets_raw = self._raw(
+                self.boot.secrets_organization_id, self.boot.secrets_collection_id
+            )
+        return membership_rows(logins, secrets_raw, self._membership())
 
     def _secrets_key(self) -> tuple[str, ...]:
         if not self.boot.secrets_collection_id:

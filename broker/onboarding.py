@@ -32,13 +32,15 @@ what a login does or proves: a promotion holds for that digest only.
 
 from __future__ import annotations
 
+# The review, its manifest parsing and the pin cases belong together.
+# pylint: disable=too-many-lines
 import hashlib
 import ipaddress
 import json
 import re
 import urllib.parse
 from collections.abc import Iterable, Mapping, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from functools import lru_cache
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -68,7 +70,16 @@ _CONTROL = re.compile(r"[\x00-\x1f\x7f-\x9f]")
 _IDENTITY_KEY = re.compile(r"e-?mail|user(name)?|login|account", re.IGNORECASE)
 # The fields an onboarding manifest item may carry besides its agent_* fields.
 _MANIFEST_KEYS = frozenset(
-    {"name", "fields", "login", "replaces", "username_form", "reveals", "id"}
+    {
+        "name",
+        "fields",
+        "login",
+        "replaces",
+        "username_form",
+        "reveals",
+        "id",
+        "collectionIds",
+    }
 )
 
 
@@ -680,6 +691,25 @@ _PLACEHOLDER = {
 }
 
 
+def _manifest_collections(manifest: Mapping[str, Any]) -> tuple[str, str | None] | None:
+    """tp#965: the manifest's ``"collections": {"login": ID, "secrets": ID}``
+    (the login and secrets collection ids the planned items' membership is
+    judged against), or None when it names none. Raises ValueError."""
+    raw = manifest.get("collections")
+    if raw is None:
+        return None
+    if not isinstance(raw, Mapping) or set(raw) - {"login", "secrets"}:
+        raise ValueError('collections must be {"login": ID, "secrets": ID}')
+    login, secrets_coll = raw.get("login"), raw.get("secrets")
+    if not isinstance(login, str) or not login:
+        raise ValueError("collections.login must be a collection id")
+    if secrets_coll is not None and (
+        not isinstance(secrets_coll, str) or not secrets_coll
+    ):
+        raise ValueError("collections.secrets must be a collection id")
+    return login, secrets_coll
+
+
 def _manifest_items(
     manifest: Mapping[str, Any],
 ) -> tuple[list[dict[str, Any]], list[str]]:
@@ -689,8 +719,9 @@ def _manifest_items(
     if "items" in manifest or "removes" in manifest:
         items = manifest.get("items") or []
         removes = manifest.get("removes") or []
-    else:
-        items, removes = [manifest], []
+    else:  # one item; `collections` is the manifest's, not the item's
+        items = [{k: v for k, v in manifest.items() if k != "collections"}]
+        removes = []
     if not isinstance(items, list) or not isinstance(removes, list):
         raise ValueError("items and removes must be lists")
     out = []
@@ -770,7 +801,33 @@ def _planned_raw(item: Mapping[str, Any]) -> tuple[dict[str, Any], list[Finding]
         "login": {"username": user},
         "fields": fields,
     }
+    if "collectionIds" in item:  # as written: the membership rule judges it
+        raw["collectionIds"] = item["collectionIds"]
     return raw, notes
+
+
+def _membership_refusal(
+    item: Mapping[str, Any],
+    raw: Mapping[str, Any],
+    collections: tuple[str, str | None] | None,
+) -> str:
+    """tp#965: the broker's own membership refusal (``vault.membership_refusal``,
+    never a copy of the rule) of a planned item, '' when fine. With the
+    manifest's ``collections``, an item without ``collectionIds`` is a NEW
+    item that goes into the login collection only. Without them, an item
+    that names ``collectionIds`` cannot be judged (ValueError)."""
+    from broker import vault  # pylint: disable=import-outside-toplevel
+
+    if collections is None:
+        if "collectionIds" in item:
+            raise ValueError(
+                "an item with collectionIds needs the manifest's "
+                '"collections": {"login": ID, "secrets": ID}'
+            )
+        return ""
+    judged = dict(raw)
+    judged.setdefault("collectionIds", [collections[0]])
+    return vault.membership_refusal(judged, collections)
 
 
 def _ok(item: SiteItem) -> bool:
@@ -792,6 +849,7 @@ def review_planned(  # pylint: disable=too-many-locals,too-many-branches
     from broker import vault  # pylint: disable=import-outside-toplevel
 
     planned_raw, removes = _manifest_items(manifest)
+    collections = _manifest_collections(manifest)
     listed = {str(v.get("site")): v for v in views if isinstance(v.get("site"), str)}
     review = Review()
     built: list[SiteItem] = []
@@ -802,6 +860,9 @@ def review_planned(  # pylint: disable=too-many-locals,too-many-branches
         raw, notes = _planned_raw(item)
         review.findings += notes
         it = vault.site_item_from_json(raw, dev=dev)
+        why = _membership_refusal(item, raw, collections)
+        if why:  # dual / unreadable membership: refused, its scope kept
+            it = replace(it, refused=why, same_account_as="")
         target = str(item.get("replaces") or "")
         if it.site in seen or (it.site in listed and it.site != target):
             it = vault.SiteItem(

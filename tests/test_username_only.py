@@ -233,14 +233,16 @@ def test_a_login_without_a_password_says_why(tmp_path: Path) -> None:
     assert resp["ok"] is False and resp["error"] == "no_password"
     assert resp["phase"] == "vault" and resp["submitted"] is False
     assert "agent_login_mode=username-only" in resp["detail"]
-    fp = brk.handle({"op": "fingerprint", "site": "mullvad"})
-    assert fp["ok"] is False and fp["error"] == "no_password"
 
 
-def test_the_fingerprint_of_a_username_only_item(tmp_path: Path) -> None:
+def test_the_fingerprint_op_is_removed_for_a_username_only_item(
+    tmp_path: Path,
+) -> None:
+    """tp#965 S1: no length, no hash — the op answers `removed`."""
     brk = _broker(tmp_path, _raw())
     fp = brk.handle({"op": "fingerprint", "site": "mullvad"})
-    assert fp["ok"] and fp["password_check"] == "len=16 (username-only: no hash)"
+    assert fp["ok"] is False and fp["error"] == "removed"
+    assert "password_check" not in fp and "len=" not in json.dumps(fp)
     assert ACCOUNT not in json.dumps(fp)
 
 
@@ -842,7 +844,7 @@ def test_a_wrong_account_fails_post_submit_masked_without_a_screenshot(
     # the page echoed the typed number in groups: masked, never shown
     assert any("***" in m for m in diag["messages"]), diag["messages"]
     assert not _leaks(resp, wrong)
-    assert diag["password_check"] == "len=16 (username-only: no hash)"
+    assert "password_check" not in diag  # tp#965 S1: no length either
     assert "screenshot" not in diag and diag["screenshot_withheld"]
     assert not stale.exists()  # no picture of this site is left behind
     assert rig.attempts()[-1][1] == "unknown"

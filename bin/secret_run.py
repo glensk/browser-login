@@ -762,7 +762,7 @@ def build_parser() -> argparse.ArgumentParser:
             "secret-run -e NAME=ITEM[:FIELD] [-e ...] [-p NAME=ITEM[:FIELD]] "
             "[-s ITEM[:FIELD]] [-t] [-T SEC] [-v] -- CMD [ARG...]\n"
             "       secret-run -o ITEM\n"
-            "       secret-run -l\n"
+            "       secret-run -l [-j]\n"
             "       secret-run -A [-N N]"
         ),
         epilog=(
@@ -780,6 +780,8 @@ def build_parser() -> argparse.ArgumentParser:
             "  secret-run -T 60 -v -e T=svc -- ./deploy.sh\n"
             "  secret-run -o github        # the current TOTP code only\n"
             "  secret-run -l               # what can be injected\n"
+            "  secret-run -l -j            # the same as JSON, with item ids and\n"
+            "                              # revisions (credctl's guard index)\n"
             "  secret-run -A -N 20         # the broker's last 20 audit lines\n"
         ),
     )
@@ -832,6 +834,13 @@ def build_parser() -> argparse.ArgumentParser:
         help="list injectable items and their exposed field names",
     )
     p.add_argument(
+        "-j",
+        "--json",
+        action="store_true",
+        help="with -l: one JSON object per item (id, name, field names, item_id, "
+        "revision, refused, reason — never a value)",
+    )
+    p.add_argument(
         "-A", "--audit", action="store_true", help="print the broker's last audit lines"
     )
     p.add_argument(
@@ -857,10 +866,30 @@ def cmd_totp(item: str) -> int:
     return 0
 
 
-def cmd_list() -> int:
-    """``-l``: ids and field NAMES (never values)."""
+_LIST_JSON_KEYS = (
+    "id",
+    "name",
+    "fields",
+    "has_totp",
+    "short",
+    "refused",
+    "reason",
+    "item_id",
+    "revision",
+)
+
+
+def cmd_list(*, as_json: bool = False) -> int:
+    """``-l``: ids and field NAMES (never values); ``-j``: one JSON object
+    per item with the view's non-secret keys (``_LIST_JSON_KEYS``)."""
     resp = broker_ok("secrets")
     rows = resp.get("secrets") or []
+    if as_json:
+        for row in rows:
+            if isinstance(row, dict):
+                rec = {k: row.get(k) for k in _LIST_JSON_KEYS}
+                print(json.dumps(rec, sort_keys=True))
+        return 0
     if not rows:
         status("⚠️", "the secrets collection holds no items")
         return 0
@@ -1032,11 +1061,13 @@ def main(argv: list[str] | None = None) -> int:
     run_mode = bool(cmd or args.env or args.path or args.stdin)
     if sum(modes) + run_mode > 1:
         parser.error("-o, -l, -A and running a command are mutually exclusive")
+    if args.json and not args.list:
+        parser.error("-j/--json goes with -l")
     try:
         if args.totp:
             return cmd_totp(args.totp)
         if args.list:
-            return cmd_list()
+            return cmd_list(as_json=args.json)
         if args.audit:
             return cmd_audit(args.lines)
         return cmd_run(args, cmd)

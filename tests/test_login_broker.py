@@ -597,7 +597,9 @@ elif cmd == "list":
 
 def test_bw_vault_env_only_secrets(tmp_path):
     items = tmp_path / "items.json"
-    items.write_text(json.dumps(FIXTURE_ITEMS))
+    # `bw list items --collectionid` lists each item's collectionIds
+    listed = [{**it, "collectionIds": ["coll-1"]} for it in FIXTURE_ITEMS]
+    items.write_text(json.dumps(listed))
     log = tmp_path / "bw.log"
     fake = tmp_path / "bw"
     fake.write_text(FAKE_BW.replace("@LOG@", str(log)).replace("@ITEMS@", str(items)))
@@ -2253,24 +2255,19 @@ def test_only_cscs_reads_the_portal(tmp_path) -> None:
     assert not bundle["storage"] and not ctx.page.goto_urls
 
 
-def test_password_fingerprint_is_short_and_stable() -> None:
-    import hashlib
+def test_fingerprint_op_is_removed(sockdir, tmp_path) -> None:
+    """tp#965 S1: the old password oracle answers `removed`, nothing else."""
 
-    fp = daemon.password_fingerprint("correct horse battery staple")
-    want = hashlib.sha256(b"correct horse battery staple").hexdigest()[:4]
-    assert fp == f"len=28 sha256:{want}"
-    assert "horse" not in fp
-
-
-def test_fingerprint_op_returns_only_the_check(sockdir, tmp_path) -> None:
     def runner(_item, _get_secret) -> dict:  # never called by this op
         return {}
 
     with running(sockdir, tmp_path, runner) as (_brk, path):
         resp = json.loads(_ask(path, {"op": "fingerprint", "site": "ricardo"}))
-    assert resp["ok"] is True
-    assert resp["password_check"] == daemon.password_fingerprint(PASSWORD)
+    assert resp["ok"] is False and resp["error"] == "removed"
+    assert "password_check" not in resp
+    assert "credctl.py check -T" in resp["detail"]
     assert PASSWORD not in json.dumps(resp)
+    assert not hasattr(daemon, "password_fingerprint")
 
 
 def test_empty_password_is_refused_before_any_login() -> None:
@@ -2764,6 +2761,8 @@ def _sitem(name, password, **kw):
         "name": name,
         "login": {"username": "u", "password": password, "totp": None},
         "fields": [],
+        # as `bw list items --collectionid coll-s` lists it
+        "collectionIds": ["coll-s"],
     }
     item.update(kw)
     return item

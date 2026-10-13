@@ -567,7 +567,7 @@ item, `agent-login.py` shows the reason):
 | `agent_attempt_group`      | Opaque slug shared by items that log into ONE account (e.g. two shop domains on one identity provider): the broker limiter then enforces interval, cooldown, caps and the hard block on `group:<id>` too. Must not contain the account name. Reset: `sudo install/install.sh -r group:<id>`, or `-r SITE -G`.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                           |
 | `agent_no_submit`          | `true` (default `false`): the broker's login NEVER asks for this item's secret, so it never types or submits its password — a login answers `submit_disabled` (phase `vault`, nothing reserved); a still-valid broker profile is exported as before. For IdPs whose bot check rejects the headless broker (every submit risks a vendor lock): agents use Albert's session there (Safari import, `agent-login.py -g SITE` in the window), and `agent-login.py` shows the site as your login. Built in, and not lifted by `false`: the sites `galaxus` and `galaxus-de` (`vault.NO_SUBMIT_SITES`) and every item with a fill origin on a Digitec Galaxus domain (`vault.NO_SUBMIT_DOMAINS`, whatever the item is called). The secret ops (`secret-run`) never expose such an item either.                                 |
 | `agent_max_session_days`   | Whole days (1–365), only together with `agent_fresh_login = true`: renew the session with a fresh login once the last proven fresh broker login is this many days old, while the session still works. For servers that end a session a fixed time after its login however much it is used — Calibre-Web Automated: 31 days, so set `28` (the daily check then has 3 days to succeed). The age counts from this client's last PROVEN fresh broker login (`~/.cache/claude-browser/session-age/SITE.json`, written once a fresh broker login was injected and verified); with none on record, from the first check that saw the session — a lost or unreadable record means "age unknown", never a renewal loop. One renewal attempt per 20 h at most (claimed under a per-site lock before it starts), whatever its outcome. `browser.py login` and `agent-login.py -c` renew under the usual gates (pending, quarantined, locked … → only a note); a failed renewal keeps the working session (exit 0, `renewal: failed` in the result record). |
-| `agent_login_mode`         | `password` (default) or `username-only`: the item's USERNAME alone is the credential (Mullvad's account number, no password on the item). The broker types it into the login form's only field (a masked one like Mullvad's `input[type=password][name=account_number]`, else a username / account-number field) and submits it under every password rule: tripwire armed first, buttons read fail-closed, submit marker right before the click, proof by the sentinel; same attempt / limiter / quarantine semantics. A form that asks for more (a password too) gets nothing typed (`recipe`, not submitted). Such a username is a secret: masked in diagnostics (also when the page shows it in groups), no failure screenshot is ever taken, `-f` and the failure report show only its length (no hash), a page that submits it by itself is marked submitted before the request leaves and never submitted twice, and the secret ops (`secret-run`) never expose an item that carries this field. Only for sites on the generic recipe. An item without a password in `password` mode now fails with `no_password` ("set agent_login_mode=username-only, or check the item / the collection permission"), a username-only item without a username with `no_username`. |
+| `agent_login_mode`         | `password` (default) or `username-only`: the item's USERNAME alone is the credential (Mullvad's account number, no password on the item). The broker types it into the login form's only field (a masked one like Mullvad's `input[type=password][name=account_number]`, else a username / account-number field) and submits it under every password rule: tripwire armed first, buttons read fail-closed, submit marker right before the click, proof by the sentinel; same attempt / limiter / quarantine semantics. A form that asks for more (a password too) gets nothing typed (`recipe`, not submitted). Such a username is a secret: masked in diagnostics (also when the page shows it in groups), no failure screenshot is ever taken, no report shows its length or a hash, a page that submits it by itself is marked submitted before the request leaves and never submitted twice, and the secret ops (`secret-run`) never expose an item that carries this field. Only for sites on the generic recipe. An item without a password in `password` mode now fails with `no_password` ("set agent_login_mode=username-only, or check the item / the collection permission"), a username-only item without a username with `no_username`. |
 
 ### Submit safety: never a guess, never a secondary action (WS2-calibre)
 
@@ -696,7 +696,12 @@ that actually happened in October 2026.
    put its planned `agent_*` fields into a manifest
    (`{"name": …, "fields": {"agent_site": …, …}}`; add `"replaces": SITE` to
    change an item that is already listed; never a password), and run
-   `./agent-login.py -V -i planned.json`.
+   `./agent-login.py -V -i planned.json`. With the manifest's
+   `"collections": {"login": ID, "secrets": ID}` the review also judges each
+   item's collection membership with the broker's own rule
+   (`vault.collection_membership`): an item whose `collectionIds` name both
+   collections is `refused` (a new item without `collectionIds` goes into the
+   login collection only).
    - It is the broker's own code (`vault.site_item_from_json` and
      `identity_rules` over the whole collection, `broker/onboarding.py`), so it
      says exactly what the broker will refuse.
@@ -829,6 +834,61 @@ never two in one browser; pick the account the task needs (ADMIN = admin
 rights)": the default member (or its alias) for ordinary work, the ADMIN
 member only when the task needs admin rights, with the instance prefix shown
 on its line.
+
+### Credential rotation safety (tp#965)
+
+A credential's master is a Vaultwarden item that mydotfiles `credctl rotate`
+rotates (tp#889). The broker takes three precautions so a rotation can never
+leak a password, lock an account or race a login:
+
+- **No password oracle.** The old `fingerprint` op (length + 4 hex of the
+  password's SHA-256, also printed as `password_check` in every failure report
+  and by `agent-login.py -f`) was an offline verifier: it is removed. The op
+  answers `{"ok": false, "error": "removed"}` for one release, then it is an
+  unknown op. To check whether two copies hold the same password, use
+  `credctl.py check -T` in mydotfiles (Touch ID window).
+- **One item, one collection.** Every item of the login read and of the
+  secrets read must carry `collectionIds` as a list of strings, else it is
+  refused on that side (`collection membership unreadable`). An item whose
+  `collectionIds` name BOTH the login collection and the configured secrets
+  collection is refused on both sides by its own item id, whatever its fields
+  or name say (`in both agent-login and agent-secrets: split it`): otherwise
+  `secret-run` would hand a website password to agents. A refused login item
+  keeps its scope in the multi-account conflict check (fail closed). The
+  onboarding review (`-V -i`) calls the same rule. List such items with
+  `sudo install/install.sh -M` (`daemon.py -M` as the broker uid: side,
+  status, safe name, item id; exit 0 none, 3 some listed) and split each into
+  a login item and a secrets item (`broker-add.py`).
+- **Rotation lease and `held`.** Before it changes a password on a server,
+  credctl leases the item's sites; the broker records the lease, then waits
+  until a login already in flight has finished:
+
+  | Op                  | Request                                         | Answer                                                                                                                                                  |
+  | :------------------ | :---------------------------------------------- | :------------------------------------------------------------------------------------------------------------------------------------------------------ |
+  | `rotation_lease`    | `{"txid": TXID, "sites": [...], "ttl_s": 1200}` | `leased` (with `expires`); `busy` when a site's login does not finish within 120 s (the lease is dropped) or another txid leases a site; `unknown_site` |
+  | `rotation_release`  | `{"txid": TXID}`                                | `released` (`released`: true / false)                                                                                                                   |
+  | `fingerprint`       | (any)                                           | `removed`                                                                                                                                               |
+
+  Peer uid `--allow-uid` only (`forbidden` otherwise). `TXID` is credctl's
+  `YYYYMMDDTHHMMSSZ-<6 hex>`. The lease is persisted (0600,
+  `/var/db/login-broker/rotation-leases.json`): a broker restart keeps it
+  until its TTL (default 1200 s, at most 3600 s); the next request that
+  reads an expired lease drops it; an unreadable lease file holds every site
+  until root removes it. From the moment the lease is recorded, every NEW
+  login, scheduled login, sentinel probe and identity challenge of a leased
+  site answers `{"ok": false, "error": "held", "txid": TXID}` — before any
+  vault read, and so does an item whose vault field `agent_hold` carries a
+  txid (credctl writes it before the password changes and removes it once
+  the copy holds the new value; a malformed value holds too, `txid` null). A
+  hold the broker only finds on the fresh secret read withdraws its limiter
+  reservation. `held` is never counted by the limiter, never quarantines,
+  never sends a failure mail: `browser.py login` exits 75 (`BUSY_RC`, `held:
+  rotation TXID in progress`), `agent-login.py` shows `⏸ held (rotation
+  TXID)` and `-c` skips the site like a busy one. A client must wait longer
+  than the drain (120 s) for the `rotation_lease` answer.
+- **Metadata for credctl.** The `sites` and `secrets` views carry `item_id`
+  (the Bitwarden item id) and `revision` (its `revisionDate`), refused items
+  too; `secret-run -l -j` prints them. Both are non-secret.
 
 ### Agents renew Albert's own sessions through his Safari (WS1b)
 
@@ -1237,12 +1297,13 @@ Sites on Albert's session (Safari sites, galaxus-de, Notion, Slack, OpenAI, clau
 
 Where a login broke: every check records its PHASE (precheck, limiter, vault, recipe, submit, profile-proof, broker-proof, bundle-export, cookie-inject, storage-inject, client-proof, consumer-followup, safari-source, unknown) and a code, a redacted detail and the broker's screenshot; the overview shows them. A ✅ is a fresh (≤ 36 h), proven check; older reads ❓. The daily check (-c) never logs in a site that is pending, quarantined, locked, in cooldown, without a sentinel, changed since its promotion or flagged by the onboarding review, and never retries after the password may have been sent. Adding a site: README "Adding a site to the broker".
 
+A credential rotation (mydotfiles credctl) holds its sites: ⏸ held (rotation TXID) — never logged in, never a failure mail, re-checked later. The old -f (password length + hash) is gone (tp#965, it was a password oracle): compare a password with `credctl.py check -T` in mydotfiles.
+
 #### Options
 
 | Flag | Description |
 |------|-------------|
 | `-t`, `--test` `SITE` | real login test for SITE |
-| `-f`, `--fingerprint` `SITE` | length + 4 hex of the SHA-256 of the broker's password for SITE (no login) |
 | `-g`, `--guided` `SITE` | guided login by hand (browser.py assisted-login: confirm on the terminal, remote view of a headless tab; the window as fallback) |
 | `-F`, `--force` | with -g: start even with UNREGISTERED CDP clients attached (browser.py assisted-login -f; they are not paused and keep running); with -D: log out even when another account's item shares the scope in the same browser instance |
 | `-c`, `--check-all` | every usable site: logged in? if not, `browser.py login`; one line per site, exit 1 if any stays logged out |

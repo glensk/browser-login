@@ -11,7 +11,9 @@ LOCAL_PEERCRED. One JSON request per connection, newline-terminated, at most
                                   "fresh": true re-reads Bitwarden
   {"op": "login", "site": "X"}    -> {"ok": true, "bundle": {...}}
   {"op": "logout", "site": "X"}   delete the broker's own profile for X
-  {"op": "fingerprint", "site": "X"}  len + 4 hex of the password's SHA-256
+  {"op": "fingerprint", ...}      REMOVED (tp#965: it was a password oracle):
+                                  answers {"ok": false, "error": "removed"};
+                                  compare with mydotfiles credctl.py check -T
   {"op": "forget", "site": "X"}   WS3 removal: X's limiter key + bindings
                                   (an orphan group key too), identity guard,
                                   profile and failure screenshot - only when
@@ -37,6 +39,33 @@ broker, the page's value never leaves the page):
                                   blocks X's challenges 1 h, then 6 h, the
                                   3rd in 7 days until install.sh -r X
 
+Credential rotation (tp#965; mydotfiles ``credctl rotate``, peer uid
+``--allow-uid`` only):
+
+  {"op": "rotation_lease", "txid": "20261013T120000Z-a1b2c3",
+   "sites": ["x", "y"], "ttl_s": 1200}
+                                  record the lease FIRST (persisted 0600 in
+                                  the broker home: a restart keeps it until
+                                  its TTL; default 1200 s, at most 3600 s),
+                                  so every NEW login, scheduled login,
+                                  sentinel probe and identity challenge of a
+                                  leased site answers "held"; then drain:
+                                  wait (bounded, DRAIN_S) until each site's
+                                  in-flight login released its site lock
+                                  -> {"ok": true, "result": "leased", ...};
+                                  drain timeout -> lease dropped, "busy";
+                                  an unknown site, or one leased by another
+                                  txid, is refused (nothing recorded)
+  {"op": "rotation_release", "txid": "..."}
+                                  drop the lease -> {"ok": true, "result":
+                                  "released", "released": true|false}
+
+  A leased site, or one whose item carries ``agent_hold = <txid>`` (written
+  by credctl, removed when the copy holds the new value), answers
+  {"ok": false, "error": "held", "txid": "..."|null}: a skip, never counted
+  by the limiter, never a quarantine or a failure mail. An expired lease is
+  dropped by the next request that reads it.
+
 "Are A and B one account?" is root-only, never a socket op:
 ``sudo install/install.sh -S A B`` (``daemon.py -S A B`` as the broker uid)
 prints same / different / unknown.
@@ -61,7 +90,7 @@ vault read):
 Errors: {"ok": false, "error": "needs_human" | "origin_violation" |
 "rate_limited" | "login_failed" | "export_failed" | "bundle_export" |
 "timeout" | "unknown_site" | "unknown_item" | "still_listed" | "busy" |
-"forget_incomplete" |
+"forget_incomplete" | "held" | "removed" |
 "unknown_field" | "refused" | "vault_error" | "leakcheck_unavailable" |
 "forbidden" | "bad_request" | "internal", "detail": "..."} — never a secret.
 
@@ -73,6 +102,8 @@ Examples:
   sudo daemon.py -r secret:github             # reset a secret item's limiter
   sudo daemon.py -r group:galaxus             # reset an attempt group
   sudo daemon.py -r galaxus -G                # reset a site and its groups
+  daemon.py -M                                # dual / unreadable members, as
+                                              # the broker uid (install.sh -M)
 """
 
 from __future__ import annotations
@@ -83,7 +114,6 @@ import argparse
 import calendar
 import contextlib
 import dataclasses
-import hashlib
 import json
 import os
 import re
@@ -190,13 +220,16 @@ from broker.secret_ops import (  # noqa: E402
     SecretOps,
     build_secret_limiter,
 )
+from broker.statefile import write_json_atomic  # noqa: E402
 from broker.useragent import CHROME_UA_TEMPLATE, engine_user_agent  # noqa: E402
 from broker.vault import (  # noqa: E402
     SITE_ID_RE,
+    TXID_RE,
     USERNAME_ONLY,
     BwBootstrap,
     BwVault,
     FixtureVault,
+    Held,
     Secret,
     SecretItem,
     SecretValues,
@@ -204,6 +237,7 @@ from broker.vault import (  # noqa: E402
     Vault,
     VaultCache,
     VaultError,
+    hold_view,
     selector_ok,
     slugify,
 )
@@ -837,7 +871,6 @@ class PlaywrightRunner:
             diag: dict[str, Any] = diagnose(page, secret)
         except Exception:  # pylint: disable=broad-exception-caught
             diag = {"error": "page could not be inspected"}
-        diag["password_check"] = secret_check(secret)
         if secret.mode == USERNAME_ONLY:
             # The credential is an account number the site may show anywhere
             # (a field, an error text, the account page): no picture at all,
@@ -1489,6 +1522,7 @@ class PlaywrightRunner:
                     NeedsHuman,
                     OriginViolation,
                     _RateLimited,
+                    _HeldStop,
                     _SubmitDisabled,
                     IdentityMismatch,
                 ):
@@ -1622,31 +1656,142 @@ class _LazyBwVault:
         """See ``BwVault.secret``."""
         return self._vault().secret(site)
 
-    def fingerprint_secret(self, site: str) -> Secret:
-        """See ``BwVault.fingerprint_secret``."""
-        return self._vault().fingerprint_secret(site)
-
-
-def secret_check(secret: Secret) -> str:
-    """What the reports show of a login secret: the password's fingerprint
-    (``password_fingerprint``); for a username-only login only the length —
-    a 4-hex hash of a 16-digit account number is a stable verifier of a short
-    secret, not a 20+-char random password's."""
-    if secret.mode == USERNAME_ONLY:
-        return f"len={len(secret.password)} (username-only: no hash)"
-    return password_fingerprint(secret.password)
-
-
-def password_fingerprint(password: str) -> str:
-    """``len=<n> sha256:<first 4 hex>`` — lets Albert check the broker used the SAME
-    password as his vault (``printf %s "$PW" | shasum -a 256 | cut -c1-4``)
-    without revealing it: 16 bits of a hash of a 20+-char random password."""
-    digest = hashlib.sha256(password.encode("utf-8")).hexdigest()[:4]
-    return f"len={len(password)} sha256:{digest}"
+    def membership_problems(self) -> list[tuple[str, str, str, str]]:
+        """See ``BwVault.membership_problems``."""
+        return self._vault().membership_problems()
 
 
 def _err(code: str, detail: str = "") -> dict[str, Any]:
     return {"ok": False, "error": code, "detail": detail}
+
+
+# tp#965 S1: what an old client asking for the removed `fingerprint` op gets.
+FINGERPRINT_REMOVED = (
+    "the fingerprint op was removed (it was a password oracle): compare with "
+    "credctl.py check -T in mydotfiles"
+)
+
+# ---------------------------------------------------------------------------
+# tp#965 S3: credential-rotation leases
+# ---------------------------------------------------------------------------
+
+ROTATION_OPS = frozenset({"rotation_lease", "rotation_release"})
+LEASE_FILE = "rotation-leases.json"
+# Above the Touch ID helper's 15-min deadline; a request may ask for less.
+LEASE_TTL_S = 1200.0
+LEASE_TTL_MAX_S = 3600.0
+# How long a lease waits for the in-flight login of each site (all sites
+# together) before it is dropped again (`busy`).
+DRAIN_S = 120.0
+MAX_LEASE_SITES = 64
+# `RotationLeases.holder` when the lease file cannot be read: every site is
+# held (fail closed) until the file is readable again or removed by root.
+LEASE_UNREADABLE = "unreadable"
+
+
+class LeaseStateError(RuntimeError):
+    """The lease file exists but cannot be read or parsed."""
+
+
+class RotationLeases:
+    """The persisted rotation leases ``{txid: {"sites": [...], "expires":
+    epoch}}`` in ``<home>/rotation-leases.json`` (0600, atomic replace,
+    never followed through a symlink). An expired lease is dropped by the
+    next read. Thread-safe."""
+
+    def __init__(self, path: Path, clock: Callable[[], float]) -> None:
+        self.path = path
+        self.clock = clock
+        self._lock = threading.Lock()
+
+    def _read(self) -> dict[str, dict[str, Any]]:
+        try:
+            fd = os.open(str(self.path), os.O_RDONLY | os.O_NOFOLLOW)
+        except FileNotFoundError:
+            return {}
+        except OSError as exc:
+            raise LeaseStateError("lease file unreadable") from exc
+        try:
+            if not stat.S_ISREG(os.fstat(fd).st_mode):
+                raise LeaseStateError("lease file is not a regular file")
+            with os.fdopen(fd, encoding="utf-8") as fh:
+                fd = -1  # the file object owns it now
+                data = json.load(fh)
+        except (OSError, ValueError) as exc:
+            raise LeaseStateError("lease file unreadable") from exc
+        finally:
+            if fd >= 0:
+                os.close(fd)
+        leases = data.get("leases") if isinstance(data, dict) else None
+        if not isinstance(leases, dict):
+            raise LeaseStateError("lease file malformed")
+        out: dict[str, dict[str, Any]] = {}
+        for txid, rec in leases.items():
+            sites = rec.get("sites") if isinstance(rec, dict) else None
+            expires = rec.get("expires") if isinstance(rec, dict) else None
+            if (
+                not isinstance(txid, str)
+                or not isinstance(sites, list)
+                or not all(isinstance(s, str) for s in sites)
+                or isinstance(expires, bool)
+                or not isinstance(expires, (int, float))
+            ):
+                raise LeaseStateError("lease file malformed")
+            out[txid] = {"sites": list(sites), "expires": float(expires)}
+        return out
+
+    def _write(self, leases: dict[str, dict[str, Any]]) -> None:
+        write_json_atomic(self.path, {"v": 1, "leases": leases})
+
+    def _live(self) -> dict[str, dict[str, Any]]:
+        """The live leases (caller holds the lock); expired ones are dropped
+        from the file (a failed write only delays that)."""
+        leases = self._read()
+        now = self.clock()
+        live = {t: r for t, r in leases.items() if r["expires"] > now}
+        if len(live) != len(leases):
+            with contextlib.suppress(OSError):
+                self._write(live)
+        return live
+
+    def live(self) -> dict[str, dict[str, Any]]:
+        """The live leases (raises LeaseStateError)."""
+        with self._lock:
+            return self._live()
+
+    def holder(self, site: str) -> str | None:
+        """The txid of the live lease covering `site`, ``LEASE_UNREADABLE``
+        when the file cannot be read (fail closed), else None."""
+        try:
+            leases = self.live()
+        except LeaseStateError:
+            return LEASE_UNREADABLE
+        return next((t for t, r in sorted(leases.items()) if site in r["sites"]), None)
+
+    def grant(self, txid: str, sites: list[str], ttl_s: float) -> tuple[str, float]:
+        """Record (or renew) `txid`'s lease. Returns ('', expiry), or (a site
+        another live txid already leases, 0.0) with nothing recorded.
+        Raises LeaseStateError / OSError."""
+        with self._lock:
+            leases = self._live()
+            for other, rec in sorted(leases.items()):
+                clash = next((s for s in sites if s in rec["sites"]), None)
+                if other != txid and clash is not None:
+                    return clash, 0.0
+            expires = self.clock() + ttl_s
+            leases[txid] = {"sites": sorted(sites), "expires": expires}
+            self._write(leases)
+            return "", expires
+
+    def drop(self, txid: str) -> bool:
+        """Remove `txid`'s lease; True when there was a live one. Raises
+        LeaseStateError / OSError."""
+        with self._lock:
+            leases = self._live()
+            had = leases.pop(txid, None) is not None
+            if had:
+                self._write(leases)
+            return had
 
 
 # What a WS5 reset clears per origin of the item (cookies go separately).
@@ -1705,6 +1850,9 @@ class Broker(SecretOps):  # pylint: disable=too-many-instance-attributes  # deps
         self._probe_slot = threading.Lock()  # `sentinel_absent`: one at a time
         # WS5: identity challenges and the account-tag key (broker home)
         self.identity_ops = IdentityOps(home, clock)
+        # tp#965: credential-rotation leases (persisted in the broker home)
+        self.leases = RotationLeases(home / LEASE_FILE, clock)
+        self.drain_s = DRAIN_S
 
     def _items(self, *, fresh: bool = False) -> list[SiteItem]:
         """The vault's site items, cached SITES_TTL_S (raises VaultError);
@@ -1783,7 +1931,15 @@ class Broker(SecretOps):  # pylint: disable=too-many-instance-attributes  # deps
                 resp = {"ok": True, "pong": True}
             elif op == "sites":
                 resp = self._sites(fresh=req.get("fresh") in (True, "1", "true"))
-            elif op in ("login", "logout", "fingerprint", "sentinel_absent", "forget"):
+            elif op == "fingerprint":
+                # tp#965 S1: removed (an offline password verifier); one
+                # release answers this, then the op is unknown.
+                site = None
+                resp = _err("removed", FINGERPRINT_REMOVED)
+            elif op in ROTATION_OPS:
+                site = None
+                resp = self._rotation_op(op, req, uid, extra)
+            elif op in ("login", "logout", "sentinel_absent", "forget"):
                 if not site or not SITE_ID_RE.match(site):
                     resp = _err("bad_request", "missing or invalid site id")
                 elif op == "login":
@@ -1803,8 +1959,6 @@ class Broker(SecretOps):  # pylint: disable=too-many-instance-attributes  # deps
                     )
                 elif op == "sentinel_absent":
                     resp = self._sentinel_absent(site, req.get("sentinel"))
-                elif op == "fingerprint":
-                    resp = self._fingerprint(site)
                 elif op == "forget":
                     resp = self._forget(site)
                     extra.update(
@@ -1842,6 +1996,9 @@ class Broker(SecretOps):  # pylint: disable=too-many-instance-attributes  # deps
         out = []
         for it in items:
             entry = it.public()
+            lease = self.leases.holder(it.site)
+            if lease is not None:  # a live rotation lease holds it too
+                entry.update(hold_view(lease))
             if not it.refused:
                 denied = self.limiter.peek_site(it.site, now, group=it.attempt_group)
                 entry["limit"] = denied.limit() if denied else {"state": "ok"}
@@ -1892,6 +2049,9 @@ class Broker(SecretOps):  # pylint: disable=too-many-instance-attributes  # deps
         of its keys — a challenge never serves a site its login would not."""
         if item is None:
             return _err("unknown_site", f"{site!r} is not in agent-logins")
+        held = self._held(site, item)
+        if held is not None:
+            return held
         if item.refused:
             return _err("refused", item.refused)
         if not item.has_proof:
@@ -1910,14 +2070,112 @@ class Broker(SecretOps):  # pylint: disable=too-many-instance-attributes  # deps
                 return {**_err("rate_limited", denied.reason), "limit": denied.limit()}
         return None
 
-    def _fingerprint(self, site: str) -> dict[str, Any]:
-        """Length + 4 hex of the SHA-256 of the password the vault holds for `site`
-        — to compare with Albert's copy without a login attempt or the value."""
+    # -- tp#965: rotation leases ----------------------------------------------
+    def _held(self, site: str, item: SiteItem | None = None) -> dict[str, Any] | None:
+        """The ``held`` reply when a live rotation lease covers `site`, or
+        `item` carries ``agent_hold``; else None. Never touches the limiter."""
+        txid = self.leases.holder(site) or (item.hold if item is not None else "")
+        if not txid:
+            return None
+        shown = txid if TXID_RE.match(txid) else None
+        return {
+            **_phase_err(
+                "held",
+                f"rotation {shown or txid} in progress — skip, re-check later",
+                "precheck",
+            ),
+            "txid": shown,
+        }
+
+    def _drop_items_cache(self) -> None:
+        """The next login re-reads the vault (an ``agent_hold`` written or
+        removed during the rotation is seen at once)."""
+        with self._items_lock:
+            self._items_cache = None
+
+    def _rotation_op(
+        self, op: str, req: dict[str, Any], uid: int | None, extra: dict[str, Any]
+    ) -> dict[str, Any]:
+        """``rotation_lease`` / ``rotation_release`` (peer uid `allow_uid`
+        only, like the secret ops). The audit gets the txid and site ids."""
+        if self.allow_uid is None or uid != self.allow_uid:
+            return _err("forbidden")
+        txid = req.get("txid")
+        if not isinstance(txid, str) or not TXID_RE.match(txid):
+            return _err("bad_request", "txid: YYYYMMDDTHHMMSSZ-<6 hex>")
+        extra["txid"] = txid
+        if op == "rotation_release":
+            try:
+                released = self.leases.drop(txid)
+            except (LeaseStateError, OSError):
+                return _err("internal", "rotation lease state not usable")
+            self._drop_items_cache()
+            extra["released"] = released
+            return {"ok": True, "result": "released", "released": released}
+        return self._rotation_lease(txid, req, extra)
+
+    # One early return per refusal, then the drain.
+    def _rotation_lease(  # pylint: disable=too-many-return-statements
+        self, txid: str, req: dict[str, Any], extra: dict[str, Any]
+    ) -> dict[str, Any]:
+        """Validate, record the lease (from now on every new login of its
+        sites is ``held``), then drain each site's lock within ``drain_s``:
+        a login already past its secret read finishes first. Drain timeout:
+        the lease is dropped again and the answer is ``busy``."""
+        raw_sites = req.get("sites")
+        if (
+            not isinstance(raw_sites, list)
+            or not raw_sites
+            or len(raw_sites) > MAX_LEASE_SITES
+            or not all(isinstance(s, str) and SITE_ID_RE.match(s) for s in raw_sites)
+        ):
+            return _err("bad_request", f"sites: 1-{MAX_LEASE_SITES} site ids")
+        sites = sorted(set(raw_sites))
+        extra["sites"] = sites
+        ttl = req.get("ttl_s", LEASE_TTL_S)
+        if (
+            isinstance(ttl, bool)
+            or not isinstance(ttl, (int, float))
+            or not 1 <= ttl <= LEASE_TTL_MAX_S
+        ):
+            return _err("bad_request", f"ttl_s: 1-{LEASE_TTL_MAX_S:g} seconds")
         try:
-            secret = self.vault.fingerprint_secret(site)
+            known = {it.site for it in self._items()}
+            if not set(sites) <= known:
+                known = {it.site for it in self._items(fresh=True)}
         except VaultError as exc:
-            return _err(exc.code, str(exc))
-        return {"ok": True, "password_check": secret_check(secret)}
+            return _err("vault_error", str(exc))
+        unknown = [s for s in sites if s not in known]
+        if unknown:
+            return _err("unknown_site", f"not in agent-logins: {', '.join(unknown)}")
+        try:
+            clash, expires = self.leases.grant(txid, sites, float(ttl))
+        except (LeaseStateError, OSError):
+            return _err("internal", "rotation lease state not usable")
+        if clash:
+            return _err("busy", f"{clash} is leased by another rotation")
+        self._drop_items_cache()
+        deadline = time.monotonic() + self.drain_s
+        for site in sites:
+            lock = self._site_lock(site)
+            if not lock.acquire(timeout=max(0.0, deadline - time.monotonic())):
+                with contextlib.suppress(LeaseStateError, OSError):
+                    self.leases.drop(txid)
+                extra["drained"] = False
+                return _err(
+                    "busy",
+                    f"a login of {site} did not finish within {self.drain_s:g}s "
+                    "— lease dropped, nothing held",
+                )
+            lock.release()
+        extra["drained"] = True
+        return {
+            "ok": True,
+            "result": "leased",
+            "txid": txid,
+            "sites": sites,
+            "expires": round(expires, 3),
+        }
 
     def _logout(self, site: str) -> dict[str, Any]:
         with self._site_lock(site):
@@ -2059,6 +2317,9 @@ class Broker(SecretOps):  # pylint: disable=too-many-instance-attributes  # deps
         candidate = req.get("candidate_sentinel")
         refresh_only = req.get("refresh_only") in (True, "1", "true")
         started = time.monotonic()  # the run deadline counts from here
+        held = self._held(site)  # at once; `_do_login` re-checks under the lock
+        if held is not None:
+            return held
         if refresh_only and candidate is not None:
             return _phase_err(
                 "bad_request", "refresh_only never tries a candidate", "precheck"
@@ -2109,6 +2370,9 @@ class Broker(SecretOps):  # pylint: disable=too-many-instance-attributes  # deps
             return _err("vault_error", str(exc))
         if item is None:
             return _err("unknown_site", f"{site!r} is not in agent-logins")
+        held = self._held(site, item)
+        if held is not None:
+            return held
         if item.refused:
             return _err("refused", item.refused)
         probe = getattr(self.runner, "sentinel_absent", None)
@@ -2123,6 +2387,9 @@ class Broker(SecretOps):  # pylint: disable=too-many-instance-attributes  # deps
             if not lock.acquire(blocking=False):
                 return _err("busy", f"a login of {site} is running — retry")
             try:
+                held = self._held(site, item)  # a lease granted meanwhile
+                if held is not None:
+                    return held
                 got = probe(item, sentinel.strip())
             finally:
                 lock.release()
@@ -2162,6 +2429,44 @@ class Broker(SecretOps):  # pylint: disable=too-many-instance-attributes  # deps
             flight.done.set()
         return result
 
+    # One return per refusal, in the order they are checked.
+    def _login_item(  # pylint: disable=too-many-return-statements
+        self, site: str
+    ) -> tuple[SiteItem | None, dict[str, Any]]:
+        """`_do_login`'s item: (item, {}) when a login may go on, else
+        (None, the reply) — vault unreadable, unknown site, held (tp#965),
+        refused, or an unprovable account (WS5)."""
+        try:
+            items = self._items()
+            item = next((it for it in items if it.site == site), None)
+            if item is None:  # added since the cache was filled?
+                items = self._items(fresh=True)
+                item = next((it for it in items if it.site == site), None)
+        except VaultError as exc:
+            return None, _phase_err("vault_error", str(exc), "vault")
+        if item is None:
+            return None, _phase_err(
+                "unknown_site", f"{site!r} is not in agent-logins", "vault"
+            )
+        # Under the site lock: a lease recorded while this request waited
+        # for the lock (or its drain) holds it here — before any secret read.
+        held = self._held(site, item)
+        if held is not None:
+            return None, held
+        if item.refused:
+            return None, _phase_err("refused", item.refused, "vault")
+        if (item.multi_account or item.identity) and item.identity_recipe is None:
+            # WS5: its session could be any of the scope's accounts and no
+            # usable recipe (reviewed, live-confirmed, with an admin bit) can
+            # tell which: no bundle, nothing reserved.
+            return None, _phase_err(
+                "identity_unproven",
+                "the item shares its login scope with another account, or names "
+                "an identity recipe, and has no usable agent_identity recipe",
+                "precheck",
+            )
+        return item, {}
+
     # One return per protocol error code, in the order they are checked.
     def _do_login(  # pylint: disable=too-many-return-statements,too-many-branches
         self,
@@ -2180,30 +2485,9 @@ class Broker(SecretOps):  # pylint: disable=too-many-instance-attributes  # deps
         (``RUN_DEADLINE_S``) counts from there. `diag`: the runner's
         value-free bundle diagnostics (``BUNDLE_DIAG_KEY``) move from the
         bundle into the reply; never left in the bundle."""
-        try:
-            items = self._items()
-            item = next((it for it in items if it.site == site), None)
-            if item is None:  # added since the cache was filled?
-                items = self._items(fresh=True)
-                item = next((it for it in items if it.site == site), None)
-        except VaultError as exc:
-            return _phase_err("vault_error", str(exc), "vault")
+        item, refusal = self._login_item(site)
         if item is None:
-            return _phase_err(
-                "unknown_site", f"{site!r} is not in agent-logins", "vault"
-            )
-        if item.refused:
-            return _phase_err("refused", item.refused, "vault")
-        if (item.multi_account or item.identity) and item.identity_recipe is None:
-            # WS5: its session could be any of the scope's accounts and no
-            # usable recipe (reviewed, live-confirmed, with an admin bit) can
-            # tell which: no bundle, nothing reserved.
-            return _phase_err(
-                "identity_unproven",
-                "the item shares its login scope with another account, or names "
-                "an identity recipe, and has no usable agent_identity recipe",
-                "precheck",
-            )
+            return refusal
         if candidate is not None:
             if item.logged_in_selector:
                 return _phase_err(
@@ -2250,6 +2534,10 @@ class Broker(SecretOps):  # pylint: disable=too-many-instance-attributes  # deps
                 **_phase_err("rate_limited", exc.denied.reason, "limiter"),
                 "limit": exc.denied.limit(),
             }
+        except _HeldStop as exc:
+            # The fresh read found `agent_hold`: the reservation was withdrawn
+            # (never counted), nothing was typed.
+            return self._held(site, dataclasses.replace(item, hold=exc.txid)) or {}
         except RecipeError as exc:
             outcome = _error_outcome(gate.attempt, exc)
             if candidate is not None and outcome == "ok":
@@ -2368,6 +2656,17 @@ class _RefreshUnavailable(RecipeError):
         )
 
 
+class _HeldStop(RecipeError):
+    """The secret's fresh read found the item held (``agent_hold``): a skip,
+    the reservation withdrawn, nothing typed."""
+
+    code = "held"
+
+    def __init__(self, txid: str) -> None:
+        super().__init__(f"held: rotation {txid} in progress", phase="precheck")
+        self.txid = txid
+
+
 class _SubmitDisabled(RecipeError):
     """The item is ``no_submit`` (``agent_no_submit``, ``vault.NO_SUBMIT_SITES`` or
     a fill origin on ``vault.NO_SUBMIT_DOMAINS``): the login never gets the
@@ -2449,7 +2748,23 @@ class _SecretGate:  # pylint: disable=too-many-instance-attributes  # deps + att
             if isinstance(got, Denied):
                 raise _RateLimited(got)
             self.grant = got
-        return self.broker.vault.secret(self.item.site)
+        try:
+            return self.broker.vault.secret(self.item.site)
+        except Held as exc:
+            # tp#965: held is never counted — take the untouched reservation
+            # back (a failed withdraw leaves it to `finish`: not_submitted).
+            self._withdraw()
+            raise _HeldStop(exc.txid) from None
+
+    def _withdraw(self) -> None:
+        """Undo the reservation (nothing was typed); keep it on failure."""
+        if self.grant is None or self.finished:
+            return
+        try:
+            self.broker.limiter.withdraw(self.grant)
+        except Exception:  # pylint: disable=broad-exception-caught
+            return
+        self.grant = None
 
     def finish(self, outcome: str) -> None:
         """Close the reservation with `outcome` (first call wins). A failed
@@ -2569,6 +2884,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
             "  sudo daemon.py -r group:galaxus    # reset an attempt group\n"
             "  sudo daemon.py -r galaxus -G       # reset a site and its groups\n"
             "  daemon.py -S docker docker-hub     # one account? as the broker uid\n"
+            "  daemon.py -M                       # dual / unreadable collection\n"
+            "                                     # members, as the broker uid\n"
         ),
     )
     p.add_argument("-s", "--socket", default=DEFAULT_SOCKET, help="socket path")
@@ -2630,6 +2947,15 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="as the broker uid (install.sh -S): do the two items log into the "
         "same account name? prints same / different / unknown (account tags; "
         "never a name) and exits",
+    )
+    p.add_argument(
+        "-M",
+        "--membership",
+        action="store_true",
+        help="as the broker uid (install.sh -M): list every item of the login "
+        "and secrets collections whose collection membership is dual (in both: "
+        "refused on both sides) or unreadable, as side<TAB>status<TAB>safe "
+        "name<TAB>item id, and exit (0 none, 3 some listed, 1 vault error)",
     )
     return p.parse_args(argv)
 
@@ -2799,6 +3125,51 @@ def _same_account_cli(args: argparse.Namespace, home: Path) -> int:
     return 0
 
 
+def _membership_cli(args: argparse.Namespace, home: Path) -> int:
+    """``-M``: the dual-member and unreadable items of both collections
+    (``vault.membership_rows``: safe name + item id, never a field or a
+    value), as the broker's own uid — it owns the bw state. One audit line
+    with the count only."""
+    if not args.dev and (os.geteuid() == 0 or _home_owner_uid(home) != os.geteuid()):
+        print("❌ -M runs as the broker uid (install/install.sh -M)", file=sys.stderr)
+        return 2
+    try:
+        if args.fixture_vault:
+            rows = FixtureVault(args.fixture_vault, dev=True).membership_problems()
+        else:
+            rows = _LazyBwVault(home).membership_problems()
+    except VaultError as exc:
+        print(f"❌ {exc}", file=sys.stderr)
+        return 1
+    rec = {
+        "ts": round(time.time(), 3),
+        "op": "membership_cli",
+        "site": None,
+        "result": "ok",
+        "listed": len(rows),
+        "uid": os.getuid(),
+    }
+    with contextlib.suppress(OSError):
+        fd = os.open(
+            str(home / "audit.log"), os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600
+        )
+        try:
+            os.write(fd, (json.dumps(rec, sort_keys=True) + "\n").encode())
+        finally:
+            os.close(fd)
+    if not rows:
+        print("✅ no dual-member or unreadable item in either collection")
+        return 0
+    for row in rows:
+        print("\t".join(_tsv_cell(c) for c in row))
+    print(
+        f"❌ {len(rows)} item(s) refused for their collection membership: split a "
+        "dual item into a login item and a secrets item",
+        file=sys.stderr,
+    )
+    return 3
+
+
 def _home_owner_uid(home: Path) -> int | None:
     try:
         return home.stat().st_uid
@@ -2827,6 +3198,8 @@ def main(  # pylint: disable=too-many-return-statements,too-many-branches,too-ma
         return _reset(args, home)
     if args.same_account:
         return _same_account_cli(args, home)
+    if args.membership:
+        return _membership_cli(args, home)
     if args.collections:
         if args.fixture_vault:
             return print_collections(FixtureVault(args.fixture_vault, dev=True))

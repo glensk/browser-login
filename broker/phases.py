@@ -43,6 +43,8 @@ CODE_TEXT = {
     "quarantined": "quarantined after a failed login — needs a release",
     "pending": "new site, not promoted yet",
     "busy": "another login of this site or its group is in progress",
+    # tp#965: a credential rotation leased the site or wrote agent_hold
+    "held": "a credential rotation holds this site — skipped, re-check later",
     "locked": "hard-blocked after failed logins — needs a root reset",
     "cooldown": "cooldown after a failed login",
     "interval": "minimum interval between logins",
@@ -165,6 +167,7 @@ _ERROR_PHASE = {
     "bad_request": "precheck",
     "access_gated": "precheck",
     "login_blocked": "precheck",
+    "held": "precheck",
 }
 
 # Phases after which a password may have been typed and submitted — used only

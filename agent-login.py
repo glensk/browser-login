@@ -59,6 +59,11 @@ never logs in a site that is pending, quarantined, locked, in cooldown,
 without a sentinel, changed since its promotion or flagged by the onboarding
 review, and never retries after the password may have been sent. Adding a
 site: README "Adding a site to the broker".
+
+A credential rotation (mydotfiles credctl) holds its sites: ⏸ held (rotation
+TXID) — never logged in, never a failure mail, re-checked later. The old -f
+(password length + hash) is gone (tp#965, it was a password oracle): compare
+a password with `credctl.py check -T` in mydotfiles.
 """
 
 from __future__ import annotations
@@ -135,7 +140,12 @@ from broker import (  # noqa: E402
 )
 from broker.identity import scope_conflicts  # noqa: E402
 from broker.recipes import DEFAULT_CHECK_URLS, REFRESH_MIN_LEFT_S  # noqa: E402
-from broker.vault import NO_SUBMIT_SITES, SITE_ID_RE, selector_ok  # noqa: E402
+from broker.vault import (  # noqa: E402
+    NO_SUBMIT_SITES,
+    SITE_ID_RE,
+    TXID_RE,
+    selector_ok,
+)
 
 # pylint: enable=wrong-import-position
 
@@ -528,8 +538,28 @@ def _broker_fields(entry: dict) -> dict:
         "session_refresh": entry.get("session_refresh"),
         # WS3: the configuration a promotion holds for
         "config": onboarding.config_digest(entry) if entry else None,
+        # tp#965: a credential rotation holds the item (lease or agent_hold)
+        "held": entry.get("held") is True,
+        "held_txid": _txid_or_none(entry.get("held_txid")),
         **_identity_fields(entry),
     }
+
+
+def _txid_or_none(value: object) -> str | None:
+    """A validated rotation txid, else None (never free text)."""
+    return value if isinstance(value, str) and TXID_RE.match(value) else None
+
+
+def held_how(row: dict | None = None, res: dict | None = None) -> str | None:
+    """``held (rotation TXID) — …`` when a credential rotation holds the row
+    (its ``sites`` entry) or the login answered ``held``, else None."""
+    if (row or {}).get("held"):
+        txid = (row or {}).get("held_txid")
+    elif (res or {}).get("code") == "held":
+        txid = (res or {}).get("txid")
+    else:
+        return None
+    return f"held (rotation {_txid_or_none(txid) or '?'}) — skipped, re-check later"
 
 
 def _slug_or_none(value: object) -> str | None:
@@ -877,7 +907,8 @@ def _account_note(row: dict) -> str:
     return "; ".join(parts)
 
 
-def _summary_line(
+# One return per row state agents.md renders.
+def _summary_line(  # pylint: disable=too-many-return-statements
     row: dict, checks: dict[str, dict], indent: str = ""
 ) -> tuple[str, str] | None:
     """(section, line) of one row in agents.md (None: no valid name)."""
@@ -916,6 +947,13 @@ def _summary_line(
         return "ok", f"{indent}- ✅ {name} (`{browser_site(site)}`): {how}"
     if state == "unproven":
         return "warn", f"{indent}- ⚠ {name} (`{site}`): {unproven_text(row)}"
+    if state == "held":
+        # a skip like busy: never a login, never ❌ (txid validated)
+        return "check", (
+            f"{indent}- ⏸ {name} (`{site}`): held (rotation "
+            f"{_txid_or_none(row.get('held_txid')) or '?'}) — a credential "
+            "rotation is in progress; do not log in, re-check later"
+        )
     if state == "on-demand":
         return "ok", (
             f"{indent}- ⏯ {name} (`{site}`): on demand — `{prefix}browser.py "
@@ -1213,6 +1251,9 @@ def row_state(  # pylint: disable=too-many-return-statements,too-many-branches
         return "setup", problem
     if account_unproven(row):
         return "unproven", unproven_text(row)
+    held = held_how(row)
+    if held:  # tp#965: a credential rotation is in progress — a skip
+        return "held", held
     site = row["site"]
     rec = checks.get(site)
     fresh = als.freshness(rec)
@@ -1317,6 +1358,8 @@ def _row_flags(row: dict) -> str:
     limit = row.get("limit") or {}
     if limit.get("state") in ("locked", "cooldown", "quarantined", "busy"):
         flags.append(f"{limit['state']}: {limit.get('reset') or limit.get('key')}")
+    if row.get("held"):
+        flags.append(f"⏸ held (rotation {row.get('held_txid') or '?'})")
     if row.get("stage") == "pending" and row["status"] in ("ready", "extra"):
         if site not in ON_DEMAND_SITES:
             flags.append(
@@ -1362,6 +1405,7 @@ def print_overview(data: dict) -> None:
         "unknown": 1,
         "unreachable": 1,
         "unchecked": 1,
+        "held": 1,
         "unproven": 2,
     }
     judged.sort(key=lambda x: (order.get(x[1], 3), x[0]["name"].lower()))
@@ -1374,6 +1418,7 @@ def print_overview(data: dict) -> None:
         "unknown": "❓",
         "unreachable": "❓",
         "unchecked": "❓",
+        "held": "⏸ ",
         "unproven": "⚠️",
     }
     print(_c("2", f"     {'login'.ljust(width)}  {col}  status"))
@@ -1605,8 +1650,12 @@ def _run_test(site: str) -> int:
     print(f"▶ browser.py logged-in {site}  (positive check on the check URL)")
     rc, check = probe(site, quiet=False)
     if BUSY_RC in (rc, login_rc):
-        print(f"⏸  {site}: {BUSY_HOW}")
-        record_check(site, None, BUSY_HOW, {"phase": "precheck", "code": "busy"})
+        held = held_how(res=res) if login_rc == BUSY_RC else None
+        how = held or BUSY_HOW
+        print(f"⏸  {site}: {how}")
+        record_check(
+            site, None, how, res if held else {"phase": "precheck", "code": "busy"}
+        )
         return BUSY_RC
     if rc == 0:
         how = INNER_TIMEOUT_OK if login_rc == LOGIN_TIMEOUT_RC else "logged in"
@@ -2019,7 +2068,10 @@ def login_run_failure(run: BrowserRun) -> str | None:
     return None
 
 
-def _after_login(site: str, run: BrowserRun, *, retry_left: bool) -> Outcome | None:
+# One return per verdict of the login run, in the order they are decided.
+def _after_login(  # pylint: disable=too-many-return-statements
+    site: str, run: BrowserRun, *, retry_left: bool
+) -> Outcome | None:
     """`ensure_logged_in`'s verdict after one `browser.py login`; None = retry."""
     res = derived_result(run)
     failed = login_run_failure(run)
@@ -2035,6 +2087,9 @@ def _after_login(site: str, run: BrowserRun, *, retry_left: bool) -> Outcome | N
         # WS5: the login's own verify ran the identity proof — its verdict is
         # final (a re-probe would cost another broker challenge, ≤ 2 a run).
         return _identity_login_outcome(run, res, routes)
+    held = held_how(res=res) if run.rc == BUSY_RC else None
+    if held:  # tp#965: a rotation holds the site — a skip like busy
+        return None, held, res
     rc, check = probe(site)
     if BUSY_RC in (rc, run.rc):
         return None, BUSY_HOW, {"phase": "precheck", "code": "busy"}
@@ -2473,6 +2528,22 @@ def _check_row(  # pylint: disable=too-many-return-statements
         )
         return True
     if row["status"] not in ("ready", "extra", "safari") or _unproven_skipped(row):
+        return True
+    held = held_how(row)
+    if held:
+        # tp#965: like busy — no login, no failure mail, no quarantine
+        print(f"⏸  {site}: {held}")
+        record_check(
+            site,
+            None,
+            held,
+            {
+                "phase": "precheck",
+                "code": "held",
+                "txid": row.get("held_txid"),
+                "instance": inst,
+            },
+        )
         return True
     rule = safari_cookies.SAFARI_SITES.get(site)
     if rule is not None and not rule.auto:
@@ -3636,12 +3707,6 @@ def build_parser() -> argparse.ArgumentParser:
     )
     ap.add_argument("-t", "--test", metavar="SITE", help="real login test for SITE")
     ap.add_argument(
-        "-f",
-        "--fingerprint",
-        metavar="SITE",
-        help="length + 4 hex of the SHA-256 of the broker's password for SITE (no login)",
-    )
-    ap.add_argument(
         "-g",
         "--guided",
         metavar="SITE",
@@ -3834,16 +3899,6 @@ def login_action(args: argparse.Namespace) -> int | None:  # pylint: disable=too
     """-t / -g / -c, or None when none was asked for."""
     if args.test:
         return run_test(args.test)
-    if args.fingerprint:
-        resp = broker_request("fingerprint", site=args.fingerprint)
-        if not resp.get("ok"):
-            print(f"❌ {resp.get('error')}: {resp.get('detail', '')}")
-            return 1
-        print(f"broker's {args.fingerprint} password: {resp['password_check']}")
-        print(
-            'compare: printf %s "<password from Bitwarden>" | shasum -a 256 | cut -c1-4'
-        )
-        return 0
     if args.guided:
         return manual_login(args.guided, force=args.force)
     if args.check_all:
