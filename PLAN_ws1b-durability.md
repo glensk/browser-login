@@ -608,7 +608,13 @@ On SIGTERM safari.py clears the clipboard (feature `sigterm_clear`).
 - [ ] L4 Final acceptance: `./agent-login.py -I`, then one observed refresh pass.
 - [x] L5 (tp#935, done 2026-10-12) Portainer NPM change + the header proof (fails before, passes after).
 - [x] L6 (M0–M4 released 2026-10-12; M6 not needed: himalaya `epfl` reads the Notion mails) mydotfiles M0–M4, M6 (builders in mydotfiles, their own plan).
-- [ ] L7 edu-ID:
+- [x] L7 (2026-10-13) edu-ID: sentinel `a[href="/account/security"]` (the account tabs; the
+      `/oidc/logout` links sit in closed dropdowns, invisible → no proof), check/login URL
+      `https://eduid.ch/account/organisations/`, fill `https://login.eduid.ch`, cookie hosts
+      `eduid.ch,login.eduid.ch`; `-p eduid` ✅, then `-t switch` ✅ (SSO click on the edu-ID
+      session; switch is a built-in site, no promotion). Lesson: `broker-add.py -L` alone
+      RE-DERIVES every login field from the item's URIs (documented) — always dry-run (`-n`)
+      and pass `-s -o -c -u -k` explicitly. Original steps:
       1. `browser.py logged-in eduid -x '<CSS>'` (two-sided);
       2. `agent-login.py -V -i <manifest>`;
       3. `broker-add.py -L` (Touch ID);
