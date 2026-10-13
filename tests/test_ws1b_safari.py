@@ -810,3 +810,140 @@ def test_feature_env_is_ignored_outside_pytest(monkeypatch: pytest.MonkeyPatch) 
 
 def test_term_grace_covers_safari_py_signal_path() -> None:
     assert s.TERM_GRACE_S == 8.0
+
+
+# ---------------------------------------------------------------------------
+# the detector in a real (throwaway, headless) Chromium — L2 page shapes
+# ---------------------------------------------------------------------------
+
+
+def _chromium_installed() -> bool:
+    try:
+        from chromium_page import (  # pylint: disable=import-outside-toplevel
+            chromium_available,
+        )
+    except ImportError:
+        return False
+    return chromium_available()
+
+
+CHROME = pytest.mark.skipif(
+    not _chromium_installed(), reason="Playwright Chromium missing"
+)
+
+# Auth0 Universal Login's identifier page as tutti serves it (L2, 2026-10-13):
+# a hidden password-manager helper in the e-mail form, an aria-hidden decoy
+# submit with the real label, and the Auth0 captcha widget.
+_AUTH0_CAPTCHA = (
+    '<div class="ulp-captcha-container" data-captcha-provider="auth0_v2">'
+    '<div id="ulp-auth0-v2-captcha" class="ulp-captcha" style="height:63px">'
+    "</div></div>"
+)
+_AUTH0_IDENTIFIER = """<form method="post">
+  <input type="email" name="username" id="username" autocomplete="email">
+  <div style="display:none"><input type="password" autocomplete="off"></div>
+  %s
+  <button type="submit" name="action" value="default" aria-hidden="true"
+    style="position:absolute;left:-9999px">Einloggen</button>
+  <button type="submit" name="action" value="default">Einloggen</button>
+</form>
+<div id="error-element-third-party-captcha" style="display:none">
+  Die Sicherheitsabfrage konnte nicht geladen werden</div>"""
+# id.galaxus.eu (L2): one form, both fields visible.
+_GALAXUS_ONE_PAGE = """<form>
+  <input type="text" name="emailOrUsername" autocomplete="username webauthn">
+  <input type="password" name="password" autocomplete="current-password">
+  <button type="submit">Weiter</button>
+</form>"""
+
+
+def _detect(html: str, recipe: s.Recipe) -> dict[str, Any]:
+    from playwright.sync_api import (  # pylint: disable=import-outside-toplevel
+        sync_playwright,
+    )
+
+    with sync_playwright() as pw:
+        browser = pw.chromium.launch(headless=True)
+        try:
+            page = browser.new_page()
+            page.set_content(html)
+            raw = page.evaluate("() => " + s.detector_js(recipe, "#account"))
+        finally:
+            browser.close()
+    parsed = s.parse_page(raw, len(recipe.steps))
+    assert parsed is not None
+    return parsed
+
+
+def _kinds_offered(recipe: s.Recipe, page: dict[str, Any]) -> list[str]:
+    return [
+        f"{step.kind}{'-no-user' if step.no_user else ''}"
+        for step, (when, unless) in zip(recipe.steps, page["steps"], strict=True)
+        if when and not unless
+    ]
+
+
+@pytest.mark.launches_chrome
+@CHROME
+def test_auth0_identifier_page_with_captcha_is_alberts_stop() -> None:
+    page = _detect(_AUTH0_IDENTIFIER % _AUTH0_CAPTCHA, s.RECIPES["tutti"])
+    assert page["captcha"] is True
+    assert page["password"] is False  # the helper input is not rendered
+
+
+@pytest.mark.launches_chrome
+@CHROME
+def test_a_hidden_password_helper_does_not_make_a_page_one_page() -> None:
+    page = _detect(_AUTH0_IDENTIFIER % "", s.RECIPES["tutti"])
+    assert page["captcha"] is False and page["user"] is True
+    # the one-page step is NOT offered; the identifier step is
+    assert _kinds_offered(s.RECIPES["tutti"], page) == ["user"]
+
+
+@pytest.mark.launches_chrome
+@CHROME
+def test_a_hidden_auth0_captcha_template_is_no_stop() -> None:
+    hidden = _AUTH0_CAPTCHA.replace(
+        'data-captcha-provider="auth0_v2"',
+        'data-captcha-provider="auth0_v2" style="display:none"',
+    )
+    page = _detect(_AUTH0_IDENTIFIER % hidden, s.RECIPES["tutti"])
+    assert page["captcha"] is False
+
+
+@pytest.mark.launches_chrome
+@CHROME
+def test_a_visible_one_page_form_offers_the_one_page_step() -> None:
+    recipe = s.RECIPES["galaxus-de"]
+    page = _detect(_GALAXUS_ONE_PAGE, recipe)
+    assert page["user"] is True and page["password"] is True
+    assert _kinds_offered(recipe, page) == ["login", "login-no-user"]
+    # the runner takes the first offered step: the one-page login, "Weiter"
+    assert recipe.steps[0].when == s.ONE_PAGE_FORM
+    assert recipe.steps[0].submit == "Weiter" and not recipe.steps[0].no_user
+
+
+def test_the_detector_evaluates_the_one_page_form_by_visible_fields() -> None:
+    js = s.detector_js(s.RECIPES["tutti"], "#account")
+    params = json.loads(js.split("const P = ", 1)[1].split(";\n", 1)[0])
+    assert params["one_page"] == s.ONE_PAGE_FORM
+    assert params["password"] == 'input[type="password"]'
+    assert "s.when === P.one_page ? onePage()" in js
+    assert "[data-captcha-provider],#ulp-auth0-v2-captcha" in js
+
+
+def test_tutti_recipe_labels_from_l2() -> None:
+    user = [st for st in s.RECIPES["tutti"].steps if st.kind == "user"]
+    assert len(user) == 1 and user[0].submit == "Einloggen"
+
+
+def test_auth0_captcha_stops_before_any_credential_step() -> None:
+    recipe = s.RECIPES["tutti"]
+    page = _page(
+        captcha=True, user=True, steps=[[False, False], [True, False], [False, False]]
+    )
+    fake = FakeSafari(recipe, [("https://auth.tutti.ch/u/login/identifier", page)])
+    out = _machine(fake).run()
+    assert out.code == "needs_albert_captcha" and out.rc == s.NEEDS_ALBERT_RC
+    assert not out.credential
+    assert not [c for c in fake.calls if c[0] in ("--login", "--otp", "--click")]

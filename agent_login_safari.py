@@ -131,15 +131,21 @@ _OTP_FIELD = (
     'input[autocomplete="one-time-code"],input[name="code"],input[name="otp"],'
     'input[inputmode="numeric"]'
 )
+# `~=`: autocomplete is a token list (Galaxus: "username webauthn").
 _USER_FIELD = (
-    'input[type="email"],input[autocomplete="username"],input[name="username"],'
+    'input[type="email"],input[autocomplete~="username"],input[name="username"],'
     'input[name="email"]'
 )
 _PASSWORD = 'input[type="password"]'
 # A form that shows BOTH fields (a one-page login; Safari supports `:has`).
+# The detector does NOT evaluate this as a plain selector: a step whose `when`
+# is ONE_PAGE_FORM runs only when one visible form holds a VISIBLE password
+# field AND a VISIBLE user field. Auth0's identifier page carries a hidden
+# password-manager helper (`input[type=password]`, no name, not rendered) in
+# the same form as the e-mail field — that page is not one-page (tutti, L2).
 ONE_PAGE_FORM = (
     'form:has(input[type="password"]):has(input[type="email"],'
-    'input[autocomplete="username"],input[name="username"],input[name="email"])'
+    'input[autocomplete~="username"],input[name="username"],input[name="email"])'
 )
 # The Google account chooser lists accounts as [data-identifier] rows; the
 # password page shows the chosen account as a chip with the same attribute —
@@ -204,11 +210,12 @@ def _two_step(idp: str, *, user_submit: str, pass_submit: str) -> tuple[Step, ..
 
 
 def _one_or_two_step(
-    idp: str, *, user_submit: str, pass_submit: str
+    idp: str, *, user_submit: str, pass_submit: str, one_page_submit: str = ""
 ) -> tuple[Step, ...]:
-    """A page with both fields (one-page), else the two-step pages."""
+    """A page with both fields (one-page, its button `one_page_submit`,
+    default `pass_submit`), else the two-step pages."""
     return (
-        Step("login", idp, submit=pass_submit, when=ONE_PAGE_FORM),
+        Step("login", idp, submit=one_page_submit or pass_submit, when=ONE_PAGE_FORM),
         *_two_step(idp, user_submit=user_submit, pass_submit=pass_submit),
     )
 
@@ -237,22 +244,40 @@ def _google(host: str, trigger: str, *, optional: bool = False) -> tuple[Step, .
     )
 
 
-# Every label below is UNVERIFIED until the main session's live step L2 has
-# read the page in Albert's Safari; a wrong one only stops the run
-# (`recipe_stuck`) — safari.py clicks exactly one visible match or nothing.
+# Labels are UNVERIFIED unless a comment says L2 read them in Albert's
+# Safari; a wrong one only stops the run (`recipe_stuck`) — safari.py clicks
+# exactly one visible match or nothing.
 RECIPES: dict[str, Recipe] = {
+    # L2 (2026-10-13): id.galaxus.eu shows ONE form with a visible
+    # emailOrUsername field (autocomplete "username webauthn"), a visible
+    # password field and the submit "Weiter". The two-step fallback's labels
+    # are unverified.
     "galaxus-de": Recipe(
         "galaxus-de",
         ("www.galaxus.de", "id.galaxus.eu"),
         "www.galaxus.de",
-        _two_step("id.galaxus.eu", user_submit="Weiter", pass_submit="Anmelden"),
+        _one_or_two_step(
+            "id.galaxus.eu",
+            user_submit="Weiter",
+            pass_submit="Anmelden",
+            one_page_submit="Weiter",
+        ),
     ),
+    # Same Digitec Galaxus ID software as id.galaxus.eu; UNVERIFIED (L2:
+    # Albert is logged in, the IdP redirected to the shop).
     "galaxus": Recipe(
         "galaxus",
         ("www.galaxus.ch", "id.digitecgalaxus.ch"),
         "www.galaxus.ch",
-        _two_step("id.digitecgalaxus.ch", user_submit="Weiter", pass_submit="Anmelden"),
+        _one_or_two_step(
+            "id.digitecgalaxus.ch",
+            user_submit="Weiter",
+            pass_submit="Anmelden",
+            one_page_submit="Weiter",
+        ),
     ),
+    # UNVERIFIED (L2: logged in, auth.anibis.ch redirected to the shop). Same
+    # Auth0 Universal Login as tutti: expect a captcha there too.
     "anibis": Recipe(
         "anibis",
         ("www.anibis.ch", "auth.anibis.ch"),
@@ -261,12 +286,19 @@ RECIPES: dict[str, Recipe] = {
             "auth.anibis.ch", user_submit="Continuer", pass_submit="Se connecter"
         ),
     ),
+    # L2 (2026-10-13): Auth0 identifier page, submit "Einloggen" (plus an
+    # aria-hidden decoy with the same label) and an Auth0 captcha that blocks
+    # the submit — the detector stops on it (needs_albert_captcha). The
+    # password page was never reached: "Anmelden" is UNVERIFIED.
     "tutti": Recipe(
         "tutti",
         ("www.tutti.ch", "auth.tutti.ch"),
         "www.tutti.ch",
-        _one_or_two_step("auth.tutti.ch", user_submit="Weiter", pass_submit="Anmelden"),
+        _one_or_two_step(
+            "auth.tutti.ch", user_submit="Einloggen", pass_submit="Anmelden"
+        ),
     ),
+    # UNVERIFIED (L2: logged in, the IdP redirected to the shop).
     "kleinanzeigen": Recipe(
         "kleinanzeigen",
         ("www.kleinanzeigen.de", "login.kleinanzeigen.de"),
@@ -277,6 +309,7 @@ RECIPES: dict[str, Recipe] = {
     ),
     # Cloudflare blocks the automated browser on Ricardo: agents work in
     # Safari itself, so the recipe only logs Safari in (no import).
+    # Labels UNVERIFIED (L2: logged in, the IdP redirected to the shop).
     "ricardo": Recipe(
         "ricardo",
         ("www.ricardo.ch", "login.ricardo.ch"),
@@ -720,7 +753,12 @@ DETECTOR_JS = r"""// agent-login:detector
     (/recaptcha\/(api2|enterprise)\/anchor/.test(src(f)) && !/size=invisible/.test(src(f))) ||
     /hcaptcha\.com/.test(src(f)) || /challenges\.cloudflare\.com/.test(src(f)) ||
     /arkoselabs|funcaptcha/.test(src(f)));
-  const captcha = frames.some(challengeFrame) || any("#challenge-form,#cf-challenge-running");
+  // Auth0 Universal Login's own captcha widget (tutti: it blocks the submit;
+  // only a rendered, non-trivial widget counts — never a hidden template).
+  const auth0Captcha = [...document.querySelectorAll(
+    "[data-captcha-provider],#ulp-auth0-v2-captcha")].some((e) => vis(e) && big(e));
+  const captcha = frames.some(challengeFrame) || auth0Captcha ||
+    any("#challenge-form,#cf-challenge-running");
   const password = any('input[type="password"]');
   const user = any(P.user);
   const code = any(P.otp);
@@ -733,8 +771,16 @@ DETECTOR_JS = r"""// agent-login:detector
   const push = fieldless && challengePath && /check your phone|approve (the )?sign.?in|tap yes|Pr(ü|ue)fe dein (Smartphone|Telefon|Handy)|Anmeldung best(ä|ae)tigen|v(é|e)rifiez votre t(é|e)l(é|e)phone/i.test(text);
   const hardware_key = fieldless && challengePath && /security key|Sicherheitsschl(ü|ue)ssel|cl(é|e) de s(é|e)curit(é|e)/i.test(text);
   const email_code = code && !sms && /e-?mail|inbox|Posteingang|courriel/i.test(text);
+  // ONE visible form holding a VISIBLE password AND a VISIBLE user field (a
+  // hidden password-manager helper input never makes a page one-page).
+  const visIn = (root, sel) => {
+    try { return [...root.querySelectorAll(sel)].some(vis); }
+    catch (err) { return false; }
+  };
+  const onePage = () => [...document.querySelectorAll("form")].some(
+    (f) => vis(f) && visIn(f, P.password) && visIn(f, P.user));
   const steps = (P.steps || []).map((s) => ({
-    when: s.when ? any(s.when) : true,
+    when: s.when ? (s.when === P.one_page ? onePage() : any(s.when)) : true,
     unless: s.unless ? any(s.unless) : false,
   }));
   return JSON.stringify({ captcha, sms, push, hardware_key, email_code,
@@ -762,6 +808,8 @@ def detector_js(recipe: Recipe, sentinel: str) -> str:
     params = {
         "sentinel": sentinel,
         "user": _USER_FIELD,
+        "password": _PASSWORD,
+        "one_page": ONE_PAGE_FORM,
         "otp": _OTP_FIELD,
         "steps": [{"when": s.when, "unless": s.unless} for s in recipe.steps],
     }

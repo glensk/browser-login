@@ -616,3 +616,7 @@ cd /Users/albert/obsidian/42-Git/home/browser-login && uv run pre-commit run --a
 cd /Users/albert/obsidian/42-Git/home/browser-login && install/install.sh -n
 cd /Users/albert/obsidian/42-Git/home/browser-login && bin/browser.py -h
 ```
+
+## Review 2026-10-13
+
+- [x] (resolved: not a defect — DSM logs a session out after 15 min idle (`dsmtimeout=15`); A3/A4 rewritten to the agent contract `logged-in` → `login` on a plain logged-out, all nine accounts pass; tp#909 closed by Albert's override) Acceptance A3 failed 2026-10-13: gitlab-sdsc-glensk, runai-test3, authentik-glensk exit 0; dsm-readonly exit 2 'Not logged into dsm-readonly (checked https://synology.dom42.space)' on two runs (site reachable, 200 via WG; overview showed it green at 12:28 today, so the session lapsed since)
