@@ -332,7 +332,7 @@ manual acceptance steps under the attempt policy below.
             into authentik's off-screen password-manager helper form (empty uid submitted); new recipe
             drives the flow-executor API (isolated world, one secret POST, no redirect follow, TOTP).
             Reviewed. Both vault items: authentik usernames, TOTP seeds present.
-      - [ ] Off-LAN gate (2026-10-13, builder running): abs-root / navidrome-root (admin browser) show ❌
+      - [x] Off-LAN gate (2026-10-13, fixed 3c… broker 6bcaded): classify by the redirect chain (origins.access_gated_via, recipes.NavTrail); abs-root/navidrome-root now ⏸. Also: launchd PATH lacked /usr/sbin (lsof) → role browsers never stopped by the scheduled run; fixed in agent_login_jobs.py, plists reinstalled: abs-root / navidrome-root (admin browser) show ❌
             "login page left the fill origins" instead of ⏸ access_gated — Cloudflare Access with one IdP
             (GitHub) redirects straight on to github.com, so the final page has no cloudflareaccess.com /
             /cdn-cgi/access/ marker. Fix: classify by the redirect chain on every path; then re-check both.
