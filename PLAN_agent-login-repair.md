@@ -332,6 +332,12 @@ manual acceptance steps under the attempt policy below.
             into authentik's off-screen password-manager helper form (empty uid submitted); new recipe
             drives the flow-executor API (isolated world, one secret POST, no redirect follow, TOTP).
             Reviewed. Both vault items: authentik usernames, TOTP seeds present.
+      - [ ] Off-LAN gate (2026-10-13, builder running): abs-root / navidrome-root (admin browser) show ❌
+            "login page left the fill origins" instead of ⏸ access_gated — Cloudflare Access with one IdP
+            (GitHub) redirects straight on to github.com, so the final page has no cloudflareaccess.com /
+            /cdn-cgi/access/ marker. Fix: classify by the redirect chain on every path; then re-check both.
+      - [x] eduid + SWITCH Cloud 2026-10-13 (WS1b L7); gitlab-ethz, npm-nixos, npm-raspi promoted; DSM both
+            accounts live (recipe 87e3722 + ad51414).
       - [x] authentik live 2026-10-13: Safari login as glensk (helper form for the uid, light-DOM proxy
             input for password + TOTP), `users/me` 200 JSON, no `original` key, glensk is a SUPERUSER →
             both items `privilege admin` (told apart by username), recipe live (e2b0856, admin_false stays
