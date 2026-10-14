@@ -215,12 +215,12 @@ def record_check(  # pylint: disable=too-many-arguments
     """
     if state not in STATES:
         raise ValueError(f"state must be one of {sorted(STATES)}")
-    now = time.time() if now is None else now
+    ts: float = time.time() if now is None else now
     rec: dict[str, Any] = {
         "v": CHECKS_V,
         "state": state,
-        "at": now,
-        "at_text": _when(now),
+        "at": ts,
+        "at_text": _when(ts),
         "phase": phase if phase in PHASES else ("ok" if state == "ok" else "unknown"),
         "code": code or ("ok" if state == "ok" else ""),
         "how": redact(how, 300),
@@ -257,8 +257,8 @@ def record_check(  # pylint: disable=too-many-arguments
     def put(data: dict[str, Any]) -> None:
         old = data.get(site) if isinstance(data.get(site), dict) else {}
         last = old.get("last_success") if isinstance(old, dict) else None
-        rec["last_success"] = now if state == "ok" else last
-        rec.update(_streak(old if isinstance(old, dict) else {}, state, run_id, now))
+        rec["last_success"] = ts if state == "ok" else last
+        rec.update(_streak(old if isinstance(old, dict) else {}, state, run_id, ts))
         data[site] = rec
 
     update(CHECKS_FILE, put)
@@ -332,9 +332,9 @@ def freshness(rec: dict[str, Any] | None, now: float | None = None) -> str:
     state = str(rec.get("state"))
     if state != "ok":
         return state if state in STATES else "unknown"
-    now = time.time() if now is None else now
+    ts: float = time.time() if now is None else now
     try:
-        age = now - float(rec.get("at", 0))
+        age = ts - float(rec.get("at", 0))
     except (TypeError, ValueError):
         return "unknown"
     return "ok" if 0 <= age <= max_status_age_s() else "stale"
@@ -360,11 +360,11 @@ def _site(data: dict[str, Any], site: str, now: float) -> dict[str, Any]:
 
 def ensure_known(sites: list[str], now: float | None = None) -> None:
     """Every broker site not seen before starts ``pending``."""
-    now = time.time() if now is None else now
+    ts: float = time.time() if now is None else now
 
     def add(data: dict[str, Any]) -> None:
         for site in sites:
-            _site(data, site, now)
+            _site(data, site, ts)
 
     update(SITE_STATE_FILE, add, strict=True)
 
@@ -402,31 +402,31 @@ def _audit_entry(action: str, why: str, now: float) -> dict[str, Any]:
 
 def quarantine(site: str, phase: str, code: str, now: float | None = None) -> None:
     """Quarantine `site` after a login that may have burnt a password attempt."""
-    now = time.time() if now is None else now
+    ts: float = time.time() if now is None else now
 
     def put(data: dict[str, Any]) -> None:
-        entry = _site(data, site, now)
+        entry = _site(data, site, ts)
         entry["quarantine"] = {
             "phase": phase if phase in PHASES else "unknown",
             "code": re.sub(r"[^a-z_]", "", code)[:32],
-            "at": now,
-            "at_text": _when(now),
+            "at": ts,
+            "at_text": _when(ts),
         }
-        entry.setdefault("audit", []).append(_audit_entry("quarantine", phase, now))
+        entry.setdefault("audit", []).append(_audit_entry("quarantine", phase, ts))
 
     update(SITE_STATE_FILE, put, strict=True)
 
 
 def release(site: str, why: str = "", now: float | None = None) -> bool:
     """Lift `site`'s quarantine (audited); False when it had none."""
-    now = time.time() if now is None else now
+    ts: float = time.time() if now is None else now
     had: list[bool] = []
 
     def put(data: dict[str, Any]) -> None:
-        entry = _site(data, site, now)
+        entry = _site(data, site, ts)
         had.append(bool(entry.get("quarantine")))
         entry["quarantine"] = None
-        entry.setdefault("audit", []).append(_audit_entry("release", why, now))
+        entry.setdefault("audit", []).append(_audit_entry("release", why, ts))
 
     update(SITE_STATE_FILE, put, strict=True)
     return bool(had and had[0])
@@ -438,28 +438,28 @@ def promote(
     """Mark `site` usable for scheduled logins (audited; checks are the
     caller's) — for the configuration whose digest is `config` (WS3: a
     changed item is not usable until it is promoted again)."""
-    now = time.time() if now is None else now
+    ts: float = time.time() if now is None else now
 
     def put(data: dict[str, Any]) -> None:
-        entry = _site(data, site, now)
+        entry = _site(data, site, ts)
         entry["stage"] = "usable"
         good = bool(CONFIG_RE.match(config or ""))
         entry["config"] = config if good else None
         entry["config_v"] = CONFIG_V if good else None
         entry.pop("trial", None)  # a promoted site starts a fresh budget later
-        entry.setdefault("audit", []).append(_audit_entry("promote", why, now))
+        entry.setdefault("audit", []).append(_audit_entry("promote", why, ts))
 
     update(SITE_STATE_FILE, put, strict=True)
 
 
 def demote(site: str, why: str = "", now: float | None = None) -> None:
     """Back to ``pending`` (audited): `agent-login.py -D` phase 1."""
-    now = time.time() if now is None else now
+    ts: float = time.time() if now is None else now
 
     def put(data: dict[str, Any]) -> None:
-        entry = _site(data, site, now)
+        entry = _site(data, site, ts)
         entry["stage"] = "pending"
-        entry.setdefault("audit", []).append(_audit_entry("demote", why, now))
+        entry.setdefault("audit", []).append(_audit_entry("demote", why, ts))
 
     update(SITE_STATE_FILE, put, strict=True)
 
@@ -490,7 +490,7 @@ def adopt_configs(digests: dict[str, str], now: float | None = None) -> list[str
     a fresh strict ✅ (`strict_fresh_ok`), audited. A current-version
     promotion is never re-adopted (a changed item stays ``changed``). Call
     it only with a FRESH live listing. Returns the adopting sites."""
-    now = time.time() if now is None else now
+    ts: float = time.time() if now is None else now
     recs = checks()
     adopted: list[str] = []
 
@@ -501,13 +501,13 @@ def adopt_configs(digests: dict[str, str], now: float | None = None) -> list[str
                 continue
             if _config_v(entry) >= CONFIG_V or not CONFIG_RE.match(digest or ""):
                 continue
-            if not strict_fresh_ok(recs.get(site), now):
+            if not strict_fresh_ok(recs.get(site), ts):
                 continue
             old = _config_v(entry)
             entry["config"] = digest
             entry["config_v"] = CONFIG_V
             entry.setdefault("audit", []).append(
-                _audit_entry("adopt_config", f"config_v {old} -> {CONFIG_V}", now)
+                _audit_entry("adopt_config", f"config_v {old} -> {CONFIG_V}", ts)
             )
             adopted.append(site)
 
@@ -674,12 +674,12 @@ def claim_trial(
     flock): (claimed, code, why). Refused when the site is already usable
     for `config`, quarantined, its budget is spent, or a LIVE claim exists;
     a dead owner's claim is recovered as spent first."""
-    now = time.time() if now is None else now
+    ts: float = time.time() if now is None else now
     verdict: list[tuple[bool, str, str]] = []
 
     def put(data: dict[str, Any]) -> None:
-        entry = _site(data, site, now)
-        _recover_trial(entry, now)
+        entry = _site(data, site, ts)
+        _recover_trial(entry, ts)
         trial = _trial_of(entry)
         q = entry.get("quarantine")
         if usable_for(entry, config):
@@ -704,10 +704,10 @@ def claim_trial(
                 "inflight": {
                     "pid": os.getpid(),
                     "pid_start": proc_start(os.getpid()),
-                    "at": now,
+                    "at": ts,
                 }
             }
-            entry.setdefault("audit", []).append(_audit_entry("trial_claim", "", now))
+            entry.setdefault("audit", []).append(_audit_entry("trial_claim", "", ts))
             verdict.append((True, "", ""))
 
     update(SITE_STATE_FILE, put, strict=True)
@@ -735,20 +735,20 @@ def finish_trial(
     """End `site`'s claim: refunded (budget unspent) when `trial_refund`
     holds, else spent with the phase / code / submitted it stopped at.
     Returns True when the budget was spent."""
-    now = time.time() if now is None else now
+    ts: float = time.time() if now is None else now
     r = result or {}
     refund = trial_refund(r)
 
     def put(data: dict[str, Any]) -> None:
-        entry = _site(data, site, now)
+        entry = _site(data, site, ts)
         if refund:
             entry.pop("trial", None)
         else:
             submitted = r.get("submitted")
             entry["trial"] = {
                 "spent": True,
-                "at": now,
-                "at_text": _when(now),
+                "at": ts,
+                "at_text": _when(ts),
                 "phase": str(r.get("phase") or "unknown")
                 if r.get("phase") in PHASES
                 else "unknown",
@@ -757,7 +757,7 @@ def finish_trial(
                 "outcome": "ok" if r.get("phase") == "ok" else "failed",
             }
         entry.setdefault("audit", []).append(
-            _audit_entry("trial_finish", "refunded" if refund else "spent", now)
+            _audit_entry("trial_finish", "refunded" if refund else "spent", ts)
         )
 
     update(SITE_STATE_FILE, put, strict=True)
@@ -767,18 +767,18 @@ def finish_trial(
 def rearm(site: str, why: str = "", now: float | None = None) -> bool:
     """Give `site` its promotion login back (`-E`, audited); False when its
     budget was unspent. A LIVE claim is never re-armed."""
-    now = time.time() if now is None else now
+    ts: float = time.time() if now is None else now
     had: list[bool] = []
 
     def put(data: dict[str, Any]) -> None:
-        entry = _site(data, site, now)
-        _recover_trial(entry, now)
+        entry = _site(data, site, ts)
+        _recover_trial(entry, ts)
         trial = _trial_of(entry)
         if isinstance(trial.get("inflight"), dict):
             raise StateError("a promotion login is running — re-arm after it ends")
         had.append(bool(trial.get("spent")))
         entry.pop("trial", None)
-        entry.setdefault("audit", []).append(_audit_entry("rearm", why, now))
+        entry.setdefault("audit", []).append(_audit_entry("rearm", why, ts))
 
     update(SITE_STATE_FILE, put, strict=True)
     return bool(had and had[0])
@@ -847,9 +847,9 @@ def audit_event(
     action: str, site: str, why: str = "", now: float | None = None
 ) -> None:
     """One line in ``audit.jsonl`` (append-only history, never state)."""
-    now = time.time() if now is None else now
+    ts: float = time.time() if now is None else now
     rec = {"site": site if SITE_ID_RE.match(site) else "?"}
-    rec.update(_audit_entry(action, why, now))
+    rec.update(_audit_entry(action, why, ts))
     path = state_dir() / AUDIT_FILE
     path.parent.mkdir(parents=True, exist_ok=True)
     fd = os.open(

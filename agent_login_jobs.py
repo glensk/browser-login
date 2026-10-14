@@ -466,6 +466,7 @@ def run_browser(
             return run
     argv = [sys.executable, str(BROWSER_PY), *args]
     t0 = time.monotonic()
+    res: subprocess.CompletedProcess[str] | subprocess.CompletedProcess[bytes]
     try:
         if capture:
             res = subprocess.run(
