@@ -156,7 +156,7 @@ Recommended new parent boxes:
       blocks it), `-B`; the id of an item with a pinned `agent_secret_id` identical before,
       during (both collections) and after a move; a sentinel value never in any `public()`
       view, exception text or `-g`/`-M` output.
-- [ ] B2 `broker/secret_ops.py` + `broker/daemon.py`: the `secrets` answer carries `gate`
+- [x] B2 `broker/secret_ops.py` + `broker/daemon.py`: the `secrets` answer carries `gate`
       (and `gate_since`); `secret`/`totp` refuse with `gate_code` in the error; a gate
       refusal never charges the limiter; bad gate fails closed for the three verbs only;
       `report` mode writes the `gate_would_refuse` events (no value); `daemon.py -g`.
