@@ -270,6 +270,139 @@ def test_stdin_value_then_eof():
     assert res.exit_code == 0 and out == b"***\n"
 
 
+# tp#853: kqueue (macOS) never reports EOF on a regular file, so the relay must
+# read such a stdin directly. Every case is bounded by `timeout=` — a regression
+# is exit 124, never a hung suite.
+
+
+def _run_pipe_from(in_fd, cmd=("wc", "-c")):
+    (r_out, w_out), (r_err, w_err) = _pipes()
+    try:
+        res = sr.run_pipe(
+            list(cmd),
+            dict(os.environ),
+            list(PATTERNS),
+            in_fd=in_fd,
+            out_fd=w_out,
+            err_fd=w_err,
+            timeout=10,
+        )
+    finally:
+        os.close(w_out)
+        os.close(w_err)
+    out = _drain(r_out)
+    os.close(r_out)
+    os.close(r_err)
+    return res, out
+
+
+@pytest.mark.parametrize("size", [0, 5, sr.MAX_PENDING_INPUT * 3 + 7])
+def test_regular_file_stdin_reaches_eof(tmp_path, size):
+    path = tmp_path / "in.bin"
+    path.write_bytes(b"x" * size)
+    with open(path, "rb") as fh:
+        start = time.monotonic()
+        res, out = _run_pipe_from(fh.fileno())
+    assert res.exit_code == 0, "child stdin never closed (124 = timed out)"
+    assert int(out.split()[0]) == size
+    assert time.monotonic() - start < 8
+
+
+def test_regular_file_stdin_from_its_current_offset(tmp_path):
+    path = tmp_path / "in.txt"
+    path.write_bytes(b"0123456789")
+    with open(path, "rb") as fh:
+        fh.seek(4)
+        res, out = _run_pipe_from(fh.fileno())
+    assert res.exit_code == 0 and int(out.split()[0]) == 6
+
+
+def test_pipe_stdin_still_relayed():
+    r, w = os.pipe()
+    os.write(w, b"hello\n")
+    os.close(w)
+    try:
+        res, out = _run_pipe_from(r)
+    finally:
+        os.close(r)
+    assert res.exit_code == 0 and int(out.split()[0]) == 6
+
+
+def test_dev_null_stdin_is_eof():
+    with open(os.devnull, "rb") as fh:
+        res, out = _run_pipe_from(fh.fileno())
+    assert res.exit_code == 0 and int(out.split()[0]) == 0
+
+
+def test_child_that_ignores_a_regular_file_stdin(tmp_path):
+    path = tmp_path / "in.bin"
+    path.write_bytes(b"y" * (sr.MAX_PENDING_INPUT * 2))
+    with open(path, "rb") as fh:
+        res, out = _run_pipe_from(fh.fileno(), cmd=("sh", "-c", "echo done"))
+    assert res.exit_code == 0 and out == b"done\n"
+
+
+def test_regular_file_stdin_backpressure_with_a_slow_child(tmp_path):
+    size = sr.MAX_PENDING_INPUT * 3 + 11
+    path = tmp_path / "in.bin"
+    path.write_bytes(b"z" * size)
+    with open(path, "rb") as fh:
+        res, out = _run_pipe_from(fh.fileno(), cmd=("sh", "-c", "sleep 1; wc -c"))
+    assert res.exit_code == 0 and int(out.split()[0]) == size
+
+
+def test_direct_pump_buffer_stays_bounded(tmp_path):
+    path = tmp_path / "in.bin"
+    path.write_bytes(b"q" * (sr.MAX_PENDING_INPUT * 4))
+    r, w = os.pipe()  # nobody reads r: every write soon fails with EAGAIN
+    os.set_blocking(w, False)
+    sel = sr.selectors.DefaultSelector()
+    try:
+        with open(path, "rb") as fh:
+            pump = sr._InputPump(sel, fh.fileno(), None)
+            assert pump.direct and not sel.get_map()
+            for _ in range(200):
+                assert pump.push(w)
+                assert len(pump.pending) <= sr.MAX_PENDING_INPUT + sr.READ_CHUNK
+            assert not pump.eof and pump.wait() > 0
+    finally:
+        sel.close()
+        os.close(r)
+        os.close(w)
+
+
+def test_closed_stdin_fd_is_eof():
+    fd = 4000  # far above anything the run opens, so it cannot be reused
+    with pytest.raises(OSError):
+        os.fstat(fd)
+    res, out = _run_pipe_from(fd)  # fstat and register both fail: plain EOF
+    assert res.exit_code == 0 and int(out.split()[0]) == 0
+
+
+@pytest.mark.parametrize("content", [b"abc\n", b"abc", b"ab\ncd", b""])
+def test_pty_regular_file_stdin_gets_eof(tmp_path, content):
+    path = tmp_path / "in.txt"
+    path.write_bytes(content)
+    r, w = os.pipe()
+    with open(path, "rb") as fh:
+        try:
+            res = sr.run_pty(
+                ["wc", "-c"],
+                dict(os.environ),
+                [],
+                in_fd=fh.fileno(),
+                out_fd=w,
+                timeout=10,
+            )
+        finally:
+            os.close(w)
+    out = _drain(r)
+    os.close(r)
+    assert res.exit_code == 0, "no ^D after the file (124 = timed out)"
+    # the PTY echoes the input and the ^D(s); `wc`'s count is the last token
+    assert out.split()[-1].endswith(str(len(content)).encode())
+
+
 def test_pty_masks_crlf_output_and_multiline_values():
     multi = sf.sentinel() + "\n" + sf.sentinel()
     patterns = list(PATTERNS) + list(sr.variant_set(multi).patterns)
@@ -397,6 +530,25 @@ def test_e2e_field_and_stdin(world):
     proc = _run(["-s", "item", "--", "cat"], world.env())
     assert proc.returncode == 0 and proc.stdout == b"***\n"
     world.assert_clean(proc.stdout, proc.stderr)
+
+
+def test_e2e_regular_file_stdin_is_relayed_and_masked(world, tmp_path):
+    path = tmp_path / "in.txt"
+    path.write_bytes(b"line one\nline two\n")
+    with open(path, "rb") as fh:
+        proc = _run(
+            ["-e", "X=item", "--", "sh", "-c", 'wc -c; echo "$X"'],
+            world.env(),
+            timeout=20,
+            stdin=fh,
+        )
+    assert proc.returncode == 0
+    assert proc.stdout.split() == [b"18", b"***"]
+    with open(path, "rb") as fh:
+        proc2 = _run(["-s", "item", "--", "cat"], world.env(), timeout=20, stdin=fh)
+    assert proc2.returncode == 0 and proc2.stdout == b"***\n"
+    world.assert_clean(proc.stdout, proc.stderr, proc2.stdout, proc2.stderr)
+    world.assert_clean(world.audit())
 
 
 def test_e2e_path_file_is_0600_and_removed_after_a_crash(world):

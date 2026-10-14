@@ -55,6 +55,7 @@ import shlex
 import shutil
 import signal
 import socket
+import stat
 import subprocess
 import sys
 import tempfile
@@ -429,19 +430,49 @@ def _spawn_error(exc: OSError) -> RunResult:
     return RunResult(EXIT_NOEXEC, 0)
 
 
-class _InputPump:
+def _is_regular_file(fd: int | None) -> bool:
+    if fd is None:
+        return False
+    try:
+        return stat.S_ISREG(os.fstat(fd).st_mode)
+    except OSError:
+        return False
+
+
+class _InputPump:  # pylint: disable=too-many-instance-attributes  # relay state
     """Bytes for the child's stdin: preset data, or relayed from `in_fd`."""
 
     def __init__(
-        self, sel: selectors.BaseSelector, in_fd: int | None, data: bytes | None
+        self,
+        sel: selectors.BaseSelector,
+        in_fd: int | None,
+        data: bytes | None,
+        eof_byte: bytes = b"",
     ) -> None:
         self.sel = sel
         self.in_fd = in_fd
         self.pending = bytearray(data or b"")
         self.eof = data is not None or in_fd is None
+        self.eof_byte = eof_byte
+        self.last_byte = b""  # the PTY needs to know whether a line is open at EOF
         self.registered = False
-        if not self.eof:
+        # A regular file is read directly, never polled: kqueue (macOS) reports
+        # a vnode readable only while unread data remains, never at EOF, so the
+        # selector would never deliver the 0-byte read that ends the input.
+        self.direct = not self.eof and _is_regular_file(in_fd)
+        if not self.eof and not self.direct:
             self._register()
+
+    @property
+    def can_pull(self) -> bool:
+        """A direct source with unread bytes and room for them: do not wait."""
+        return self.direct and not self.eof and len(self.pending) < MAX_PENDING_INPUT
+
+    def wait(self) -> float:
+        """The relay loop's select timeout for the current input state."""
+        if self.can_pull:
+            return 0.0
+        return TICK_S / 10 if self.pending else TICK_S
 
     def _register(self) -> None:
         assert self.in_fd is not None
@@ -459,8 +490,8 @@ class _InputPump:
         self.eof = True
         self.pending.clear()
 
-    def on_readable(self, eof_byte: bytes = b"") -> None:
-        """Read what `in_fd` has; at EOF optionally queue `eof_byte` (PTY ^D)."""
+    def on_readable(self) -> None:
+        """Read what `in_fd` has; at EOF queue `eof_byte` (PTY ^D, else nothing)."""
         assert self.in_fd is not None
         try:
             data = os.read(self.in_fd, READ_CHUNK)
@@ -470,11 +501,15 @@ class _InputPump:
             data = b""
         if data:
             self.pending += data
+            self.last_byte = data[-1:]
             if len(self.pending) > MAX_PENDING_INPUT and self.registered:
                 self.sel.unregister(self.in_fd)
                 self.registered = False
             return
-        self.pending += eof_byte
+        # A canonical-mode PTY turns ^D after a partial line into "flush the
+        # line", not EOF: a second ^D at the line start is then the EOF.
+        partial = self.last_byte not in (b"", b"\n")
+        self.pending += self.eof_byte * (2 if partial else 1)
         if self.registered:
             self.sel.unregister(self.in_fd)
             self.registered = False
@@ -482,6 +517,8 @@ class _InputPump:
 
     def push(self, fd: int) -> bool:
         """Write pending bytes to `fd` (non-blocking); False when `fd` is gone."""
+        if self.can_pull:
+            self.on_readable()  # a regular file never blocks: one chunk per tick
         if self.pending:
             try:
                 n = os.write(fd, self.pending)
@@ -493,6 +530,7 @@ class _InputPump:
             del self.pending[:n]
         if (
             not self.registered
+            and not self.direct
             and not self.eof
             and len(self.pending) < MAX_PENDING_INPUT
         ):
@@ -545,7 +583,7 @@ def run_pipe(
     try:
         with _forwarding(group, forward_signals):
             while open_streams and not group.give_up():
-                wait = TICK_S / 10 if pump.pending else TICK_S
+                wait = pump.wait()
                 for key, _ev in sel.select(wait):
                     if key.data == "agent":
                         pump.on_readable()
@@ -644,10 +682,10 @@ def _pty_loop(
     """Relay: agent -> child raw, child -> agent masked, until the PTY closes."""
     open_stream = True
     while open_stream and not group.give_up():
-        wait = TICK_S / 10 if pump.pending else TICK_S
+        wait = pump.wait()
         for key, _ev in sel.select(wait):
             if key.data == "agent":
-                pump.on_readable(eof_byte=b"\x04")
+                pump.on_readable()
                 continue
             try:
                 data = os.read(master, READ_CHUNK)
@@ -721,7 +759,7 @@ def run_pty(
     os.set_blocking(master, False)
     sel.register(master, selectors.EVENT_READ, "child")
     data = stdin_data + b"\x04" if stdin_data is not None else None
-    pump = _InputPump(sel, in_fd, data)
+    pump = _InputPump(sel, in_fd, data, eof_byte=b"\x04")
 
     def on_winch() -> None:
         _copy_winsize((in_fd, out_fd), master)
