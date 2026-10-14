@@ -194,7 +194,8 @@ class _Env:
         )
 
     def ask(self, op: str, uid: int | None = UID, **kw: Any) -> dict[str, Any]:
-        return self.broker.handle({"op": op, **kw}, uid)
+        resp: dict[str, Any] = self.broker.handle({"op": op, **kw}, uid)
+        return resp
 
     def login(self, site: str = "shop", **kw: Any) -> dict[str, Any]:
         return self.ask("login", site=site, **kw)
@@ -908,6 +909,10 @@ def test_secret_run_list_json_prints_ids_and_revisions(tmp_path: Path) -> None:
     rows = [json.loads(line) for line in proc.stdout.decode().splitlines()]
     assert rows == [
         {
+            # tp#991: the gate keys (kind, flag, what mode agent_script says)
+            "agent_script": False,
+            "gate_code": "no_agent_script",
+            "kind": "secret",
             "fields": ["password"],
             "has_totp": False,
             "id": "api",

@@ -44,15 +44,35 @@ def clean_rows(rows: Any) -> list[dict[str, Any]]:
     return out
 
 
+GATES = ("collections", "report", "agent_script", "bad_secret_gate")
+
+
+def _gate_of(resp: dict) -> str:
+    """The broker's agent_script gate from a ``secrets`` answer (tp#991): a
+    broker from before it sends none (= collections); anything else that
+    cannot be read is ``unknown``."""
+    if resp.get("ok"):
+        gate = resp.get("gate", "collections")
+    else:
+        gate = resp.get("gate") or "unknown"
+    return gate if gate in GATES else "unknown"
+
+
 def live_secrets(request: Request) -> tuple[str, list[dict[str, Any]]]:
     """(note, rows) straight from the broker; rows empty when unavailable."""
+    note, rows, _gate = _live(request)
+    return note, rows
+
+
+def _live(request: Request) -> tuple[str, list[dict[str, Any]], str]:
     try:
         resp = request("secrets")
     except (OSError, ValueError) as exc:
-        return f"broker not reachable: {exc}", []
+        return f"broker not reachable: {exc}", [], "unknown"
     if not resp.get("ok"):
-        return f"{resp.get('error')}: {resp.get('detail') or ''}".rstrip(": "), []
-    return "ok", clean_rows(resp.get("secrets"))
+        note = f"{resp.get('error')}: {resp.get('detail') or ''}".rstrip(": ")
+        return note, [], _gate_of(resp)
+    return "ok", clean_rows(resp.get("secrets")), _gate_of(resp)
 
 
 def snapshot_secrets(state_dir: Path) -> list[dict[str, Any]]:
@@ -78,18 +98,41 @@ def secrets_state(
                 return str(data["note"]), clean_rows(data["secrets"])
         except (OSError, ValueError, KeyError, TypeError):
             pass
-    note, rows = live_secrets(request)
+    note, rows, gate = _live(request)
     try:
         state_dir.mkdir(parents=True, exist_ok=True)
         tmp = snap.with_suffix(".tmp")
         tmp.write_text(
-            json.dumps({"at": time.time(), "note": note, "secrets": rows}),
+            json.dumps(
+                {"at": time.time(), "note": note, "secrets": rows, "gate": gate}
+            ),
             encoding="utf-8",
         )
         tmp.replace(snap)
     except OSError:
         pass
     return note, rows
+
+
+def gate_state(request: Request, state_dir: Path, *, fresh: bool = False) -> str:
+    """The broker's agent_script gate: from a recent snapshot, else live
+    (which refreshes the snapshot); ``unknown`` when neither can tell."""
+    if not fresh:
+        try:
+            data = json.loads((state_dir / SNAPSHOT_NAME).read_text(encoding="utf-8"))
+            if 0 <= time.time() - float(data["at"]) < SNAPSHOT_MAX_AGE_S:
+                gate = data.get("gate")
+                if gate in GATES:
+                    return str(gate)
+        except (OSError, ValueError, KeyError, TypeError):
+            pass
+    secrets_state(request, state_dir, fresh=True)
+    try:
+        data = json.loads((state_dir / SNAPSHOT_NAME).read_text(encoding="utf-8"))
+        gate = data.get("gate")
+        return str(gate) if gate in GATES else "unknown"
+    except (OSError, ValueError, TypeError):
+        return "unknown"
 
 
 def summary_lines(rows: list[dict[str, Any]]) -> list[str]:

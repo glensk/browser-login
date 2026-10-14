@@ -169,7 +169,7 @@ Recommended new parent boxes:
       `kind`, `agent_script`, `gate_code`; text `-l` folds unflagged login rows into ONE line
       (`N login item(s) not injectable: agent_script unset`); help + epilog. Tests in
       `tests/test_secret_run.py` against the fake broker.
-- [ ] B4 Onboarding review (`agent-login.py -V -i`, `broker/onboarding.py`): the gate from
+- [x] B4 Onboarding review (`agent-login.py -V -i`, `broker/onboarding.py`): the gate from
       the `secrets` answer is saved with the site-list snapshot and passed explicitly into
       the pure `review_planned(..., gate=)` (O12); gate unknown → blocking finding "broker
       gate unknown"; a planned item's `agent_script` judged with `agent_script_flag`

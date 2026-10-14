@@ -810,6 +810,7 @@ def _membership_refusal(
     item: Mapping[str, Any],
     raw: Mapping[str, Any],
     collections: tuple[str, str | None] | None,
+    gate: str = "collections",
 ) -> str:
     """tp#965: the broker's own membership refusal (``vault.membership_refusal``,
     never a copy of the rule) of a planned item, '' when fine. With the
@@ -827,7 +828,57 @@ def _membership_refusal(
         return ""
     judged = dict(raw)
     judged.setdefault("collectionIds", [collections[0]])
-    return vault.membership_refusal(judged, collections)
+    return vault.membership_refusal(judged, collections, gate)
+
+
+def _gate_findings(raw: Mapping[str, Any], gate: str) -> list[Finding]:
+    """tp#991: a planned item's ``agent_script`` (the broker's own
+    ``vault.agent_script_flag``): malformed is refused; ``true`` on an admin
+    login is a risk (O1: raw disclosure to any child a script picks)."""
+    from broker import vault  # pylint: disable=import-outside-toplevel
+
+    fields = {
+        str(f.get("name")): str(f.get("value") or "")
+        for f in raw.get("fields") or []
+        if isinstance(f, Mapping)
+    }
+    site = safe_id(
+        fields.get("agent_site") or vault.slugify(str(raw.get("name") or ""))
+    )
+    flag = vault.agent_script_flag(fields)
+    if flag is None:
+        return [
+            Finding(
+                site,
+                "refused",
+                "bad_agent_script",
+                "agent_script must be true or false: secret-run refuses the item "
+                "(fail closed)",
+            )
+        ]
+    out: list[Finding] = []
+    if flag and fields.get("agent_privilege", "").strip().lower() == "admin":
+        out.append(
+            Finding(
+                site,
+                "risk",
+                "agent_script_admin",
+                "agent_script on an admin login: secret-run hands its raw "
+                "password to any command an agent picks (O1) — only for a "
+                "script that really reads it",
+            )
+        )
+    if flag and gate != vault.GATE_AGENT_SCRIPT:
+        out.append(
+            Finding(
+                site,
+                "hint",
+                "agent_script_not_enforced",
+                f"the broker gate is {safe_id(gate)}: agent_script takes effect "
+                "once it is agent_script",
+            )
+        )
+    return out
 
 
 def _ok(item: SiteItem) -> bool:
@@ -835,23 +886,42 @@ def _ok(item: SiteItem) -> bool:
 
 
 # One pass per rule of the review, in the order the broker applies them.
-def review_planned(  # pylint: disable=too-many-locals,too-many-branches
+# pylint: disable-next=too-many-locals,too-many-branches,too-many-statements
+def review_planned(
     manifest: Mapping[str, Any],
     views: Sequence[Mapping[str, Any]],
     *,
     dev: bool = False,
+    gate: str = "collections",
 ) -> Review:
     """Review a planned change (additions, ``replaces`` updates, ``removes``)
     against the live collection `views`, with the broker's own item and
     collection rules, BEFORE anything is written. The planned items' own
     findings, plus every established item the change refuses (``displaced``)
-    or turns into an unprovable multi-account item (``made_unproven``)."""
+    or turns into an unprovable multi-account item (``made_unproven``).
+
+    `gate` (tp#991) is the broker's ``secret_gate`` as the caller read it:
+    membership is judged for that mode, a script-only item (no agent_site,
+    no fill origins, ``agent_script=true``) is no site under
+    ``agent_script``, and a gate the caller could not read (``unknown`` or
+    anything else) is ONE blocking finding."""
     from broker import vault  # pylint: disable=import-outside-toplevel
 
     planned_raw, removes = _manifest_items(manifest)
     collections = _manifest_collections(manifest)
-    listed = {str(v.get("site")): v for v in views if isinstance(v.get("site"), str)}
     review = Review()
+    if gate not in vault.SECRET_GATES:
+        review.findings.append(
+            Finding(
+                "<review>",
+                "refused",
+                "gate_unknown",
+                "broker gate unknown: refresh the broker listing "
+                "(agent-login.py -V -r) — membership cannot be judged",
+            )
+        )
+        gate = vault.GATE_COLLECTIONS
+    listed = {str(v.get("site")): v for v in views if isinstance(v.get("site"), str)}
     built: list[SiteItem] = []
     raws: list[Mapping[str, Any]] = []
     replaced: set[str] = set()
@@ -859,8 +929,14 @@ def review_planned(  # pylint: disable=too-many-locals,too-many-branches
     for item in planned_raw:
         raw, notes = _planned_raw(item)
         review.findings += notes
+        review.findings += _gate_findings(raw, gate)
+        if gate == vault.GATE_AGENT_SCRIPT and vault.is_script_only(raw):
+            # a secret-run item, not a login: no site rules apply
+            _membership_refusal(item, raw, collections, gate)
+            review.planned.append(safe_id(vault.slugify(str(raw.get("name") or ""))))
+            continue
         it = vault.site_item_from_json(raw, dev=dev)
-        why = _membership_refusal(item, raw, collections)
+        why = _membership_refusal(item, raw, collections, gate)
         if why:  # dual / unreadable membership: refused, its scope kept
             it = replace(it, refused=why, same_account_as="")
         target = str(item.get("replaces") or "")

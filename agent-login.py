@@ -2658,7 +2658,10 @@ def validate_action(item_file: str | None, *, fresh: bool) -> int:
             manifest = json.loads(raw)
             if not isinstance(manifest, dict):
                 raise ValueError("not a JSON object")
-            review = onboarding.review_planned(manifest, sites)
+            gate = agent_login_secrets.gate_state(
+                broker_request, _state_path(AGENTS_FILE_NAME).parent, fresh=fresh
+            )
+            review = onboarding.review_planned(manifest, sites, gate=gate)
         except (OSError, ValueError) as exc:
             print(f"❌ manifest not usable: {onboarding.safe_reason(exc)}")
             return 2
