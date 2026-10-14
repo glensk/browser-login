@@ -223,12 +223,14 @@ from broker.secret_ops import (  # noqa: E402
 from broker.statefile import write_json_atomic  # noqa: E402
 from broker.useragent import CHROME_UA_TEMPLATE, engine_user_agent  # noqa: E402
 from broker.vault import (  # noqa: E402
+    GATE_OK,
     SITE_ID_RE,
     TXID_RE,
     USERNAME_ONLY,
     BwBootstrap,
     BwVault,
     FixtureVault,
+    GateRow,
     Held,
     Secret,
     SecretItem,
@@ -1648,6 +1650,14 @@ class _LazyBwVault:
         """Bump the cache generation (no bootstrap read needed)."""
         return self.cache.bump()
 
+    def secret_gate(self) -> tuple[str, str]:
+        """See ``BwVault.secret_gate`` (the bootstrap as it is NOW)."""
+        return self._vault().secret_gate()
+
+    def script_gate_report(self) -> list[GateRow]:
+        """See ``BwVault.script_gate_report``."""
+        return self._vault().script_gate_report()
+
     def items(self) -> list[SiteItem]:
         """See ``BwVault.items``."""
         return self._vault().items()
@@ -2957,6 +2967,24 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "refused on both sides) or unreadable, as side<TAB>status<TAB>safe "
         "name<TAB>item id, and exit (0 none, 3 some listed, 1 vault error)",
     )
+    p.add_argument(
+        "-g",
+        "--script-gate",
+        action="store_true",
+        help="as the broker uid (install.sh -g): the agent_script gate report — "
+        "every item secret-run serves TODAY that mode agent_script would refuse, "
+        "and every item with a malformed agent_script, as "
+        "kind<TAB>gate_code<TAB>id<TAB>safe name<TAB>item id; exit 0 none, 3 some "
+        "listed, 1 vault error. With -j: EVERY row mode agent_script would list, "
+        "one JSON object each (what install.sh -D checks)",
+    )
+    p.add_argument(
+        "-j",
+        "--json",
+        action="store_true",
+        help="with -g: one JSON object per row (kind, gate_code, id, name, "
+        "item_id, served_now — never a value)",
+    )
     return p.parse_args(argv)
 
 
@@ -3170,6 +3198,62 @@ def _membership_cli(args: argparse.Namespace, home: Path) -> int:
     return 3
 
 
+def _script_gate_cli(args: argparse.Namespace, home: Path) -> int:
+    """``-g``: the agent_script gate report (``vault.script_gate_rows``: kind,
+    code, id, safe name, item id — never a field or a value), as the broker's
+    own uid. One audit line with the counts only."""
+    if not args.dev and (os.geteuid() == 0 or _home_owner_uid(home) != os.geteuid()):
+        print("❌ -g runs as the broker uid (install/install.sh -g)", file=sys.stderr)
+        return 2
+    try:
+        if args.fixture_vault:
+            rows = FixtureVault(args.fixture_vault, dev=True).script_gate_report()
+        else:
+            rows = _LazyBwVault(home).script_gate_report()
+    except VaultError as exc:
+        print(f"❌ {exc}", file=sys.stderr)
+        return 1
+    problems = [
+        r
+        for r in rows
+        if r.gate_code == "bad_agent_script"
+        or (r.served_now and r.gate_code != GATE_OK)
+    ]
+    rec = {
+        "ts": round(time.time(), 3),
+        "op": "script_gate_cli",
+        "site": None,
+        "result": "ok",
+        "listed": len(problems),
+        "rows": len(rows),
+        "uid": os.getuid(),
+    }
+    with contextlib.suppress(OSError):
+        fd = os.open(
+            str(home / "audit.log"), os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600
+        )
+        try:
+            os.write(fd, (json.dumps(rec, sort_keys=True) + "\n").encode())
+        finally:
+            os.close(fd)
+    if args.json:
+        for row in rows:
+            print(json.dumps(row.public(), sort_keys=True))
+        return 0
+    if not problems:
+        print("✅ every item secret-run serves today carries agent_script=true")
+        return 0
+    for r in problems:
+        cells = (r.kind, r.gate_code, r.secret_id, r.name, r.item_id or "?")
+        print("\t".join(_tsv_cell(c) for c in cells))
+    print(
+        f"❌ {len(problems)} item(s) mode agent_script would refuse: set "
+        "agent_script=true on the ones a script reads (broker-add.py NAME -a)",
+        file=sys.stderr,
+    )
+    return 3
+
+
 def _home_owner_uid(home: Path) -> int | None:
     try:
         return home.stat().st_uid
@@ -3200,6 +3284,11 @@ def main(  # pylint: disable=too-many-return-statements,too-many-branches,too-ma
         return _same_account_cli(args, home)
     if args.membership:
         return _membership_cli(args, home)
+    if args.script_gate:
+        return _script_gate_cli(args, home)
+    if args.json:
+        print("❌ -j/--json only works with -g/--script-gate", file=sys.stderr)
+        return 2
     if args.collections:
         if args.fixture_vault:
             return print_collections(FixtureVault(args.fixture_vault, dev=True))

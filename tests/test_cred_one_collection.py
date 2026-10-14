@@ -103,13 +103,13 @@ def _secret(
 
 def _write(
     path: Path,
-    logins: list,
+    logins: list | None = None,
     secrets_items: list | None = None,
     *,
     gate: str | None = None,
     with_secrets: bool = True,
 ) -> Path:
-    data: dict[str, Any] = {"collection_id": LOGIN, "logins": logins}
+    data: dict[str, Any] = {"collection_id": LOGIN, "logins": logins or []}
     if with_secrets:
         data["secrets_collection_id"] = SECRETS
         data["secrets"] = secrets_items or []
@@ -650,3 +650,212 @@ def test_install_with_group_still_parses() -> None:
     proc = _install("-r", "galaxus", "-G")
     assert proc.returncode == 0, proc.stderr
     assert "-r galaxus -G" in proc.stdout
+
+
+# ---------------------------------------------------------------------------
+# B2: the broker ops (secrets / secret / totp under each gate, report events)
+# ---------------------------------------------------------------------------
+
+UID = 501
+
+
+class _OpsEnv:
+    """A broker on a fixture vault with a fake secretkeeper."""
+
+    def __init__(self, tmp_path: Path, keeper_sock: str, **vault_kw: Any) -> None:
+        import secret_fixtures as sf  # pylint: disable=import-outside-toplevel
+
+        self.home = tmp_path / "home"
+        self.path = _write(tmp_path / "vault.json", **vault_kw)
+        self.broker = sf.make_broker(
+            self.home, self.path, allow_uid=UID, keeper_sock=keeper_sock
+        )
+
+    def ask(self, op: str, **kw: Any) -> dict[str, Any]:
+        resp: dict[str, Any] = self.broker.handle({"op": op, **kw}, UID)
+        return resp
+
+    def secret(self, *items: str) -> dict[str, Any]:
+        return self.ask(
+            "secret",
+            items=[{"item": i, "field": "password"} for i in items],
+            env=["X"],
+            argv0="/bin/true",
+        )
+
+    def audit_lines(self) -> list[dict[str, Any]]:
+        path = self.home / "audit.log"
+        if not path.exists():
+            return []
+        return [json.loads(x) for x in path.read_text().splitlines() if x.strip()]
+
+    def limiter_text(self) -> str:
+        path = self.home / "secret-limiter.json"
+        return path.read_text() if path.exists() else ""
+
+
+@pytest.fixture
+def keeper() -> Any:
+    import secret_fixtures as sf  # pylint: disable=import-outside-toplevel
+
+    with sf.sockdir() as d:
+        k = sf.FakeSecretkeeper(str(d / "keeper.sock"))
+        try:
+            yield k
+        finally:
+            k.close()
+
+
+def test_secrets_answer_carries_the_gate(tmp_path: Path, keeper: Any) -> None:
+    env = _OpsEnv(
+        tmp_path,
+        keeper.path,
+        logins=[_login(flag="true")],
+        secrets_items=[_secret()],
+        gate=vault.GATE_AGENT_SCRIPT,
+    )
+    resp = env.ask("secrets")
+    assert resp["ok"] and resp["gate"] == "agent_script"
+    assert resp["gate_since"] == "2026-10-14T10:00:00Z"
+    rows = {r["id"]: r for r in resp["secrets"]}
+    assert rows["shop"]["kind"] == "login" and rows["shop"]["gate_code"] == "ok"
+    assert rows["api"]["gate_code"] == "no_agent_script" and rows["api"]["refused"]
+    _no_sentinel(json.dumps(resp))
+
+
+def test_collections_answer_reads_collections(tmp_path: Path, keeper: Any) -> None:
+    env = _OpsEnv(tmp_path, keeper.path, logins=[], secrets_items=[_secret()])
+    resp = env.ask("secrets")
+    assert resp["gate"] == "collections"
+    assert resp["secrets"][0]["gate_code"] == "no_agent_script"
+
+
+def test_secret_injects_a_flagged_login_item(tmp_path: Path, keeper: Any) -> None:
+    env = _OpsEnv(
+        tmp_path,
+        keeper.path,
+        logins=[_login(flag="true")],
+        gate=vault.GATE_AGENT_SCRIPT,
+    )
+    resp = env.secret("shop")
+    assert resp["ok"] and resp["values"] == [PASSWORD]
+    _no_sentinel(json.dumps(env.audit_lines()))
+
+
+def test_a_gate_refusal_carries_its_code_and_is_not_charged(
+    tmp_path: Path, keeper: Any
+) -> None:
+    env = _OpsEnv(
+        tmp_path,
+        keeper.path,
+        logins=[_login()],
+        secrets_items=[_secret(flag="maybe")],
+        gate=vault.GATE_AGENT_SCRIPT,
+    )
+    before = env.limiter_text()
+    resp = env.secret("shop")
+    assert resp["error"] == "refused" and resp["gate_code"] == "no_agent_script"
+    assert "script read without agent_script" in resp["detail"]
+    resp = env.secret("api")
+    assert resp["gate_code"] == "bad_agent_script"
+    resp = env.ask("totp", item="shop")
+    assert resp["gate_code"] == "no_agent_script"
+    assert env.limiter_text() == before
+    _no_sentinel(json.dumps(resp))
+
+
+def test_a_bad_gate_fails_closed_for_the_reads_only(
+    tmp_path: Path, keeper: Any
+) -> None:
+    env = _OpsEnv(
+        tmp_path, keeper.path, logins=[], secrets_items=[_secret()], gate="enforce"
+    )
+    for resp in (env.ask("secrets"), env.secret("api"), env.ask("totp", item="api")):
+        assert resp["ok"] is False and resp["error"] == "bad_secret_gate"
+    assert env.ask("secrets")["gate"] == "bad_secret_gate"
+    assert env.ask("audit", n=5)["ok"]
+    assert env.ask("invalidate")["ok"]
+    resp = env.ask("secret_done", nonce="0" * 64, exit=0)
+    assert resp.get("error") != "bad_secret_gate"
+
+
+def test_report_mode_writes_one_event_per_issued_item(
+    tmp_path: Path, keeper: Any
+) -> None:
+    a, b = _secret("Api"), _secret("Ok", flag="true", value=secrets.token_hex(16))
+    env = _OpsEnv(
+        tmp_path, keeper.path, logins=[], secrets_items=[a, b], gate=vault.GATE_REPORT
+    )
+    resp = env.secret("api", "api", "ok")
+    assert resp["ok"]  # report mode serves exactly like collections
+    events = [r for r in env.audit_lines() if r.get("op") == "gate_would_refuse"]
+    assert len(events) == 1
+    assert events[0]["site"] == "api" and events[0]["gate_code"] == "no_agent_script"
+    _no_sentinel(json.dumps(env.audit_lines()))
+
+
+def test_report_mode_failed_issue_writes_no_event(tmp_path: Path) -> None:
+    """No secretkeeper: leakcheck_unavailable, so nothing was issued."""
+    import secret_fixtures as sf  # pylint: disable=import-outside-toplevel
+
+    env = _OpsEnv(
+        tmp_path,
+        "",
+        logins=[],
+        secrets_items=[_secret("Api")],
+        gate=vault.GATE_REPORT,
+    )
+    env.broker = sf.make_broker(env.home, env.path, allow_uid=UID, keeper_sock=None)
+    resp = env.secret("api")
+    assert resp["error"] == "leakcheck_unavailable"
+    assert not [r for r in env.audit_lines() if r.get("op") == "gate_would_refuse"]
+
+
+def test_collections_mode_writes_no_event(tmp_path: Path, keeper: Any) -> None:
+    env = _OpsEnv(tmp_path, keeper.path, logins=[], secrets_items=[_secret("Api")])
+    assert env.secret("api")["ok"]
+    assert not [r for r in env.audit_lines() if r.get("op") == "gate_would_refuse"]
+
+
+def test_daemon_script_gate_cli(tmp_path: Path, capsys: Any) -> None:
+    from broker import daemon  # pylint: disable=import-outside-toplevel
+
+    path = _write(
+        tmp_path / "vault.json",
+        [_login(), _login("Bad", site="bad", flag="maybe")],
+        [_secret("Api"), _secret("Ok", flag="true")],
+    )
+    home = tmp_path / "home"
+    home.mkdir()
+    rc = daemon.main(["-H", str(home), "--dev", "-f", str(path), "-g"])
+    out = capsys.readouterr()
+    assert rc == 3
+    lines = out.out.strip().splitlines()
+    assert {ln.split("\t")[2] for ln in lines} == {"api", "bad"}
+    _no_sentinel(out.out + out.err)
+    rc = daemon.main(["-H", str(home), "--dev", "-f", str(path), "-g", "-j"])
+    rows = [json.loads(x) for x in capsys.readouterr().out.splitlines()]
+    assert rc == 0 and {r["id"] for r in rows} == {"shop", "bad", "api", "ok"}
+    assert {r["kind"] for r in rows} == {"login", "secret"}
+    assert daemon.main(["-H", str(home), "--dev", "-f", str(path), "-j"]) == 2
+
+
+def test_daemon_script_gate_cli_clean(tmp_path: Path, capsys: Any) -> None:
+    from broker import daemon  # pylint: disable=import-outside-toplevel
+
+    path = _write(tmp_path / "vault.json", [_login()], [_secret("Ok", flag="true")])
+    home = tmp_path / "home"
+    home.mkdir()
+    assert daemon.main(["-H", str(home), "--dev", "-f", str(path), "-g"]) == 0
+    assert "✅" in capsys.readouterr().out
+
+
+def test_a_secret_named_ok_is_served_not_mistaken_for_an_error(
+    tmp_path: Path, keeper: Any
+) -> None:
+    """Incidental (tp#991): `"ok" in listing` took an item with id `ok` for an
+    error answer and returned the whole listing."""
+    env = _OpsEnv(tmp_path, keeper.path, logins=[], secrets_items=[_secret("Ok")])
+    resp = env.secret("ok")
+    assert resp["ok"] is True and resp["values"] == [TOKEN]
+    assert env.ask("totp", item="ok")["error"] == "unknown_field"

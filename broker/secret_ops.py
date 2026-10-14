@@ -7,6 +7,15 @@ after the per-item + global limiter granted the request atomically, every value
 was registered with the secretkeeper (else ``leakcheck_unavailable``) and the
 run row was written. Audit lines carry names, never values (see
 ``Broker.audit``).
+
+tp#991: the ``secrets`` answer carries ``gate`` (the vault's ``secret_gate``)
+and ``gate_since``; a refusal of ``secret``/``totp`` carries the item's
+``gate_code``; a gate refusal is decided before the limiter, so it is never
+charged. An unknown gate fails closed for ``secrets``, ``secret`` and ``totp``
+only (``bad_secret_gate``) — ``secret_done``, ``audit`` and ``invalidate``
+keep working. In mode ``report`` every issued item that mode
+``agent_script`` would refuse gets ONE ``gate_would_refuse`` audit event
+(item + code), written only after the value/code was issued.
 """
 
 from __future__ import annotations
@@ -26,14 +35,21 @@ from broker.recipes import fresh_totp, parse_totp
 from broker.runs import RunError, RunStateError, RunTable, nonce_prefix
 from broker.variants import VARIANT_POLICY_VERSION
 from broker.vault import (
+    BAD_SECRET_GATE,
+    GATE_COLLECTIONS,
+    GATE_OK,
+    GATE_REPORT,
     NO_SECRETS_COLLECTION,
     SAFE_NAME_RE,
+    SECRET_GATES,
     SITE_ID_RE,
+    BadSecretGate,
     SecretItem,
     SecretsNotConfigured,
     Vault,
     VaultError,
     is_short,
+    resolve_secret,
     safe_name,
 )
 
@@ -63,6 +79,12 @@ SECRET_OPS = frozenset(
 
 def _err(code: str, detail: str = "") -> dict[str, Any]:
     return {"ok": False, "error": code, "detail": detail}
+
+
+def _is_error(resp: dict[str, Any]) -> bool:
+    """An error response (``ok`` is the bool False), not a listing — a secret
+    whose id is ``ok`` is a listing key, never an error."""
+    return resp.get("ok") is False
 
 
 def build_secret_limiter(home: Path) -> Limiter:
@@ -110,7 +132,7 @@ class SecretOps:  # pylint: disable=too-few-public-methods
         handlers: dict[str, Callable[[], dict[str, Any]]] = {
             "secrets": self._secrets,
             "secret": lambda: self._secret(req, uid, extra),
-            "totp": lambda: self._totp(req, extra),
+            "totp": lambda: self._totp(req, extra, uid),
             "secret_done": lambda: self._secret_done(req, uid, extra),
             "audit": lambda: self._audit_tail(req),
             "invalidate": self._invalidate,
@@ -136,20 +158,83 @@ class SecretOps:  # pylint: disable=too-few-public-methods
                 },
             )
 
-    def _secret_listing(self) -> dict[str, SecretItem] | dict[str, Any]:
-        """{id: SecretItem}, or an error response (key "ok")."""
+    def _secret_gate_now(self) -> tuple[str, str]:
+        """(gate, since) as the vault is configured NOW; an unknown gate is
+        ``bad_secret_gate``, an unreadable configuration ``unknown``."""
+        reader = getattr(self.vault, "secret_gate", None)
+        if reader is None:
+            return GATE_COLLECTIONS, ""
         try:
-            return {it.secret_id: it for it in self.vault.secret_items()}
+            gate, since = reader()
+        except VaultError:
+            return "unknown", ""
+        if gate not in SECRET_GATES:
+            return BAD_SECRET_GATE, ""
+        return gate, since if isinstance(since, str) else ""
+
+    def _secret_items(self) -> list[SecretItem] | dict[str, Any]:
+        """Every listed item, or an error response (key "ok")."""
+        try:
+            return self.vault.secret_items()
+        except BadSecretGate:
+            return {
+                **_err(BAD_SECRET_GATE, "unknown secret_gate"),
+                "gate": BAD_SECRET_GATE,
+            }
         except SecretsNotConfigured:
             return _err("refused", NO_SECRETS_COLLECTION)
         except VaultError as exc:
             return _err("vault_error", str(exc))
 
+    def _secret_listing(self) -> dict[str, SecretItem] | dict[str, Any]:
+        """{id: the item a request reaches (``resolve_secret``)}, or an error
+        response (``_is_error``)."""
+        items = self._secret_items()
+        if isinstance(items, dict):
+            return items
+        out: dict[str, SecretItem] = {}
+        for sid in dict.fromkeys(it.secret_id for it in items):
+            hit = resolve_secret(items, sid)
+            if hit is not None:
+                out[sid] = hit
+        return out
+
     def _secrets(self) -> dict[str, Any]:
-        listing = self._secret_listing()
-        if "ok" in listing:
-            return listing
-        return {"ok": True, "secrets": [it.public() for it in listing.values()]}
+        items = self._secret_items()
+        if isinstance(items, dict):
+            return items
+        gate, since = self._secret_gate_now()
+        return {
+            "ok": True,
+            "gate": gate,
+            "gate_since": since,
+            "secrets": [it.public() for it in items],
+        }
+
+    def _gate_events(self, op: str, items: list[SecretItem], uid: int | None) -> None:
+        """Mode report: one ``gate_would_refuse`` audit event per unique item
+        mode agent_script would refuse (after the issue; never a value)."""
+        if self._secret_gate_now()[0] != GATE_REPORT:
+            return
+        seen: set[str] = set()
+        for it in items:
+            if it.secret_id in seen or it.gate_code == GATE_OK:
+                continue
+            seen.add(it.secret_id)
+            self.audit(
+                "gate_would_refuse",
+                it.secret_id,
+                "would_refuse",
+                uid,
+                {"for_op": op, "gate_code": it.gate_code},
+            )
+
+    @staticmethod
+    def _refused(it: SecretItem) -> dict[str, Any]:
+        return {
+            **_err("refused", f"{it.secret_id}: {it.refused}"),
+            "gate_code": it.code,
+        }
 
     @staticmethod
     # A flat validator: one early return per rule.
@@ -201,7 +286,7 @@ class SecretOps:  # pylint: disable=too-few-public-methods
         names = [f"{i}:{f}" for i, f in pairs]
         extra.update(items=names, env=env, argv0=argv0)
         listing = self._secret_listing()
-        if "ok" in listing:
+        if _is_error(listing):
             return listing
         allow_short: dict[str, bool] = {}
         for item, fld in pairs:
@@ -211,7 +296,7 @@ class SecretOps:  # pylint: disable=too-few-public-methods
                     "unknown_item", f"{item!r} is not in the secrets collection"
                 )
             if it.refused:
-                return _err("refused", f"{item}: {it.refused}")
+                return self._refused(it)
             if fld not in it.listed:
                 return _err("unknown_field", f"{item}: field {fld!r} is not exposed")
             allow_short[item] = it.allow_short
@@ -255,21 +340,25 @@ class SecretOps:  # pylint: disable=too-few-public-methods
         if any(shorts):
             resp["short"] = True
             resp["short_values"] = shorts
+        self._gate_events("secret", [listing[i] for i in ids], uid)
         return resp
 
-    def _totp(self, req: dict[str, Any], extra: dict[str, Any]) -> dict[str, Any]:  # pylint: disable=too-many-return-statements
+    # pylint: disable-next=too-many-return-statements
+    def _totp(
+        self, req: dict[str, Any], extra: dict[str, Any], uid: int | None = None
+    ) -> dict[str, Any]:
         item = req.get("item")
         if not isinstance(item, str) or not SITE_ID_RE.match(item):
             return _err("bad_request", "missing or invalid item id")
         extra["items"] = [f"{item}:totp"]
         listing = self._secret_listing()
-        if "ok" in listing:
+        if _is_error(listing):
             return listing
         it = listing.get(item)
         if not isinstance(it, SecretItem):
             return _err("unknown_item", f"{item!r} is not in the secrets collection")
         if it.refused:
-            return _err("refused", f"{item}: {it.refused}")
+            return self._refused(it)
         if not it.has_totp:
             return _err("unknown_field", f"{item}: no TOTP")
         granted = self.secret_limiter.reserve(
@@ -286,6 +375,7 @@ class SecretOps:  # pylint: disable=too-few-public-methods
         if otp is None or code is None:
             return _err("refused", f"{item}: the TOTP seed is not usable")
         valid_s = int(otp.interval - (time.time() % otp.interval))
+        self._gate_events("totp", [it], uid)
         return {"ok": True, "code": code, "valid_s": valid_s}
 
     def _secret_done(
