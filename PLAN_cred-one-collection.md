@@ -203,11 +203,12 @@ Recommended new parent boxes:
       modes, `gate_code`, the O1 consequence, `-M` vs `-g`, `-V`, the R7g/R7h recipes), the
       broker op table (`secrets` answer `gate`), `secret-run -h`, AGENTS.md one bullet,
       `repo_scope.md` lines that name two collections.
-- [ ] B7 (main session, live, no behavior change) install the reviewed commit:
+- [x] B7 (main session, live, no behavior change) install the reviewed commit:
       `sudo install/install.sh` (broker + clients, gate stays `collections`).
       Verify: `secret-run -V` → `gate: collections`; `secret-run -l` lists the same
       injectable items as before; `./agent-login.py` shows the credential section (⚠️ no
       state file until parent R3b) and no new ❌ site.
+  ↳ evidence 2026-10-14: release b3226fa66469-20261014T135845Z installed by sudo install/install.sh; selfcheck all ✅; secret-run -V gate=collections; secret-run -l lists the same items; agent-login shows the credential section (no state file yet)
 - [ ] B8 (main session, live — parent R7g, then R7m and R7h) the flip and the collection
       drop, per "Gate staging". Not this plan's agent.
 
