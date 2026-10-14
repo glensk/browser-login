@@ -86,6 +86,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))  # the repo's `broker` package
 # pylint: disable=wrong-import-position
+import agent_login_cred  # noqa: E402
 import agent_login_keychain  # noqa: E402
 import agent_login_safari as alsafari  # noqa: E402
 import agent_login_secrets  # noqa: E402
@@ -3988,6 +3989,7 @@ def main() -> int:  # pylint: disable=too-many-return-statements,too-many-branch
         agent_login_keychain.print_list(_state_path("keychain.json"), _c, full=True)
         return 0
     if args.json:
+        data["credentials"] = agent_login_cred.summary(agent_login_cred.load())
         print(json.dumps(data, indent=1))
     else:
         print_overview(data)
@@ -3995,6 +3997,8 @@ def main() -> int:  # pylint: disable=too-many-return-statements,too-many-branch
             print(f"  {line}")
         print()
         agent_login_keychain.print_list(_state_path("keychain.json"), _c)
+        print()
+        agent_login_cred.print_section(_c)  # tp#991: credctl's daily verdicts
     return 0 if data["broker_ok"] else 1
 
 

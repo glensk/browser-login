@@ -177,7 +177,7 @@ Recommended new parent boxes:
       an admin login (raw disclosure, O1)"); the manifest's `collections` may be `{"login":
       ID}` alone; membership judged per the gate. Tests
       `tests/test_onboarding_agent_script.py`.
-- [ ] B5 `agent_login_cred.py` + its section in `./agent-login.py` (overview text after the
+- [x] B5 `agent_login_cred.py` + its section in `./agent-login.py` (overview text after the
       keychain list; key `credentials` in `-j`): reads ONLY
       `~/.local/state/credctl/check-latest.json` (`$CREDCTL_STATE_FILE` overrides); closed
       schema (O13) — `v` must be 1, `attempt` in {started, completed, failed, timeout},
