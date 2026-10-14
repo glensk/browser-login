@@ -192,7 +192,7 @@ Recommended new parent boxes:
       absent, unreadable, not JSON or `v` ≠ 1 → ONE ⚠️ line. Prints only the validated
       fields. Tests `tests/test_agent_login_cred.py` (every branch; a sentinel in every
       displayable field and in unknown keys never printed).
-- [ ] B6 Docs: README "One item, one collection" rewritten (one collection, the gate and its
+- [x] B6 Docs: README "One item, one collection" rewritten (one collection, the gate and its
       modes, `gate_code`, the O1 consequence, `-M` vs `-g`, `-V`, the R7g/R7h recipes), the
       broker op table (`secrets` answer `gate`), `secret-run -h`, AGENTS.md one bullet,
       `repo_scope.md` lines that name two collections.

@@ -319,7 +319,18 @@ framework. It is a **provider**: other repos depend on it, not the reverse. See
   item in BOTH the login and the secrets collection is refused on both sides
   by its OWN `collectionIds` (`vault.collection_membership`, unreadable =
   refused too), never by its fields or name; the onboarding review calls that
-  function. `held` (a `rotation_lease` or `agent_hold`) is a skip, never a
+  function.
+- **The `agent_script` gate (tp#991, `PLAN_cred-one-collection.md`)**: the
+  bootstrap's `secret_gate` (`collections` default | `report` |
+  `agent_script`, `install.sh -W`) decides what `secret-run` may read; under
+  `agent_script` ONLY items with `agent_script=true` (fail closed: absent,
+  false or malformed = refused), from the one login collection plus the
+  legacy secrets collection until `install.sh -D`. Refusals carry the closed
+  `gate_code` set (`vault.GATE_CODES`) — consumers (credctl) map codes, never
+  reason texts; never add a code without updating the plan's compare
+  interface. The gate never becomes an oracle: no op compares a value.
+  Flipping the live gate is a main-session live step (tp#889 R7g), never a
+  builder's. `held` (a `rotation_lease` or `agent_hold`) is a skip, never a
   failure: checked before any vault read, never counted by the limiter (a
   hold found on the fresh secret read withdraws the reservation), never a
   quarantine or a failure mail; clients map it to exit 75 / `⏸ held`.

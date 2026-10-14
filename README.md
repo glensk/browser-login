@@ -697,11 +697,16 @@ that actually happened in October 2026.
    (`{"name": …, "fields": {"agent_site": …, …}}`; add `"replaces": SITE` to
    change an item that is already listed; never a password), and run
    `./agent-login.py -V -i planned.json`. With the manifest's
-   `"collections": {"login": ID, "secrets": ID}` the review also judges each
-   item's collection membership with the broker's own rule
-   (`vault.collection_membership`): an item whose `collectionIds` name both
-   collections is `refused` (a new item without `collectionIds` goes into the
-   login collection only).
+   `"collections": {"login": ID, "secrets": ID}` (or `{"login": ID}` alone:
+   one collection) the review also judges each item's collection membership
+   with the broker's own rule (`vault.collection_membership`), for the gate
+   mode the broker reports (`secrets` answer, saved in the secrets snapshot):
+   under `collections` an item whose `collectionIds` name both collections
+   is `refused` (a new item without `collectionIds` goes into the login
+   collection only); under `agent_script` it is fine. A malformed
+   `agent_script` is `refused`, `agent_script=true` on an
+   `agent_privilege=admin` item is a `risk`, and a gate the review cannot
+   read blocks (`gate_unknown`).
    - It is the broker's own code (`vault.site_item_from_json` and
      `identity_rules` over the whole collection, `broker/onboarding.py`), so it
      says exactly what the broker will refuse.
@@ -847,18 +852,62 @@ leak a password, lock an account or race a login:
   answers `{"ok": false, "error": "removed"}` for one release, then it is an
   unknown op. To check whether two copies hold the same password, use
   `credctl.py check -T` in mydotfiles (Touch ID window).
-- **One item, one collection.** Every item of the login read and of the
-  secrets read must carry `collectionIds` as a list of strings, else it is
-  refused on that side (`collection membership unreadable`). An item whose
-  `collectionIds` name BOTH the login collection and the configured secrets
-  collection is refused on both sides by its own item id, whatever its fields
-  or name say (`in both agent-login and agent-secrets: split it`): otherwise
-  `secret-run` would hand a website password to agents. A refused login item
-  keeps its scope in the multi-account conflict check (fail closed). The
-  onboarding review (`-V -i`) calls the same rule. List such items with
-  `sudo install/install.sh -M` (`daemon.py -M` as the broker uid: side,
-  status, safe name, item id; exit 0 none, 3 some listed) and split each into
-  a login item and a secrets item (`broker-add.py`).
+- **One item, one collection — the `agent_script` gate (tp#991).** ONE
+  Vaultwarden collection holds every agent-usable item. The browser fill is
+  unchanged (items with `agent_fill_origins` / `agent_site`, origin binding,
+  limiter). `secret-run` injects an item only when it carries the custom
+  field `agent_script = true`; a missing, `false` or malformed value is a
+  refusal (fail closed). The flag authorizes handing the RAW value to any
+  child process an agent picks — masking is output hygiene, not a boundary —
+  so it goes only on credentials a script really reads; admin website logins
+  without a script (authentik, DSM, GitLab admin, …) never get it, and the
+  onboarding review flags `agent_script` on an `agent_privilege=admin` item
+  as a `risk`. The gate is staged by the bootstrap key `secret_gate`
+  (`sudo install/install.sh -W MODE`, rollback `-W collections` or `-B`;
+  `secret_gate_since` records the switch):
+
+  | Mode                      | What `secret-run` reads                                                                                                                                                                                                                                                     |
+  | :------------------------ | :-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+  | `collections` (default)   | the legacy secrets collection (`secrets_collection_id`), exactly as before; an item listed in BOTH collections is refused on both sides by its own item id (`in both agent-login and agent-secrets: split it`)                                                              |
+  | `report`                  | the same, plus ONE `gate_would_refuse` audit line per issued item that mode `agent_script` would refuse (item id + `gate_code`, never a value) — the soak before the flip                                                                                                   |
+  | `agent_script` (enforced) | the login collection AND, until `install.sh -D` drops it, the legacy secrets collection, merged by item id; only flagged items are served; an item in both is no refusal; a flagged item with neither `agent_site` nor `agent_fill_origins` is a script-only item (no site) |
+
+  Every item of either read must carry `collectionIds` as a list of strings
+  (else `collection membership unreadable`, refused in every mode). Every
+  `secrets` row carries `kind` (`secret` = legacy collection, `login`),
+  `agent_script` (true / false / `malformed`) and `gate_code`, a closed set
+  — `ok`, `no_agent_script` (text: `script read without agent_script`),
+  `bad_agent_script`, `held`, `no_submit`, `username_only`, `duplicate_id`,
+  `membership_unreadable`, `invalid_item` — which in the first two modes is
+  what mode `agent_script` WOULD answer; a refused `secret`/`totp` request
+  carries the item's code. Ids: a legacy item keeps `agent_secret_id` → the
+  name slug in every mode; a login-collection item uses `agent_secret_id` →
+  `agent_site` → the slug; two FLAGGED items claiming one id are both
+  refused (`duplicate_id`), an unflagged login claims none. A flagged
+  username-only login exposes its username as `password`; no-submit and held
+  items are never injected. An unknown `secret_gate` refuses `secrets`,
+  `secret` and `totp` (`bad_secret_gate`) while logins, `secret_done`,
+  `audit` and `invalidate` keep working. No comparison op exists: credctl
+  compares a flagged item's copies inside its own compare child, started by
+  `secret-run -s` (plan `PLAN_cred-one-collection.md`, "Compare interface").
+
+  | Tool                                  | What it shows                                                                                                                                                          |
+  | :------------------------------------ | :--------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+  | `sudo install/install.sh -M`          | membership defects only (dual / unreadable): side, status, safe name, item id; exit 0 none, 3 some                                                                     |
+  | `sudo install/install.sh -g`          | the gate report: items `secret-run` serves TODAY that mode `agent_script` would refuse, plus malformed flags (kind, code, id, safe name, item id); exit 0 none, 3 some |
+  | `daemon.py -g -j` (as the broker uid) | every row mode `agent_script` would list, one JSON object each — what `install.sh -D` checks                                                                           |
+  | `secret-run -V`                       | `{"v": 1, "gate": …, "features": […]}`; exit 125 for `bad_secret_gate` / `unknown`                                                                                     |
+  | `secret-run -l` / `-l -j`             | injectable items; unflagged logins folded into ONE line / every row with `kind`, `agent_script`, `gate_code`                                                           |
+
+  **The flip (main session, parent plan tp#889 R7g/R7m/R7h):** list what
+  consumers read (`install.sh -g`, `secret-run -l -j`); set
+  `agent_script=true` on each, in place (`broker-add.py NAME -a`, mydotfiles);
+  `install.sh -W report` and soak until a day after `secret_gate_since` shows
+  no `gate_would_refuse` line for a live consumer; `install.sh -W
+  agent_script`. Later, after every legacy item was moved into the login
+  collection (its id pinned with `agent_secret_id` first) or retired,
+  `install.sh -D` drops the legacy collection — refused unless the gate is
+  `agent_script` and `daemon.py -g -j` lists ZERO items of kind `secret`.
 - **Rotation lease and `held`.** Before it changes a password on a server,
   credctl leases the item's sites; the broker records the lease, then waits
   until a login already in flight has finished:
@@ -888,7 +937,18 @@ leak a password, lock an account or race a login:
   than the drain (120 s) for the `rotation_lease` answer.
 - **Metadata for credctl.** The `sites` and `secrets` views carry `item_id`
   (the Bitwarden item id) and `revision` (its `revisionDate`), refused items
-  too; `secret-run -l -j` prints them. Both are non-secret.
+  too; `secret-run -l -j` prints them, with `kind`, `agent_script` and
+  `gate_code`. The `secrets` answer itself carries `gate` and `gate_since`.
+  All non-secret.
+- **Credentials in two or more places.** `./agent-login.py` ends with a
+  section read ONLY from mydotfiles credctl's daily state file
+  (`~/.local/state/credctl/check-latest.json`, `$CREDCTL_STATE_FILE`
+  overrides; `agent_login_cred.py`): one line per credential with
+  `location_count >= 2` — ✅ all equal, ❌ `DRIFT` / `missing` /
+  `unreadable`, ⚠️ `uncompared` with `credctl.py check -T ID` — plus ONE line
+  for a failed / timed-out run (❌), a run in progress or older than 36 h, or
+  a missing / unreadable file (⚠️). Every printed field is validated; `-j`
+  carries the same as `credentials`.
 
 ### Agents renew Albert's own sessions through his Safari (WS1b)
 
