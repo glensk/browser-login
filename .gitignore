@@ -53,3 +53,4 @@ CLAUDE.local.md
 
 # agent worktrees (Claude Code isolation)
 .claude/worktrees/
+.claude/worktrees.noindex/
