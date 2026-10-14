@@ -63,8 +63,8 @@ compared at all.
 - MD1 `cred_lib/check.py`: the classification above, keyed on `gate_code`; the new fixed
   detail texts in `check.DETAILS`; `state.py` already treats `unverified`/`uncompared` as
   never green.
-- MD2 `bin/broker-add.py`: `-a/--agent-script` sets `agent_script=true` (an explicit
-  `-a ''` removes it, like the identity fields) on a login item AND, in place, on an item
+- MD2 `bin/broker-add.py`: `-e/--agent-script` (`-a` is `--account`) sets `agent_script=true` (an explicit
+  `-e ''` removes it, like the identity fields) on a login item AND, in place, on an item
   already in the legacy secrets collection (only that field, no move, no new item,
   collections kept — O2); `-x` writes `agent_script=true` on every NEW secrets item; the
   plan / Touch ID window shows the flag; the rule check calls browser-login's
