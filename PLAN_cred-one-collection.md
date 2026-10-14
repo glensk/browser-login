@@ -5,10 +5,17 @@ Parent: /Users/albert/obsidian/42-Git/home/mydotfiles/PLAN_credential-single-sou
 
 # Broker: one collection + `agent_script` gate, compare interface, agent-login credential section
 
-> [!important] Status 2026-10-14 — debated (Codex gpt-5.6-sol, 2 rounds, converged; O1–O15 folded in), building
-> tp#991 — tp#889 R4 (child plan). The compare interface below was committed first for the
-> mydotfiles R5 builder; the reconciliation added the closed `gate_code` enum (O6) — R5 maps
-> codes, never reason texts.
+> [!important] Status 2026-10-14 — B1–B6 landed (hermetic, full suite green); B7 install and B8 flip are the main session's
+> tp#991 — tp#889 R4 (child plan), debated with Codex gpt-5.6-sol (2 rounds, converged; O1–O15
+> folded in). The compare interface below was committed first for the mydotfiles R5 builder;
+> the reconciliation added the closed `gate_code` enum (O6) — R5 maps codes, never reason
+> texts. The live broker still runs the pre-tp#991 release until B7: `secret-run -V` answers
+> "unrecognized arguments" (exit 125) there, which R5 treats as gate `collections`.
+> Build note: B2's box was ticked by 8c03cf6, whose code landed one commit later (d2cb9c9).
+> Incidental fixes in their own commits: an item with secret id `ok` was taken for an error
+> answer by `secret`/`totp` (fixed in d2cb9c9 with a regression test); brew-mypy errors in
+> `agent_login_state.py` / `agent_login_jobs.py` that blocked every commit touching
+> `agent-login.py`; a pylint R0917 in `secret_ops.py`.
 
 ## Compare interface (for mydotfiles R5)
 
