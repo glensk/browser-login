@@ -68,7 +68,20 @@ def test_every_option_has_a_short_and_a_long_flag():
         longs = [o for o in action.option_strings if o.startswith("--")]
         assert shorts and longs, action.option_strings
     flags = {o for a in parser._actions for o in a.option_strings}
-    for want in ("-e", "-p", "-s", "-t", "-T", "-v", "-o", "-l", "-A", "-N", "-h"):
+    for want in (
+        "-e",
+        "-p",
+        "-s",
+        "-t",
+        "-T",
+        "-v",
+        "-o",
+        "-l",
+        "-V",
+        "-A",
+        "-N",
+        "-h",
+    ):
         assert want in flags
 
 
@@ -741,3 +754,90 @@ def test_e2e_sigterm_kills_a_term_ignoring_group_within_the_deadline(
             with contextlib.suppress(ProcessLookupError):
                 os.kill(pid, signal.SIGKILL)
     assert proc.returncode == code
+
+
+# ---------------------------------------------------------------------------
+# tp#991: -V capabilities, the agent_script gate in -l / -l -j, login items
+# ---------------------------------------------------------------------------
+
+
+def _gate_vault(world: World, gate: str | None) -> None:
+    """Rewrite the world's vault: one flagged and one unflagged login item in
+    the login collection, the legacy item in the secrets collection."""
+
+    def login(name: str, site: str, flag: str | None) -> dict:
+        fields = {
+            "agent_site": site,
+            "agent_fill_origins": f"https://login.{site}.example",
+            "agent_cookie_hosts": f"{site}.example",
+            "agent_logged_in_selector": "#me",
+        }
+        if flag is not None:
+            fields["agent_script"] = flag
+        item = sf.secret_item(name, world.pw, fields=fields, username="u")
+        item["collectionIds"] = ["coll-login"]
+        return item
+
+    data = json.loads(world.vault_path.read_text())
+    data["collection_id"] = "coll-login"
+    data["logins"] = [login("Shop", "shop", "true"), login("Web", "web", None)]
+    for item in data["secrets"]:
+        item["collectionIds"] = ["coll-secrets"]
+    data["secrets_collection_id"] = "coll-secrets"
+    if gate is not None:
+        data["secret_gate"] = gate
+    world.vault_path.write_text(json.dumps(data))
+    world.broker.invalidate()
+
+
+def test_capabilities_reports_the_gate(world):
+    proc = _run(["-V"], world.env())
+    assert proc.returncode == 0
+    caps = json.loads(proc.stdout)
+    assert caps == {
+        "v": 1,
+        "gate": "collections",
+        "features": ["capabilities", "agent-script-gate", "login-items", "gate-code"],
+    }
+    _gate_vault(world, "agent_script")
+    assert json.loads(_run(["-V"], world.env()).stdout)["gate"] == "agent_script"
+
+
+def test_capabilities_bad_gate_and_no_broker_exit_125(world, tmp_path):
+    _gate_vault(world, "enforce")
+    proc = _run(["-V"], world.env())
+    assert proc.returncode == 125
+    assert json.loads(proc.stdout)["gate"] == "bad_secret_gate"
+    proc = _run(["-V"], {sr.SOCKET_ENV: str(tmp_path / "nope.sock")})
+    assert proc.returncode == 125 and json.loads(proc.stdout)["gate"] == "unknown"
+
+
+def test_list_json_carries_the_gate_keys(world):
+    _gate_vault(world, "agent_script")
+    proc = _run(["-l", "-j"], world.env())
+    assert proc.returncode == 0
+    rows = {r["id"]: r for r in map(json.loads, proc.stdout.splitlines())}
+    assert rows["shop"]["kind"] == "login" and rows["shop"]["gate_code"] == "ok"
+    assert rows["web"]["gate_code"] == "no_agent_script" and rows["web"]["refused"]
+    assert rows["item"]["kind"] == "secret"
+    assert rows["item"]["agent_script"] is False
+    world.assert_clean(proc.stdout, proc.stderr)
+
+
+def test_list_folds_browser_only_logins_into_one_line(world):
+    _gate_vault(world, "agent_script")
+    out = _run(["-l"], world.env()).stdout.decode()
+    assert "✅ shop: password" in out
+    assert "web" not in out
+    assert "1 login item(s) not injectable: agent_script unset" in out
+    assert "❌ item: refused" in out  # the legacy item lacks the flag
+
+
+def test_a_flagged_login_item_is_injected_and_masked(world):
+    _gate_vault(world, "agent_script")
+    proc = _run(["-s", "shop", "--", "cat"], world.env())
+    assert proc.returncode == 0 and proc.stdout == b"***\n"
+    proc = _run(["-s", "web", "--", "cat"], world.env())
+    assert proc.returncode == 125
+    assert b"script read without agent_script" in proc.stderr
+    world.assert_clean(proc.stdout, proc.stderr, world.audit())

@@ -34,6 +34,13 @@ Exit codes: the child's; 128+N when it died of signal N; 124 timeout (-T);
 unavailable, bad usage); 126 cannot execute; 127 not found; 141 the reader of
 secret-run's output went away (EPIPE).
 
+``-V`` (tp#991) prints the capability object credctl reads before it
+compares: ``{"v": 1, "gate": ..., "features": [...]}`` — the broker's
+agent_script gate mode (collections | report | agent_script, or
+bad_secret_gate / unknown with exit 125). ``-l -j`` rows carry ``kind``,
+``agent_script`` and ``gate_code`` (what mode agent_script answers for the
+item); never a value.
+
 Status lines go to stderr (✅ ❌ ⚠️); stdout belongs to the child. The broker
 socket is /var/db/login-broker-run/broker.sock ($SECRET_RUN_SOCKET overrides).
 """
@@ -93,6 +100,9 @@ SIGNAL_KILL_DEADLINE_S = 3.0
 TICK_S = 0.05
 READ_CHUNK = 65536
 MAX_PENDING_INPUT = 1024 * 1024
+CAPABILITIES_VERSION = 1
+FEATURES = ("capabilities", "agent-script-gate", "login-items", "gate-code")
+SERVING_GATES = frozenset({"collections", "report", "agent_script"})
 NAME_RE = re.compile(r"^[A-Z_][A-Z0-9_]*$")
 ITEM_RE = re.compile(r"^[a-z0-9][a-z0-9._-]{0,63}$")
 FIELD_RE = re.compile(r"^[A-Za-z0-9._ -]{1,64}$")
@@ -418,8 +428,8 @@ def _forwarding(
     try:
         yield
     finally:
-        for sig, handler in saved.items():
-            signal.signal(sig, handler)
+        for signum, handler in saved.items():
+            signal.signal(signum, handler)
 
 
 def _spawn_error(exc: OSError) -> RunResult:
@@ -801,6 +811,7 @@ def build_parser() -> argparse.ArgumentParser:
             "[-s ITEM[:FIELD]] [-t] [-T SEC] [-v] -- CMD [ARG...]\n"
             "       secret-run -o ITEM\n"
             "       secret-run -l [-j]\n"
+            "       secret-run -V\n"
             "       secret-run -A [-N N]"
         ),
         epilog=(
@@ -818,8 +829,9 @@ def build_parser() -> argparse.ArgumentParser:
             "  secret-run -T 60 -v -e T=svc -- ./deploy.sh\n"
             "  secret-run -o github        # the current TOTP code only\n"
             "  secret-run -l               # what can be injected\n"
-            "  secret-run -l -j            # the same as JSON, with item ids and\n"
-            "                              # revisions (credctl's guard index)\n"
+            "  secret-run -l -j            # the same as JSON: item ids, revisions,\n"
+            "                              # kind, agent_script, gate_code\n"
+            "  secret-run -V               # capabilities + the broker's gate mode\n"
             "  secret-run -A -N 20         # the broker's last 20 audit lines\n"
         ),
     )
@@ -876,7 +888,15 @@ def build_parser() -> argparse.ArgumentParser:
         "--json",
         action="store_true",
         help="with -l: one JSON object per item (id, name, field names, item_id, "
-        "revision, refused, reason — never a value)",
+        "revision, refused, reason, kind, agent_script, gate_code — never a value)",
+    )
+    p.add_argument(
+        "-V",
+        "--capabilities",
+        action="store_true",
+        help="print one JSON object: the capability version, the broker's "
+        "agent_script gate mode and the feature names (exit 125 when the gate "
+        "is unknown or misconfigured)",
     )
     p.add_argument(
         "-A", "--audit", action="store_true", help="print the broker's last audit lines"
@@ -914,6 +934,9 @@ _LIST_JSON_KEYS = (
     "reason",
     "item_id",
     "revision",
+    "kind",
+    "agent_script",
+    "gate_code",
 )
 
 
@@ -931,10 +954,18 @@ def cmd_list(*, as_json: bool = False) -> int:
     if not rows:
         status("⚠️", "the secrets collection holds no items")
         return 0
+    browser_only = 0
     for row in rows:
         if not isinstance(row, dict):
             continue
         sid = str(row.get("id") or "")
+        if (
+            row.get("refused")
+            and row.get("kind") == "login"
+            and row.get("gate_code") == "no_agent_script"
+        ):
+            browser_only += 1  # a browser-only login: one summary line
+            continue
         if row.get("refused"):
             print(f"❌ {sid}: refused — {row.get('reason') or ''}")
             continue
@@ -946,7 +977,31 @@ def cmd_list(*, as_json: bool = False) -> int:
             extras.append("short value: masked raw-only")
         tail = f"  [{'; '.join(extras)}]" if extras else ""
         print(f"✅ {sid}: {fields}{tail}")
+    if browser_only:
+        print(f"·  {browser_only} login item(s) not injectable: agent_script unset")
     return 0
+
+
+def cmd_capabilities() -> int:
+    """``-V``: ONE JSON object — what this client supports and the broker's
+    gate mode (from the ``secrets`` answer). Exit 0 while the broker serves a
+    known gate, 125 for ``bad_secret_gate`` / ``unknown``."""
+    try:
+        resp = broker_request("secrets")
+    except SecretRunError:
+        resp = {}
+    if resp.get("ok") is True:
+        # a broker from before tp#991 sends no gate: it is `collections`
+        gate = resp.get("gate", "collections")
+    elif resp.get("error") == "bad_secret_gate":
+        gate = "bad_secret_gate"
+    else:
+        gate = "unknown"
+    if gate not in SERVING_GATES | {"bad_secret_gate"}:
+        gate = "unknown"
+    out = {"v": CAPABILITIES_VERSION, "gate": gate, "features": list(FEATURES)}
+    print(json.dumps(out, sort_keys=True))
+    return 0 if gate in SERVING_GATES else EXIT_OWN
 
 
 def cmd_audit(lines: int) -> int:
@@ -1095,10 +1150,10 @@ def main(argv: list[str] | None = None) -> int:
         argv, cmd = argv[:cut], argv[cut + 1 :]
     parser = build_parser()
     args = parser.parse_args(argv)
-    modes = [bool(args.totp), args.list, args.audit]
+    modes = [bool(args.totp), args.list, args.audit, args.capabilities]
     run_mode = bool(cmd or args.env or args.path or args.stdin)
     if sum(modes) + run_mode > 1:
-        parser.error("-o, -l, -A and running a command are mutually exclusive")
+        parser.error("-o, -l, -V, -A and running a command are mutually exclusive")
     if args.json and not args.list:
         parser.error("-j/--json goes with -l")
     try:
@@ -1106,6 +1161,8 @@ def main(argv: list[str] | None = None) -> int:
             return cmd_totp(args.totp)
         if args.list:
             return cmd_list(as_json=args.json)
+        if args.capabilities:
+            return cmd_capabilities()
         if args.audit:
             return cmd_audit(args.lines)
         return cmd_run(args, cmd)

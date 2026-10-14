@@ -165,7 +165,7 @@ Recommended new parent boxes:
       `secret_done`/`audit`/`invalidate` under a bad gate, sentinel absent from responses
       and the audit file); `tests/test_cred_rotation.py` / `tests/test_secret_ops.py` green
       unchanged.
-- [ ] B3 `bin/secret_run.py`: `-V/--capabilities` (contract above); `-l -j` rows add
+- [x] B3 `bin/secret_run.py`: `-V/--capabilities` (contract above); `-l -j` rows add
       `kind`, `agent_script`, `gate_code`; text `-l` folds unflagged login rows into ONE line
       (`N login item(s) not injectable: agent_script unset`); help + epilog. Tests in
       `tests/test_secret_run.py` against the fake broker.
