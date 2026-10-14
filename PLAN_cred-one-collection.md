@@ -120,7 +120,7 @@ plan BEFORE R7b (the first step that injects a login item, `npm-nixos` / `npm-ra
 Recommended new parent boxes:
 
 - **R7g** (flip): (1) `install.sh -g` + `secret-run -l -j` list every current secrets item a
-  consumer reads; (2) MD2's `broker-add.py NAME -a` writes `agent_script=true` on each, in
+  consumer reads; (2) MD2's `broker-add.py NAME -e` writes `agent_script=true` on each, in
   place (attended vault writes, Albert's go per batch); (3) `install.sh -W report`, then a
   soak until one day of normal use after `secret_gate_since` shows no `gate_would_refuse`
   event for a live consumer AND the consumer canaries (env_profiles tokens, `credctl check
