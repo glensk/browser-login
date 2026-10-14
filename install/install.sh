@@ -62,12 +62,13 @@ LOGIN_PAIR=""
 SECRETS_PAIR=""
 SAME_A=""
 SAME_B=""
+GATE_MODE=""
 
 usage() {
 	/bin/cat <<'EOF'
 Usage: sudo install/install.sh [-n] [-U [-P]] [-e] [-r KEY [-G]] [-c]
                                [-C ORG_ID:COLL_ID] [-X ORG_ID:COLL_ID] [-B]
-                               [-S SITE_A SITE_B] [-M] [-h]
+                               [-S SITE_A SITE_B] [-M] [-g] [-W MODE] [-D] [-h]
 
 Install (default), update, uninstall or enrol the login broker LaunchDaemon.
 Refuses unless the repo is clean and HEAD is contained in origin/main; installs
@@ -116,6 +117,22 @@ Options:
                           on both sides) or unreadable, by safe name + item id
                           (runs the installed daemon as the role account;
                           audited). Exit 0 none, 3 some listed
+  -g, --script-gate       the agent_script gate report: every item secret-run
+                          serves today that mode agent_script would refuse,
+                          plus malformed flags (role account; audited).
+                          Exit 0 none, 3 some listed
+  -W, --secret-gate MODE  set the agent_script gate: collections (default:
+                          the two-collection behaviour), report (the same +
+                          a gate_would_refuse audit event per issued item the
+                          gate would refuse) or agent_script (enforced: one
+                          collection, only items with agent_script=true reach
+                          secret-run); bootstrap.json rewritten like -C/-X,
+                          then reload. Rollback: -W collections or -B
+  -D, --drop-secrets-collection
+                          remove the legacy secrets collection from
+                          bootstrap.json — refused unless the gate is
+                          agent_script and `daemon.py -g -j` lists ZERO items
+                          of kind secret
   -h, --help              show this help and exit
 
 Examples:
@@ -131,6 +148,10 @@ Examples:
   sudo install/install.sh -B     # roll the last switch back
   sudo install/install.sh -S docker docker-hub  # one account or two?
   sudo install/install.sh -M     # items in both collections (split them)
+  sudo install/install.sh -g     # what the agent_script gate would refuse
+  sudo install/install.sh -W report        # soak: audit would-be refusals
+  sudo install/install.sh -W agent_script  # enforce the gate
+  sudo install/install.sh -D     # drop the emptied legacy secrets collection
   sudo install/install.sh -U     # uninstall, keep state
   sudo install/install.sh -U -P  # uninstall and purge state + role account
 EOF
@@ -203,6 +224,15 @@ while (($#)); do
 		shift 2
 		;;
 	-M | --membership) MODE="membership" ;;
+	-g | --script-gate) MODE="scriptgate" ;;
+	-W | --secret-gate)
+		MODE="gate"
+		GATE_MODE="${2:-}"
+		[[ "$GATE_MODE" =~ ^(collections|report|agent_script)$ ]] ||
+			die "-W needs collections, report or agent_script"
+		shift
+		;;
+	-D | --drop-secrets-collection) MODE="dropsecrets" ;;
 	*)
 		usage >&2
 		exit 2
@@ -755,6 +785,54 @@ do_membership() {
 	return "$rc"
 }
 
+# do_scriptgate — `daemon.py -g` as the role account (it owns the bw state):
+# the items the agent_script gate would refuse, never a value.
+do_scriptgate() {
+	local py="${LIBEXEC}/current/venv/bin/python" rc=0
+	[[ -x "$py" ]] || ((DRY)) || die "install the broker first (no ${py})"
+	run /usr/bin/sudo -u "$ROLE" /usr/bin/env HOME="$HOME_DIR" \
+		PATH="${LIBEXEC}/bin:/usr/bin:/bin" "$py" \
+		"${LIBEXEC}/current/broker/daemon.py" -H "$HOME_DIR" -g || rc=$?
+	audit "agent_script gate report (exit ${rc})"
+	return "$rc"
+}
+
+# do_gate — set secret_gate in bootstrap.json, then reload.
+do_gate() {
+	local py="${LIBEXEC}/current/venv/bin/python"
+	[[ -x "$py" ]] || ((DRY)) || die "install the broker first (no ${py})"
+	run "$py" "${LIBEXEC}/current/broker/bootstrap_switch.py" -H "$HOME_DIR" \
+		-W "$GATE_MODE" || die "bootstrap.json NOT changed"
+	audit "secret gate set to ${GATE_MODE}"
+	reload_daemon
+}
+
+# do_dropsecrets — drop the legacy secrets collection once `daemon.py -g -j`
+# lists no item of kind secret (bootstrap_switch.py -D checks), then reload.
+do_dropsecrets() {
+	local py="${LIBEXEC}/current/venv/bin/python" listing
+	local gate=("$py" "${LIBEXEC}/current/broker/daemon.py" -H "$HOME_DIR" -g -j)
+	local args=(-H "$HOME_DIR" -v - -D)
+	if ((DRY)); then
+		printf '+ sudo -u %q' "$ROLE"
+		printf ' %q' "${gate[@]}"
+		printf ' |'
+		printf ' %q' "$py" "${LIBEXEC}/current/broker/bootstrap_switch.py" "${args[@]}"
+		printf '\n'
+		audit "legacy secrets collection dropped"
+		reload_daemon
+		return 0
+	fi
+	[[ -x "$py" ]] || die "install the broker first (no ${py})"
+	listing="$(/usr/bin/sudo -u "$ROLE" /usr/bin/env HOME="$HOME_DIR" \
+		PATH="${LIBEXEC}/bin:/usr/bin:/bin" "${gate[@]}")" ||
+		die "cannot read the agent_script gate listing"
+	printf '%s\n' "$listing" | "$py" "${LIBEXEC}/current/broker/bootstrap_switch.py" "${args[@]}" ||
+		die "bootstrap.json NOT changed"
+	audit "legacy secrets collection dropped"
+	reload_daemon
+}
+
 # do_rollback — restore the newest bootstrap.json.prev-*, then reload.
 do_rollback() {
 	local py="${LIBEXEC}/current/venv/bin/python"
@@ -775,4 +853,7 @@ switch) do_switch ;;
 rollback) do_rollback ;;
 same) do_same ;;
 membership) do_membership ;;
+scriptgate) do_scriptgate ;;
+gate) do_gate ;;
+dropsecrets) do_dropsecrets ;;
 esac

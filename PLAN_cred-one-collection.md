@@ -131,7 +131,7 @@ Recommended new parent boxes:
 
 ## Steps
 
-- [ ] B1 `broker/vault.py`: `agent_script_flag(fields) -> True | False | None` (None =
+- [x] B1 `broker/vault.py`: `agent_script_flag(fields) -> True | False | None` (None =
       malformed, via `_parse_flag`); `GATE_CODES`; `SECRET_GATES`; `BwBootstrap.secret_gate`
       / `secret_gate_since` (absent = `collections`; an unknown value kept and refused at the
       op); the secret source per mode (table above) with the cache key of O10; secret ids per

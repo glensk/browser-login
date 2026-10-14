@@ -12,9 +12,18 @@ the newest ``.prev-*`` (the current file becomes a ``.prev-*`` itself, so
 nothing is lost). Collections are always identified by IDs, never by name.
 No secret value is ever printed.
 
+tp#991: ``-W MODE`` sets the agent_script gate (``secret_gate``:
+collections | report | agent_script) and stamps ``secret_gate_since`` (UTC);
+``-D`` drops the legacy secrets collection (``secrets_organization_id`` +
+``secrets_collection_id``) — only while the gate is ``agent_script`` and the
+listing ``-v FILE`` (``daemon.py -g -j``, ``-`` = stdin) parses, is not empty
+and holds ZERO rows of kind ``secret``, in any state.
+
 Examples:
   bootstrap_switch.py -H /var/db/login-broker -v visible.tsv -C ORG:COLL
   daemon.py -C | bootstrap_switch.py -H /var/db/login-broker -v - -X ORG:COLL
+  bootstrap_switch.py -H /var/db/login-broker -W report
+  daemon.py -g -j | bootstrap_switch.py -H /var/db/login-broker -v - -D
   bootstrap_switch.py -H /var/db/login-broker -B
 """
 
@@ -34,7 +43,14 @@ if __package__ in (None, ""):  # run as a script: make `broker` importable
     sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 # pylint: disable=wrong-import-position
-from broker.vault import BwBootstrap, VaultError  # noqa: E402
+from broker.vault import (  # noqa: E402
+    GATE_AGENT_SCRIPT,
+    KIND_LOGIN,
+    KIND_SECRET,
+    SECRET_GATES,
+    BwBootstrap,
+    VaultError,
+)
 
 # pylint: enable=wrong-import-position
 
@@ -50,6 +66,8 @@ KEEP_KEYS = (
     "organization_id",
     "secrets_organization_id",
     "secrets_collection_id",
+    "secret_gate",
+    "secret_gate_since",
 )
 
 
@@ -150,6 +168,76 @@ def switch(
     return True, prev
 
 
+def _utc_iso() -> str:
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+
+
+def _rewrite(home: Path, new: dict[str, Any], raw: bytes) -> Path:
+    path = home / BOOTSTRAP
+    owner = path.stat()
+    prev = _keep_previous(home, raw, owner)
+    _write_like(path, json.dumps(new).encode(), owner)
+    return prev
+
+
+def set_gate(home: Path, mode: str) -> tuple[bool, Path | None]:
+    """Set ``secret_gate`` (+ ``secret_gate_since``); (changed, previous)."""
+    if mode not in SECRET_GATES:
+        raise SwitchError(f"unknown gate {mode!r} (one of {', '.join(SECRET_GATES)})")
+    path = home / BOOTSTRAP
+    old, raw = _load_raw(path)
+    if old.get("secret_gate") == mode:
+        return False, None
+    new = {k: old[k] for k in KEEP_KEYS if k in old}
+    new["secret_gate"] = mode
+    new["secret_gate_since"] = _utc_iso()
+    return True, _rewrite(home, new, raw)
+
+
+def listing_kinds(text: str) -> tuple[int, int]:
+    """(rows of kind login, rows of kind secret) of a ``daemon.py -g -j``
+    listing; any line that is not such a row raises SwitchError (fail closed)."""
+    login = secret = 0
+    for n, line in enumerate(text.splitlines(), 1):
+        if not line.strip():
+            continue
+        try:
+            row = json.loads(line)
+        except ValueError:
+            raise SwitchError(f"listing line {n} is not JSON") from None
+        kind = row.get("kind") if isinstance(row, dict) else None
+        if kind == KIND_LOGIN:
+            login += 1
+        elif kind == KIND_SECRET:
+            secret += 1
+        else:
+            raise SwitchError(f"listing line {n} has no kind login|secret")
+    return login, secret
+
+
+def drop_secrets(home: Path, listing: str) -> tuple[bool, Path | None]:
+    """Remove the legacy secrets collection ids; (changed, previous)."""
+    path = home / BOOTSTRAP
+    old, raw = _load_raw(path)
+    if old.get("secret_gate") != GATE_AGENT_SCRIPT:
+        raise SwitchError(
+            "refused: the gate is not agent_script (install.sh -W agent_script first)"
+        )
+    login, secret = listing_kinds(listing)
+    if login + secret == 0:
+        raise SwitchError("refused: the listing is empty (is it `daemon.py -g -j`?)")
+    if secret:
+        raise SwitchError(
+            f"refused: {secret} item(s) still in the legacy secrets collection — "
+            "move or retire each first"
+        )
+    dropped = ("secrets_organization_id", "secrets_collection_id")
+    if not any(k in old for k in dropped):
+        return False, None
+    new = {k: old[k] for k in KEEP_KEYS if k in old and k not in dropped}
+    return True, _rewrite(home, new, raw)
+
+
 def previous_files(home: Path) -> list[Path]:
     """``bootstrap.json.prev-*``, oldest first."""
     return sorted(home.glob(f"{PREV_PREFIX}*"))
@@ -179,7 +267,30 @@ def describe(home: Path) -> str:
         secrets = f"{boot.secrets_organization_id or '?'}:{boot.secrets_collection_id}"
     else:
         secrets = "none"
-    return f"login {login}, secrets {secrets}"
+    return f"login {login}, secrets {secrets}, gate {boot.secret_gate}"
+
+
+def _gate_action(args: argparse.Namespace, home: Path) -> int:
+    """``-W`` / ``-D`` (raises SwitchError)."""
+    if args.secret_gate:
+        changed, prev = set_gate(home, args.secret_gate)
+    else:
+        if not args.visible:
+            raise SwitchError("-D needs -v FILE (the output of `daemon.py -g -j`)")
+        text = (
+            sys.stdin.read()
+            if args.visible == "-"
+            else Path(args.visible).read_text(encoding="utf-8")
+        )
+        changed, prev = drop_secrets(home, text)
+    if not changed:
+        print(f"✅ bootstrap.json unchanged ({describe(home)})")
+        return 0
+    assert prev is not None
+    print(
+        f"✅ bootstrap.json switched ({describe(home)}); previous kept as {prev.name}"
+    )
+    return 0
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -192,6 +303,8 @@ def main(argv: list[str] | None = None) -> int:
             "Examples:\n"
             "  bootstrap_switch.py -H /var/db/login-broker -v visible.tsv -C ORG:COLL\n"
             "  bootstrap_switch.py -H /var/db/login-broker -v - -X ORG:COLL\n"
+            "  bootstrap_switch.py -H /var/db/login-broker -W report\n"
+            "  daemon.py -g -j | bootstrap_switch.py -H /var/db/login-broker -v - -D\n"
             "  bootstrap_switch.py -H /var/db/login-broker -B\n"
         ),
     )
@@ -212,6 +325,20 @@ def main(argv: list[str] | None = None) -> int:
         help="secrets collection",
     )
     p.add_argument(
+        "-W",
+        "--secret-gate",
+        metavar="MODE",
+        choices=SECRET_GATES,
+        help="set the agent_script gate: " + " | ".join(SECRET_GATES),
+    )
+    p.add_argument(
+        "-D",
+        "--drop-secrets-collection",
+        action="store_true",
+        help="drop the legacy secrets collection (gate agent_script, -v = the "
+        "`daemon.py -g -j` listing with zero kind=secret rows)",
+    )
+    p.add_argument(
         "-B",
         "--rollback",
         action="store_true",
@@ -220,16 +347,24 @@ def main(argv: list[str] | None = None) -> int:
     args = p.parse_args(argv)
     home = Path(args.home)
     try:
+        modes = [
+            bool(args.login_collection or args.secrets_collection),
+            bool(args.secret_gate),
+            args.drop_secrets_collection,
+            args.rollback,
+        ]
+        if sum(modes) > 1:
+            raise SwitchError("-C/-X, -W, -D and -B are mutually exclusive")
+        if args.secret_gate or args.drop_secrets_collection:
+            return _gate_action(args, home)
         if args.rollback:
-            if args.login_collection or args.secrets_collection:
-                raise SwitchError("-B cannot be combined with -C/-X")
             restored, saved = rollback(home)
             print(
                 f"✅ restored {restored.name} ({describe(home)}); was kept as {saved.name}"
             )
             return 0
         if not (args.login_collection or args.secrets_collection):
-            raise SwitchError("nothing to do: give -C, -X or -B")
+            raise SwitchError("nothing to do: give -C, -X, -W, -D or -B")
         if not args.visible:
             raise SwitchError("-C/-X need -v FILE (the output of `daemon.py -C`)")
         tsv = (

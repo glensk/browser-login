@@ -33,6 +33,19 @@ sides by its item id, whatever its fields or name say
 ``secret-run`` value. A refused login item keeps its scope for the conflict
 check.
 
+The ``agent_script`` gate (tp#991, ``secret_gate`` in the bootstrap): mode
+``collections`` (the default, key absent) is the behaviour above; ``report``
+is the same plus a ``gate_would_refuse`` audit event per issued item that
+mode ``agent_script`` would refuse; ``agent_script`` makes ONE collection
+the source — ``secret-run`` reads every item of the login collection (and,
+until it is dropped, of the legacy secrets collection) but injects only an
+item whose ``agent_script`` field is ``true``; a missing, ``false`` or
+malformed flag is a refusal (fail closed). Every listed secret carries
+``kind`` (``secret`` | ``login``), ``agent_script`` and ``gate_code`` (a
+closed enum, ``GATE_CODES``; in the other modes the code mode
+``agent_script`` WOULD answer). An unknown gate refuses the secret reads
+(``BadSecretGate``).
+
 A credential rotation (mydotfiles ``credctl rotate``) writes ``agent_hold =
 <txid>`` on the login copies it is about to change: the item is ``held`` (a
 skip, never a failure) until the field is removed; a malformed value holds
@@ -148,6 +161,44 @@ MEMBERSHIP_REASONS = {
     MEMBERSHIP_UNREADABLE: "collection membership unreadable",
     MEMBERSHIP_DUAL: "in both agent-login and agent-secrets: split it",
 }
+# tp#991: the agent_script gate. `collections` = tp#965 (two collections),
+# `report` = the same + would-refuse audit events, `agent_script` = one
+# collection, only items with agent_script=true reach secret-run.
+GATE_COLLECTIONS = "collections"
+GATE_REPORT = "report"
+GATE_AGENT_SCRIPT = "agent_script"
+SECRET_GATES = (GATE_COLLECTIONS, GATE_REPORT, GATE_AGENT_SCRIPT)
+BAD_SECRET_GATE = "bad_secret_gate"
+# What a script read of one item gets (closed set; credctl maps these, never
+# the reason texts).
+GATE_OK = "ok"
+GATE_NO_FLAG = "no_agent_script"
+GATE_BAD_FLAG = "bad_agent_script"
+GATE_HELD = "held"
+GATE_NO_SUBMIT = "no_submit"
+GATE_USERNAME_ONLY = "username_only"
+GATE_DUPLICATE = "duplicate_id"
+GATE_UNREADABLE = "membership_unreadable"
+GATE_INVALID = "invalid_item"
+GATE_CODES = (
+    GATE_OK,
+    GATE_NO_FLAG,
+    GATE_BAD_FLAG,
+    GATE_HELD,
+    GATE_NO_SUBMIT,
+    GATE_USERNAME_ONLY,
+    GATE_DUPLICATE,
+    GATE_UNREADABLE,
+    GATE_INVALID,
+)
+# In mode agent_script the "dual" refusal means a script read that reaches an
+# item without the flag (R0: MEMBERSHIP_DUAL becomes this).
+NO_AGENT_SCRIPT = "script read without agent_script"
+BAD_AGENT_SCRIPT = "bad agent_script (true or false)"
+HELD_SECRET = "held by a credential rotation"
+DUPLICATE_SECRET_ID = "duplicate secret id"
+KIND_SECRET = "secret"
+KIND_LOGIN = "login"
 # tp#965 S3: a rotation's transaction id (mydotfiles cred_lib.journal.TXID_RE)
 # in `agent_hold`; any other non-empty value holds the item too (fail closed).
 TXID_RE = re.compile(r"^[0-9]{8}T[0-9]{6}Z-[0-9a-f]{6}$")
@@ -188,6 +239,11 @@ class Held(VaultError):
     def __init__(self, txid: str) -> None:
         super().__init__(f"held: rotation {txid} in progress")
         self.txid = txid
+
+
+class BadSecretGate(VaultError):
+    """The bootstrap's ``secret_gate`` is not one of ``SECRET_GATES``: every
+    secret read is refused (fail closed); logins are not affected."""
 
 
 class SecretsNotConfigured(VaultError):
@@ -449,13 +505,43 @@ def collection_membership(
     return MEMBERSHIP_OK
 
 
-def membership_refusal(raw: Mapping[str, Any], membership: Membership | None) -> str:
+def membership_refusal(
+    raw: Mapping[str, Any],
+    membership: Membership | None,
+    gate: str = GATE_COLLECTIONS,
+) -> str:
     """The fixed refusal of `raw`'s collection membership, or '' (also when
-    `membership` is None: no collection ids known, e.g. a legacy fixture)."""
+    `membership` is None: no collection ids known, e.g. a legacy fixture).
+    In mode ``agent_script`` an item in both collections is not refused (the
+    flag decides); an unreadable membership is refused in every mode."""
     if membership is None:
         return ""
     status = collection_membership(raw, membership[0], membership[1])
+    if status == MEMBERSHIP_DUAL and gate == GATE_AGENT_SCRIPT:
+        return ""
     return MEMBERSHIP_REASONS.get(status, "")
+
+
+def agent_script_flag(fields: Mapping[str, str]) -> bool | None:
+    """An item's ``agent_script`` field: True, False (absent or false) or
+    None (malformed — callers refuse it, fail closed)."""
+    return _parse_flag(fields.get("agent_script", ""))
+
+
+def flag_view(flag: bool | None) -> bool | str:
+    """``agent_script`` as the views show it: true, false or "malformed"."""
+    return "malformed" if flag is None else flag
+
+
+def is_script_only(raw: Mapping[str, Any]) -> bool:
+    """A flagged item that is no login: neither ``agent_site`` nor
+    ``agent_fill_origins`` (mode agent_script leaves it out of the sites)."""
+    fields = _fields(raw)
+    return (
+        agent_script_flag(fields) is True
+        and not fields.get("agent_site", "").strip()
+        and not fields.get("agent_fill_origins", "").strip()
+    )
 
 
 class Vault(Protocol):
@@ -476,6 +562,10 @@ class Vault(Protocol):
 
     def invalidate(self) -> int:
         """Drop every cached value; returns the new cache generation."""
+
+    def secret_gate(self) -> tuple[str, str]:
+        """(the configured ``secret_gate`` as written, its ``secret_gate_since``
+        or "") — an unknown gate is returned as is (the ops refuse it)."""
 
 
 def safe_name(text: str, n: int, *, prefix: str = "item") -> str:
@@ -522,10 +612,19 @@ class SecretItem:  # pylint: disable=too-many-instance-attributes
     refused: str | None = None
     item_id: str = ""
     revision: str = ""
+    kind: str = KIND_SECRET
+    agent_script: bool | None = False
+    # `code`: why THIS mode refuses it (GATE_OK when served); `gate_code`: what
+    # mode agent_script answers (equal to `code` in that mode).
+    code: str = GATE_OK
+    gate_code: str = GATE_OK
 
     def public(self) -> dict[str, Any]:
         """The ``secrets`` view: ids and field NAMES — never a value or seed."""
         return {
+            "kind": self.kind,
+            "agent_script": flag_view(self.agent_script),
+            "gate_code": self.gate_code,
             "id": self.secret_id,
             "name": self.name,
             "fields": list(self.fields),
@@ -628,24 +727,49 @@ def _item_origin_texts(
 
 
 # A flat validator: one early refusal per rule, in field order.
-# pylint: disable-next=too-many-locals,too-many-return-statements,too-many-branches
+# pylint: disable-next=too-many-locals,too-many-return-statements,too-many-branches,too-many-statements
 def secret_item_from_json(
-    item: Mapping[str, Any], n: int
+    item: Mapping[str, Any],
+    n: int,
+    *,
+    kind: str = KIND_SECRET,
+    login_ids: bool = False,
+    username_secret: bool = False,
 ) -> tuple[SecretItem, SecretValues | None]:
     """Build a ``SecretItem`` (+ its values) from a Bitwarden item JSON; problems
-    become ``refused`` and carry no values. `n` numbers unsafe names."""
+    become ``refused`` (with their ``code``) and carry no values. `n` numbers
+    unsafe names.
+
+    `login_ids`: the id falls back to ``agent_site`` before the name slug (an
+    item read from the login collection only, mode agent_script). A legacy
+    secrets item keeps ``agent_secret_id`` → name slug in every mode.
+    `username_secret`: a username-only login exposes its username as
+    ``password`` (only for an item with ``agent_script=true`` in mode
+    agent_script); otherwise it is refused as today."""
     raw_name = str(item.get("name") or "")
     name = safe_name(raw_name, n)
     fields = _fields(item)
     item_id = str(item.get("id") or "")
     revision = item_revision(item)
-    raw_id = (fields.get("agent_secret_id") or "").strip().lower() or slugify(raw_name)
+    raw_id = (fields.get("agent_secret_id") or "").strip().lower()
+    if not raw_id and login_ids:
+        raw_id = (fields.get("agent_site") or "").strip().lower()
+    raw_id = raw_id or slugify(raw_name)
     secret_id = raw_id if SITE_ID_RE.match(raw_id) else f"item-{n}"
+    flag = agent_script_flag(fields)
 
-    def refused(reason: str) -> tuple[SecretItem, None]:
+    def refused(reason: str, code: str = GATE_INVALID) -> tuple[SecretItem, None]:
         return (
             SecretItem(
-                secret_id, name, item_id=item_id, revision=revision, refused=reason
+                secret_id,
+                name,
+                item_id=item_id,
+                revision=revision,
+                refused=reason,
+                kind=kind,
+                agent_script=flag,
+                code=code,
+                gate_code=code,
             ),
             None,
         )
@@ -654,15 +778,18 @@ def secret_item_from_json(
         return refused("invalid agent_secret_id")
     why = _no_submit_reason(item, fields)
     if why:
-        return refused(why)
+        return refused(why, GATE_NO_SUBMIT if why == NO_SUBMIT_SECRET else GATE_INVALID)
     mode, _problem = login_mode(fields.get("agent_login_mode", ""))
-    if mode != PASSWORD_MODE:
+    account_only = False
+    if mode == USERNAME_ONLY and username_secret:
+        account_only = True
+    elif mode != PASSWORD_MODE:
         # A (copy of a) username-only login: its username is the credential.
         # A malformed mode fails closed: it may be meant as username-only.
+        if mode == USERNAME_ONLY:
+            return refused(USERNAME_ONLY_SECRET, GATE_USERNAME_ONLY)
         return refused(
-            USERNAME_ONLY_SECRET
-            if mode == USERNAME_ONLY
-            else "bad agent_login_mode: cannot tell whether it is a username-only login"
+            "bad agent_login_mode: cannot tell whether it is a username-only login"
         )
     counts = _custom_field_counts(item)
     if any(c > 1 for c in counts.values()):
@@ -684,7 +811,10 @@ def secret_item_from_json(
         if shown in listed:
             continue
         listed.append(shown)
-        if fname in _BUILTIN_FIELDS:
+        if account_only and fname == "password":
+            # the account number IS the credential (agent_script authorized it)
+            value = _builtin_value(item, "username").strip()
+        elif fname in _BUILTIN_FIELDS:
             value = _builtin_value(item, fname)
         else:
             value = fields.get(fname, "")
@@ -718,41 +848,188 @@ def secret_item_from_json(
         short=short,
         item_id=item_id,
         revision=revision,
+        kind=kind,
+        agent_script=flag,
     )
     return public, SecretValues(fields=values, totp_seed=seed)
 
 
+@dataclass(frozen=True)
+class SecretEntry:
+    """One raw item of the secret read and which collection(s) listed it."""
+
+    raw: Mapping[str, Any]
+    in_login: bool = False
+    in_secrets: bool = True
+
+
+def secret_entries(
+    secrets_raw: list[Any], login_raw: list[Any] | None = None
+) -> list[SecretEntry]:
+    """The entries of one secret read. With `login_raw` (mode agent_script):
+    both reads, an item listed by both (same id-shaped Bitwarden id) merged
+    into ONE entry; items without such an id are never merged."""
+    entries: list[SecretEntry] = []
+    by_id: dict[str, int] = {}
+    for raw in login_raw or []:
+        if not isinstance(raw, Mapping):
+            continue
+        item_id = view_item_id(str(raw.get("id") or ""))
+        if item_id and item_id in by_id:
+            continue  # the same item twice in one read: keep the first
+        if item_id:
+            by_id[item_id] = len(entries)
+        entries.append(SecretEntry(raw, in_login=True, in_secrets=False))
+    for raw in secrets_raw:
+        if not isinstance(raw, Mapping):
+            continue
+        item_id = view_item_id(str(raw.get("id") or ""))
+        if item_id and item_id in by_id:
+            idx = by_id[item_id]
+            if entries[idx].in_login and not entries[idx].in_secrets:
+                entries[idx] = SecretEntry(entries[idx].raw, True, True)
+            continue
+        if item_id:
+            by_id[item_id] = len(entries)
+        entries.append(SecretEntry(raw, in_login=False, in_secrets=True))
+    return entries
+
+
+_GATE_REASONS = {
+    GATE_UNREADABLE: MEMBERSHIP_REASONS[MEMBERSHIP_UNREADABLE],
+    GATE_BAD_FLAG: BAD_AGENT_SCRIPT,
+    GATE_NO_FLAG: NO_AGENT_SCRIPT,
+    GATE_HELD: HELD_SECRET,
+    GATE_DUPLICATE: DUPLICATE_SECRET_ID,
+}
+
+
+def _strict_judgement(
+    entry: SecretEntry, n: int, membership: Membership | None
+) -> tuple[SecretItem, SecretValues | None]:
+    """What mode agent_script answers for `entry` (before the duplicate rule)."""
+    raw = entry.raw
+    fields = _fields(raw)
+    flag = agent_script_flag(fields)
+    kind = KIND_LOGIN if entry.in_login else KIND_SECRET
+    it, vals = secret_item_from_json(
+        raw,
+        n,
+        kind=kind,
+        login_ids=not entry.in_secrets,
+        username_secret=flag is True,
+    )
+    if membership_refusal(raw, membership, GATE_AGENT_SCRIPT):
+        code = GATE_UNREADABLE
+    elif flag is None:
+        code = GATE_BAD_FLAG
+    elif flag is False:
+        code = GATE_NO_FLAG
+    elif item_hold(fields):
+        code = GATE_HELD
+    else:
+        code = it.code
+    if code == GATE_OK:
+        return replace(it, gate_code=GATE_OK), vals
+    return (
+        replace(
+            it,
+            fields=(),
+            listed=(),
+            has_totp=False,
+            refused=_GATE_REASONS.get(code) or it.refused or code,
+            code=code,
+            gate_code=code,
+        ),
+        None,
+    )
+
+
+def _refused_copy(it: SecretItem, reason: str, code: str) -> SecretItem:
+    return replace(it, fields=(), listed=(), has_totp=False, refused=reason, code=code)
+
+
+# One pass per mode over the entries; the branches are the gate table.
+# pylint: disable-next=too-many-locals,too-many-branches
 def build_secret_items(
-    raw_items: list[Any], *, membership: Membership | None = None
+    raw_items: list[Any],
+    *,
+    membership: Membership | None = None,
+    gate: str = GATE_COLLECTIONS,
+    login_raw: list[Any] | None = None,
 ) -> tuple[list[SecretItem], dict[str, SecretValues]]:
-    """All secrets items (a second item claiming a taken id is refused) and the
-    values of the non-refused ones, keyed by id. `membership` (login and
-    secrets collection ids): an item whose ``collectionIds`` are unreadable
-    or name both collections is refused (``collection_membership``)."""
+    """All secret items and the values of the served ones, keyed by id.
+
+    Mode ``collections``/``report`` (tp#965, unchanged): `raw_items` is the
+    secrets collection; a second item claiming a taken id is refused; an
+    item whose ``collectionIds`` are unreadable or name both collections is
+    refused. Every item also carries ``gate_code`` = what mode agent_script
+    would answer. Mode ``agent_script``: the login read (`login_raw`) and the
+    legacy secrets read, merged by item id; only an item with
+    ``agent_script=true`` is served; two FLAGGED (or malformed) items
+    claiming one id are both refused (``duplicate_id``) — an unflagged item
+    claims no id."""
+    if gate not in SECRET_GATES:
+        raise BadSecretGate(
+            f"unknown secret_gate {safe_name(gate, 0, prefix='gate')!r}"
+        )
+    strict_mode = gate == GATE_AGENT_SCRIPT
+    entries = secret_entries(raw_items, login_raw if strict_mode else None)
+    judged: list[tuple[SecretItem, SecretValues | None]] = []
+    n = 0
+    for entry in entries:
+        n += 1
+        strict, strict_vals = _strict_judgement(entry, n, membership)
+        if strict_mode:
+            judged.append((strict, strict_vals))
+            continue
+        it, vals = secret_item_from_json(entry.raw, n)
+        why = membership_refusal(entry.raw, membership)
+        if why:
+            code = (
+                GATE_UNREADABLE
+                if why == MEMBERSHIP_REASONS[MEMBERSHIP_UNREADABLE]
+                else GATE_INVALID
+            )
+            it, vals = _refused_copy(it, why, code), None
+        judged.append((replace(it, gate_code=strict.gate_code), vals))
+    # the duplicate rule (preview in the other modes)
+    claims: dict[str, int] = {}
+    for it, _vals in judged:
+        if it.agent_script is not False:
+            claims[it.secret_id] = claims.get(it.secret_id, 0) + 1
     items: list[SecretItem] = []
     values: dict[str, SecretValues] = {}
     seen: set[str] = set()
-    n = 0
-    for raw in raw_items:
-        if not isinstance(raw, Mapping):
-            continue
-        n += 1
-        it, vals = secret_item_from_json(raw, n)
-        why = membership_refusal(raw, membership)
-        if why or it.secret_id in seen:
-            it = SecretItem(
-                it.secret_id,
-                it.name,
-                item_id=it.item_id,
-                revision=it.revision,
-                refused=why or "duplicate agent_secret_id",
-            )
+    for it, vals in judged:
+        duplicate = it.agent_script is not False and claims.get(it.secret_id, 0) > 1
+        if duplicate:
+            it = replace(it, gate_code=GATE_DUPLICATE)
+        if strict_mode:
+            if duplicate:
+                it, vals = _refused_copy(it, DUPLICATE_SECRET_ID, GATE_DUPLICATE), None
+        elif it.secret_id in seen:
+            it = _refused_copy(it, "duplicate agent_secret_id", GATE_DUPLICATE)
             vals = None
         seen.add(it.secret_id)
         items.append(it)
         if vals is not None and it.refused is None:
             values[it.secret_id] = vals
     return items, values
+
+
+def resolve_secret(items: list[SecretItem], secret_id: str) -> SecretItem | None:
+    """The item a request for `secret_id` reaches: the one claiming owner (or
+    its refused duplicate), else the first unflagged item of that id (refused
+    ``no_agent_script``), else None."""
+    owners = [it for it in items if it.secret_id == secret_id]
+    if not owners:
+        return None
+    served = [it for it in owners if it.refused is None]
+    if served:
+        return served[0]
+    claiming = [it for it in owners if it.agent_script is not False]
+    return (claiming or owners)[0]
 
 
 def filter_org(raw_items: list[Any], org_id: str | None, coll_id: str) -> list[Any]:
@@ -774,14 +1051,26 @@ def filter_org(raw_items: list[Any], org_id: str | None, coll_id: str) -> list[A
 
 
 class _SecretSource:
-    """Cached, single-flight access to a secrets collection (mixin).
+    """Cached, single-flight access to the secret read (mixin).
 
-    Subclasses provide ``cache``, ``_secrets_key`` (raises SecretsNotConfigured)
-    and ``_load_secrets`` (one uncached read; a ``bw sync`` in it bumps the
-    cache generation).
+    Subclasses provide ``cache``, ``secret_gate``, ``_secrets_key`` (raises
+    SecretsNotConfigured / BadSecretGate) and ``_load_secrets`` (one uncached
+    read: (legacy secrets items, login items or None); a ``bw sync`` in it
+    bumps the cache generation). The key holds the gate and every collection
+    id, so a switch never serves an entry cached under another mode.
     """
 
     cache: VaultCache
+
+    def secret_gate(self) -> tuple[str, str]:
+        """(gate as configured, since)."""
+        return GATE_COLLECTIONS, ""
+
+    def _gate(self) -> str:
+        gate = self.secret_gate()[0]
+        if gate not in SECRET_GATES:
+            raise BadSecretGate(BAD_SECRET_GATE)
+        return gate
 
     def _secrets_key(self) -> tuple[str, ...]:
         raise SecretsNotConfigured(NO_SECRETS_COLLECTION)
@@ -791,7 +1080,7 @@ class _SecretSource:
         None = unknown (no membership rule)."""
         return None
 
-    def _load_secrets(self, key: tuple[str, ...]) -> list[Any]:
+    def _load_secrets(self, key: tuple[str, ...]) -> tuple[list[Any], list[Any] | None]:
         raise SecretsNotConfigured(NO_SECRETS_COLLECTION)
 
     def _fill(self, key: tuple[str, ...], want: tuple[str, ...]) -> Any:
@@ -801,9 +1090,14 @@ class _SecretSource:
             hit = self.cache.get(want)
             if hit is not None:
                 return hit
-            raw = self._load_secrets(key)
+            raw, login_raw = self._load_secrets(key)
             gen = self.cache.generation
-            items, values = build_secret_items(raw, membership=self._membership())
+            items, values = build_secret_items(
+                raw,
+                membership=self._membership(),
+                gate=key[0],
+                login_raw=login_raw,
+            )
             for sid, vals in values.items():
                 self.cache.put(
                     ("values", *key, sid), vals, size=vals.nbytes(), generation=gen
@@ -816,7 +1110,7 @@ class _SecretSource:
             return values.get(want[-1])
 
     def secret_items(self) -> list[SecretItem]:
-        """Every item of the secrets collection, refused ones included."""
+        """Every item of the secret read, refused ones included."""
         key = self._secrets_key()
         want = ("items", *key)
         hit = self.cache.get(want)
@@ -825,7 +1119,7 @@ class _SecretSource:
         return list(hit)
 
     def secret_values(self, secret_id: str) -> SecretValues:
-        """The values of a non-refused secrets item."""
+        """The values of a served secret item."""
         key = self._secrets_key()
         want = ("values", *key, secret_id)
         hit = self.cache.get(want)
@@ -1434,20 +1728,28 @@ def identity_rules(  # pylint: disable=too-many-branches
 
 
 def build_items(
-    raw_items: list[Any], *, dev: bool = False, membership: Membership | None = None
+    raw_items: list[Any],
+    *,
+    dev: bool = False,
+    membership: Membership | None = None,
+    gate: str = GATE_COLLECTIONS,
 ) -> list[SiteItem]:
     """All items; a second item claiming an already-taken site id is refused;
     an item whose collection membership is unreadable or dual (`membership`:
     the login and secrets collection ids) is refused, its scope kept; then
-    the collection-wide WS5 rules (`identity_rules`)."""
+    the collection-wide WS5 rules (`identity_rules`). Mode ``agent_script``
+    (`gate`): an item in both collections is not refused, and a script-only
+    item (``is_script_only``) is no site at all — left out."""
     out: list[SiteItem] = []
     raws: list[Mapping[str, Any]] = []
     seen: set[str] = set()
     for raw in raw_items:
         if not isinstance(raw, Mapping):
             continue
+        if gate == GATE_AGENT_SCRIPT and is_script_only(raw):
+            continue
         it = site_item_from_json(raw, dev=dev)
-        why = membership_refusal(raw, membership)
+        why = membership_refusal(raw, membership, gate)
         if why:
             it = _refuse(it, why)
         if it.site in seen:
@@ -1502,13 +1804,20 @@ def _find(
     *,
     dev: bool,
     membership: Membership | None = None,
+    gate: str = GATE_COLLECTIONS,
 ) -> Mapping[str, Any]:
     """The raw item of `site` from a FRESH read, for a login: a held item
     (``agent_hold``) raises ``Held``; a refused one (its collection
     membership included) and a no-submit one (``SiteItem.no_submit``) are
     refused — judged on this fresh read, not on a cached list."""
-    items = build_items(raw_items, dev=dev, membership=membership)
-    for it, raw in zip(items, [r for r in raw_items if isinstance(r, Mapping)]):
+    raws = [
+        r
+        for r in raw_items
+        if isinstance(r, Mapping)
+        and not (gate == GATE_AGENT_SCRIPT and is_script_only(r))
+    ]
+    items = build_items(raws, dev=dev, membership=membership, gate=gate)
+    for it, raw in zip(items, raws):
         if it.site == site:
             if it.hold:
                 raise Held(it.hold)
@@ -1544,6 +1853,52 @@ def membership_rows(
             name = safe_name(str(raw.get("name") or ""), n)
             rows.append((side, status, name, item_id))
     return rows
+
+
+@dataclass(frozen=True)
+class GateRow:
+    """One row of ``daemon.py -g``: names, ids and codes — never a value."""
+
+    kind: str
+    gate_code: str
+    secret_id: str
+    name: str
+    item_id: str
+    served_now: bool
+
+    def public(self) -> dict[str, Any]:
+        """The JSON row of ``daemon.py -g -j``."""
+        return {
+            "kind": self.kind,
+            "gate_code": self.gate_code,
+            "id": self.secret_id,
+            "name": self.name,
+            "item_id": view_item_id(self.item_id),
+            "served_now": self.served_now,
+        }
+
+
+def script_gate_rows(
+    secrets_raw: list[Any], login_raw: list[Any], membership: Membership | None
+) -> list[GateRow]:
+    """Every item mode agent_script would list (both reads), with its
+    ``gate_code`` and whether mode collections serves it today."""
+    strict, _vals = build_secret_items(
+        secrets_raw, membership=membership, gate=GATE_AGENT_SCRIPT, login_raw=login_raw
+    )
+    now, _now_vals = build_secret_items(secrets_raw, membership=membership)
+    served = {(it.item_id or it.secret_id) for it in now if it.refused is None}
+    return [
+        GateRow(
+            kind=it.kind,
+            gate_code=it.gate_code,
+            secret_id=it.secret_id,
+            name=it.name,
+            item_id=it.item_id,
+            served_now=(it.item_id or it.secret_id) in served,
+        )
+        for it in strict
+    ]
 
 
 class FixtureVault(_SecretSource):
@@ -1598,14 +1953,37 @@ class FixtureVault(_SecretSource):
             str(data.get("secrets_collection_id") or "") or None,
         )
 
+    def secret_gate(self) -> tuple[str, str]:
+        """The fixture's ``secret_gate`` / ``secret_gate_since`` (absent =
+        collections)."""
+        data = self._data()
+        if not isinstance(data, dict) or "secret_gate" not in data:
+            return GATE_COLLECTIONS, ""
+        return str(data.get("secret_gate")), str(data.get("secret_gate_since") or "")
+
+    def _site_gate(self) -> str:
+        gate = self.secret_gate()[0]
+        return gate if gate in SECRET_GATES else GATE_COLLECTIONS
+
     def items(self) -> list[SiteItem]:
         """Every fixture item, refused ones included."""
-        return build_items(self._raw(), dev=self.dev, membership=self._membership())
+        return build_items(
+            self._raw(),
+            dev=self.dev,
+            membership=self._membership(),
+            gate=self._site_gate(),
+        )
 
     def secret(self, site: str) -> Secret:
         """The fixture LOGIN secret of `site` (never for a no-submit site)."""
         return secret_from_json(
-            _find(self._raw(), site, dev=self.dev, membership=self._membership())
+            _find(
+                self._raw(),
+                site,
+                dev=self.dev,
+                membership=self._membership(),
+                gate=self._site_gate(),
+            )
         )
 
     def membership_problems(self) -> list[tuple[str, str, str, str]]:
@@ -1621,25 +1999,43 @@ class FixtureVault(_SecretSource):
             membership,
         )
 
-    def _secrets_key(self) -> tuple[str, ...]:
+    def script_gate_report(self) -> list[GateRow]:
+        """See ``BwVault.script_gate_report``."""
         data = self._data()
-        if not isinstance(data, dict) or not isinstance(data.get("secrets"), list):
-            raise SecretsNotConfigured(NO_SECRETS_COLLECTION)
-        return (
-            "fixture",
-            str(self.path),
-            str(data.get("secrets_organization_id") or ""),
-            str(data.get("secrets_collection_id") or ""),
+        secrets_raw = data.get("secrets", []) if isinstance(data, dict) else []
+        return script_gate_rows(
+            secrets_raw if isinstance(secrets_raw, list) else [],
+            self._raw(),
+            self._membership(),
         )
 
-    def _load_secrets(self, key: tuple[str, ...]) -> list[Any]:
+    def _secrets_key(self) -> tuple[str, ...]:
+        gate = self._gate()
         data = self._data()
-        if not isinstance(data, dict) or not isinstance(data.get("secrets"), list):
+        has_secrets = isinstance(data, dict) and isinstance(data.get("secrets"), list)
+        if not has_secrets and gate != GATE_AGENT_SCRIPT:
             raise SecretsNotConfigured(NO_SECRETS_COLLECTION)
-        raw = list(data["secrets"])
-        coll = str(data.get("secrets_collection_id") or "")
-        org = str(data.get("secrets_organization_id") or "")
-        return filter_org(raw, org, coll) if org and coll else raw
+        conf: dict[str, Any] = data if isinstance(data, dict) else {}
+        return (
+            gate,
+            "fixture",
+            str(self.path),
+            str(conf.get("organization_id") or ""),
+            str(conf.get("collection_id") or ""),
+            str(conf.get("secrets_organization_id") or ""),
+            str(conf.get("secrets_collection_id") or ""),
+        )
+
+    def _load_secrets(self, key: tuple[str, ...]) -> tuple[list[Any], list[Any] | None]:
+        data = self._data()
+        raw: list[Any] = []
+        if isinstance(data, dict) and isinstance(data.get("secrets"), list):
+            raw = list(data["secrets"])
+            coll = str(data.get("secrets_collection_id") or "")
+            org = str(data.get("secrets_organization_id") or "")
+            raw = filter_org(raw, org, coll) if org and coll else raw
+        login_raw = self._raw() if key[0] == GATE_AGENT_SCRIPT else None
+        return raw, login_raw
 
     def collections(self) -> list[tuple[str, str, str, str]]:
         """``(org_id, org_name, collection_id, collection_name)`` rows."""
@@ -1687,6 +2083,7 @@ DEFAULT_SERVER_URL = "https://vaultwarden.dom42.space"
 
 
 _OPTIONAL_IDS = ("organization_id", "secrets_organization_id", "secrets_collection_id")
+_OPTIONAL_GATE = ("secret_gate", "secret_gate_since")
 
 
 @dataclass(frozen=True)
@@ -1708,6 +2105,10 @@ class BwBootstrap:  # pylint: disable=too-many-instance-attributes
     organization_id: str | None = None
     secrets_organization_id: str | None = None
     secrets_collection_id: str | None = None
+    # tp#991: absent = collections; an unknown value is kept and refused by
+    # the secret ops (logins keep working).
+    secret_gate: str = GATE_COLLECTIONS
+    secret_gate_since: str = ""
 
     @classmethod
     def load(cls, path: str | os.PathLike[str]) -> BwBootstrap:
@@ -1730,6 +2131,12 @@ class BwBootstrap:  # pylint: disable=too-many-instance-attributes
             if value is not None and (not isinstance(value, str) or not value):
                 raise VaultError(f"bootstrap {path}: {k} must be a non-empty string")
             optional[k] = value
+        gate_keys: dict[str, str] = {}
+        for k in _OPTIONAL_GATE:
+            value = data.get(k)
+            if value is not None and not isinstance(value, str):
+                raise VaultError(f"bootstrap {path}: {k} must be a string")
+            gate_keys[k] = value or ""
         return cls(
             client_id=data["client_id"],
             client_secret=data["client_secret"],
@@ -1739,6 +2146,8 @@ class BwBootstrap:  # pylint: disable=too-many-instance-attributes
             organization_id=optional["organization_id"],
             secrets_organization_id=optional["secrets_organization_id"],
             secrets_collection_id=optional["secrets_collection_id"],
+            secret_gate=gate_keys["secret_gate"] or GATE_COLLECTIONS,
+            secret_gate_since=gate_keys["secret_gate_since"],
         )
 
 
@@ -1845,11 +2254,20 @@ class BwVault(_SecretSource):
     def _membership(self) -> Membership:
         return (self.boot.collection_id, self.boot.secrets_collection_id)
 
+    def secret_gate(self) -> tuple[str, str]:
+        """The bootstrap's ``secret_gate`` / ``secret_gate_since``."""
+        return self.boot.secret_gate, self.boot.secret_gate_since
+
+    def _site_gate(self) -> str:
+        gate = self.boot.secret_gate
+        return gate if gate in SECRET_GATES else GATE_COLLECTIONS
+
     def items(self) -> list[SiteItem]:
         """Every item of the ``agent-logins`` collection."""
         return build_items(
             self._raw(self.boot.organization_id, self.boot.collection_id),
             membership=self._membership(),
+            gate=self._site_gate(),
         )
 
     def secret(self, site: str) -> Secret:
@@ -1859,7 +2277,13 @@ class BwVault(_SecretSource):
         reaches a login."""
         raw = self._raw(self.boot.organization_id, self.boot.collection_id)
         return secret_from_json(
-            _find(raw, site, dev=False, membership=self._membership())
+            _find(
+                raw,
+                site,
+                dev=False,
+                membership=self._membership(),
+                gate=self._site_gate(),
+            )
         )
 
     def membership_problems(self) -> list[tuple[str, str, str, str]]:
@@ -1874,17 +2298,40 @@ class BwVault(_SecretSource):
             )
         return membership_rows(logins, secrets_raw, self._membership())
 
+    def script_gate_report(self) -> list[GateRow]:
+        """``daemon.py -g``: every item mode agent_script would list, from a
+        fresh read of both collections (`script_gate_rows`) — no value."""
+        logins = self._raw(self.boot.organization_id, self.boot.collection_id)
+        secrets_raw: list[Any] = []
+        if self.boot.secrets_collection_id:
+            secrets_raw = self._raw(
+                self.boot.secrets_organization_id, self.boot.secrets_collection_id
+            )
+        return script_gate_rows(secrets_raw, logins, self._membership())
+
     def _secrets_key(self) -> tuple[str, ...]:
-        if not self.boot.secrets_collection_id:
+        gate = self._gate()
+        if not self.boot.secrets_collection_id and gate != GATE_AGENT_SCRIPT:
             raise SecretsNotConfigured(NO_SECRETS_COLLECTION)
         return (
+            gate,
             "bw",
+            self.boot.organization_id or "",
+            self.boot.collection_id,
             self.boot.secrets_organization_id or "",
-            self.boot.secrets_collection_id,
+            self.boot.secrets_collection_id or "",
         )
 
-    def _load_secrets(self, key: tuple[str, ...]) -> list[Any]:
-        return self._raw(key[1] or None, key[2])
+    def _load_secrets(self, key: tuple[str, ...]) -> tuple[list[Any], list[Any] | None]:
+        raw: list[Any] = []
+        if self.boot.secrets_collection_id:
+            raw = self._raw(
+                self.boot.secrets_organization_id, self.boot.secrets_collection_id
+            )
+        login_raw = None
+        if key[0] == GATE_AGENT_SCRIPT:
+            login_raw = self._raw(self.boot.organization_id, self.boot.collection_id)
+        return raw, login_raw
 
     def collections(self) -> list[tuple[str, str, str, str]]:
         """``(org_id, org_name, collection_id, collection_name)`` of every
