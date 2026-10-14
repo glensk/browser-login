@@ -112,7 +112,7 @@ class SecretOps:  # pylint: disable=too-few-public-methods
     _items_lock: threading.Lock
     _items_cache: Any
 
-    def audit(  # pylint: disable=too-many-arguments
+    def audit(  # pylint: disable=too-many-arguments,too-many-positional-arguments
         self,
         op: str,
         site: str | None,
