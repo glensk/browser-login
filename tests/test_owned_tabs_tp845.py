@@ -257,6 +257,7 @@ def _stub_checks(monkeypatch) -> None:
     monkeypatch.setattr(browser, "_chatgpt_state", lambda page: "valid")
     monkeypatch.setattr(browser, "_slack_state", lambda page: "valid")
     monkeypatch.setattr(browser, "_biopolwifi_logged_in", lambda page: True)
+    monkeypatch.setattr(browser, "_biopolwifi_state", lambda page: "in")  # tp#1059
     monkeypatch.setattr(
         browser, "_slack_session_from_page", lambda ctx, page: {"token": "x"}
     )

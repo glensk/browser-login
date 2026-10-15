@@ -9085,7 +9085,11 @@ def _biopolwifi_login_owned(page) -> int:
         # Poll up to ~20s for the logged-in sentinel.
         for _ in range(40):
             if _biopolwifi_logged_in(page):
-                print("✓ Logged into the Cloudpath MDU portal (edificom).")
+                print(
+                    "✓ Logged into the Cloudpath MDU portal (edificom) — the "
+                    "credential works. This session ends with this tab: "
+                    f"{BIOPOLWIFI_PER_TAB_NOTE}."
+                )
                 _record_login_event("biopolwifi", "env")
                 return 0
             page.wait_for_timeout(500)
@@ -9095,16 +9099,54 @@ def _biopolwifi_login_owned(page) -> int:
         )
 
 
-def _biopolwifi_check(page) -> bool:
-    """`logged-in biopolwifi`'s ACTIVE check: load the portal, read the sentinel."""
+# The portal page state the check settles on: "in" (sentinel), "form" (the
+# login form), anything else = an unexpected page. Evaluated as ONE expression
+# so a page mid-render cannot yield "form" and "in" from two different DOMs.
+BIOPOLWIFI_STATE_JS = (
+    "() => { const t = document.body ? document.body.innerText : '';"
+    " if (/SDSC - Biopole/.test(t) || /\\bProperties\\b/.test(t)) return 'in';"
+    " return document.querySelector('input[placeholder=\"Email Address\"]')"
+    " ? 'form' : 'other'; }"
+)
+# Why a fresh tab can never be logged in (tp#1059):
+# the Cloudpath SPA keeps its login token in the tab's sessionStorage (vuex
+# `authentication`), sets no session cookie (its REST API answers 401 to the
+# browser's cookies right after a login) and the token lives ~5 min. So the
+# session ends with the tab `login biopolwifi` closes again (tp#845).
+BIOPOLWIFI_PER_TAB_NOTE = (
+    "the Cloudpath portal keeps its login only in the tab that signed in "
+    "(sessionStorage token, ~5 min, no session cookie), so no session outlives "
+    "`login biopolwifi` — that login is the credential check; for portal work "
+    "use sdsc/biopol-wifi/biopol-wifi.py"
+)
+
+
+def _biopolwifi_state(page) -> str:
+    """'in' / 'form' / 'other' for the page now (`BIOPOLWIFI_STATE_JS`)."""
+    from playwright.sync_api import Error as PlaywrightError
+
+    try:
+        return str(page.evaluate(BIOPOLWIFI_STATE_JS))
+    except PlaywrightError:
+        return "other"
+
+
+def _biopolwifi_check_state(page) -> str:
+    """`logged-in biopolwifi`'s ACTIVE check: load the portal, then poll (up to
+    ~15 s) until the SPA settles on the sentinel or the login form."""
     from playwright.sync_api import Error as PlaywrightError
 
     try:
         page.goto(BIOPOLWIFI_PORTAL_URL, wait_until="domcontentloaded")
-        page.wait_for_timeout(2500)
     except PlaywrightError:
         pass
-    return _biopolwifi_logged_in(page)
+    state = "other"
+    for _ in range(30):
+        state = _biopolwifi_state(page)
+        if state != "other":
+            break
+        page.wait_for_timeout(500)
+    return state
 
 
 def cmd_biopolwifi_logged_in(port: int) -> int:
@@ -9113,11 +9155,30 @@ def cmd_biopolwifi_logged_in(port: int) -> int:
     ACTIVE check in a fresh background tab of its own (`_logged_in_page_check`,
     tp#845): navigate to the portal, settle, and confirm the 'SDSC - Biopole' /
     'Properties' sentinel on the properties surface (never merely 'the URL
-    isn't the login form')."""
-    if _logged_in_page_check(port, _biopolwifi_check):
+    isn't the login form'). The portal's session is per tab
+    (`BIOPOLWIFI_PER_TAB_NOTE`), so after a `login` this answers 2 — truthfully:
+    no tab of the browser holds a session — and says why."""
+    seen: list[str] = []
+
+    def check(page) -> bool:
+        seen.append(_biopolwifi_check_state(page))
+        return seen[-1] == "in"
+
+    if _logged_in_page_check(port, check):
         print("✓ Logged into the Cloudpath MDU portal (edificom).")
         return 0
-    print("Not logged into the Cloudpath MDU portal (edificom).", file=sys.stderr)
+    if seen and seen[-1] == "form":
+        print(
+            "Not logged into the Cloudpath MDU portal (edificom): a fresh tab "
+            f"shows its login form — {BIOPOLWIFI_PER_TAB_NOTE}.",
+            file=sys.stderr,
+        )
+    else:
+        print(
+            "Not logged into the Cloudpath MDU portal (edificom): neither the "
+            "logged-in sentinel nor the login form appeared.",
+            file=sys.stderr,
+        )
     return 2
 
 
