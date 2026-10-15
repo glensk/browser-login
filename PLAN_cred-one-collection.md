@@ -209,8 +209,9 @@ Recommended new parent boxes:
       injectable items as before; `./agent-login.py` shows the credential section (⚠️ no
       state file until parent R3b) and no new ❌ site.
   ↳ evidence 2026-10-14: release b3226fa66469-20261014T135845Z installed by sudo install/install.sh; selfcheck all ✅; secret-run -V gate=collections; secret-run -l lists the same items; agent-login shows the credential section (no state file yet)
-- [ ] B8 (after R7m, R7h) main session, live — the flip (done with parent R7g, 2026-10-14) and the collection
+- [x] B8 (after R7m, R7h) main session, live — the flip (done with parent R7g, 2026-10-14) and the collection
       drop, per "Gate staging". Not this plan's agent.
+  ↳ evidence 2026-10-15: flip 2026-10-14 21:57 (R7g); R7m waves 1-3 moved all 26 legacy items 2026-10-15; R7h install.sh -D 20:04, 71 rows kind login
 
 **Order.** B1 → B2 → B3 → B4 → B5 → B6, each committed with its tests before the next; B7
 after review; B8 belongs to the parent's live sequence.
