@@ -365,12 +365,13 @@ NOTION_SIDEBAR_SELECTOR = ".notion-sidebar, .notion-sidebar-switcher"
 # --- Biopol WiFi (Ruckus Cloudpath MDU portal) site -------------------------
 # The SDSC Biopole WiFi units are managed through a Ruckus Cloudpath MDU
 # property-management portal — a plain Vue SPA at cloudpath.edificom.cloud whose
-# login is an ordinary email+password form (no SSO, no TOTP). That makes this
-# site UNATTENDED like CSCS: we fill the form from two macOS-keychain items and
-# submit. Those two items are SHARED VERBATIM with sdsc/biopol-wifi/biopol-wifi.py
-# (the pure-`requests` CLI that drives the SAME portal's REST API) — do NOT rename
-# them, or the CLI stops finding its credentials. No token is extracted here; this
-# Site only keeps the GUI logged in for manual portal work. Logged-in sentinel =
+# login is an ordinary email+password form (no SSO, no TOTP). We fill the form
+# from the env vars BIOPOLWIFI_EMAIL / BIOPOLWIFI_PASSWORD — the same names
+# sdsc/biopol-wifi/biopol-wifi.py (the pure-`requests` CLI for the SAME portal's
+# REST API) reads — injected from the vault item `biopol-wifi` by
+# `env-profile-run.py biopol-wifi -- browser.py login biopolwifi`. Nothing is read
+# from the macOS keychain. No token is extracted here; this Site only keeps the
+# GUI logged in for manual portal work. Logged-in sentinel =
 # the property name "SDSC - Biopole" / a "Properties" breadcrumb (the login form
 # page has neither; it shows input[placeholder="Email Address"]).
 BIOPOLWIFI_PORTAL_URL = (
@@ -378,8 +379,9 @@ BIOPOLWIFI_PORTAL_URL = (
     "MduPortalAccess-ba2441af-c90a-47bd-9f00-847a817da979"
     "?redirect=%2FMduPortalAccess-ba2441af-c90a-47bd-9f00-847a817da979%2Fproperties"
 )
-KEYCHAIN_SVC_BIOPOL_EMAIL = "biopol-wifi: email"
-KEYCHAIN_SVC_BIOPOL_PASS = "biopol-wifi: password"
+BIOPOLWIFI_ENV_EMAIL = "BIOPOLWIFI_EMAIL"
+BIOPOLWIFI_ENV_PASSWORD = "BIOPOLWIFI_PASSWORD"  # noqa: S105 - env var NAME
+BIOPOLWIFI_ENV_PROFILE = "biopol-wifi"  # mydotfiles env_profiles.json
 
 # Per-site log of REAL (cold) logins — one JSON object per line. Appended only
 # when `login <site>` actually had to sign in (never on a warm/already-logged-in
@@ -785,8 +787,8 @@ def parse_args() -> argparse.Namespace:
             "  ./browser.py token              # cache the CSCS portal token\n"
             "  ./browser.py cscs-store-creds   # one-time: cache CSCS creds in keychain\n"
             "  ./browser.py cscs-login         # auto-login to CSCS (keychain, no Touch ID)\n"
-            "  ./browser.py store-creds biopolwifi  # one-time: cache Cloudpath portal creds\n"
-            "  ./browser.py login biopolwifi   # auto-login to the Cloudpath MDU WiFi portal\n"
+            "  env-profile-run.py biopol-wifi -- ./browser.py login biopolwifi"
+            "  # Cloudpath WiFi portal\n"
             "  ./browser.py broker-sites       # sites the login broker may log into\n"
             "  ./browser.py login ricardo      # broker site: session bundle, no password\n"
             "  ./browser.py logout ricardo     # drop that session again\n"
@@ -9022,9 +9024,10 @@ def _biopolwifi_logged_in(page) -> bool:
 def cmd_biopolwifi_login(port: int) -> int:
     """Ensure the Cloudpath MDU portal (cloudpath.edificom.cloud) is logged in.
 
-    UNATTENDED like CSCS: the portal login is a plain email+password Vue form, so
-    we fill it from the two macOS-keychain items (shared with biopol-wifi.py) and
-    submit — no SSO, no 1Password fallback for this site. Idempotent: a warm
+    The portal login is a plain email+password Vue form, so we fill it from the
+    env vars BIOPOLWIFI_EMAIL / BIOPOLWIFI_PASSWORD (injected by
+    `env-profile-run.py biopol-wifi -- …`; never the macOS keychain) and
+    submit — no SSO for this site. Idempotent: a warm
     session (the 'SDSC - Biopole' / 'Properties' sentinel already present) just
     returns 0. No token is extracted; this only keeps the GUI logged in. Held
     under the INTERACTION lease — no other tool clicks in the meantime. In a
@@ -9069,13 +9072,10 @@ def _biopolwifi_login_owned(page) -> int:
                 "Cloudpath portal showed neither the login form nor the logged-in "
                 f"sentinel — unexpected page ({_tab_hint(page.url)})."
             )
-        email = _keychain_get(KEYCHAIN_SVC_BIOPOL_EMAIL)
-        password = _keychain_get(KEYCHAIN_SVC_BIOPOL_PASS)
-        if not (email and password):
-            return _fail(
-                "No Cloudpath portal credentials in the keychain. "
-                "Run: browser.py store-creds biopolwifi"
-            )
+        creds = _biopolwifi_env_creds()
+        if creds is None:
+            return 1
+        email, password = creds
         try:
             page.fill(email_sel, email)
             page.fill(pass_sel, password)
@@ -9086,7 +9086,7 @@ def _biopolwifi_login_owned(page) -> int:
         for _ in range(40):
             if _biopolwifi_logged_in(page):
                 print("✓ Logged into the Cloudpath MDU portal (edificom).")
-                _record_login_event("biopolwifi", "keychain")
+                _record_login_event("biopolwifi", "env")
                 return 0
             page.wait_for_timeout(500)
         return _fail(
@@ -9121,56 +9121,39 @@ def cmd_biopolwifi_logged_in(port: int) -> int:
     return 2
 
 
-def cmd_biopolwifi_store_creds() -> int:
-    """Store the Cloudpath MDU portal email+password in the macOS keychain.
+def _biopolwifi_env_hint() -> str:
+    """The re-run line that injects the Cloudpath portal credentials."""
+    return f"env-profile-run.py {BIOPOLWIFI_ENV_PROFILE} -- browser.py login biopolwifi"
 
-    Interactive one-time setup: prompt for the portal email (shown) and password
-    (hidden via getpass), then write the two items — SHARED with biopol-wifi.py —
-    so `browser.py login biopolwifi` runs unattended. No 1Password / TOTP for this
-    site; it's a plain email+password form."""
-    import getpass
 
-    print(
-        "Setting up unattended Cloudpath MDU portal (cloudpath.edificom.cloud) "
-        "login.\nCredentials are stored in your macOS login keychain (encrypted at "
-        "rest, read only by the `security` tool, no Touch ID on later reads).\n"
-    )
-    email = input("Cloudpath portal email (e.g. albert.glensk@epfl.ch): ").strip()
-    password = getpass.getpass("Cloudpath portal password: ")
-    if not (email and password):
-        return _fail("Missing email or password — nothing stored.")
-    print("If macOS shows a keychain dialog, answer it.", file=sys.stderr)
-    result = _keychain_set_all(
-        [
-            (KEYCHAIN_SVC_BIOPOL_EMAIL, email),
-            (KEYCHAIN_SVC_BIOPOL_PASS, password),
-        ],
-        "biopol-wifi credential",
-    )
-    if not result.ok:
-        return _report_keychain_batch_failure(
-            result, "store-creds biopolwifi", "forget-creds biopolwifi"
+def _biopolwifi_env_creds() -> tuple[str, str] | None:
+    """(email, password) from the env, or None after printing what is missing."""
+    email = os.environ.get(BIOPOLWIFI_ENV_EMAIL, "")
+    password = os.environ.get(BIOPOLWIFI_ENV_PASSWORD, "")
+    if email and password:
+        return email, password
+    missing = [
+        name
+        for name, value in (
+            (BIOPOLWIFI_ENV_EMAIL, email),
+            (BIOPOLWIFI_ENV_PASSWORD, password),
         )
-    print(
-        "✓ Stored the Cloudpath portal email and password in the macOS keychain.\n"
-        "  `browser.py login biopolwifi` now runs without a prompt.\n"
-        "  Verify with:  browser.py login biopolwifi\n"
-        "  Revoke with:  browser.py forget-creds biopolwifi"
+        if not value
+    ]
+    _fail(
+        f"No Cloudpath portal credentials: {' and '.join(missing)} not set. "
+        f"Re-run with the vault credentials injected: {_biopolwifi_env_hint()}"
     )
-    return 0
+    return None
 
 
-def cmd_biopolwifi_forget_creds() -> int:
-    """Delete the Cloudpath MDU portal credentials from the macOS keychain."""
-    services = (KEYCHAIN_SVC_BIOPOL_EMAIL, KEYCHAIN_SVC_BIOPOL_PASS)
-    left = [svc for svc in services if not _keychain_delete(svc)]
-    if left:
-        return _fail(f"Could not remove keychain item(s): {', '.join(left)}.")
-    print(
-        "✓ Removed the Cloudpath portal keychain credentials. "
-        "`browser.py login biopolwifi` needs `store-creds biopolwifi` again."
+def cmd_biopolwifi_creds_retired() -> int:
+    """`store-creds` / `forget-creds biopolwifi`: no keychain copy is kept any more."""
+    return _fail(
+        "biopolwifi keeps no credentials in the macOS keychain: they come from "
+        f"{BIOPOLWIFI_ENV_EMAIL} / {BIOPOLWIFI_ENV_PASSWORD}, injected by "
+        f"{_biopolwifi_env_hint()}"
     )
-    return 0
 
 
 # ---------------------------------------------------------------------------
@@ -15931,11 +15914,12 @@ def _sites() -> list[Site]:
         Site(
             name="biopolwifi",
             aliases=("biopol", "cloudpath", "edificom"),
-            blurb="Cloudpath MDU WiFi portal (keychain email+password; SDSC Biopole units)",
+            blurb="Cloudpath MDU WiFi portal (env email+password via env-profile-run; "
+            "SDSC Biopole units)",
             login=cmd_biopolwifi_login,
             logged_in=cmd_biopolwifi_logged_in,
-            store_creds=cmd_biopolwifi_store_creds,
-            forget_creds=cmd_biopolwifi_forget_creds,
+            store_creds=cmd_biopolwifi_creds_retired,
+            forget_creds=cmd_biopolwifi_creds_retired,
         ),
         Site(
             name="switch",

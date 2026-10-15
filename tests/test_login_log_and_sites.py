@@ -253,7 +253,7 @@ def test_store_and_forget_creds_refused_for_assisted_sites(capsys):
 
 def test_store_creds_dispatches_to_the_site(monkeypatch):
     monkeypatch.setattr(browser, "cmd_cscs_store_creds", lambda: 7)
-    monkeypatch.setattr(browser, "cmd_biopolwifi_forget_creds", lambda: 8)
+    monkeypatch.setattr(browser, "cmd_biopolwifi_creds_retired", lambda: 8)
     assert browser.cmd_store_creds("cscs") == 7
     assert browser.cmd_forget_creds("biopol") == 8
 

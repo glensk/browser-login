@@ -459,35 +459,19 @@ def cscs_store(kc, monkeypatch):
     return kc
 
 
-@pytest.fixture
-def biopol_store(kc, monkeypatch):
-    import getpass
-
-    kc.items = {}
-    monkeypatch.setattr("builtins.input", lambda _prompt="": "dummy@example.org")
-    monkeypatch.setattr(getpass, "getpass", lambda _prompt="": "DUMMYPASS")
-    return kc
-
-
 def _run_store(which: str) -> int:
-    cmd = browser.cmd_cscs_store_creds if which == "cscs" else None
-    return int((cmd or browser.cmd_biopolwifi_store_creds)())
+    assert which == "cscs"
+    return int(browser.cmd_cscs_store_creds())
 
 
 def _first_svc(which: str) -> str:
-    return str(
-        browser.KEYCHAIN_SVC_USER
-        if which == "cscs"
-        else browser.KEYCHAIN_SVC_BIOPOL_EMAIL
-    )
+    assert which == "cscs"
+    return str(browser.KEYCHAIN_SVC_USER)
 
 
 def _second_svc(which: str) -> str:
-    return str(
-        browser.KEYCHAIN_SVC_PASS
-        if which == "cscs"
-        else browser.KEYCHAIN_SVC_BIOPOL_PASS
-    )
+    assert which == "cscs"
+    return str(browser.KEYCHAIN_SVC_PASS)
 
 
 def _no_values(capsys) -> str:
@@ -498,10 +482,9 @@ def _no_values(capsys) -> str:
     return str(out.err)
 
 
-@pytest.fixture(params=["cscs", "biopolwifi"])
+@pytest.fixture(params=["cscs"])
 def store(request):
-    fixture = "cscs_store" if request.param == "cscs" else "biopol_store"
-    return request.param, request.getfixturevalue(fixture)
+    return request.param, request.getfixturevalue("cscs_store")
 
 
 def test_store_prints_the_dialog_hint_without_values(store, capsys):

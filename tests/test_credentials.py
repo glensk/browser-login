@@ -748,32 +748,6 @@ def test_store_creds_invalid_last_field_writes_nothing(monkeypatch, sec):
     assert not rec.calls
 
 
-def test_biopolwifi_store_creds_labels_and_validates(monkeypatch, sec):
-    rec = sec(OK)
-    answers = iter(["me@example.org"])
-    monkeypatch.setattr("builtins.input", lambda _prompt="": next(answers))
-    import getpass
-
-    monkeypatch.setattr(getpass, "getpass", lambda _prompt="": "pw\nrest")
-    assert browser.cmd_biopolwifi_store_creds() == 1
-    assert not rec.calls
-
-    seen: list[tuple[str, str, str]] = []
-
-    def fake_write(svc, v, description, keychain, touched=None):
-        seen.append((svc, v, description))
-        return "ok"
-
-    monkeypatch.setattr(browser, "_keychain_write", fake_write)
-    answers = iter(["me@example.org"])
-    monkeypatch.setattr(getpass, "getpass", lambda _prompt="": "pw")
-    assert browser.cmd_biopolwifi_store_creds() == 0
-    assert seen == [
-        (browser.KEYCHAIN_SVC_BIOPOL_EMAIL, "me@example.org", "biopol-wifi credential"),
-        (browser.KEYCHAIN_SVC_BIOPOL_PASS, "pw", "biopol-wifi credential"),
-    ]
-
-
 # --- Keycloak form ---------------------------------------------------------------
 
 
@@ -1010,9 +984,7 @@ def test_kc_delete_outcomes(sec, keychain_path, answer, outcome):
     assert browser._kc_delete("svc", keychain_path) == outcome
 
 
-@pytest.mark.parametrize(
-    "cmd", ["cmd_cscs_forget_creds", "cmd_biopolwifi_forget_creds"]
-)
+@pytest.mark.parametrize("cmd", ["cmd_cscs_forget_creds"])
 def test_forget_creds_fails_loud_when_an_item_survives(monkeypatch, capsys, cmd):
     # Regression: forget-creds printed "✓ Removed" and exited 0 even when the
     # secrets were still in the keychain.
@@ -1022,9 +994,7 @@ def test_forget_creds_fails_loud_when_an_item_survives(monkeypatch, capsys, cmd)
     assert "✓" not in out.out and "password" in out.err
 
 
-@pytest.mark.parametrize(
-    "cmd", ["cmd_cscs_forget_creds", "cmd_biopolwifi_forget_creds"]
-)
+@pytest.mark.parametrize("cmd", ["cmd_cscs_forget_creds"])
 def test_forget_creds_succeeds_when_all_items_are_gone(monkeypatch, capsys, cmd):
     deleted: list[str] = []
 

@@ -2,7 +2,7 @@
 
 ## Purpose
 
-Launches a single Chromium with a dedicated profile and remote debugging (CDP) on a fixed port so that multiple CLI tools and AI agents share one logged-in browser session. A built-in site registry handles automated or assisted login for services like CSCS (Keycloak + TOTP), Anthropic/Claude (magic-link), OpenAI/ChatGPT (assisted SSO), Slack (assisted + xoxc token extraction), and Biopole WiFi (keychain credentials). Credentials live in the macOS keychain or 1Password — never in source. Downstream consumers shell out to `browser.py` and react to exit codes instead of reimplementing auth.
+Launches a single Chromium with a dedicated profile and remote debugging (CDP) on a fixed port so that multiple CLI tools and AI agents share one logged-in browser session. A built-in site registry handles automated or assisted login for services like CSCS (Keycloak + TOTP), Anthropic/Claude (magic-link), OpenAI/ChatGPT (assisted SSO), Slack (assisted + xoxc token extraction), and Biopole WiFi (env credentials via env-profile-run). Credentials live in the macOS keychain or 1Password — never in source. Downstream consumers shell out to `browser.py` and react to exit codes instead of reimplementing auth.
 
 ## Key Capabilities
 
