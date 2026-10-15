@@ -901,13 +901,15 @@ leak a password, lock an account or race a login:
 
   **The flip (main session, parent plan tp#889 R7g/R7m/R7h):** list what
   consumers read (`install.sh -g`, `secret-run -l -j`); set
-  `agent_script=true` on each, in place (`broker-add.py NAME -a`, mydotfiles);
+  `agent_script=true` on each, in place (`broker-add.py NAME -e`, mydotfiles);
   `install.sh -W report` and soak until a day after `secret_gate_since` shows
   no `gate_would_refuse` line for a live consumer; `install.sh -W
   agent_script`. Later, after every legacy item was moved into the login
   collection (its id pinned with `agent_secret_id` first) or retired,
   `install.sh -D` drops the legacy collection — refused unless the gate is
   `agent_script` and `daemon.py -g -j` lists ZERO items of kind `secret`.
+  Done 2026-10-15: the gate is `agent_script` and `install.sh -D` dropped the
+  legacy collection — `agent-login` is the only collection the broker reads.
 - **Rotation lease and `held`.** Before it changes a password on a server,
   credctl leases the item's sites; the broker records the lease, then waits
   until a login already in flight has finished:
