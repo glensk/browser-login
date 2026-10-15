@@ -11,10 +11,14 @@ Reads ONLY mydotfiles credctl's daily state file
 and prints one line per credential with ``location_count >= 2``, derived
 from the file (no hand-written list): ✅ ``equal``; ❌ ``DRIFT`` /
 ``missing`` / ``unreadable``; ⚠️ ``uncompared`` with the command that
-compares it. A failed or timed-out run, or one that started more than an hour
-ago and never finished, is ONE ❌ line; a run still in progress, a last run
-older than 36 h and a missing, unreadable or unknown-version file are ONE ⚠️
-line each.
+compares it. An ``uncompared`` result credctl marks ``accepted_uncompared:
+true`` (an ``accept_uncompared`` reason in the manifest, or the classes
+external-master / machine-only — uncompared by design, tp#889 R3b) is no
+warning: all of them fold into ONE quiet ``·`` count line, since a per-id
+line would carry no action and drown the real findings. A failed or
+timed-out run, or one that started more than an hour ago and never finished,
+is ONE ❌ line; a run still in progress, a last run older than 36 h and a
+missing, unreadable or unknown-version file are ONE ⚠️ line each.
 
 Closed schema: every field that is printed is validated (the id against the
 site-id pattern, the verdict and attempt against their closed sets, the
@@ -52,7 +56,7 @@ VERDICTS = frozenset({EQUAL, "single", UNCOMPARED, *BAD})
 _ID_RE = re.compile(r"^[a-z0-9][a-z0-9._-]{0,63}$")
 _TS_RE = re.compile(r"^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$")
 
-OK, FAIL, WARN = "✅", "❌", "⚠️"
+OK, FAIL, WARN, QUIET = "✅", "❌", "⚠️", "·"
 
 
 @dataclass
@@ -96,7 +100,15 @@ def _result(row: object) -> dict[str, Any] | None:
         return None
     if not 0 <= count <= MAX_LOCATIONS:
         return None
-    return {"id": cid, "verdict": verdict, "location_count": count}
+    # Only a literal ``true`` on an ``uncompared`` row is accepted; anything
+    # else stays a warning (fail towards showing it).
+    accepted = verdict == UNCOMPARED and row.get("accepted_uncompared") is True
+    return {
+        "id": cid,
+        "verdict": verdict,
+        "location_count": count,
+        "accepted_uncompared": accepted,
+    }
 
 
 # One early return per envelope rule.
@@ -207,7 +219,17 @@ def lines(state: CredState, now: float | None = None) -> list[tuple[str, str]]:
     if state.invalid:
         out.append((WARN, f"{state.invalid} result(s) unreadable in the state file"))
     multi = [r for r in state.results if r["location_count"] >= 2]
-    out += [_result_line(r) for r in sorted(multi, key=lambda r: r["id"])]
+    shown = [r for r in multi if not r["accepted_uncompared"]]
+    out += [_result_line(r) for r in sorted(shown, key=lambda r: r["id"])]
+    accepted = len(multi) - len(shown)
+    if accepted:
+        out.append(
+            (
+                QUIET,
+                f"{accepted} accepted as uncompared by design (external master, "
+                f"machine-only or browser-only login) — list: {CREDCTL} check -e",
+            )
+        )
     return out
 
 
@@ -242,6 +264,6 @@ def print_section(
     if state.status == "ok" and not any(
         r["location_count"] >= 2 for r in state.results
     ):
-        shown.append(("·", "no credential is stored in two or more places"))
+        shown.append((QUIET, "no credential is stored in two or more places"))
     for mark, text in shown:
         print(f"  {mark} {text}")

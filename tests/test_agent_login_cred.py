@@ -202,6 +202,49 @@ def test_one_line_per_multi_location_result(tmp_path: Path) -> None:
     assert "check -T qbittorrent" in by_id["qbittorrent"][1]
 
 
+def test_accepted_uncompared_rows_fold_into_one_quiet_line(tmp_path: Path) -> None:
+    """tp#889 R3b: uncompared by design is no warning; unaccepted still is."""
+    results = [
+        _result("ext-a", "uncompared", 2, accepted_uncompared=True),
+        _result("ext-b", "uncompared", 3, accepted_uncompared=True),
+        _result("qbittorrent", "uncompared", 2, accepted_uncompared=False),
+        _result("legacy", "uncompared", 2),  # flag absent = not accepted
+        _result("groq", "DRIFT", 2, accepted_uncompared=True),  # flag ignored
+        _result("npm", "equal", 2),
+        _result("solo", "uncompared", 1, accepted_uncompared=True),  # one place
+    ]
+    out = _lines(tmp_path, _doc(results))
+    texts = [t for _m, t in out]
+    assert not any(t.startswith(("ext-a", "ext-b", "solo")) for t in texts)
+    by_id = {t.split(" ", maxsplit=1)[0]: m for m, t in out}
+    assert by_id["qbittorrent"] == alc.WARN and by_id["legacy"] == alc.WARN
+    assert by_id["groq"] == alc.FAIL and by_id["npm"] == alc.OK
+    assert out[-1][0] == alc.QUIET
+    assert out[-1][1].startswith("2 accepted as uncompared by design")
+    assert _marks(out).count(alc.WARN) == 2
+
+
+@pytest.mark.parametrize("flag", ["true", 1, None, {"x": SENTINEL}])
+def test_a_non_true_accepted_flag_still_warns(tmp_path: Path, flag: Any) -> None:
+    results = [_result("odd", "uncompared", 2, accepted_uncompared=flag)]
+    assert _marks(_lines(tmp_path, _doc(results))) == [alc.WARN]
+
+
+def test_only_accepted_rows_leave_no_warning(tmp_path: Path, capsys: Any) -> None:
+    results = [
+        _result(f"ext-{i}", "uncompared", 2, accepted_uncompared=True) for i in range(5)
+    ]
+    path = _write(tmp_path, _doc(results))
+    alc.print_section(lambda _c, t: t, path=path, now=NOW)
+    out = capsys.readouterr().out
+    assert alc.WARN not in out and alc.FAIL not in out
+    assert "· 5 accepted as uncompared by design" in out
+    assert "no credential is stored" not in out
+    data = alc.summary(alc.load(path), NOW)
+    assert all(r["accepted_uncompared"] for r in data["results"])
+    assert len(data["results"]) == 5
+
+
 @pytest.mark.parametrize(
     "bad",
     [
@@ -262,7 +305,14 @@ def test_summary_holds_validated_fields_only(tmp_path: Path) -> None:
     )
     data = alc.summary(alc.load(path), NOW)
     assert data["status"] == "ok" and data["attempt"] == "completed"
-    assert data["results"] == [{"id": "groq", "verdict": "DRIFT", "location_count": 2}]
+    assert data["results"] == [
+        {
+            "id": "groq",
+            "verdict": "DRIFT",
+            "location_count": 2,
+            "accepted_uncompared": False,
+        }
+    ]
     assert SENTINEL not in json.dumps(data)
 
 
