@@ -435,6 +435,37 @@ def test_script_only_item_is_no_site_under_agent_script(tmp_path: Path) -> None:
     assert sites["api"].refused  # today: a refused site
 
 
+def test_unflagged_siteless_item_is_no_site_and_not_injectable(
+    tmp_path: Path,
+) -> None:
+    """tp#889: a legacy secrets item moved into the login collection without
+    agent_script is no refused site, and secret-run still refuses it."""
+    moved = _secret("Comicvine", colls=(LOGIN,))
+    v = _vault(tmp_path, [_login(), moved], gate=vault.GATE_AGENT_SCRIPT)
+    sites = v.items()
+    assert [it.site for it in sites] == ["shop"]
+    assert all(it.refused is None for it in sites)
+    rows = _rows(v)
+    assert rows["comicvine"]["gate_code"] == vault.GATE_NO_FLAG
+    with pytest.raises(vault.VaultError):
+        v.secret_values("comicvine")
+
+
+def test_flagged_siteless_item_is_injectable(tmp_path: Path) -> None:
+    script = _secret("Api", flag="true", colls=(LOGIN,))
+    v = _vault(tmp_path, [_login(), script], gate=vault.GATE_AGENT_SCRIPT)
+    assert [it.site for it in v.items()] == ["shop"]
+    assert v.secret_values("api").fields["password"] == TOKEN
+
+
+def test_item_with_agent_site_is_a_site_whatever_its_flag(tmp_path: Path) -> None:
+    for flag in (None, "false", "true"):
+        v = _vault(tmp_path, [_login(flag=flag)], gate=vault.GATE_AGENT_SCRIPT)
+        sites = v.items()
+        assert [(it.site, it.refused) for it in sites] == [("shop", None)]
+        assert v.secret("shop").password == PASSWORD
+
+
 def test_agent_site_without_origins_stays_a_refused_site(tmp_path: Path) -> None:
     broken = _login("Broken", site="broken", flag="true", origins=None)
     v = _vault(tmp_path, [_login(), broken], gate=vault.GATE_AGENT_SCRIPT)

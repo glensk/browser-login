@@ -534,12 +534,14 @@ def flag_view(flag: bool | None) -> bool | str:
 
 
 def is_script_only(raw: Mapping[str, Any]) -> bool:
-    """A flagged item that is no login: neither ``agent_site`` nor
-    ``agent_fill_origins`` (mode agent_script leaves it out of the sites)."""
+    """An item that is no login: neither ``agent_site`` nor
+    ``agent_fill_origins``, whatever its ``agent_script`` value (mode
+    agent_script leaves it out of the sites). Whether ``secret-run`` may
+    inject it is still the ``agent_script`` flag alone: an unflagged one is
+    refused there with ``no_agent_script``."""
     fields = _fields(raw)
     return (
-        agent_script_flag(fields) is True
-        and not fields.get("agent_site", "").strip()
+        not fields.get("agent_site", "").strip()
         and not fields.get("agent_fill_origins", "").strip()
     )
 
