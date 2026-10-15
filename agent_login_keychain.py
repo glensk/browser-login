@@ -106,9 +106,9 @@ def _readable(block: str) -> bool:
     return trusted and (not partition or "apple-tool:" in partition)
 
 
-def parse_dump(text: str) -> list[dict]:
-    """Items of a ``dump-keychain -a`` text: kind, service, account, readable."""
-    out: list[dict] = []
+def _blocks(text: str) -> list[tuple[str, str, str, str]]:
+    """(kind, RAW service, RAW account, block) of every non-system item."""
+    out: list[tuple[str, str, str, str]] = []
     for block in re.split(r"(?m)^keychain: ", text):
         cls = re.search(r'^class: "?(\w+)"?', block, re.MULTILINE)
         if not cls or cls.group(1) not in ("genp", "inet"):
@@ -116,11 +116,20 @@ def parse_dump(text: str) -> list[dict]:
         service = _attr(block, "svce") or _attr(block, "srvr")
         if not service or _SYSTEM.match(service) or "Safe Storage" in service:
             continue
+        kind = "password" if cls.group(1) == "genp" else "internet"
+        out.append((kind, service, _attr(block, "acct"), block))
+    return out
+
+
+def parse_dump(text: str) -> list[dict]:
+    """Items of a ``dump-keychain -a`` text: kind, service, account, readable."""
+    out: list[dict] = []
+    for kind, service, account, block in _blocks(text):
         out.append(
             {
-                "kind": "password" if cls.group(1) == "genp" else "internet",
+                "kind": kind,
                 "service": safe_name(service),
-                "account": safe_name(_attr(block, "acct")),
+                "account": safe_name(account),
                 "readable": _readable(block),
             }
         )
@@ -173,23 +182,86 @@ def refresh(path: Path, *, force: bool = False) -> tuple[float, list[dict]]:
     return now, items
 
 
+def live_names() -> list[tuple[str, str, str]] | None:
+    """(kind, RAW service, RAW account) of every item now — or None when unknown.
+
+    ``dump-keychain`` WITHOUT ``-a`` reads attributes only (no access lists,
+    never a value) and takes ~30 ms, against ~15 s with ``-a``. The raw names
+    only ever feed `still_present`'s comparison; they are never printed (some
+    items store the secret AS their name). Like every ``security`` call here:
+    its own session, no timeout, never killed (AGENTS.md, tp#504).
+    """
+    try:
+        res = subprocess.run(
+            ["security", "dump-keychain"],
+            check=False,
+            capture_output=True,
+            text=True,
+            errors="replace",
+            start_new_session=True,
+        )
+    except OSError:
+        return None
+    if res.returncode != 0:
+        return None
+    return [(k, s, a) for k, s, a, _block in _blocks(res.stdout)]
+
+
+def _matches(item: dict, live: tuple[str, str, str]) -> bool:
+    """A cached (masked) item names this live item; MASKED matches any name."""
+    kind, service, account = live
+    return (
+        item["kind"] == kind
+        and item["service"] in (MASKED, service)
+        and item["account"] in (MASKED, account)
+    )
+
+
+def still_present(
+    items: list[dict], live: list[tuple[str, str, str]]
+) -> tuple[list[dict], int]:
+    """(the cached items that still exist, how many live items the scan lacks)."""
+    kept = [i for i in items if any(_matches(i, x) for x in live)]
+    new = sum(1 for x in live if not any(_matches(i, x) for i in items))
+    return kept, new
+
+
 def print_list(
     path: Path, _c: Callable[[str, str], str], *, full: bool = False
 ) -> None:
-    """The login-keychain list: names only, and whether agents can read it."""
+    """The login-keychain list: names only, and whether agents can read it.
+
+    The readability scan is cached (~15 s, at most hourly), but which items
+    EXIST is re-read on every call (`live_names`, ~30 ms): an item deleted
+    since the scan is never listed as present (tp#1059), and items added
+    since are counted so the reader knows a rescan (-K) is due.
+    """
     at, items = cached(path)
     print(_c("1", "Login keychain") + "  (names only, never values)")
     if not items:
         print(_c("2", "  not scanned yet — ./agent-login.py -K (takes ~15 s)"))
         return
+    live = live_names()
+    gone = new = 0
+    if live is not None:
+        kept, new = still_present(items, live)
+        gone, items = len(items) - len(kept), kept
     readable = [i for i in items if i["readable"]]
     shown = items if full else readable
     when = time.strftime("%Y-%m-%d %H:%M", time.localtime(at))
+    if live is None:
+        state = f"scan {when}, NOT re-checked — names may be stale"
+    else:
+        changes = [f"{gone} deleted since"] if gone else []
+        changes += [f"{new} new, readability unknown"] if new else []
+        state = f"scan {when}, existence checked now" + "".join(
+            f"; {c}" for c in changes
+        )
     print(
         _c(
             "2",
             f"  {len(readable)} of {len(items)} items readable by any agent without "
-            f"a prompt (scan {when}; -K rescans + lists all)",
+            f"a prompt ({state}; -K rescans + lists all)",
         )
     )
     width = max(len(i["service"]) for i in shown) if shown else 10

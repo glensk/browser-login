@@ -447,7 +447,10 @@ framework. It is a **provider**: other repos depend on it, not the reverse. See
 - **Keychain list = names only**: `agent_login_keychain.py` reads attributes and
   access lists (`dump-keychain -a`, never `-d`), and masks any service/account
   name that looks like a secret value (`safe_name`) — some items store the
-  secret AS their name. Never print raw keychain attribute dumps.
+  secret AS their name. Never print raw keychain attribute dumps. The
+  readability scan (`-a`, ~15 s) is cached, but every listing re-reads which
+  items EXIST (`dump-keychain` without `-a`, ~30 ms) and drops deleted ones,
+  counting new ones (tp#1059); those raw names are compared, never printed.
 - **What agents can use** = `agent-login.py -A` (the file
   `~/.local/state/agent-login/agents.md`, refreshed by `-S` every 10 min and by
   every `agent-login.py` run; a SessionStart hook in mydotfiles' Claude

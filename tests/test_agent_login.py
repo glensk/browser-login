@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import ast
 import importlib.util
+import json
 import os
 import subprocess
 import sys
@@ -349,6 +350,55 @@ def test_keychain_parse_names_only() -> None:
         "prompting-item": False,
         "other-team": False,
     }
+
+
+def test_keychain_list_drops_items_deleted_since_the_scan(
+    monkeypatch, tmp_path, capsys
+) -> None:
+    """tp#1059: the cached readability scan never lists a deleted item as
+    present; a masked cached name matches any live name; new items are counted
+    (never named)."""
+    import agent_login_keychain as kc  # pylint: disable=import-outside-toplevel
+
+    def item(service: str, account: str = "albert") -> dict:
+        return {
+            "kind": "password",
+            "service": service,
+            "account": account,
+            "readable": True,
+        }
+
+    cache = tmp_path / "keychain.json"
+    cache.write_text(
+        json.dumps(
+            {
+                "at": 1.0,
+                "items": [
+                    item("KEPT_PASSWORD"),
+                    item("DELETED_PASSWORD"),
+                    item(kc.MASKED, kc.MASKED),
+                ],
+            }
+        )
+    )
+    live = [
+        ("password", "KEPT_PASSWORD", "albert"),
+        ("password", "Xq7#pL9vT2", "s3cr3t-acct"),
+        ("internet", "BRAND_NEW", "albert"),
+    ]
+    monkeypatch.setattr(kc, "live_names", lambda: live)
+    kc.print_list(cache, lambda _code, text: text)
+    out = capsys.readouterr().out
+    assert "KEPT_PASSWORD" in out
+    assert "DELETED_PASSWORD" not in out
+    assert "2 of 2 items" in out
+    assert "1 deleted since" in out and "1 new" in out
+    assert "BRAND_NEW" not in out and "Xq7#pL9vT2" not in out
+
+    monkeypatch.setattr(kc, "live_names", lambda: None)
+    kc.print_list(cache, lambda _code, text: text)
+    out = capsys.readouterr().out
+    assert "DELETED_PASSWORD" in out and "NOT re-checked" in out
 
 
 def test_keychain_names_without_broker_are_strict(monkeypatch) -> None:
