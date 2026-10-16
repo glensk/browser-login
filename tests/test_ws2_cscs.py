@@ -121,6 +121,22 @@ _KC_FORM = """<html><body><form id=kc-form-login method=post action="__POST__">
 <input id=rememberMe name=rememberMe type=checkbox>
 <input id=kc-login name=login type=submit value="Sign In">
 </form>__MSG__</body></html>"""
+# Username-first Keycloak: the username alone, the password on the next page.
+_KC_USER_FORM = """<html><body><form id=kc-form-login method=post action="__POST__">
+<input id=username name=username type=text autocomplete=username>
+<input id=rememberMe name=rememberMe type=checkbox>
+<input id=kc-login name=login type=submit value="Next">
+</form></body></html>"""
+# Keycloak's password page for an account it already knows (re-authentication
+# or the second step of username-first): the username shown, not asked.
+_KC_PW_FORM = """<html><body><div id=kc-username>
+<label id=kc-attempted-username>__USER__</label>
+<a id=reset-login href="__RESTART__">Restart login</a></div>
+<form id=kc-form-login method=post action="__POST__">
+<input id=password name=password type=password autocomplete=current-password>
+<input id=kc-login name=login type=submit value="Sign In">
+</form></body></html>"""
+KC_RESTART = AUTH + "/auth/realms/cscs/login-actions/restart"
 
 
 @dataclass
@@ -138,6 +154,13 @@ class Portal:
     logins: int = 0
     remember_me: list[bool] = field(default_factory=list)
     me_calls: int = 0
+    # Keycloak's first page: "combined" (username + password), "username_first"
+    # or "reauth" (the password page for `reauth_user`, with a restart link)
+    form_mode: str = "combined"
+    reauth_user: str = ""
+    pending_user: str = ""  # the username a password-only page asks for
+    restarts: int = 0
+    passwords_posted: list[str] = field(default_factory=list)
 
     def issue(self) -> str:
         token = secrets.token_hex(20)
@@ -181,9 +204,24 @@ class Portal:
 
     def _auth(self, route: Any, req: Any, url: Any) -> None:
         done = PORTAL + "/oauth_login_completed/?state=s"
+        if url.path.endswith("/restart"):  # "Restart login": the full form
+            self.restarts += 1
+            self.form_mode = "combined"
+            _html(route, _KC_FORM.replace("__POST__", KC_POST).replace("__MSG__", ""))
+            return
         if req.method == "POST" and url.path.endswith("/authenticate"):
             form = urllib.parse.parse_qs(req.post_data or "")
-            self.remember_me.append(form.get("rememberMe") == ["on"])
+            if "password" not in form:  # username-first: the password page next
+                self.pending_user = (form.get("username") or [""])[0]
+                self.remember_me.append(form.get("rememberMe") == ["on"])
+                _html(route, self._pw_form(self.pending_user))
+                return
+            self.passwords_posted.append((form.get("username") or [""])[0])
+            if "username" not in form:  # the password page: the known account
+                known = self.pending_user.casefold() == self.username.casefold()
+                form["username"] = [self.username if known else self.pending_user]
+            else:
+                self.remember_me.append(form.get("rememberMe") == ["on"])
             if form.get("username") == [self.username] and form.get("password") == [
                 self.password
             ]:
@@ -198,7 +236,22 @@ class Portal:
                 f"<script>setTimeout(() => location.replace('{done}'), 2500)</script>",
             )
             return
+        if self.form_mode == "username_first":
+            _html(route, _KC_USER_FORM.replace("__POST__", KC_POST))
+            return
+        if self.form_mode == "reauth":
+            self.pending_user = self.reauth_user or self.username
+            _html(route, self._pw_form(self.pending_user))
+            return
         _html(route, _KC_FORM.replace("__POST__", KC_POST).replace("__MSG__", ""))
+
+    @staticmethod
+    def _pw_form(user: str) -> str:
+        return (
+            _KC_PW_FORM.replace("__POST__", KC_POST)
+            .replace("__RESTART__", KC_RESTART)
+            .replace("__USER__", user)
+        )
 
     def _api(self, route: Any, req: Any, path: str) -> None:
         if path == "/api/configuration/":
@@ -434,12 +487,13 @@ class _Rig:
         return str(entry["attempts"][-1][1])
 
 
-def _rig(tmp_path: Path, app: Portal) -> _Rig:
+def _rig(tmp_path: Path, app: Portal, **extra: str) -> _Rig:
     fields = {
         "agent_site": "cscs",
         "agent_fill_origins": AUTH,
         "agent_cookie_hosts": "portal.cscs.ch",
         "agent_login_url": PORTAL + "/profile/",
+        **extra,
     }
     item = {
         "id": "id-cscs",
@@ -583,6 +637,77 @@ def test_a_silent_sso_types_nothing(tmp_path: Path, portal: Portal) -> None:
     )
     # the preflight ran BEFORE any reservation: limiter and vault untouched
     assert rig.limiter_bytes() == before and rig.vault.secret_calls == calls
+
+
+@pytest.mark.launches_chrome
+@CHROME
+def test_a_username_first_form_logs_in(tmp_path: Path, portal: Portal) -> None:
+    """tp#1132: Keycloak asks for the username alone, the password next."""
+    portal.form_mode = "username_first"
+    rig = _rig(tmp_path, portal)
+    resp = rig.login()
+    assert resp.get("ok"), resp
+    assert portal.logins == 1 and portal.passwords_posted == [""]
+    assert portal.remember_me == [True]
+
+
+@pytest.mark.launches_chrome
+@CHROME
+def test_a_reauth_page_for_this_account_takes_only_the_password(
+    tmp_path: Path, portal: Portal
+) -> None:
+    portal.form_mode = "reauth"
+    portal.reauth_user = portal.username.upper()  # Keycloak may case it
+    rig = _rig(tmp_path, portal)
+    resp = rig.login()
+    assert resp.get("ok"), resp
+    assert portal.logins == 1 and portal.restarts == 0
+
+
+@pytest.mark.launches_chrome
+@CHROME
+def test_a_reauth_page_for_another_account_restarts_first(
+    tmp_path: Path, portal: Portal
+) -> None:
+    """The password is never typed for an account the page names differently."""
+    portal.form_mode = "reauth"
+    portal.reauth_user = "someone-else"
+    rig = _rig(tmp_path, portal)
+    resp = rig.login()
+    assert resp.get("ok"), resp
+    assert portal.restarts == 1 and portal.logins == 1
+    assert portal.passwords_posted == [portal.username]  # the full form only
+
+
+@pytest.mark.launches_chrome
+@CHROME
+def test_a_bare_idp_login_url_starts_at_the_portal(
+    tmp_path: Path, portal: Portal
+) -> None:
+    """tp#1132: the item's login URL became https://auth.cscs.ch (a 403 admin
+    page live); the login starts at the portal, whose redirect carries the
+    OIDC state."""
+    rig = _rig(tmp_path, portal, agent_login_url=AUTH)
+    resp = rig.login()
+    assert resp.get("ok"), resp
+    assert portal.logins == 1
+
+
+@pytest.mark.launches_chrome
+@CHROME
+def test_a_check_url_off_the_portal_stops_before_the_secret(
+    tmp_path: Path, portal: Portal
+) -> None:
+    """tp#1132: a check page on auth.cscs.ch fails every server proof — after
+    the password went out. The preflight refuses first."""
+    rig = _rig(tmp_path, portal, agent_check_url=AUTH)
+    before, calls = rig.limiter_bytes(), rig.vault.secret_calls
+    resp = rig.login()
+    assert not resp.get("ok"), resp
+    assert "check URL" in json.dumps(resp)
+    assert resp.get("submitted") is not True
+    assert portal.logins == 0 and portal.passwords_posted == []
+    assert rig.vault.secret_calls == calls and rig.limiter_bytes() == before
 
 
 def _streak(rig: _Rig) -> tuple[int, Any]:
@@ -919,6 +1044,55 @@ class _NoFormPage:
 def test_no_form_and_no_portal_is_a_pre_submit_failure() -> None:
     with pytest.raises(recipes.LoginFailed, match="form not found") as err:
         recipes._cscs_form_or_portal(_NoFormPage(), 0.5)
+    assert err.value.submitted is False
+
+
+class _UserOnlyPage(_NoFormPage):
+    """Only a username field — a username-first Keycloak page."""
+
+    def __init__(self) -> None:
+        self.user = _Visible()
+
+    def query_selector_all(self, sel: str) -> list[Any]:
+        return [self.user] if sel == "#username" else []
+
+
+class _Visible:
+    def is_visible(self) -> bool:
+        return True
+
+
+def test_a_username_alone_is_username_first() -> None:
+    page = _UserOnlyPage()
+    form = recipes._cscs_form_or_portal(page, 0.5)
+    assert form is not None and form.user is page.user and form.password is None
+
+
+def test_the_cscs_item_layout_is_checked() -> None:
+    assert recipes.cscs_item_problem(_cscs_item()) == ""
+    bare = _cscs_item(agent_fill_origins=PORTAL)
+    assert "auth.cscs.ch" in recipes.cscs_item_problem(bare)
+    off = _cscs_item(agent_check_url=AUTH)
+    assert "check URL" in recipes.cscs_item_problem(off)
+
+
+def test_the_cscs_start_url_is_on_the_portal() -> None:
+    assert recipes.cscs_start_url(_cscs_item(agent_login_url=AUTH)) == (
+        recipes.CSCS_LOGIN_URL
+    )
+    mine = PORTAL + "/projects/"
+    assert recipes.cscs_start_url(_cscs_item(agent_login_url=mine)) == mine
+
+
+class _NoLoadPage(_NoFormPage):
+    def goto(self, *_a: Any, **_k: Any) -> None:
+        pytest.fail("loaded a page")
+
+
+def test_the_preflight_refuses_a_broken_item_before_loading() -> None:
+    page = _NoLoadPage()
+    with pytest.raises(recipes.OriginViolation, match="check URL") as err:
+        recipes.cscs_preflight(page, _cscs_item(agent_check_url=AUTH))
     assert err.value.submitted is False
 
 

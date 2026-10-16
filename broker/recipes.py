@@ -1240,6 +1240,27 @@ def _select_authenticator(page: Any, otp_label: str | None) -> None:
         )
 
 
+# A code page whose code came by e-mail (Namecheap's "Device Verification":
+# "We sent a verification code to the email address …"), not from an
+# authenticator: answered in the page as a boolean, never its text.
+_EMAIL_CODE_PAGE_JS = r"""() => {
+  const t = (document.body && document.body.innerText || '').replace(/\s+/g, ' ');
+  return /\b(sent|emailed|mailed)\b[^.]{0,80}\bcode\b[^.]{0,80}\be-?mail\b/i.test(t)
+    || /\bcode\b[^.]{0,40}\b(sent|emailed|mailed)\b[^.]{0,40}\b(e-?mail|inbox)\b/i.test(t)
+    || /\bcheck your (e-?mail|inbox)\b[^.]{0,80}\bcode\b/i.test(t);
+}"""
+
+
+def email_code_page(page: Any) -> bool:
+    """True when the current page asks for a code the site sent by e-mail
+    (device verification) — the broker never reads mail, so no item seed can
+    answer it. False when unsure or unreadable."""
+    try:
+        return page.evaluate(_EMAIL_CODE_PAGE_JS) is True
+    except Exception:  # pylint: disable=broad-exception-caught
+        return False
+
+
 def _fill_otp(  # pylint: disable=too-many-arguments
     page: Any,
     otp_field: Any,
@@ -1265,6 +1286,12 @@ def _fill_otp(  # pylint: disable=too-many-arguments
     nothing selected or typed, the caller's loop comes back. True = the code
     went in."""
     if not secret.totp_seed:
+        if email_code_page(page):
+            raise NeedsHuman(
+                "the site e-mailed a verification code (device verification); "
+                "the broker has no mailbox access",
+                submitted=True,
+            )
         raise NeedsHuman("otp required but the item has no TOTP seed", submitted=True)
     code = fresh_totp(secret.totp_seed)
     if not code:
@@ -2620,20 +2647,70 @@ KEYCLOAK_REMEMBER_ME = "#rememberMe"
 CSCS_FINAL_CHECK_S = 8.0
 
 
-def _cscs_form_or_portal(page: Any, timeout_s: float) -> Any:
-    """Wait for Keycloak's username field — or for the portal with a token the
-    server accepts (a silent SSO through the IdP's own session, or a session
-    that still works): then None, nothing to type. Raises ``LoginFailed``
-    ("Keycloak login form not found", pre-submit) when neither shows, after a
-    final server check; a bot challenge raises ``NeedsHuman``. Bounded by about
-    `timeout_s` + ``CSCS_FINAL_CHECK_S`` (+ 2 × ``CSCS_MIN_CHECK_S``): every
-    in-page check gets only what is left."""
+# Keycloak's re-authentication page (the IdP still remembers the account):
+# the username is SHOWN, not asked — only the password field — and "Restart
+# login" goes back to the full form.
+KEYCLOAK_ATTEMPTED_USER = "#kc-attempted-username"
+KEYCLOAK_RESTART = "#reset-login"
+# What a "form not found" names about the page: value-free (input types and
+# ids of a fixed shape, the path's safe characters), never page text.
+_KC_PAGE_HINT_JS = """() => {
+  const ok = s => /^[A-Za-z0-9_-]{1,32}$/.test(s || '') ? s : '?';
+  const shown = [...document.querySelectorAll('input')]
+    .filter(e => e.type !== 'hidden' && (e.offsetWidth || e.offsetHeight))
+    .slice(0, 6).map(e => ok(e.type) + (e.id ? '#' + ok(e.id) : ''));
+  return {path: location.pathname, fields: shown};
+}"""
+
+
+class KeycloakForm:  # pylint: disable=too-few-public-methods
+    """The Keycloak login page found: `user` is None on the re-authentication
+    page (username shown, not asked), `password` None on a username-first
+    page (the password step follows the username's submit)."""
+
+    def __init__(self, user: Any, password: Any) -> None:
+        self.user = user
+        self.password = password
+
+
+def _kc_page_hint(page: Any) -> str:
+    """ " (on <path>; fields: text#username, …)": where a Keycloak step found
+    no form, value-free; "" when the page cannot be read."""
+    try:
+        got = page.evaluate(_KC_PAGE_HINT_JS)
+        path = re.sub(r"[^A-Za-z0-9/_.-]", "", str(got.get("path") or ""))[:64]
+        fields = [str(f)[:66] for f in got.get("fields") or []][:6]
+    except Exception:  # pylint: disable=broad-exception-caught
+        return ""
+    return f" (on {path or '/'}; fields: {', '.join(fields) or 'none'})"
+
+
+def _cscs_form_or_portal(page: Any, timeout_s: float) -> KeycloakForm | None:
+    """Wait for Keycloak's login page — the combined form (username +
+    password), a username-first page (only the username; two polls in a row,
+    so a form still rendering is not mistaken for one) or the
+    re-authentication page (only the password) — or for the portal with a
+    token the server accepts (a silent SSO through the IdP's own session, or a
+    session that still works): then None, nothing to type. Raises
+    ``LoginFailed`` ("Keycloak login form not found", pre-submit, with a
+    value-free page hint) when neither shows, after a final server check; a
+    bot challenge raises ``NeedsHuman``. Bounded by about `timeout_s` +
+    ``CSCS_FINAL_CHECK_S`` (+ 2 × ``CSCS_MIN_CHECK_S``): every in-page check
+    gets only what is left."""
     ticks = max(1, math.ceil(timeout_s * 1000 / CSCS_POLL_MS))
     deadline = time.monotonic() + timeout_s
+    user_only = False
     for tick in range(ticks + 1):
         user = _visible(page, "#username")
+        password = _visible(page, "#password")
+        if password is not None:
+            return KeycloakForm(user, password)
         if user is not None:
-            return user
+            if user_only:
+                return KeycloakForm(user, None)
+            user_only = True
+        else:
+            user_only = False
         if cscs_on_portal(str(page.url or "")):
             left = deadline - time.monotonic()
             if cscs_token_state(page, budget_s=left).get("state") == VALID:
@@ -2642,9 +2719,39 @@ def _cscs_form_or_portal(page: Any, timeout_s: float) -> Any:
         if tick >= ticks or time.monotonic() >= deadline:
             break
         page.wait_for_timeout(CSCS_POLL_MS)
+    if user_only:  # seen on the last poll: one more look decides
+        page.wait_for_timeout(CSCS_POLL_MS)
+        user = _visible(page, "#username")
+        if user is not None:
+            return KeycloakForm(user, _visible(page, "#password"))
     if cscs_token_proof(page, wait_s=CSCS_FINAL_CHECK_S) == VALID:
         return None
-    raise LoginFailed("Keycloak login form not found")
+    raise LoginFailed("Keycloak login form not found" + _kc_page_hint(page))
+
+
+def cscs_item_problem(item: SiteItem, *, dev: bool = False) -> str:
+    """Why the cscs item cannot log in, "" when it can: its fill origins must
+    list ``https://auth.cscs.ch`` (the only origin a secret is typed on) and
+    its check page must be the portal (the server proof runs only there — a
+    check page elsewhere fails every proof, AFTER the password went out)."""
+    if not dev and CSCS_AUTH_ORIGIN not in item.fill_origins:
+        return "the cscs item does not list https://auth.cscs.ch"
+    if not cscs_on_portal(check_page_url(item)):
+        return (
+            "the cscs item's check URL is not on https://portal.cscs.ch "
+            "(set agent_check_url to https://portal.cscs.ch/profile/)"
+        )
+    return ""
+
+
+def cscs_start_url(item: SiteItem, *, dev: bool = False) -> str:
+    """Where a CSCS login starts: the item's login URL only when it is on the
+    portal (its redirect carries the OIDC state Keycloak's form needs; a bare
+    ``https://auth.cscs.ch`` ends on a 403 admin page), else the built-in."""
+    url = item.login_url
+    if url and url_origin(url, dev=dev) == CSCS_PORTAL_ORIGIN:
+        return url
+    return CSCS_LOGIN_URL
 
 
 def cscs_preflight(page: Any, item: SiteItem, *, dev: bool = False) -> str:
@@ -2652,10 +2759,13 @@ def cscs_preflight(page: Any, item: SiteItem, *, dev: bool = False) -> str:
     whether the IdP's own session logs the portal in by itself (silent SSO)
     — ``valid`` — or shows the Keycloak form — ``invalid`` (a password login
     is needed). Neither → ``LoginFailed`` (pre-submit, nothing reserved); a
-    bot challenge → ``NeedsHuman``. A silent SSO then costs the limiter
-    nothing."""
-    del dev
-    page.goto(item.login_url or CSCS_LOGIN_URL, wait_until="domcontentloaded")
+    bot challenge → ``NeedsHuman``; an item that could never be proven
+    (``cscs_item_problem``) → ``OriginViolation`` before anything loads. A
+    silent SSO then costs the limiter nothing."""
+    problem = cscs_item_problem(item, dev=dev)
+    if problem:  # before anything loads: the login could never be proven
+        raise OriginViolation(problem)
+    page.goto(cscs_start_url(item, dev=dev), wait_until="domcontentloaded")
     return VALID if _cscs_form_or_portal(page, STEP_TIMEOUT_S) is None else INVALID
 
 
@@ -2724,6 +2834,89 @@ def click_keycloak_submit(
     return True
 
 
+def _cscs_reauth(
+    page: Any, form: KeycloakForm, secret: Secret, allowed: list[str], *, dev: bool
+) -> KeycloakForm | None:
+    """Keycloak's re-authentication page names the account it asks the
+    password for: this item's username (compared in-process, case-folded) →
+    the page as it is; any other (or none) → "Restart login" and the full form
+    again — a password is never typed for an account the page names
+    differently. No restart link, or no form after it → ``LoginFailed``
+    (pre-submit). None: the portal took over (silent SSO)."""
+    shown = ""
+    try:
+        el = _visible(page, KEYCLOAK_ATTEMPTED_USER)
+        shown = str(el.inner_text() if el is not None else "").strip()
+    except Exception:  # pylint: disable=broad-exception-caught
+        shown = ""
+    if shown and shown.casefold() == secret.username.strip().casefold():
+        return form
+    restart = _visible(page, KEYCLOAK_RESTART)
+    if restart is None:
+        raise LoginFailed(
+            "Keycloak asks for a password without naming this item's account"
+            + _kc_page_hint(page)
+        )
+    _guard(page, restart, allowed, dev=dev)
+    restart.click()
+    again = _cscs_form_or_portal(page, STEP_TIMEOUT_S)
+    if again is not None and again.user is None:
+        raise LoginFailed(
+            "Keycloak's restart did not show the username field" + _kc_page_hint(page)
+        )
+    return again
+
+
+def _cscs_password_step(page: Any, allowed: list[str], *, dev: bool) -> Any:
+    """Username-first Keycloak: submit the filled username (no secret goes
+    out, nothing is marked submitted), then wait for the password field.
+    None: the portal landed with a token the server accepts. No button, or no
+    password field within ``STEP_TIMEOUT_S`` → ``LoginFailed`` (pre-submit)."""
+    if not click_keycloak_submit(page, None, allowed=allowed, dev=dev):
+        raise LoginFailed(
+            "Keycloak username step: no login button" + _kc_page_hint(page)
+        )
+    ticks = max(1, math.ceil(STEP_TIMEOUT_S * 1000 / CSCS_POLL_MS))
+    deadline = time.monotonic() + STEP_TIMEOUT_S
+    for _ in range(ticks + 1):
+        page.wait_for_timeout(CSCS_POLL_MS)
+        field_handle = _visible(page, "#password")
+        if field_handle is not None:
+            return field_handle
+        if cscs_on_portal(str(page.url or "")):
+            left = deadline - time.monotonic()
+            if cscs_token_state(page, budget_s=left).get("state") == VALID:
+                return None
+        _check_challenge(page, submitted=False)
+        if time.monotonic() >= deadline:
+            break
+    raise LoginFailed(
+        "Keycloak showed no password step after the username" + _kc_page_hint(page)
+    )
+
+
+def _cscs_password_field(
+    page: Any, secret: Secret, allowed: list[str], *, dev: bool
+) -> Any:
+    """Keycloak up to its password field, whatever the page's shape: the
+    combined form (username filled), username-first (username filled and
+    submitted, ``_cscs_password_step``) or the re-authentication page
+    (``_cscs_reauth``). None: the portal holds a token the server accepts
+    (silent SSO) — nothing to type."""
+    form = _cscs_form_or_portal(page, STEP_TIMEOUT_S)
+    if form is not None and form.user is None:
+        form = _cscs_reauth(page, form, secret, allowed, dev=dev)
+    if form is None:
+        return None
+    if form.user is not None:
+        _guard(page, form.user, allowed, dev=dev)
+        form.user.fill(secret.username)
+        _remember_me(page, allowed, dev=dev)
+    if form.password is not None:
+        return form.password
+    return _cscs_password_step(page, allowed, dev=dev)
+
+
 def cscs_login(
     page: Any,
     item: SiteItem,
@@ -2741,21 +2934,16 @@ def cscs_login(
     with a token the server accepts instead of the Keycloak form (a silent SSO
     through the IdP's remembered session) ends the recipe with nothing typed.
     """
+    problem = cscs_item_problem(item, dev=dev)
+    if problem:
+        raise OriginViolation(problem)
     allowed = [o for o in item.fill_origins if o == CSCS_AUTH_ORIGIN]
     if dev:
         allowed = list(item.fill_origins)
-    if not allowed:
-        raise OriginViolation("the cscs item does not list https://auth.cscs.ch")
-    page.goto(item.login_url or CSCS_LOGIN_URL, wait_until="domcontentloaded")
-    user = _cscs_form_or_portal(page, STEP_TIMEOUT_S)
-    if user is None:
-        return  # silent SSO / a session that still works: nothing to type
-    pw_field = _visible(page, "#password")
+    page.goto(cscs_start_url(item, dev=dev), wait_until="domcontentloaded")
+    pw_field = _cscs_password_field(page, secret, allowed, dev=dev)
     if pw_field is None:
-        raise LoginFailed("Keycloak login form not found")
-    _guard(page, user, allowed, dev=dev)
-    user.fill(secret.username)
-    _remember_me(page, allowed, dev=dev)
+        return  # silent SSO / a session that still works: nothing to type
     # Same protected entry as the generic recipe: wait for the page to settle,
     # verify the field KEPT the password, retry key by key, fail before submit.
     pw_field = _fill_password(page, pw_field, secret, allowed, dev=dev, attempt=attempt)
