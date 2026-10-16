@@ -76,7 +76,9 @@ and an observed URL change (fragment-less hash differs from the last sample).
    such tab. Headed mode never reaps (rule 1: a mode-A guided login is a maintenance
    record).
 
-At most `-m/--max` closes per run (default 20), one overall deadline (60 s). Each
+At most `-m/--max` closes per run (default 20), one overall deadline (8 s: the
+exclusive gate makes registering clients wait, at most 15 s; gate wait 2 s,
+lease wait 3 s, 2 s per close). Each
 close is journaled (`tab_reaped`: origin, id8, idle_s, opener session — never a raw URL
 or cwd) and printed origin-only via `_target_label`. `-n/--dry-run` is a pure read: no
 gate, no lease, persists nothing, prints `would close:` plus skip-reason counts.
@@ -118,8 +120,10 @@ aggregated by severity 1 > 75 > 0.
 - [x] B5 **LaunchAgent** `com.albert.browser-tab-reaper` in `agent_plists()`
       (`launchagent_plist` gains a `script` parameter): every 15 min,
       `browser.py reap-idle -A -q`, own log, `RunAtLoad false`. Installed with
-      `agent-login.py --install-daily`.
-- [ ] B6 **Docs + live acceptance.** README section "Tabs: who opened what, keep pins,
+      `agent-login.py --install-daily` (2026-10-16 the new label alone was
+      written and bootstrapped, so the three running agent-login jobs were not
+      booted out; their plists were byte-identical).
+- [x] B6 **Docs + live acceptance.** README section "Tabs: who opened what, keep pins,
       the idle reaper"; AGENTS.md bullet (reaping only via `reap-idle` / `reap-owned` /
       `close`; agents that need a long-lived tab run `browser.py keep`). Live: `tabs`
       and `reap-idle -A -n` against the live browsers (read-only); the LaunchAgent
@@ -154,3 +158,8 @@ cd /Users/albert/obsidian/42-Git/home/browser-login && bin/browser.py tabs -h &&
 - "Never the last tab of a window" is implemented as "never the last page of the
   browser" (rule 7 reason).
 - Blank / non-http(s) tabs are never reaped.
+- 2026-10-16 live: `keep -o https://app.straiv.io` pinned the long-lived straiv
+  dashboard tab the ticket names.
+- Owned-ledger exclusion covers ledgers of EVERY owner state (not only live /
+  unknown): a dead owner's tabs are `reap-owned`'s; an unreadable ledger stops
+  the run.

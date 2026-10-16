@@ -472,6 +472,57 @@ Rules for anything that drives this browser:
   best-effort against them: they can still navigate a tab in the
   milliseconds between the re-list and the close.
 
+## Tabs: who opened what, keep pins, the idle reaper (tp#1109)
+
+Tabs outlive the agent sessions that opened them; a few days of leftovers
+(ad-heavy pages, admin consoles) cost gigabytes and a busy main process. Three
+commands keep that visible and bounded. Their state is
+`<cache>/tabs.json` (per instance, 0600): who opened a tab, when browser.py last
+used it, the pins, and when `tabs`/`reap-idle` first saw it or saw its URL
+change — a hash of the URL only, never the URL.
+
+```commands
+browser.py tabs                     # every tab of every running instance
+browser.py tabs -1 -j               # this instance, JSON (origins only; -f raw URLs)
+browser.py open -N -k https://app.example.com/   # open AND pin
+browser.py keep <target-id>         # pin a tab (full id or ≥ 8-char prefix)
+browser.py keep -o https://app.example.com       # pin every tab of an origin
+browser.py keep -r <target-id>      # release a pin;  keep -l lists the pins
+browser.py reap-idle -A -n          # what the reaper would close (dry run)
+```
+
+- **`tabs`** shows per tab: the opener (agent session id + cwd, recorded by
+  `open`; `unknown` for tabs created by anything else, e.g. the Playwright MCP),
+  age, LOADED (`performance.timeOrigin`, diagnostic only), IDLE and the flags
+  `keep`/`keep-origin`, `attached` (a CDP client is attached right now) and
+  `owned` (an owned-tab ledger names it). Its header lists the registered
+  clients with their session (`register-exec` records it).
+- **Idle** = time since the latest of: browser.py opened the tab, `eval`
+  (`-T` or `--url`) used it, its URL (without fragment) changed between two
+  samples, or it was first seen. A tab first seen now is never idle — the
+  reaper's own runs record the samples.
+- **`reap-idle`** closes a page only when it is http(s), not pinned (tab or
+  origin), not in an owned-tab ledger (nor a popup of one), idle at least the
+  threshold (`-I HOURS`, else `$CLAUDE_BROWSER_TAB_IDLE_H`, default 2 h, floor
+  15 min), and — re-read right before its close — still not attached, its URL
+  unchanged, still unpinned, and not the last page of the browser. It runs
+  only with NO client attached: it takes the registry gate exclusively (any
+  registered client, e.g. a live `register-exec` Playwright MCP → exit 75),
+  refuses when an unregistered client is attached or `lsof` is missing (75),
+  when any maintenance record exists (75), then takes the interaction lease.
+  The whole pass is kept short (a few seconds: every client that registers
+  meanwhile waits for the gate); what it did not reach is closed next time.
+  At most `-m` (20) closes per run; each is journaled (`tab_reaped`: origin,
+  idle, opener session). `-n` takes no lock and writes nothing.
+- **Schedule**: LaunchAgent `com.albert.browser-tab-reaper` runs
+  `browser.py reap-idle -A -q` every 15 min over every running instance (it
+  never starts one); log `~/Library/Logs/com.albert.browser-tab-reaper.log`
+  (quiet: only closes and failures). It is one of `agent-login.py`'s
+  LaunchAgents (`agent_login_jobs.agent_plists()`).
+- **Agents that need a tab for long** (a dashboard they come back to) pin it:
+  `open -N -k URL`, `keep <id>` or `keep -o <origin>`. A closed tab costs only
+  a reload — the session lives in the profile's cookies.
+
 ## Multi-site login
 
 A **site** is one entry in the `SITES` registry inside `browser.py`. Generic

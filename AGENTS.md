@@ -57,6 +57,19 @@ framework. It is a **provider**: other repos depend on it, not the reverse. See
   and pid gone/reused; unknown = unreadable → never reaped). Reaping only via
   `reap-owned`, the guided-login transaction (start, `_guided_a`'s finally) and
   the maintenance watchdog — never `_preflight`, never `status`.
+- **Idle-tab reaper and keep pins** (tp#1109, README "Tabs: who opened
+  what"): `<cache>/tabs.json` records openers (`open`), last use (`open`,
+  `eval`), pins and observations — never a raw URL (a fragment-less sha256),
+  always under `tabs.lock`, the innermost lock (gate → lease → tabs.lock).
+  `reap-idle` is the only heuristic tab closer: registry gate EXCLUSIVE (never
+  while any client is registered or an unregistered one is attached), no
+  maintenance record, the interaction lease, a fresh `Target.getTargets`
+  `attached: false` + unchanged URL hash + unpinned right before each close,
+  never an owned-ledger tab or its popup, never a non-http(s) tab, never the
+  last page; its pass stays a few seconds (clients wait on the gate). A
+  malformed state file stops it. Pins are durable writes (`keep`, `open -k`
+  fail loud); activity/observations are best effort. Never make `attached`
+  count as activity or add a URL-substring `keep`.
 - This repo declares **no** `EXTERNAL_DEPS` registry (extdeps package) — it is a
   provider, not a consumer. Its own external tools (`op`, `himalaya`, `security`, Playwright) are
   **optional** and degrade gracefully (assisted fallback); they are documented in
