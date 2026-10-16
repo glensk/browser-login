@@ -44,6 +44,7 @@ Examples:
   ./agent-login.py -L notion    # an AGENT imports Albert's Safari session (+ a Safari login)
   ./agent-login.py -L galaxus-de -n  # what -L would do (no import, no Safari login)
   ./agent-login.py -R           # refresh-only pass (NPM tokens; LaunchAgent every 6 h)
+  ./agent-login.py -l           # items agents can fill into Albert's Safari (safari.py -L)
 
 Sites on Albert's session (Safari sites, galaxus-de, Notion, Slack, OpenAI,
 claude.ai) are renewed by AGENTS with -L — never a to-do for Albert, except
@@ -64,6 +65,10 @@ A credential rotation (mydotfiles credctl) holds its sites: ⏸ held (rotation
 TXID) — never logged in, never a failure mail, re-checked later. The old -f
 (password length + hash) is gone (tp#965, it was a password oracle): compare
 a password with `credctl.py check -T` in mydotfiles.
+
+Fill-only items (`agent_fill_only = true`, tp#1082): the broker never logs in
+with them, so they get no ✅/❌ row and are never checked, promoted or tested;
+the agents file carries one line with their count, `-l` lists them.
 """
 
 from __future__ import annotations
@@ -80,6 +85,7 @@ import shutil
 import socket
 import sys
 import time
+import urllib.parse
 from collections.abc import Callable, Iterator
 from dataclasses import asdict, dataclass
 from pathlib import Path
@@ -379,7 +385,7 @@ def adopt_configs(sites: list[dict]) -> list[str]:
     digests = {
         str(s.get("site")): onboarding.config_digest(s)
         for s in sites
-        if s.get("site") and not s.get("refused")
+        if s.get("site") and not s.get("refused") and not is_fill_only(s)
     }
     with contextlib.suppress(als.StateError, OSError):
         return als.adopt_configs(digests)
@@ -504,6 +510,74 @@ def is_no_submit(site: str, entry: dict | None = None) -> bool:
     return site in NO_SUBMIT_SITES or bool((entry or {}).get("no_submit"))
 
 
+def is_fill_only(entry: dict | None) -> bool:
+    """A broker row of a fill-only item (tp#1082 D5): the broker never logs
+    in with it — no ✅/❌ row, never checked (-c), promoted or tested; agents
+    fill it into Albert's Safari (`safari.py -L`)."""
+    return bool(entry) and (entry or {}).get("fill_only") is True
+
+
+def _hint_host(origins: object) -> str:
+    """The host of the first fill origin ('' when none)."""
+    first = origins[0] if isinstance(origins, list) and origins else ""
+    return urllib.parse.urlsplit(str(first)).hostname or ""
+
+
+def fillable_rows(sites: list[dict]) -> list[dict]:
+    """Every listed, non-refused item `safari_fill` may serve (fill-only, or a
+    login item with `agent_safari_fill`): site id, name, fill origins and
+    whether it is fill-only — names and origins only, never a value."""
+    rows = []
+    for entry in sites:
+        site = str(entry.get("site") or "")
+        if not SITE_ID_RE.match(site) or entry.get("refused"):
+            continue
+        fill_only = entry.get("fill_only") is True
+        if not (fill_only or entry.get("safari_fill") is True):
+            continue
+        origins = [str(o) for o in entry.get("fill_origins") or []]
+        rows.append(
+            {
+                "site": site,
+                "name": _clean_name(entry.get("name"), site),
+                "fill_origins": origins,
+                "fill_only": fill_only,
+            }
+        )
+    return sorted(rows, key=lambda r: r["site"])
+
+
+def _clean_name(value: object, fallback: str) -> str:
+    """A vault item name for a listing: printable, one line, ≤ 64 chars."""
+    text = str(value or "")
+    if not text or len(text) > 64 or not text.isprintable():
+        return fallback
+    return text
+
+
+def fillable_action(*, as_json: bool, fresh: bool) -> int:
+    """`-l`: every item agents can fill into Albert's Safari (`safari.py -L`),
+    from the broker's `sites` listing — `site  name  fill origins`."""
+    health, sites = broker_state(fresh=fresh)
+    rows = fillable_rows(sites)
+    if as_json:
+        print(json.dumps(rows, indent=1))
+        return 0
+    if not health.startswith("running, Bitwarden"):
+        print(f"⚠️ login broker: {health}", file=sys.stderr)
+    if not rows:
+        print("(no item can be filled into Albert's Safari)")
+        return 0
+    w0 = max(len(r["site"]) for r in rows)
+    w1 = max(len(r["name"]) for r in rows)
+    for r in rows:
+        tag = "" if r["fill_only"] else "  (login item, agent_safari_fill)"
+        print(
+            f"{r['site']:<{w0}}  {r['name']:<{w1}}  {', '.join(r['fill_origins'])}{tag}"
+        )
+    return 0
+
+
 def safari_state(sites: list[str]) -> dict[str, dict]:
     """`safari_sessions`, falling back to the last readable state.
 
@@ -607,7 +681,13 @@ def overview(*, fresh: bool = False) -> dict:
     listed = {str(s.get("site")): s for s in sites}
     if readable and listed:
         with contextlib.suppress(als.StateError, OSError):
-            als.ensure_known([s for s in listed if SITE_ID_RE.match(s)])
+            als.ensure_known(
+                [
+                    s
+                    for s, e in listed.items()
+                    if SITE_ID_RE.match(s) and not is_fill_only(e)
+                ]
+            )
     try:
         stages = als.site_states()
     except als.StateError:
@@ -650,8 +730,8 @@ def overview(*, fresh: bool = False) -> dict:
         )
     planned = {t.site for t in TARGETS}
     for site, entry in sorted(listed.items()):
-        if site in planned:
-            continue
+        if site in planned or is_fill_only(entry):
+            continue  # a fill-only item: the one agents.md line, `-l`
         refused = entry.get("refused")
         status, detail = "extra", ""
         if refused:
@@ -697,6 +777,7 @@ def overview(*, fresh: bool = False) -> dict:
         "broker": health,
         "broker_ok": readable,
         "rows": rows,
+        "fillable": fillable_rows(sites),
     }
 
 
@@ -1050,6 +1131,7 @@ def agent_summary(data: dict, checks: dict[str, dict]) -> str:
         *check_lines,
         *warn_lines,
         *bad_lines,
+        *fill_only_lines(data),
         *agent_login_secrets.summary_lines(data.get("secrets") or []),
         "",
         f"Full status: `{here}/agent-login.py` (❌ items name the command an "
@@ -1058,6 +1140,19 @@ def agent_summary(data: dict, checks: dict[str, dict]) -> str:
     if not data.get("broker_ok"):
         out.insert(2, "⚠️ login broker unavailable — broker sites cannot log in now\n")
     return "\n".join(out) + "\n"
+
+
+def fill_only_lines(data: dict) -> list[str]:
+    """The ONE agents-file line about fill-only items (none when there are
+    none): a count and fixed text only."""
+    n = sum(1 for r in data.get("fillable") or [] if r.get("fill_only") is True)
+    if not n:
+        return []
+    what = "1 site can" if n == 1 else f"{n} sites can"
+    return [
+        f"- {what} be filled into Albert's Safari (login broker, fill-only): "
+        '`safari.py -L "<item>" -u <host>`; list them with `agent-login.py -l`'
+    ]
 
 
 def write_agent_summary(data: dict | None = None) -> Path:
@@ -1568,6 +1663,15 @@ def run_test(site: str) -> int:
     """
     site = resolve_site(site)
     static = site in ASSISTED_SITES or site in safari_cookies.SAFARI_SITES
+    if not static:
+        entry = next((s for s in _snapshot_sites() if s.get("site") == site), None)
+        if is_fill_only(entry):
+            host = _hint_host((entry or {}).get("fill_origins")) or "<host>"
+            print(
+                f"❌ {site}: a fill-only item — the broker never logs in with it; "
+                f'agents fill it into Albert\'s Safari: safari.py -L "<item>" -u {host}'
+            )
+            return 2
     inst = "" if static else broker_instance(site)
     if not inst:
         return _run_test(site)
@@ -2720,6 +2824,13 @@ def promote_precheck(  # pylint: disable=too-many-return-statements
     if entry.get("refused"):
         reason = onboarding.safe_reason(entry.get("reason") or "?")
         return f"the broker refuses the item ({reason})", entry, sites
+    if is_fill_only(entry):
+        return (
+            "a fill-only item: the broker never logs in with it (agents fill "
+            "it into Albert's Safari: safari.py -L)",
+            entry,
+            sites,
+        )
     if (
         is_no_submit(site, entry)
         or site in ASSISTED_SITES
@@ -3868,6 +3979,15 @@ def build_parser() -> argparse.ArgumentParser:
         "retry later",
     )
     ap.add_argument(
+        "-l",
+        "--fillable",
+        action="store_true",
+        help="list every item agents can fill into Albert's Safari (fill-only "
+        "items and login items with agent_safari_fill): site, name, fill "
+        "origins — names only, never a value (from the broker's site listing; "
+        "-r asks the broker now; -j: JSON)",
+    )
+    ap.add_argument(
         "-n",
         "--dry-run",
         action="store_true",
@@ -3957,6 +4077,8 @@ def main() -> int:  # pylint: disable=too-many-return-statements,too-many-branch
         return rc
     if args.validate:  # read-only: not even the agents file
         return validate_action(args.item, fresh=args.refresh)
+    if args.fillable:  # read-only: names and origins only
+        return fillable_action(as_json=args.json, fresh=args.refresh)
     if args.snapshot:
         # First, before anything else touches the browser: a guided login
         # whose owner and watchdog both died leaves its record behind.

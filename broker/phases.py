@@ -45,6 +45,9 @@ CODE_TEXT = {
     "busy": "another login of this site or its group is in progress",
     # tp#965: a credential rotation leased the site or wrote agent_hold
     "held": "a credential rotation holds this site — skipped, re-check later",
+    # tp#1082 D5: the broker never logs in with a fill-only item
+    "fill_only": "a fill-only item — agents fill it into Albert's Safari "
+    "(safari.py -L), never a login",
     "locked": "hard-blocked after failed logins — needs a root reset",
     "cooldown": "cooldown after a failed login",
     "interval": "minimum interval between logins",
@@ -168,6 +171,7 @@ _ERROR_PHASE = {
     "access_gated": "precheck",
     "login_blocked": "precheck",
     "held": "precheck",
+    "fill_only": "precheck",
 }
 
 # Phases after which a password may have been typed and submitted — used only

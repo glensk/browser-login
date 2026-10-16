@@ -249,8 +249,8 @@ def _ip(host: str) -> ipaddress.IPv4Address | ipaddress.IPv6Address | None:
 # The config digest's version (stored with every promotion as `config_v`):
 # bump it whenever `config_canon` changes; a promotion of an older version
 # re-adopts the current digest only after a fresh strict check
-# (agent_login_state.adopt_configs).
-CONFIG_V = 1
+# (agent_login_state.adopt_configs). 2: `fill_only` + `safari_fill` (tp#1082).
+CONFIG_V = 2
 
 
 def _strs(value: object) -> list[str]:
@@ -308,6 +308,9 @@ def config_canon(view: Mapping[str, Any]) -> dict[str, Any]:
         if isinstance(days, int) and not isinstance(days, bool)
         else None,
         "username_only": view.get("username_only") is True,
+        # tp#1082: may the broker log in at all, may agents fill it into Safari
+        "fill_only": view.get("fill_only") is True,
+        "safari_fill": view.get("safari_fill") is True,
         "attempt_group": str(view.get("attempt_group") or ""),
         "instance": _identity.instance_of(view),
         "privilege": str(view.get("privilege") or ""),
@@ -590,6 +593,10 @@ def item_findings(
         )
         if not _list(view, "fill_origins"):
             return out
+    if view.get("fill_only") is True:
+        # tp#1082 D5: never logged in — no proof, scope, storage or account
+        # rule applies (the broker refuses only its own fields)
+        return out
     others = [v for v in views if v.get("site") != view.get("site")]
     siblings = _identity.scope_conflicts([dict(view), *others]).get(
         str(view.get("site")), ()
@@ -667,6 +674,8 @@ def item_from_view(view: Mapping[str, Any]) -> SiteItem:
         identity=str(view.get("identity") or ""),
         same_account_as=same[0] if same else "",
         alias=str(view.get("alias") or ""),
+        fill_only=view.get("fill_only") is True,
+        safari_fill=view.get("safari_fill") is True,
     )
 
 

@@ -169,7 +169,7 @@ import uuid
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, NamedTuple
+from typing import Any, NamedTuple, NoReturn
 
 # The broker package (repo root) is the one home of the TOTP, Keycloak-submit
 # and identity-provider helpers; browser.py reuses them instead of copies.
@@ -9816,6 +9816,8 @@ BROKER_ERRORS = {
     "(often its bot check)",
     "captcha_required": "the identity provider wants a captcha",
     "held": "a credential rotation holds this site — skip, re-check later",
+    "fill_only": "a fill-only item: the broker never logs in with it — agents "
+    "fill it into Albert's Safari (safari.py -L)",
 }
 # Broker refusals that need Albert (exit NEEDS_ALBERT_RC, 4).
 BROKER_NEEDS_ALBERT = frozenset({"needs_human", "captcha_required", "submit_disabled"})
@@ -10066,6 +10068,55 @@ def _note_alias(alias: str, site: str) -> None:
     """Say (stderr) and record that `alias` resolved to `site`."""
     _result_set(site=site, alias=alias)
     print(f"↪ {alias} = {site} (the group's default account)", file=sys.stderr)
+
+
+# A vault item name shown in a `safari.py -L "<name>"` hint; anything else
+# (quotes, `$`, backticks, control characters) is shown as the site id.
+_HINT_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9 ._@()+,'-]{0,63}$")
+
+
+def _is_fill_only(entry: Mapping[str, Any] | None) -> bool:
+    """A broker `sites` row of a fill-only item (tp#1082 D5): never a Site."""
+    return entry is not None and entry.get("fill_only") is True
+
+
+def _fill_only_hint(key: str, entry: Mapping[str, Any]) -> str:
+    """`safari.py -L "<item name>" -u <host>` for a fill-only row."""
+    name = str(entry.get("name") or "")
+    shown = name if _HINT_NAME_RE.match(name) else str(entry.get("site") or key)
+    origins = entry.get("fill_origins")
+    first = str(origins[0]) if isinstance(origins, list) and origins else ""
+    host = urllib.parse.urlsplit(first).hostname or "<host>"
+    return f'safari.py -L "{shown}" -u {host}'
+
+
+def _fill_only_exit(key: str, entry: Mapping[str, Any]) -> NoReturn:
+    """Exit 2: `key` names a fill-only broker item — the broker never logs
+    in with it, so it is never loginable, checkable or logged out here."""
+    _result_fail(
+        "precheck",
+        "fill_only",
+        "a fill-only item: the broker never logs in with it",
+        submitted=False,
+    )
+    print(
+        f"❌ {key}: a fill-only login broker item — the broker never logs in "
+        f"with it; fill it into Albert's Safari: {_fill_only_hint(key, entry)}",
+        file=sys.stderr,
+    )
+    sys.exit(2)
+
+
+def _alias_fill_only_gate(key: str, target: str) -> None:
+    """Exit 2 when alias `key` names a fill-only item `target` (a broker
+    never publishes an alias for one; an older or odd listing still must not
+    turn it into a loginable Site)."""
+    try:
+        entry = _broker_site(target)
+    except BrokerUnavailable:
+        return
+    if _is_fill_only(entry):
+        _fill_only_exit(key, entry or {})
 
 
 def _is_static_site(key: str) -> bool:
@@ -13345,6 +13396,8 @@ def cmd_try_sentinel(port: int, site_name: str, sentinel: str) -> int:
         return _broker_fail(3, str(exc))
     if entry is None:
         return _broker_fail(2, f"{site}: not listed by the broker.")
+    if _is_fill_only(entry):
+        _fill_only_exit(site, entry)
     present = _broker_check_entry(port, site, entry, sentinel=sentinel) == 0
     try:
         resp = _broker_request("sentinel_absent", site=site, sentinel=sentinel)
@@ -13379,6 +13432,8 @@ def cmd_broker_sites() -> int:
     rows = [("SITE", "FILL ORIGINS", "CHECK", "STATUS")]
     for s in sorted(sites, key=lambda e: str(e.get("site"))):
         status = f"refused: {s.get('reason') or '?'}" if s.get("refused") else "ok"
+        if _is_fill_only(s) and not s.get("refused"):
+            status = "fill-only (safari.py -L)"
         check = str(s.get("check_url") or "") or (
             "sentinel" if s.get("logged_in_selector") else "-"
         )
@@ -13407,6 +13462,8 @@ def cmd_broker_logout(port: int, site_name: str) -> int:  # pylint: disable=too-
     site = site_name.strip().lower()
     try:
         entry = _broker_site(site)
+        if _is_fill_only(entry):  # no session, no profile: never logged in
+            _fill_only_exit(site, entry or {})
         # WS5: never clear a session in another instance's browser (that
         # would be a sibling account's), nor drop the profile from there.
         wrong = None if entry is None else _instance_gate(site, entry, port, "logout")
@@ -15791,6 +15848,12 @@ def _guided_instance_gate(key: str, port: int) -> int | None:
             f"{key}: not a built-in site and not listed by the login broker — "
             "nothing started.",
         )
+    if _is_fill_only(entry):
+        return _broker_fail(
+            2,
+            f"{key}: a fill-only login broker item — nothing to log in here; "
+            f"fill it into Albert's Safari: {_fill_only_hint(key, entry)}",
+        )
     return _instance_gate(key, entry, port, "assisted-login")
 
 
@@ -16024,10 +16087,13 @@ def _resolve_site(name: str, *, for_login: bool = False) -> Site:
         entry = _broker_site(key)
     except BrokerUnavailable as exc:
         entry, reason = None, f" ({exc})"
+    if _is_fill_only(entry):
+        _fill_only_exit(key, entry or {})
     if entry is not None and not entry.get("refused"):
         return _broker_site_obj(key)
     target = None if entry is not None or reason else _broker_alias_target(key)
     if target is not None:  # WS5: a group's default member (after ids, never before)
+        _alias_fill_only_gate(key, target)
         _note_alias(key, target)
         return _broker_site_obj(target)
     if entry is not None:

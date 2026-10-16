@@ -320,7 +320,11 @@ def item_scopes(entry: Mapping[str, object]) -> frozenset[CookieScope]:
     """Every scope an item's session lives in or is typed into: its cookie
     scopes (`entry_cookie_scopes`), and its fill and storage origins'
     hosts at path ``/`` — origin-scoped state (localStorage, a login form)
-    cannot be split by path, so an origin overlap stays a conflict."""
+    cannot be split by path, so an origin overlap stays a conflict. A
+    fill-only item (``fill_only``, tp#1082 D5) has none: the broker never
+    holds a session of it."""
+    if entry.get("fill_only") is True:
+        return frozenset()
     scopes = set(entry_cookie_scopes(entry))
     for key in ("fill_origins", "storage_origins"):
         scopes |= {CookieScope(o) for o in _list(entry.get(key))}

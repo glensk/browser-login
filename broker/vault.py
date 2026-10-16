@@ -4,7 +4,11 @@ Whitelisting a site = its login item sits in the ``agent-logins`` collection AND
 carries the custom field ``agent_fill_origins``. Items without it are listed as
 refused, and so are items with neither a check URL (``agent_check_url`` or a
 built-in default for the site id) nor a sentinel (``agent_logged_in_selector``):
-without one the broker cannot PROVE a login worked. Secrets never leave this
+without one the broker cannot PROVE a login worked — except a FILL-ONLY item
+(``agent_fill_only = true``, tp#1082 D5): the broker never logs in with it, so
+it needs only its fill origins; ``SiteItem.loginable`` is False and only
+``safari_fill`` serves it (and it is never a ``secret-run`` value, gate code
+``fill_only``). Secrets never leave this
 module except as a ``Secret`` handed to a recipe; ``Secret`` has a redacting
 ``repr`` so a stray log line shows nothing.
 
@@ -69,7 +73,7 @@ import re
 import subprocess
 import threading
 import urllib.parse
-from collections.abc import Iterator, Mapping
+from collections.abc import Callable, Iterator, Mapping
 from contextlib import contextmanager
 from dataclasses import dataclass, field, replace
 from pathlib import Path
@@ -137,6 +141,8 @@ PASSWORD_MODE = "password"
 USERNAME_ONLY = USERNAME_ONLY_MODE
 LOGIN_MODES = (PASSWORD_MODE, USERNAME_ONLY)
 USERNAME_ONLY_SECRET = "a username-only login item is never exposed as a secret"
+# tp#1082 D5: a fill-only item's website password never becomes a secret-run value.
+FILL_ONLY_SECRET = "a fill-only login item is never exposed as a secret"
 NO_PASSWORD = (
     "the item has no password (if it logs in with only a username/account "
     "number, set agent_login_mode=username-only; if it should have one, check "
@@ -180,6 +186,7 @@ GATE_BAD_FLAG = "bad_agent_script"
 GATE_HELD = "held"
 GATE_NO_SUBMIT = "no_submit"
 GATE_USERNAME_ONLY = "username_only"
+GATE_FILL_ONLY = "fill_only"
 GATE_DUPLICATE = "duplicate_id"
 GATE_UNREADABLE = "membership_unreadable"
 GATE_INVALID = "invalid_item"
@@ -190,6 +197,7 @@ GATE_CODES = (
     GATE_HELD,
     GATE_NO_SUBMIT,
     GATE_USERNAME_ONLY,
+    GATE_FILL_ONLY,
     GATE_DUPLICATE,
     GATE_UNREADABLE,
     GATE_INVALID,
@@ -242,6 +250,26 @@ class Held(VaultError):
     def __init__(self, txid: str) -> None:
         super().__init__(f"held: rotation {txid} in progress")
         self.txid = txid
+
+
+class FillOnly(VaultError):
+    """A login, check, probe or challenge asked for a fill-only item
+    (``agent_fill_only``, tp#1082 D5): a skip with code ``fill_only``,
+    never a failure."""
+
+    code = "fill_only"
+
+    def __init__(self, site: str) -> None:
+        super().__init__(fill_only_detail(site))
+        self.site = site
+
+
+def fill_only_detail(site: str) -> str:
+    """The ``fill_only`` refusal's detail (names only)."""
+    return (
+        f"{site} is a fill-only item: the broker never logs in with it; agents "
+        "fill it into Safari with safari.py -L"
+    )
 
 
 class NotFillable(VaultError):
@@ -348,6 +376,11 @@ class SiteItem:  # pylint: disable=too-many-instance-attributes
     # handed to his uid for a fill into his own Safari. Read through
     # `fill_enabled`, never directly.
     safari_fill: bool = False
+    # `agent_fill_only` (tp#1082 D5): the broker NEVER logs in with this item
+    # (no check URL, sentinel, cookie scope or identity); only ``safari_fill``
+    # serves it. Implies the fill opt-in (`fill_enabled`); read the login
+    # side through `loginable`.
+    fill_only: bool = False
     refused: str | None = None
     item_id: str = ""
     # Bitwarden `revisionDate` (ISO string, "" when absent or malformed).
@@ -410,6 +443,13 @@ class SiteItem:  # pylint: disable=too-many-instance-attributes
         )
 
     @property
+    def loginable(self) -> bool:
+        """May any broker path log in, check, probe, challenge, schedule or
+        export for this item? False for a fill-only item (tp#1082 D5) —
+        every such path answers ``fill_only`` before anything else."""
+        return not self.fill_only
+
+    @property
     def has_proof(self) -> bool:
         """The STRICT proof is possible: an authenticated DOM sentinel exists,
         or the site has a registered server proof (``recipes.PROOFS``: CSCS
@@ -468,6 +508,7 @@ class SiteItem:  # pylint: disable=too-many-instance-attributes
             # "password" (a leak canary in the tests checks for the word)
             "username_only": self.login_mode == USERNAME_ONLY,
             "safari_fill": self.safari_fill,
+            "fill_only": self.fill_only,
             "refused": self.refused is not None,
             "reason": self.refused or "",
             # tp#965: non-secret metadata for credctl's guard index / tail
@@ -808,6 +849,9 @@ def secret_item_from_json(
     why = _no_submit_reason(item, fields)
     if why:
         return refused(why, GATE_NO_SUBMIT if why == NO_SUBMIT_SECRET else GATE_INVALID)
+    if _parse_flag(fields.get("agent_fill_only", "")) is not False:
+        # true, or a malformed value: fail closed (tp#1082 D5)
+        return refused(FILL_ONLY_SECRET, GATE_FILL_ONLY)
     mode, _problem = login_mode(fields.get("agent_login_mode", ""))
     account_only = False
     if mode == USERNAME_ONLY and username_secret:
@@ -1297,11 +1341,14 @@ def site_item_from_json(item: Mapping[str, Any], *, dev: bool = False) -> SiteIt
     item_id = str(item.get("id") or "")
     revision = item_revision(item)
     hold = item_hold(fields)
+    # tp#1082 D5: malformed = None (refused below; its scope then counts)
+    fill_only = _parse_flag(fields.get("agent_fill_only", ""))
 
     def refused(reason: str) -> SiteItem:
         # WS3: a refused item keeps a VALID attempt group (one that does not
         # reveal the account): the broker's `forget` must never drop a group
-        # key an item still declares, refused or not.
+        # key an item still declares, refused or not. A refused fill-only
+        # item keeps its flag: it never takes part in the scope rules.
         group, _problem = _attempt_group(fields.get("agent_attempt_group", ""), item)
         return SiteItem(
             site=site,
@@ -1310,11 +1357,14 @@ def site_item_from_json(item: Mapping[str, Any], *, dev: bool = False) -> SiteIt
             revision=revision,
             hold=hold,
             refused=reason,
-            attempt_group=group,
+            attempt_group=None if fill_only else group,
+            fill_only=fill_only is True,
         )
 
     if not SITE_ID_RE.match(site):
         return refused("invalid agent_site id")
+    if fill_only is None:
+        return refused("bad agent_fill_only (true or false)")
     raw_origins = fields.get("agent_fill_origins", "").strip()
     if not raw_origins:
         return refused("missing agent_fill_origins")
@@ -1322,6 +1372,10 @@ def site_item_from_json(item: Mapping[str, Any], *, dev: bool = False) -> SiteIt
         fill_origins = parse_fill_origins(raw_origins, dev=dev)
     except ValueError as exc:
         return refused(f"bad agent_fill_origins: {exc}")
+    if fill_only:
+        # before every login-only rule (check URL / sentinel, cookie hosts,
+        # identity): those fields are ignored, never a refusal
+        return _fill_only_item(refused, fields, site, fill_origins)
     if not fields.get("agent_site") and site not in DEFAULT_CHECK_URLS:
         # An item named e.g. "tutti.ch" still means the known site "tutti":
         # match the built-in sites by the fill origins' site domain.
@@ -1449,6 +1503,39 @@ def site_item_from_json(item: Mapping[str, Any], *, dev: bool = False) -> SiteIt
         hold=hold,
     )
     return _with_identity_fields(built, item, fields)
+
+
+def _fill_only_item(
+    refused: Callable[[str], SiteItem],
+    fields: Mapping[str, str],
+    site: str,
+    fill_origins: list[str],
+) -> SiteItem:
+    """The ``SiteItem`` of a fill-only item (tp#1082 D5): its id, name, fill
+    origins and hold (from `refused`'s base), its login mode (username-only
+    stays parseable: ``safari_fill`` refuses it) and its no-submit flag; every
+    check / login / cookie / storage / identity field empty. Login-only
+    fields the item carries are ignored. A malformed ``agent_safari_fill``
+    or ``agent_login_mode`` still refuses it (fail closed)."""
+    base = refused("")
+    safari_fill = _parse_flag(fields.get("agent_safari_fill", ""))
+    if safari_fill is None:
+        return refused("bad agent_safari_fill (true or false)")
+    mode, problem = login_mode(fields.get("agent_login_mode", ""))
+    if problem:
+        return refused(problem)
+    return replace(
+        base,
+        refused=None,
+        attempt_group=None,
+        fill_origins=fill_origins,
+        fill_only=True,
+        safari_fill=safari_fill,
+        login_mode=mode or PASSWORD_MODE,
+        no_submit=_parse_flag(fields.get("agent_no_submit", "")) is True
+        or site in NO_SUBMIT_SITES
+        or no_submit_by_origin(fill_origins),
+    )
 
 
 def _cookie_scopes(
@@ -1696,7 +1783,8 @@ def identity_rules(  # pylint: disable=too-many-branches
     """
     out = list(items)
     for i, it in enumerate(out):
-        if it.refused and not it.cookie_hosts:
+        # a fill-only item has no cookie scope, refused or not (tp#1082 D5)
+        if it.refused and not it.cookie_hosts and not it.fill_only:
             out[i] = replace(it, cookie_hosts=_raw_scope_hosts(raws[i]))
     live = {it.site: it for it in out if not it.refused}
     for i, it in enumerate(out):
@@ -1793,6 +1881,7 @@ def build_items(
                 revision=it.revision,
                 hold=it.hold,
                 refused="duplicate agent_site",
+                fill_only=it.fill_only,
             )
         seen.add(it.site)
         out.append(it)
@@ -1834,8 +1923,8 @@ def secret_from_json(item: Mapping[str, Any]) -> Secret:
 def fill_enabled(item: SiteItem) -> bool:
     """May ``safari_fill`` serve `item` (tp#1082 D2): the ONE place the
     opt-in is decided. ``agent_safari_fill = true`` today; the fill-only
-    class (``agent_fill_only``, tp#1082 B2) implies it and is added HERE."""
-    return item.safari_fill
+    class (``agent_fill_only``, tp#1082 B2) implies it."""
+    return item.safari_fill or item.fill_only
 
 
 def _find(  # pylint: disable=too-many-arguments
@@ -1869,6 +1958,8 @@ def _find(  # pylint: disable=too-many-arguments
             if fill:
                 _fill_check(it)
                 return raw
+            if not it.loginable:
+                raise FillOnly(site)
             if it.refused:
                 raise VaultError(f"site {site!r} is refused: {it.refused}")
             if it.no_submit:

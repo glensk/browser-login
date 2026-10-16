@@ -569,6 +569,7 @@ item, `agent-login.py` shows the reason):
 | `agent_max_session_days`   | Whole days (1–365), only together with `agent_fresh_login = true`: renew the session with a fresh login once the last proven fresh broker login is this many days old, while the session still works. For servers that end a session a fixed time after its login however much it is used — Calibre-Web Automated: 31 days, so set `28` (the daily check then has 3 days to succeed). The age counts from this client's last PROVEN fresh broker login (`~/.cache/claude-browser/session-age/SITE.json`, written once a fresh broker login was injected and verified); with none on record, from the first check that saw the session — a lost or unreadable record means "age unknown", never a renewal loop. One renewal attempt per 20 h at most (claimed under a per-site lock before it starts), whatever its outcome. `browser.py login` and `agent-login.py -c` renew under the usual gates (pending, quarantined, locked … → only a note); a failed renewal keeps the working session (exit 0, `renewal: failed` in the result record). |
 | `agent_login_mode`         | `password` (default) or `username-only`: the item's USERNAME alone is the credential (Mullvad's account number, no password on the item). The broker types it into the login form's only field (a masked one like Mullvad's `input[type=password][name=account_number]`, else a username / account-number field) and submits it under every password rule: tripwire armed first, buttons read fail-closed, submit marker right before the click, proof by the sentinel; same attempt / limiter / quarantine semantics. A form that asks for more (a password too) gets nothing typed (`recipe`, not submitted). Such a username is a secret: masked in diagnostics (also when the page shows it in groups), no failure screenshot is ever taken, no report shows its length or a hash, a page that submits it by itself is marked submitted before the request leaves and never submitted twice, and the secret ops (`secret-run`) never expose an item that carries this field. Only for sites on the generic recipe. An item without a password in `password` mode now fails with `no_password` ("set agent_login_mode=username-only, or check the item / the collection permission"), a username-only item without a username with `no_username`. |
 | `agent_safari_fill`        | `true` (default `false`; any other value refuses the item): the broker's `safari_fill` op may hand this item's username / password, or its TOTP code, to Albert's uid so an agent fills it into his own Safari (`safari.py -L`) — only for one of the item's fill origins, only while the console is unlocked and used within 15 min, rate-limited (10/h per item, 15 distinct items a day), leak-registered and audited. No-submit items may opt in, username-only items never. Set it with mydotfiles `broker-add.py` (Touch ID approval). Threat model: it contains accidental leaks and shrinks exposure from the whole unlocked vault tab to the opted-in items; it is no barrier against a hostile process running as Albert. |
+| `agent_fill_only`          | `true` (default `false`; any other value refuses the item): a FILL-ONLY item (tp#1082) — the broker never logs in, checks, probes, challenges, schedules or exports it; every such op answers `fill_only` (a skip: no limiter charge, quarantine or failure mail), and only `safari_fill` serves it (it implies `agent_safari_fill`). It needs only `agent_fill_origins` (required): no check URL or sentinel, because nothing is ever proven logged in; check / login / cookie / storage / identity fields on it are ignored and the `sites` view shows them empty. Never a `secret-run` value (gate code `fill_only`), no ✅/❌ row in `agent-login.py` (the agents file has one line with the count; `agent-login.py -l` lists every fillable item). Onboard with mydotfiles `broker-add.py NAME -Z` (Touch ID approval). |
 
 ### Submit safety: never a guess, never a secondary action (WS2-calibre)
 
@@ -878,15 +879,15 @@ leak a password, lock an account or race a login:
   `secrets` row carries `kind` (`secret` = legacy collection, `login`),
   `agent_script` (true / false / `malformed`) and `gate_code`, a closed set
   — `ok`, `no_agent_script` (text: `script read without agent_script`),
-  `bad_agent_script`, `held`, `no_submit`, `username_only`, `duplicate_id`,
+  `bad_agent_script`, `held`, `no_submit`, `username_only`, `fill_only`, `duplicate_id`,
   `membership_unreadable`, `invalid_item` — which in the first two modes is
   what mode `agent_script` WOULD answer; a refused `secret`/`totp` request
   carries the item's code. Ids: a legacy item keeps `agent_secret_id` → the
   name slug in every mode; a login-collection item uses `agent_secret_id` →
   `agent_site` → the slug; two FLAGGED items claiming one id are both
   refused (`duplicate_id`), an unflagged login claims none. A flagged
-  username-only login exposes its username as `password`; no-submit and held
-  items are never injected. An unknown `secret_gate` refuses `secrets`,
+  username-only login exposes its username as `password`; no-submit, fill-only
+  and held items are never injected. An unknown `secret_gate` refuses `secrets`,
   `secret` and `totp` (`bad_secret_gate`) while logins, `secret_done`,
   `audit` and `invalidate` keep working. No comparison op exists: credctl
   compares a flagged item's copies inside its own compare child, started by
@@ -1354,6 +1355,7 @@ Examples:
 ./agent-login.py -L notion    # an AGENT imports Albert's Safari session (+ a Safari login)
 ./agent-login.py -L galaxus-de -n  # what -L would do (no import, no Safari login)
 ./agent-login.py -R           # refresh-only pass (NPM tokens; LaunchAgent every 6 h)
+./agent-login.py -l           # items agents can fill into Albert's Safari (safari.py -L)
 ```
 
 Sites on Albert's session (Safari sites, galaxus-de, Notion, Slack, OpenAI, claude.ai) are renewed by AGENTS with -L — never a to-do for Albert, except a CAPTCHA, an SMS code, a push / security-key approval or a locked vault (exit 4, named). myfritz is on demand: never checked daily.
@@ -1361,6 +1363,8 @@ Sites on Albert's session (Safari sites, galaxus-de, Notion, Slack, OpenAI, clau
 Where a login broke: every check records its PHASE (precheck, limiter, vault, recipe, submit, profile-proof, broker-proof, bundle-export, cookie-inject, storage-inject, client-proof, consumer-followup, safari-source, unknown) and a code, a redacted detail and the broker's screenshot; the overview shows them. A ✅ is a fresh (≤ 36 h), proven check; older reads ❓. The daily check (-c) never logs in a site that is pending, quarantined, locked, in cooldown, without a sentinel, changed since its promotion or flagged by the onboarding review, and never retries after the password may have been sent. Adding a site: README "Adding a site to the broker".
 
 A credential rotation (mydotfiles credctl) holds its sites: ⏸ held (rotation TXID) — never logged in, never a failure mail, re-checked later. The old -f (password length + hash) is gone (tp#965, it was a password oracle): compare a password with `credctl.py check -T` in mydotfiles.
+
+Fill-only items (`agent_fill_only = true`, tp#1082): the broker never logs in with them, so they get no ✅/❌ row and are never checked, promoted or tested; the agents file carries one line with their count, `-l` lists them.
 
 #### Options
 
@@ -1387,5 +1391,6 @@ A credential rotation (mydotfiles credctl) holds its sites: ⏸ held (rotation T
 | `-D`, `--remove` `SITE` | remove a broker site, run twice: while it is listed -> demote + browser.py logout; after its vault item is gone -> drop every trace (broker `forget`, state files, cache files); audited |
 | `-Q`, `--release` `SITE` | release SITE's quarantine (after a failed login that may have submitted the password) — the main session's decision, audited |
 | `-L`, `--safari-login` `SITE` | an AGENT's login through Albert's Safari (WS1b): free check, else import Safari's own session (works without new safari.py features), else log Safari in (safari.py, a new window, his Vaultwarden tab and clipboard) and import it; claude.ai: the automated magic link. One run, no retries; never from a LaunchAgent. Exit 4 = needs Albert (CAPTCHA, SMS, push / security key, locked vault); exit 3 = the Mac is locked or idle: retry later |
+| `-l`, `--fillable` | list every item agents can fill into Albert's Safari (fill-only items and login items with agent_safari_fill): site, name, fill origins — names only, never a value (from the broker's site listing; -r asks the broker now; -j: JSON) |
 | `-n`, `--dry-run` | with -L: report what it would do (no import, no Safari login) |
 | `-R`, `--refresh-pass` | refresh-only pass: renew every refreshable token (NPM) with < 12 h left; never logs in (LaunchAgent com.albert.agent-login-refresh, every 6 h) |

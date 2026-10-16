@@ -112,7 +112,11 @@ Errors: {"ok": false, "error": "needs_human" | "origin_violation" |
 "forget_incomplete" | "held" | "removed" |
 "unknown_field" | "refused" | "vault_error" | "leakcheck_unavailable" |
 "no_item" | "ambiguous" | "not_enabled" | "no_password" | "unattended" |
-"forbidden" | "bad_request" | "internal", "detail": "..."} — never a secret.
+"fill_only" | "forbidden" | "bad_request" | "internal", "detail": "..."} —
+never a secret. ``fill_only`` (tp#1082 D5): ``login`` (scheduled, candidate,
+refresh_only), ``sentinel_absent`` and ``identity_challenge`` of an item with
+``agent_fill_only = true`` — a skip answered before any limiter charge,
+quarantine, failure screenshot or mail; only ``safari_fill`` serves it.
 
 Examples:
   daemon.py                                   # production (as _loginbroker)
@@ -253,6 +257,7 @@ from broker.vault import (  # noqa: E402
     USERNAME_ONLY,
     BwBootstrap,
     BwVault,
+    FillOnly,
     FixtureVault,
     GateRow,
     Held,
@@ -263,6 +268,7 @@ from broker.vault import (  # noqa: E402
     Vault,
     VaultCache,
     VaultError,
+    fill_only_detail,
     hold_view,
     selector_ok,
     slugify,
@@ -2044,7 +2050,7 @@ class Broker(SecretOps, FillOps):  # pylint: disable=too-many-instance-attribute
             lease = self.leases.holder(it.site)
             if lease is not None:  # a live rotation lease holds it too
                 entry.update(hold_view(lease))
-            if not it.refused:
+            if not it.refused and it.loginable:
                 denied = self.limiter.peek_site(it.site, now, group=it.attempt_group)
                 entry["limit"] = denied.limit() if denied else {"state": "ok"}
             out.append(entry)
@@ -2094,6 +2100,8 @@ class Broker(SecretOps, FillOps):  # pylint: disable=too-many-instance-attribute
         of its keys — a challenge never serves a site its login would not."""
         if item is None:
             return _err("unknown_site", f"{site!r} is not in agent-logins")
+        if not item.loginable:
+            return _err("fill_only", fill_only_detail(site))
         held = self._held(site, item)
         if held is not None:
             return held
@@ -2400,7 +2408,7 @@ class Broker(SecretOps, FillOps):  # pylint: disable=too-many-instance-attribute
             )
 
     # One early return per refusal, in the order they are checked.
-    def _sentinel_absent(  # pylint: disable=too-many-return-statements
+    def _sentinel_absent(  # pylint: disable=too-many-return-statements,too-many-branches
         self, site: str, sentinel: object
     ) -> dict[str, Any]:
         """``sentinel_absent``: does `sentinel` show on the check page in a
@@ -2415,6 +2423,8 @@ class Broker(SecretOps, FillOps):  # pylint: disable=too-many-instance-attribute
             return _err("vault_error", str(exc))
         if item is None:
             return _err("unknown_site", f"{site!r} is not in agent-logins")
+        if not item.loginable:
+            return _err("fill_only", fill_only_detail(site))
         held = self._held(site, item)
         if held is not None:
             return held
@@ -2479,8 +2489,8 @@ class Broker(SecretOps, FillOps):  # pylint: disable=too-many-instance-attribute
         self, site: str
     ) -> tuple[SiteItem | None, dict[str, Any]]:
         """`_do_login`'s item: (item, {}) when a login may go on, else
-        (None, the reply) — vault unreadable, unknown site, held (tp#965),
-        refused, or an unprovable account (WS5)."""
+        (None, the reply) — vault unreadable, unknown site, fill-only
+        (tp#1082), held (tp#965), refused, or an unprovable account (WS5)."""
         try:
             items = self._items()
             item = next((it for it in items if it.site == site), None)
@@ -2493,6 +2503,10 @@ class Broker(SecretOps, FillOps):  # pylint: disable=too-many-instance-attribute
             return None, _phase_err(
                 "unknown_site", f"{site!r} is not in agent-logins", "vault"
             )
+        if not item.loginable:
+            # tp#1082 D5: a skip — before the limiter, a secret read, a
+            # quarantine, a screenshot or a mail
+            return None, _phase_err("fill_only", fill_only_detail(site), "precheck")
         # Under the site lock: a lease recorded while this request waited
         # for the lock (or its drain) holds it here — before any secret read.
         held = self._held(site, item)
@@ -2769,6 +2783,8 @@ class _SecretGate:  # pylint: disable=too-many-instance-attributes  # deps + att
     def __call__(self) -> Secret:
         if self.refresh_only:
             raise _RefreshUnavailable()
+        if not self.item.loginable:  # `_login_item` refused it already
+            raise FillOnly(self.item.site)
         if self.item.no_submit:
             # Before the deadline check and the reservation: the limiter is
             # never touched and the login never gets the secret.
@@ -2800,6 +2816,10 @@ class _SecretGate:  # pylint: disable=too-many-instance-attributes  # deps + att
             # back (a failed withdraw leaves it to `finish`: not_submitted).
             self._withdraw()
             raise _HeldStop(exc.txid) from None
+        except FillOnly:
+            # tp#1082: turned fill-only since the listing — never counted
+            self._withdraw()
+            raise
 
     def _withdraw(self) -> None:
         """Undo the reservation (nothing was typed); keep it on failure."""
