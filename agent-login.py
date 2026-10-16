@@ -3393,6 +3393,14 @@ def safari_login_lock(wait_s: float = SAFARI_LOCK_WAIT_S) -> Iterator[bool]:
         os.close(fd)
 
 
+def _mail_detail(out: alsafari.Outcome) -> dict:
+    """The fixed ``mail_archived`` status of a used login-code mail as a
+    result-record detail ({} when no mail code was used)."""
+    return (
+        {"detail": f"mail_archived: {out.mail_archived}"} if out.mail_archived else {}
+    )
+
+
 def _safari_fail(site: str, out: alsafari.Outcome, how: str) -> int:
     """Record a failed `-L` (phase/code fixed), quarantine when a credential
     step may have sent something; the exit code. Says "quarantined" only
@@ -3408,7 +3416,12 @@ def _safari_fail(site: str, out: alsafari.Outcome, how: str) -> int:
         site,
         None if out.rc in (BUSY_RC, 3) else False,
         how,
-        {"phase": out.phase, "code": out.code, "route": "safari-login"},
+        {
+            "phase": out.phase,
+            "code": out.code,
+            "route": "safari-login",
+            **_mail_detail(out),
+        },
     )
     who = "needs Albert" if out.rc == alsafari.NEEDS_ALBERT_RC else "not logged in"
     print(f"❌ {site}: {who} — {phases.text(out.phase, out.code)}")
@@ -3607,6 +3620,8 @@ def _safari_login_locked(  # pylint: disable=too-many-return-statements
             )
         print(f"↻ {site}: the imported session does not work — logging Safari in")
     out = _drive_safari(site, recipe)
+    if out.mail_archived == "failed":
+        print(f"⚠️ {site}: the login-code mail could not be archived (left in INBOX)")
     if not out.ok:
         return _safari_fail(site, out, f"Safari login stopped — {out.code}")
     if not recipe.import_after:
@@ -3614,7 +3629,7 @@ def _safari_login_locked(  # pylint: disable=too-many-return-statements
             site,
             True,
             "Safari logged in (agents use Safari)",
-            {"phase": "ok", "code": "ok", "route": "safari-login"},
+            {"phase": "ok", "code": "ok", "route": "safari-login", **_mail_detail(out)},
         )
         print(f"✅ {site}: Safari is logged in (agents work in Safari for {site})")
         return 0
@@ -3627,6 +3642,7 @@ def _safari_login_locked(  # pylint: disable=too-many-return-statements
             True,
             "logged in (agent's Safari login)",
             {
+                **_mail_detail(out),
                 **(run.result or {}),
                 "phase": "ok",
                 "code": "ok",
@@ -3644,6 +3660,7 @@ def _safari_login_locked(  # pylint: disable=too-many-return-statements
         ),
         credential=out.credential,
         phase=str(res.get("phase") or "client-proof"),
+        mail_archived=out.mail_archived,
     )
     return _safari_fail(
         site, failed, _import_how(run, "Safari login done, the import failed")

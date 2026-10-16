@@ -426,6 +426,9 @@ class Outcome:
     phase: str = "safari-source"
     # a window this run opened may still be open (its id was not returned)
     window_left: bool = False
+    # the used login-code mail moved out of INBOX: ok / failed / skipped
+    # ("" = no mail code was used); fixed vocabulary, never mail content
+    mail_archived: str = ""
 
     @property
     def ok(self) -> bool:
@@ -865,6 +868,9 @@ def safe_host(url: object) -> str:
 # only when it was already missing for the baseline: a folder that answered
 # then must answer later, or old and new mail cannot be told apart.
 MAIL_FOLDERS = ("INBOX", "Archive", "[Gmail]/All Mail")
+# Where a used code mail goes, first readable one wins: Gmail archives by
+# leaving INBOX for All Mail; other accounts have an Archive folder.
+ARCHIVE_FOLDERS = ("[Gmail]/All Mail", "Archive")
 
 
 def _addrs(raw: object) -> tuple[str, list[str]]:
@@ -949,6 +955,9 @@ class MailReader:
     account: str | None = None
     run: Callable[..., subprocess.CompletedProcess] = subprocess.run
     folders: tuple[str, ...] | None = None  # the baseline's readable folders
+    # code -> (folder, id) of the mails it was read from, by the latest
+    # scan (memory only; cleared once the code was used)
+    sources: dict[str, list[tuple[str, str]]] = field(default_factory=dict)
 
     def _cmd(self, *args: str) -> str | None:
         argv = [self.himalaya, *args]
@@ -991,6 +1000,18 @@ class MailReader:
                 return None
             self.folders = tuple(answered)
         return out
+
+    def archive(self, code: str) -> str:
+        """Move the INBOX mail(s) `code` was read from out of INBOX; best
+        effort, ``ok`` / ``failed`` / ``skipped`` (no INBOX source — e.g. a
+        server rule archived it already — or no archive folder)."""
+        found, self.sources = self.sources.get(code, []), {}
+        ids = sorted({i for f, i in found if f == "INBOX"})
+        target = next((f for f in ARCHIVE_FOLDERS if f in (self.folders or ())), "")
+        if not ids or not target:
+            return "skipped"
+        moved = self._cmd("message", "move", "--folder", "INBOX", target, *ids)
+        return "ok" if moved is not None else "failed"
 
     def message(self, folder: str, msg_id: str) -> str | None:
         """The message with its Authentication-Results header, read without
@@ -1046,6 +1067,7 @@ def _codes(
     `signed`: only mails whose topmost Authentication-Results says dkim=pass
     for the sender's domain count."""
     envs = reader.envelopes()
+    reader.sources = {}
     if envs is None:
         return None
     out: list[str] = []
@@ -1059,7 +1081,10 @@ def _codes(
         sender = _addrs(env.get("from"))[1][0]
         if signed and not dkim_pass(headers, sender):
             continue
-        out += re.findall(step.code_re, body)
+        found = re.findall(step.code_re, body)
+        for code in dict.fromkeys(found):
+            reader.sources.setdefault(code, []).append((folder, msg_id))
+        out += found
     return out
 
 
@@ -1068,6 +1093,7 @@ def mail_baseline(reader: MailReader, step: Step) -> Baseline | None:
     any recipient, signed or not); None when unreadable — then no code is
     ever taken."""
     codes = _codes(reader, step, "", signed=False)
+    reader.sources = {}
     if codes is None:
         return None
     base = Baseline(secrets.token_bytes(32), set())
@@ -1377,7 +1403,12 @@ class Machine:  # pylint: disable=too-many-instance-attributes
         finally:
             params.clear()
             del body
-        return None if ok else self._end(2, "email_code")
+        if not ok:
+            reader.sources = {}
+            return self._end(2, "email_code")
+        # typed and submitted: the mail did its job, out of INBOX with it
+        self.out.mail_archived = reader.archive(code)
+        return None
 
     def _wait_code(self, reader: MailReader, step: Step) -> str | None:
         """The code once two consecutive polls agree on one new signed code."""

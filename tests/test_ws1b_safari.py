@@ -545,6 +545,8 @@ class FakeMailbox:
         self.mails: dict[tuple[str, str], tuple[dict, str]] = {}
         self.unreadable = False
         self.folders = set(folders)
+        self.moves: list[list[str]] = []
+        self.move_rc = 0
 
     def add(
         self, folder: str, msg_id: str, body: str, auth: str = SIGNED, **env: Any
@@ -561,6 +563,11 @@ class FakeMailbox:
 
     def run(self, argv: list[str], **_kw: Any) -> subprocess.CompletedProcess:
         folder = argv[argv.index("--folder") + 1]
+        if argv[1:3] == ["message", "move"]:
+            self.moves.append(argv[3:])
+            if self.move_rc == 124:
+                raise subprocess.TimeoutExpired(argv, 30)
+            return subprocess.CompletedProcess(argv, self.move_rc, "", "")
         if self.unreadable or folder not in self.folders:
             return subprocess.CompletedProcess(argv, 1, "", "")
         if argv[1:3] == ["envelope", "list"]:
@@ -740,6 +747,71 @@ def test_mail_code_order_email_trigger_wait_fill_submit() -> None:
     assert fake.order == ["email", "click:Continue", "code"]
     assert fake.modes == [0o600]
     assert len(polls) >= 2  # the code had to be seen in two consecutive polls
+    # after the submit: exactly that mail, out of INBOX into Archive, once
+    assert box.moves == [["--folder", "INBOX", "Archive", "9"]]
+    assert out.mail_archived == "ok"
+
+
+def _mail_run(
+    box: FakeMailbox, folder: str = "INBOX", code_ok: bool = True
+) -> s.Outcome:
+    """One mail-code run whose code mail lands in `folder`; the code fill
+    answers ok (submitted) or not."""
+    code = _code()
+    script = [
+        ("https://www.example.org/login", _page(user=True, steps=[[True, False]])),
+        ("https://www.example.org/", _page(sentinel=True)),
+    ]
+    fake = MailSafari(NOTION_LIKE, script, code)
+    if not code_ok:
+        real = fake.__call__
+
+        def call(args: list[str]) -> s.Reply:
+            if args[0] == "--eval" and "agent-login:code" in Path(args[1]).read_text(
+                encoding="utf-8"
+            ):
+                return s.Reply(0, {"result": json.dumps({"ok": False})})
+            return real(args)
+
+        runner: Any = call
+    else:
+        runner = fake
+
+    def sleep(_s: float) -> None:
+        if not box.mails:
+            box.add(folder, "7", f"code {code}")
+
+    plan = _plan(expected_email="me@example.org", mail=_reader(box))
+    return s.Machine(NOTION_LIKE, plan, runner, sleep=sleep).run()
+
+
+def test_gmail_archives_the_code_mail_to_all_mail() -> None:
+    box = FakeMailbox(folders=("INBOX", "[Gmail]/All Mail"))
+    out = _mail_run(box)
+    assert out.ok and out.mail_archived == "ok"
+    assert box.moves == [["--folder", "INBOX", "[Gmail]/All Mail", "7"]]
+
+
+def test_a_code_mail_already_out_of_inbox_is_left_alone() -> None:
+    box = FakeMailbox()
+    out = _mail_run(box, folder="Archive")
+    assert out.ok and out.mail_archived == "skipped" and not box.moves
+
+
+def test_no_archive_when_the_code_was_not_submitted() -> None:
+    box = FakeMailbox()
+    out = _mail_run(box, code_ok=False)
+    assert not out.ok and out.code == "email_code"
+    assert not box.moves and out.mail_archived == ""
+
+
+@pytest.mark.parametrize("move_rc", [1, 124])
+def test_a_failed_archive_does_not_change_the_login(move_rc: int) -> None:
+    box = FakeMailbox()
+    box.move_rc = move_rc  # 124: the move times out
+    out = _mail_run(box)
+    assert out.ok and out.credential and out.mail_archived == "failed"
+    assert len(box.moves) == 1  # tried once, never retried
 
 
 def test_a_code_that_changes_between_polls_is_not_taken_early() -> None:
