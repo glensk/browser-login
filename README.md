@@ -969,9 +969,15 @@ security review: `plans-done/PLAN_ws1b-durability_DONE.md`.
 3. **Otherwise the agent logs Safari in.** It uses mydotfiles' `safari.py` in a
    NEW Safari window (`--new-window`). Every action names that window
    (`--handle`) and the host the tab must be on (`--expect-host`, re-checked
-   in the page right before each fill or click). Credentials come from
-   Albert's unlocked Vaultwarden tab through his clipboard, never through argv
-   or output. The steps per site are the recipes in `agent_login_safari.py`:
+   in the page right before each fill or click). Credentials come from the
+   login broker (`safari_fill`, only items Albert opted in with
+   `agent_safari_fill` / `agent_fill_only`) and only otherwise from Albert's
+   unlocked Vaultwarden tab through his clipboard — never through argv or
+   output. A locked or missing vault tab stops the run (`vault_locked`); the
+   agent then runs `~/.local/libexec/vault-touchid unlock-safari -a main` itself (Albert only
+   touches Touch ID once; while the tab is unlocked every agent can read the
+   vault) or, better, onboards the item into the broker (`broker-add.py ITEM
+   -Y` / `-Z`, approved with Touch ID), and re-runs `-L`. The steps per site are the recipes in `agent_login_safari.py`:
    username, password, TOTP, "Continue with Google", the account chooser, and
    the e-mail code. The code is read by himalaya: only a new mail, DKIM-signed
    by the sender's domain, with one code that two polls in a row agree on.
@@ -987,9 +993,15 @@ Guards:
   (`AGENT_LOGIN_SCHEDULED`, any non-empty value). The gate proves someone is
   at the Mac, not that Albert started the run. Exit 3 means: retry later,
   do not ask Albert.
-- **Albert's stops:** only a CAPTCHA, an SMS code, a push / security-key
-  approval and a locked vault are his. `-L` detects them by the page's
-  structure, never clicks them, and exits 4 naming the stop.
+- **Albert's stops:** only a CAPTCHA, an SMS code and a push / security-key
+  approval are his — plus the one Touch ID touch of an unlock or broker-add
+  the agent started. A locked vault is not his. `-L` detects his stops by the
+  page's structure, never clicks them, and exits 4 naming the stop.
+- **Broker refusals end the run:** `broker_unavailable`, `broker_unattended`,
+  `broker_rate_limited` and `held` exit 3 (retry later); `broker_refused`
+  (origin, refused or ambiguous item) exits 2. Nothing was filled.
+- **safari.py is pinned:** `-L` runs only mydotfiles' `bin/safari.py`;
+  `SAFARI_PY_BIN` and a PATH lookup count only inside pytest.
 - **No retries:** every credential step runs at most once. A failure after one
   quarantines the site; `-Q SITE` releases it.
 - **A hung safari.py** gets SIGTERM (it clears the clipboard), then SIGKILL;
@@ -1328,7 +1340,7 @@ agent-login.py — which of Albert's logins can agents use through the login bro
 
 Without arguments: a health line for the broker, then every login we want agents to use, once: ✅ when it works for agents (setup complete AND the latest real check, -c/-t, passed) or ❌ with the reason. Read-only: it asks the broker for its site list (never a secret), reads the names and expiry dates (never values) of Safari's cookies, and logs into nothing unless you pass -t, -g or -c.
 
-The marketplace sites (anibis, tutti, Ricardo, Kleinanzeigen), Galaxus and Galaxus DE run on YOUR Safari session: `browser.py login SITE` copies that site's session cookies into the shared Chromium (Kleinanzeigen falls back to the broker). The broker never submits a password for galaxus and galaxus-de (their bot check rejects it; any item opts in with agent_no_submit=true). When such a session or one of Notion, Slack, OpenAI or claude.ai lapses, an AGENT renews it: `-L SITE` imports your Safari session — logging Safari in first (safari.py with every feature its recipe needs, your Vaultwarden tab) when it has lapsed there too — claude.ai through its automated magic link. Only a CAPTCHA, an SMS code, a push / security-key approval or a locked vault stay yours (exit 4, named); `-g SITE` is still there for a login by hand. CSCS and Smartsheet log in through the broker. SWITCH Cloud logs in with the portal's SSO click, on the browser's own edu-ID session first, then on the broker's (no window).
+The marketplace sites (anibis, tutti, Ricardo, Kleinanzeigen), Galaxus and Galaxus DE run on YOUR Safari session: `browser.py login SITE` copies that site's session cookies into the shared Chromium (Kleinanzeigen falls back to the broker). The broker never submits a password for galaxus and galaxus-de (their bot check rejects it; any item opts in with agent_no_submit=true). When such a session or one of Notion, Slack, OpenAI or claude.ai lapses, an AGENT renews it: `-L SITE` imports your Safari session — logging Safari in first (safari.py with every feature its recipe needs; the credentials from the login broker, else your Vaultwarden tab) when it has lapsed there too — claude.ai through its automated magic link. Only a CAPTCHA, an SMS code, a push / security-key approval (exit 4, named) and the Touch ID touch stay yours: a locked vault is the agent's — it runs `~/.local/libexec/vault-touchid unlock-safari -a main` (you touch Touch ID once) or onboards the item into the broker (`broker-add.py ITEM -Y`/`-Z`); `-g SITE` is still there for a login by hand. CSCS and Smartsheet log in through the broker. SWITCH Cloud logs in with the portal's SSO click, on the browser's own edu-ID session first, then on the broker's (no window).
 
 Examples:
 
@@ -1358,7 +1370,7 @@ Examples:
 ./agent-login.py -l           # items agents can fill into Albert's Safari (safari.py -L)
 ```
 
-Sites on Albert's session (Safari sites, galaxus-de, Notion, Slack, OpenAI, claude.ai) are renewed by AGENTS with -L — never a to-do for Albert, except a CAPTCHA, an SMS code, a push / security-key approval or a locked vault (exit 4, named). myfritz is on demand: never checked daily.
+Sites on Albert's session (Safari sites, galaxus-de, Notion, Slack, OpenAI, claude.ai) are renewed by AGENTS with -L — never a to-do for Albert, except a CAPTCHA, an SMS code or a push / security-key approval (exit 4, named) and the Touch ID touch of `~/.local/libexec/vault-touchid unlock-safari -a main` / `broker-add.py`, which the agent runs itself when the vault is locked. myfritz is on demand: never checked daily.
 
 Where a login broke: every check records its PHASE (precheck, limiter, vault, recipe, submit, profile-proof, broker-proof, bundle-export, cookie-inject, storage-inject, client-proof, consumer-followup, safari-source, unknown) and a code, a redacted detail and the broker's screenshot; the overview shows them. A ✅ is a fresh (≤ 36 h), proven check; older reads ❓. The daily check (-c) never logs in a site that is pending, quarantined, locked, in cooldown, without a sentinel, changed since its promotion or flagged by the onboarding review, and never retries after the password may have been sent. Adding a site: README "Adding a site to the broker".
 
@@ -1390,7 +1402,7 @@ Fill-only items (`agent_fill_only = true`, tp#1082): the broker never logs in wi
 | `-E`, `--rearm` `SITE` | give SITE its one promotion login back (after reviewing why it failed) — the main session's decision, audited |
 | `-D`, `--remove` `SITE` | remove a broker site, run twice: while it is listed -> demote + browser.py logout; after its vault item is gone -> drop every trace (broker `forget`, state files, cache files); audited |
 | `-Q`, `--release` `SITE` | release SITE's quarantine (after a failed login that may have submitted the password) — the main session's decision, audited |
-| `-L`, `--safari-login` `SITE` | an AGENT's login through Albert's Safari (WS1b): free check, else import Safari's own session (works without new safari.py features), else log Safari in (safari.py, a new window, his Vaultwarden tab and clipboard) and import it; claude.ai: the automated magic link. One run, no retries; never from a LaunchAgent. Exit 4 = needs Albert (CAPTCHA, SMS, push / security key, locked vault); exit 3 = the Mac is locked or idle: retry later |
+| `-L`, `--safari-login` `SITE` | an AGENT's login through Albert's Safari (WS1b): free check, else import Safari's own session (works without new safari.py features), else log Safari in (safari.py, a new window; the login broker's credentials, else his Vaultwarden tab and clipboard) and import it; claude.ai: the automated magic link. One run, no retries; never from a LaunchAgent. Exit 4 = needs Albert (CAPTCHA, SMS, push / security key); a locked vault is the agent's: `vault-touchid unlock-safari -a main` (Albert touches once); exit 3 = the Mac is locked or idle: retry later |
 | `-l`, `--fillable` | list every item agents can fill into Albert's Safari (fill-only items and login items with agent_safari_fill): site, name, fill origins — names only, never a value (from the broker's site listing; -r asks the broker now; -j: JSON) |
 | `-n`, `--dry-run` | with -L: report what it would do (no import, no Safari login) |
 | `-R`, `--refresh-pass` | refresh-only pass: renew every refreshable token (NPM) with < 12 h left; never logs in (LaunchAgent com.albert.agent-login-refresh, every 6 h) |

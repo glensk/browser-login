@@ -25,6 +25,7 @@ import pytest
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import agent_login_safari as s  # noqa: E402
+from broker import phases  # noqa: E402
 
 # every safari.py feature a recipe can need
 ALL_FEATURES = frozenset().union(*(r.features() for r in s.RECIPES.values()))
@@ -227,9 +228,16 @@ def test_a_signal_exit_counts_as_maybe_done(rc: int) -> None:
     ("message", "code", "rc"),
     [
         (
-            "the Vaultwarden tab shows the lock / login screen — agents never unlock",
-            "needs_albert_vault_locked",
-            4,
+            "the Vaultwarden tab shows the lock / login screen — add it to the "
+            "broker: broker-add.py 'X' -Y …; or run `~/.local/libexec/vault-touchid unlock-safari "
+            "-a main` yourself — Albert only touches Touch ID; then re-run",
+            "vault_locked",
+            2,
+        ),
+        (
+            "no Safari tab URL contains 'vault.dom42.space' (the Vaultwarden tab)",
+            "vault_locked",
+            2,
         ),
         ("vault tab busy (another session) — the lock was held", "busy", 75),
         ("Safari is not running", "safari_unavailable", 3),
@@ -241,6 +249,67 @@ def test_vault_and_safari_errors_map_to_fixed_codes(
     fake = FakeSafari(SHOP, TWO_STEP[1:], fail={"--login": s.Reply(3, {}, message)})
     out = _machine(fake).run()
     assert (out.code, out.rc) == (code, rc)
+
+
+@pytest.mark.parametrize(
+    ("broker", "rc_in", "code", "rc"),
+    [
+        ("broker_unavailable", 3, "broker_unavailable", 3),
+        ("leakcheck_unavailable", 3, "broker_unavailable", 3),
+        ("unattended", 3, "broker_unattended", 3),
+        ("rate_limited", 3, "broker_rate_limited", 3),
+        ("held", 3, "held", 3),
+        ("origin_violation", 2, "broker_refused", 2),
+        ("refused", 2, "broker_refused", 2),
+        ("ambiguous", 2, "broker_refused", 2),
+        ("bad_request", 2, "broker_refused", 2),
+    ],
+)
+def test_broker_refusals_map_to_fixed_codes(
+    broker: str, rc_in: int, code: str, rc: int
+) -> None:
+    """safari.py's JSON names the broker's answer; nothing was filled, so no
+    credential counts and the site is never quarantined."""
+    reply = s.Reply(
+        rc_in,
+        {"ok": False, "broker": broker, "source": "broker"},
+        f"broker refused 'X' for https://shop.example: {broker} (…)",
+    )
+    fake = FakeSafari(SHOP, TWO_STEP[1:], fail={"--login": reply})
+    out = _machine(fake).run()
+    assert (out.code, out.rc) == (code, rc)
+    assert not out.credential
+
+
+def test_a_vault_failure_after_a_broker_fallback_is_vault_locked() -> None:
+    """no_item / not_enabled sent safari.py to the vault tab: its failure decides."""
+    reply = s.Reply(
+        3,
+        {"ok": False, "broker": "no_item", "source": "vault"},
+        "the Vaultwarden tab shows the lock / login screen — …",
+    )
+    assert s.error_code(reply) == "vault_locked"
+    assert s.stop_rc("vault_locked") == 2
+
+
+def test_a_broker_unavailable_message_without_json_is_still_named() -> None:
+    reply = s.Reply(3, {}, "broker_unavailable: the login broker gave no usable answer")
+    assert s.error_code(reply) == "broker_unavailable"
+
+
+def test_every_new_stop_code_has_a_fixed_text() -> None:
+    for code in (
+        "vault_locked",
+        "broker_unavailable",
+        "broker_unattended",
+        "broker_rate_limited",
+        "broker_refused",
+        "held",
+    ):
+        assert phases.CODE_TEXT[code]
+    text = phases.CODE_TEXT["vault_locked"]
+    assert "~/.local/libexec/vault-touchid unlock-safari -a main" in text
+    assert "broker-add.py" in text and "needs Albert" not in text
 
 
 def test_a_window_without_an_id_is_named_and_never_driven() -> None:
@@ -806,6 +875,25 @@ def test_feature_env_is_ignored_outside_pytest(monkeypatch: pytest.MonkeyPatch) 
     monkeypatch.setattr(s, "safari_py_bin", lambda: None)
     assert s.available_features() == frozenset()  # the env cannot fake it
     assert "handle" in s.missing_features("galaxus-de")
+
+
+def test_safari_py_bin_ignores_env_and_path_outside_pytest(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    fake = tmp_path / "safari.py"
+    fake.write_text("#!/bin/sh\nexit 0\n")
+    fake.chmod(0o700)
+    real = tmp_path / "mydotfiles-safari.py"
+    real.write_text("#!/bin/sh\nexit 0\n")
+    real.chmod(0o700)
+    monkeypatch.setattr(s, "DEFAULT_SAFARI_PY", real)
+    monkeypatch.setenv(s.SAFARI_PY_ENV, str(fake))
+    monkeypatch.setenv("PATH", str(tmp_path))
+    assert s.safari_py_bin() == str(fake)  # test mode: the override counts
+    monkeypatch.delenv("PYTEST_CURRENT_TEST")
+    assert s.safari_py_bin() == str(real)  # production: only the fixed path
+    monkeypatch.setattr(s, "DEFAULT_SAFARI_PY", tmp_path / "missing.py")
+    assert s.safari_py_bin() is None  # never the env / PATH one: fails loud
 
 
 def test_term_grace_covers_safari_py_signal_path() -> None:

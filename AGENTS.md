@@ -363,8 +363,14 @@ framework. It is a **provider**: other repos depend on it, not the reverse. See
   - **What leaves safari.py:** only the closed fields `agent_login_safari`
     parses. Its page text, candidates and error messages are never stored or
     printed.
-  - **Albert's stops:** only `needs_albert_captcha|sms|push|hardware_key|vault_locked`.
-    Every other stop is the agent's.
+  - **Albert's stops:** only `needs_albert_captcha|sms|push|hardware_key`.
+    Every other stop is the agent's — `vault_locked` included (the agent runs
+    `~/.local/libexec/vault-touchid unlock-safari -a main` or onboards the item with
+    `broker-add.py -Y`/`-Z`; Albert only touches Touch ID). safari.py's broker
+    refusals map to `broker_unavailable|broker_unattended|broker_rate_limited|held`
+    (exit 3) and `broker_refused` (exit 2), read from its JSON `broker` field.
+  - **safari.py is pinned** to mydotfiles' `bin/safari.py`; `SAFARI_PY_BIN` and
+    a PATH lookup are honoured only inside pytest (`in_test_mode`).
   - **Credentials:** a credential step runs once. A failure after one
     quarantines (`-Q` releases it).
   - **A built-in import** (`SAFARI_BUILTIN`: notion, slack, openai) is one

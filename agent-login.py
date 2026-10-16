@@ -14,10 +14,13 @@ The broker never submits a password for galaxus and galaxus-de (their bot check
 rejects it; any item opts in with agent_no_submit=true). When such a session or
 one of Notion, Slack, OpenAI or claude.ai lapses, an AGENT renews it: `-L SITE`
 imports your Safari session — logging Safari in first (safari.py with every
-feature its recipe needs, your Vaultwarden tab) when it has lapsed there too —
-claude.ai through its automated magic link. Only a CAPTCHA, an SMS code, a push /
-security-key approval or a locked vault stay yours (exit 4, named); `-g SITE` is
-still there for a login by hand. CSCS and Smartsheet log in through the broker.
+feature its recipe needs; the credentials from the login broker, else your
+Vaultwarden tab) when it has lapsed there too — claude.ai through its automated
+magic link. Only a CAPTCHA, an SMS code, a push / security-key approval (exit 4,
+named) and the Touch ID touch stay yours: a locked vault is the agent's — it runs
+`~/.local/libexec/vault-touchid unlock-safari -a main` (you touch Touch ID once) or onboards the
+item into the broker (`broker-add.py ITEM -Y`/`-Z`); `-g SITE` is still there
+for a login by hand. CSCS and Smartsheet log in through the broker.
 SWITCH Cloud logs in with the portal's SSO click, on the browser's own edu-ID
 session first, then on the broker's (no window).
 
@@ -48,8 +51,9 @@ Examples:
 
 Sites on Albert's session (Safari sites, galaxus-de, Notion, Slack, OpenAI,
 claude.ai) are renewed by AGENTS with -L — never a to-do for Albert, except
-a CAPTCHA, an SMS code, a push / security-key approval or a locked vault
-(exit 4, named). myfritz is on demand: never checked daily.
+a CAPTCHA, an SMS code or a push / security-key approval (exit 4, named) and
+the Touch ID touch of `~/.local/libexec/vault-touchid unlock-safari -a main` / `broker-add.py`,
+which the agent runs itself when the vault is locked. myfritz is on demand: never checked daily.
 
 Where a login broke: every check records its PHASE (precheck, limiter, vault,
 recipe, submit, profile-proof, broker-proof, bundle-export, cookie-inject,
@@ -865,6 +869,8 @@ def _summary_reason(  # pylint: disable=too-many-return-statements
     text = phases.text(str(rec.get("phase") or ""), code)
     if code.startswith("needs_albert_"):
         return f"not logged in — {phases.CODE_TEXT.get(code, 'needs Albert')}"
+    if code == "vault_locked":  # the agent's own fix, named (never Albert's)
+        return f"not logged in — {phases.CODE_TEXT[code]}"
     if isinstance(row.get("quarantine"), dict):
         return (
             "not logged in — quarantined after a login that may have sent a "
@@ -900,9 +906,11 @@ def _route_header(rows: list[dict]) -> str:
         f"for {', '.join(routed)} run `agent-login.py -L <site>` yourself (it "
         "renews the session through Albert's Safari or the magic link; one run, "
         "no retries) — never ask Albert to log in: only a CAPTCHA, an SMS code, "
-        "a push / security-key approval or a locked vault are his, and -L names "
-        "them; exit 3 = the Mac is locked or idle: retry later, do not ask "
-        f"Albert; {rest}"
+        "a push / security-key approval and the Touch ID touch are his, and -L "
+        "names them; a locked vault is NOT his: -L takes the login from the "
+        "broker first, else run `~/.local/libexec/vault-touchid unlock-safari -a main` yourself "
+        "(Albert touches Touch ID once); exit 3 = the Mac is locked or idle: "
+        f"retry later, do not ask Albert; {rest}"
     )
 
 
@@ -3972,11 +3980,13 @@ def build_parser() -> argparse.ArgumentParser:
         help="an AGENT's login through Albert's Safari (WS1b): free check, "
         "else import Safari's own session (works without new safari.py "
         "features), else log Safari in (safari.py, a "
-        "new window, his Vaultwarden tab and clipboard) and import it; "
+        "new window; the login broker's credentials, else his Vaultwarden "
+        "tab and clipboard) and import it; "
         "claude.ai: the automated magic link. One run, no retries; never "
         "from a LaunchAgent. Exit 4 = needs Albert (CAPTCHA, SMS, push / "
-        "security key, locked vault); exit 3 = the Mac is locked or idle: "
-        "retry later",
+        "security key); a locked vault is the agent's: `vault-touchid "
+        "unlock-safari -a main` (Albert touches once); exit 3 = the Mac is "
+        "locked or idle: retry later",
     )
     ap.add_argument(
         "-l",

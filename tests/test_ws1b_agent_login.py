@@ -250,6 +250,20 @@ def test_l_albert_stop_is_exit_4_and_no_quarantine(pipeline: dict) -> None:
     assert rec["code"] == "needs_albert_captcha" and rec["phase"] == "safari-source"
 
 
+def test_l_vault_locked_is_the_agents_fix_not_albert(pipeline: dict) -> None:
+    """tp#1082: a locked vault tab is no stop of Albert's — exit 2, no
+    quarantine, and the text names the agent's own fixes."""
+    pipeline["outcome"] = alsafari.Outcome(2, "vault_locked")
+    assert al.safari_login_action("galaxus-de") == 2
+    assert als.quarantined("galaxus-de") is None
+    rec = al.last_checks()["galaxus-de"]
+    assert rec["code"] == "vault_locked"
+    row = {"site": "galaxus-de", "flow": al.SAFARI_FLOW, "status": "safari"}
+    why = al._summary_reason(row, "failed", {"galaxus-de": rec})
+    assert "~/.local/libexec/vault-touchid unlock-safari -a main" in why
+    assert "needs Albert" not in why
+
+
 def test_l_stops_when_the_import_lacks_an_expected_account(
     pipeline: dict, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -329,6 +343,10 @@ def test_agents_md_tells_agents_to_run_l_not_to_ask_albert() -> None:
     assert (
         "exit 3 = the Mac is locked or idle: retry later, do not ask Albert" in header
     )
+    # tp#1082: a locked vault is no longer Albert's stop — the agent unlocks
+    assert "or a locked vault are his" not in header
+    assert "a locked vault is NOT his" in header
+    assert "`~/.local/libexec/vault-touchid unlock-safari -a main` yourself" in header
     assert "for the other sites on Albert's session" in header
     assert header in al.agent_summary({**data, "rows": rows}, {})
 

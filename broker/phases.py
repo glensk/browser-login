@@ -35,6 +35,13 @@ PHASE_TEXT = {
 }
 PHASES = frozenset(PHASE_TEXT)
 
+# A locked Vaultwarden tab in Safari is the agent's to fix (tp#1082).
+_VAULT_LOCKED = (
+    "vault locked: run `~/.local/libexec/vault-touchid unlock-safari -a main` yourself (Albert "
+    "touches Touch ID once), or add the item to the broker (`broker-add.py "
+    "NAME -Y`/`-Z`, Albert approves with Touch ID)"
+)
+
 # code -> fixed text
 CODE_TEXT = {
     "ok": "logged in",
@@ -90,13 +97,24 @@ CODE_TEXT = {
     "no_safari_session": "Safari holds no usable session",
     "manual_import": "the Safari import of this site runs by hand only",
     # WS1b: an agent's login in Albert's Safari (`agent-login.py -L SITE`).
-    # The four `needs_albert_*` stops (and a locked vault) are the ONLY ones
-    # that are Albert's; every other code is for the agent.
+    # The four `needs_albert_*` stops are the ONLY ones that are Albert's;
+    # every other code is for the agent — a locked vault included (tp#1082).
     "needs_albert_captcha": "needs Albert: a CAPTCHA in Safari",
     "needs_albert_sms": "needs Albert: an SMS code",
     "needs_albert_push": "needs Albert: a push approval on his phone",
     "needs_albert_hardware_key": "needs Albert: a security key / passkey",
-    "needs_albert_vault_locked": "needs Albert: unlock Vaultwarden in Safari",
+    "vault_locked": _VAULT_LOCKED,
+    # the code a check recorded before the rename to vault_locked (read only)
+    "needs_albert_vault_locked": _VAULT_LOCKED,
+    # safari.py asks the login broker first (`safari_fill`); its refusals
+    "broker_unattended": (
+        "the login broker fills only while Albert uses the Mac — retry later"
+    ),
+    "broker_rate_limited": "the login broker's fill limit is reached — retry later",
+    "broker_refused": (
+        "the login broker refused this item for this page (origin, refused or "
+        "ambiguous item) — nothing filled"
+    ),
     "email_code": (
         "the site sent an e-mail code — an agent reads it from the mailbox "
         "and types it in Safari, then re-runs -L"
@@ -105,7 +123,9 @@ CODE_TEXT = {
     "safari_unavailable": (
         "Safari is not running, or JavaScript from Apple Events is off"
     ),
-    "safari_py_missing": "safari.py (mydotfiles bin) is not installed",
+    "safari_py_missing": (
+        "safari.py is not installed at ~/obsidian/42-Git/home/mydotfiles/bin/safari.py"
+    ),
     "safari_py_outdated": "safari.py lacks a feature this login needs (mydotfiles)",
     "safari_tab_moved": "the Safari login tab left the recipe's hosts — stopped",
     "safari_no_recipe": "no Safari login recipe for this site",

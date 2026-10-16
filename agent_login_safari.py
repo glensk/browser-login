@@ -3,15 +3,19 @@
 Albert, 2026-10-11: the assisted logins (galaxus-de, notion, openai, slack and
 the Safari marketplace sites) are done by agents in his Safari — never a
 `-g` to-do for him. `agent-login.py -L SITE` drives his Safari through
-mydotfiles' ``safari.py`` (credentials come from his unlocked Vaultwarden
-tab, never through this process's argv or output), then copies the session
-into the shared Chromium (``browser.py import-safari``).
+mydotfiles' ``safari.py`` (credentials come from the login broker's
+``safari_fill`` op for items Albert opted in, else from his unlocked
+Vaultwarden tab — never through this process's argv or output), then copies
+the session into the shared Chromium (``browser.py import-safari``).
 
 This module is the Safari side: the recipes (data), the page detector (a
 fixed JS that returns booleans only), the step machine, the mail-code reader
-and the interactive gate. Only four stops are Albert's: a CAPTCHA, an SMS
-code, a push / security-key approval and a locked vault. Everything else is
-the agent's.
+and the interactive gate. Only Albert's stops are his: a CAPTCHA, an SMS
+code, a push / security-key approval — and the one Touch ID touch of a fix
+the agent starts. A locked vault is NOT his: the agent onboards the item into
+the broker (``broker-add.py ITEM -Y`` / ``-Z``) or runs ``vault-touchid
+unlock-safari -a main`` itself (``vault_locked``). Everything else is the
+agent's.
 
 Safety rules (each one tested):
 
@@ -31,6 +35,9 @@ Safety rules (each one tested):
   killed credential step this process clears the clipboard itself.
 * safari.py's free text (page text, candidates, error messages) is never
   stored or printed: only fixed codes, validated hosts and booleans leave.
+* safari.py is the fixed mydotfiles path (``DEFAULT_SAFARI_PY``); neither
+  ``$SAFARI_PY_BIN`` nor ``PATH`` can redirect a credential step outside a
+  pytest run (``PYTEST_CURRENT_TEST``).
 """
 
 from __future__ import annotations
@@ -495,13 +502,24 @@ def json_object_text(path: Path) -> dict | None:
 # ---------------------------------------------------------------------------
 
 
+def in_test_mode() -> bool:
+    """True only inside a pytest run (``PYTEST_CURRENT_TEST`` set) — the one
+    place the safari.py path and its feature set may be overridden."""
+    return bool(os.environ.get("PYTEST_CURRENT_TEST"))
+
+
 def safari_py_bin() -> str | None:
-    """safari.py: $SAFARI_PY_BIN, PATH, then mydotfiles' bin; None if absent."""
-    for cand in (
-        os.environ.get(SAFARI_PY_ENV),
-        shutil.which("safari.py"),
-        str(DEFAULT_SAFARI_PY),
-    ):
+    """safari.py: mydotfiles' bin (``DEFAULT_SAFARI_PY``); None if it is not
+    an executable file (the caller stops loudly: ``safari_py_missing``).
+    ``$SAFARI_PY_BIN`` and a PATH lookup are honoured ONLY in `in_test_mode`:
+    an agent's credential step never runs an executable chosen by its
+    environment."""
+    cands: tuple[str | None, ...] = (
+        (os.environ.get(SAFARI_PY_ENV), shutil.which("safari.py"))
+        if in_test_mode()
+        else ()
+    )
+    for cand in (*cands, str(DEFAULT_SAFARI_PY)):
         if cand and Path(cand).is_file() and os.access(cand, os.X_OK):
             return cand
     return None
@@ -585,20 +603,65 @@ def interrupted(reply: Reply) -> bool:
     return reply.killed or reply.rc >= 128 or reply.rc < 0
 
 
+# safari.py -L / -O asks the login broker first; its JSON names the broker's
+# answer ("broker": <code>). A refusal that ended the run -> our fixed code.
+# no_item / not_enabled are absent on purpose: there safari.py fell back to the
+# vault tab, and the vault tab's own failure decides.
+BROKER_STOPS = {
+    "broker_unavailable": "broker_unavailable",
+    "leakcheck_unavailable": "broker_unavailable",
+    "unattended": "broker_unattended",
+    "rate_limited": "broker_rate_limited",
+    "held": "held",
+    "origin_violation": "broker_refused",
+    "refused": "broker_refused",
+    "ambiguous": "broker_refused",
+    "bad_request": "broker_refused",
+}
+# Stops that end the run for now: retry later (exit ENV_RC); the agent's own
+# fixes (vault_locked, broker_refused) and the rest end with exit 2.
+RETRY_LATER = frozenset(
+    {
+        "safari_unavailable",
+        "broker_unavailable",
+        "broker_unattended",
+        "broker_rate_limited",
+        "held",
+    }
+)
+
+
+def stop_rc(code: str) -> int:
+    """The exit code of a run that stopped with `code`."""
+    if code.startswith("needs_albert_"):
+        return NEEDS_ALBERT_RC
+    if code == "busy":
+        return BUSY_RC
+    if code in RETRY_LATER:
+        return ENV_RC
+    return 2
+
+
 # One return per class of failure.
 def error_code(reply: Reply) -> str:  # pylint: disable=too-many-return-statements
-    """The fixed code of a failed safari.py call (by its exit code and the
-    class of its message; the message itself is dropped)."""
+    """The fixed code of a failed safari.py call (by its exit code, the
+    broker's answer in its JSON and the class of its message; the message
+    itself is dropped)."""
     msg = reply.error.lower()
     if reply.killed:
         return "safari_timeout"
     if interrupted(reply):
         return "safari_signal"
+    broker = reply.data.get("broker")
+    if isinstance(broker, str) and broker in BROKER_STOPS:
+        return BROKER_STOPS[broker]
+    if msg.startswith("broker_unavailable"):
+        return "broker_unavailable"
     if reply.rc == ENV_RC:
         if "lock / login screen" in msg or "unlock" in msg:
-            return "needs_albert_vault_locked"
+            return "vault_locked"
         if "no safari tab url contains" in msg and "vault" in msg:
-            return "needs_albert_vault_locked"
+            return "vault_locked"
         if "vault tab busy" in msg:
             return "busy"
         return "safari_unavailable"
@@ -624,7 +687,7 @@ def available_features() -> frozenset[str]:
     honoured ONLY inside a pytest run (``PYTEST_CURRENT_TEST`` set): outside
     tests nobody can fake a capability."""
     env = os.environ.get(FEATURES_ENV)
-    if env is not None and os.environ.get("PYTEST_CURRENT_TEST"):
+    if env is not None and in_test_mode():
         return frozenset(f for f in env.split(",") if f and f != "none")
     binary = safari_py_bin()
     if binary is None:
@@ -1115,16 +1178,7 @@ class Machine:  # pylint: disable=too-many-instance-attributes
 
     def _fail(self, reply: Reply) -> Outcome:
         code = error_code(reply)
-        rc = (
-            NEEDS_ALBERT_RC
-            if code.startswith("needs_albert_")
-            else BUSY_RC
-            if code == "busy"
-            else ENV_RC
-            if code == "safari_unavailable"
-            else 2
-        )
-        return self._end(rc, code)
+        return self._end(stop_rc(code), code)
 
     def _end(self, rc: int, code: str) -> Outcome:
         self.out.rc, self.out.code = rc, code
@@ -1199,16 +1253,7 @@ class Machine:  # pylint: disable=too-many-instance-attributes
         for _ in range(MAX_POLLS):
             host, stop = self.tab_host()
             if stop:
-                rc = (
-                    NEEDS_ALBERT_RC
-                    if stop.startswith("needs_albert_")
-                    else ENV_RC
-                    if stop == "safari_unavailable"
-                    else BUSY_RC
-                    if stop == "busy"
-                    else 2
-                )
-                return self._end(rc, stop)
+                return self._end(stop_rc(stop), stop)
             page = self.read_page(host) if host else None
             if page is None:
                 idle += 1
@@ -1375,6 +1420,7 @@ __all__ = [
     "features",
     "find_code",
     "idle_seconds",
+    "in_test_mode",
     "interactive_gate",
     "load_overrides",
     "mail_baseline",
@@ -1384,4 +1430,5 @@ __all__ = [
     "safari_py_bin",
     "safe_host",
     "scheduled",
+    "stop_rc",
 ]
