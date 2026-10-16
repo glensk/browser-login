@@ -87,11 +87,31 @@ vault read):
   {"op": "audit", "n": 50}        the last N audit lines (secret-free)
   {"op": "invalidate"}            drop cached values (also SIGHUP)
 
+Fill into Albert's Safari (tp#1082, broker/fill_ops.py; peer uid
+``--allow-uid`` only, ``forbidden`` before any vault read; only items with
+``agent_safari_fill = true``, only for one of the item's fill origins, only
+while the console is unlocked and used within 15 min):
+
+  {"op": "safari_fill", "item": "<name|site id|alias>",
+   "origin": "https://host[:port]", "fields": ["username", "password"]}
+                                  -> {"ok": true, "site": "x", "values":
+                                      {"username": ..., "password": ...}}
+                                  (only the requested fields; every value
+                                  registered with the secretkeeper first,
+                                  labels loginbroker:fill.<site>:<field>)
+  {"op": "safari_fill", ..., "fields": ["totp"]}
+                                  -> {"ok": true, "site": "x", "code":
+                                      "123456", "valid_s": N}
+                                  limiter fill:<site> 10/h 40/day,
+                                  filltotp:<site> 10/h, fill:* 20/h 60/day,
+                                  at most 15 distinct items per 24 h
+
 Errors: {"ok": false, "error": "needs_human" | "origin_violation" |
 "rate_limited" | "login_failed" | "export_failed" | "bundle_export" |
 "timeout" | "unknown_site" | "unknown_item" | "still_listed" | "busy" |
 "forget_incomplete" | "held" | "removed" |
 "unknown_field" | "refused" | "vault_error" | "leakcheck_unavailable" |
+"no_item" | "ambiguous" | "not_enabled" | "no_password" | "unattended" |
 "forbidden" | "bad_request" | "internal", "detail": "..."} — never a secret.
 
 Examples:
@@ -100,6 +120,7 @@ Examples:
   daemon.py -C -H /var/db/login-broker        # list visible collections (IDs)
   sudo daemon.py -r ricardo                   # reset the limiter for one site
   sudo daemon.py -r secret:github             # reset a secret item's limiter
+  sudo daemon.py -r fill:github               # reset a site's safari_fill limiter
   sudo daemon.py -r group:galaxus             # reset an attempt group
   sudo daemon.py -r galaxus -G                # reset a site and its groups
   daemon.py -M                                # dual / unreadable members, as
@@ -139,12 +160,14 @@ if __package__ in (None, ""):  # run as a script: make `broker` importable
 
 # pylint: disable=wrong-import-position
 from broker import identity as _identity  # noqa: E402
+from broker.attended import attended as attended_gate  # noqa: E402
 from broker.bundle import (  # noqa: E402
     DIAG_CAP,
     cookie_diag,
     filter_cookies,
     filter_storage,
 )
+from broker.fill_ops import FILL_OPS, FillOps  # noqa: E402
 from broker.identity_ops import (  # noqa: E402
     IDENTITY_OPS,
     TAG_KEY_NAME,
@@ -215,6 +238,7 @@ from broker.recipes import (  # noqa: E402
 )
 from broker.runs import RunTable  # noqa: E402
 from broker.secret_ops import (  # noqa: E402
+    LIMITER_KEY_PREFIXES,
     LIMITER_KEY_RE,
     SECRET_OPS,
     SecretOps,
@@ -1666,6 +1690,10 @@ class _LazyBwVault:
         """See ``BwVault.secret``."""
         return self._vault().secret(site)
 
+    def fill_secret(self, site: str) -> Secret:
+        """See ``BwVault.fill_secret``."""
+        return self._vault().fill_secret(site)
+
     def membership_problems(self) -> list[tuple[str, str, str, str]]:
         """See ``BwVault.membership_problems``."""
         return self._vault().membership_problems()
@@ -1817,12 +1845,13 @@ _CHALLENGE_BLOCKS = frozenset({"locked", "cooldown", "quarantined", "unreadable"
 SITES_TTL_S = 600.0
 
 
-class Broker(SecretOps):  # pylint: disable=too-many-instance-attributes  # deps + 4 locks/maps
+class Broker(SecretOps, FillOps):  # pylint: disable=too-many-instance-attributes  # deps + 4 locks/maps
     """Protocol logic, independent of the socket (unit-testable).
 
-    The secret ops answer only `allow_uid` (None = nobody). `leakcheck`
-    defaults to a backend that always fails, so a broker wired without one
-    fails closed (``leakcheck_unavailable``).
+    The secret ops and ``safari_fill`` answer only `allow_uid` (None =
+    nobody). `leakcheck` defaults to a backend that always fails, so a broker
+    wired without one fails closed (``leakcheck_unavailable``). `attended`
+    (``broker.attended.attended``; tests inject a fake) gates ``safari_fill``.
     """
 
     def __init__(  # pylint: disable=too-many-arguments
@@ -1837,6 +1866,7 @@ class Broker(SecretOps):  # pylint: disable=too-many-instance-attributes  # deps
         secret_limiter: Limiter | None = None,
         runs: RunTable | None = None,
         leakcheck: Registrar | None = None,
+        attended: Callable[[int], str | None] = attended_gate,
     ) -> None:
         self.vault = vault
         self.limiter = limiter
@@ -1863,6 +1893,9 @@ class Broker(SecretOps):  # pylint: disable=too-many-instance-attributes  # deps
         # tp#965: credential-rotation leases (persisted in the broker home)
         self.leases = RotationLeases(home / LEASE_FILE, clock)
         self.drain_s = DRAIN_S
+        # tp#1082: `safari_fill`'s attended gate and its distinct-item cap
+        self.attended = attended
+        self._fill_lock = threading.Lock()
 
     def _items(self, *, fresh: bool = False) -> list[SiteItem]:
         """The vault's site items, cached SITES_TTL_S (raises VaultError);
@@ -1989,6 +2022,8 @@ class Broker(SecretOps):  # pylint: disable=too-many-instance-attributes  # deps
                 site, resp = self._identity_op(
                     op, req, site, uid=uid, pid=pid, extra=extra
                 )
+            elif op in FILL_OPS:
+                site, resp = self._fill_op(op, req, uid=uid, pid=pid, extra=extra)
             else:
                 resp = _err("bad_request", f"unknown op {op!r}")
         except Exception:  # pylint: disable=broad-exception-caught
@@ -2912,8 +2947,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--reset",
         metavar="KEY",
         help="reset the limiter for a site or group:<id>, or for secret:ITEM / "
-        "totp:ITEM / secret:* (the secret limiter), and exit (exit 3 while a "
-        "login is in flight on the key)",
+        "totp:ITEM / secret:* / fill:SITE / filltotp:SITE / fill:* (the secret "
+        "limiter), and exit (exit 3 while a login is in flight on the key)",
     )
     p.add_argument(
         "-G",
@@ -3029,7 +3064,7 @@ def _reset(args: argparse.Namespace, home: Path) -> int:  # pylint: disable=too-
         return 2
     key = args.reset.strip().lower()
     owner = _home_owner(home)
-    if key.startswith(("secret:", "totp:")):
+    if key.startswith(LIMITER_KEY_PREFIXES):
         if args.with_group or not LIMITER_KEY_RE.match(key):
             print(f"❌ not a secret limiter key: {key!r}", file=sys.stderr)
             return 2

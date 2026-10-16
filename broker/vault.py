@@ -146,6 +146,9 @@ NO_USERNAME = (
     "the item has no username (agent_login_mode=username-only logs in with "
     "the username/account number alone)"
 )
+# Leak-check label item of a ``safari_fill`` value: ``fill.<site>``
+# (labels ``loginbroker:fill.<site>:<field>``); no secrets item id may use it.
+FILL_LABEL_PREFIX = "fill."
 SAFE_NAME_RE = re.compile(r"^[A-Za-z0-9._ -]{1,64}$")
 BW_TIMEOUT_S = 120.0
 # A value shorter than this is refused unless the item sets
@@ -241,6 +244,16 @@ class Held(VaultError):
         self.txid = txid
 
 
+class NotFillable(VaultError):
+    """``fill_secret`` refused the item on its fresh read: ``refused`` (a
+    refused or username-only item) or ``not_enabled`` (no ``fill_enabled``
+    opt-in). The message carries names only."""
+
+    def __init__(self, code: str, message: str) -> None:
+        super().__init__(message)
+        self.code = code
+
+
 class BadSecretGate(VaultError):
     """The bootstrap's ``secret_gate`` is not one of ``SECRET_GATES``: every
     secret read is refused (fail closed); logins are not affected."""
@@ -330,6 +343,11 @@ class SiteItem:  # pylint: disable=too-many-instance-attributes
     # `agent_login_mode`: ``password`` (default) or ``username-only`` (the
     # username alone is typed and submitted; see ``Secret``).
     login_mode: str = PASSWORD_MODE
+    # `agent_safari_fill` (tp#1082 D2): Albert opted this login item in for
+    # the ``safari_fill`` op — its username / password / TOTP code may be
+    # handed to his uid for a fill into his own Safari. Read through
+    # `fill_enabled`, never directly.
+    safari_fill: bool = False
     refused: str | None = None
     item_id: str = ""
     # Bitwarden `revisionDate` (ISO string, "" when absent or malformed).
@@ -449,6 +467,7 @@ class SiteItem:  # pylint: disable=too-many-instance-attributes
             # a flag, not the mode's name: the `sites` view never says
             # "password" (a leak canary in the tests checks for the word)
             "username_only": self.login_mode == USERNAME_ONLY,
+            "safari_fill": self.safari_fill,
             "refused": self.refused is not None,
             "reason": self.refused or "",
             # tp#965: non-secret metadata for credctl's guard index / tail
@@ -555,6 +574,11 @@ class Vault(Protocol):
     def secret(self, site: str) -> Secret:
         """The LOGIN secret of a non-refused site (VaultError otherwise, and for
         a no-submit site)."""
+
+    def fill_secret(self, site: str) -> Secret:
+        """The secret of an opted-in site for ``safari_fill``: ``secret`` minus
+        the no-submit refusal; a held item raises ``Held``, a refused,
+        username-only or not opted-in one ``NotFillable``."""
 
     def secret_items(self) -> list[SecretItem]:
         """Items of the secrets collection (SecretsNotConfigured without one)."""
@@ -778,6 +802,9 @@ def secret_item_from_json(
 
     if not SITE_ID_RE.match(raw_id):
         return refused("invalid agent_secret_id")
+    if raw_id.startswith(FILL_LABEL_PREFIX):
+        # the leak-check labels of `safari_fill` live under this prefix
+        return refused(f"agent_secret_id prefix {FILL_LABEL_PREFIX} is reserved")
     why = _no_submit_reason(item, fields)
     if why:
         return refused(why, GATE_NO_SUBMIT if why == NO_SUBMIT_SECRET else GATE_INVALID)
@@ -1377,6 +1404,9 @@ def site_item_from_json(item: Mapping[str, Any], *, dev: bool = False) -> SiteIt
     no_submit = _parse_flag(fields.get("agent_no_submit", ""))
     if no_submit is None:
         return refused("bad agent_no_submit (true or false)")
+    safari_fill = _parse_flag(fields.get("agent_safari_fill", ""))
+    if safari_fill is None:
+        return refused("bad agent_safari_fill (true or false)")
     max_days, problem = _max_session_days(
         fields.get("agent_max_session_days", ""), fresh_login=bool(fresh_login)
     )
@@ -1411,6 +1441,7 @@ def site_item_from_json(item: Mapping[str, Any], *, dev: bool = False) -> SiteIt
         or no_submit_by_origin(fill_origins),
         max_session_days=max_days,
         login_mode=mode or PASSWORD_MODE,
+        safari_fill=safari_fill,
         site=site,
         name=name,
         item_id=item_id,
@@ -1800,18 +1831,30 @@ def secret_from_json(item: Mapping[str, Any]) -> Secret:
     )
 
 
-def _find(
+def fill_enabled(item: SiteItem) -> bool:
+    """May ``safari_fill`` serve `item` (tp#1082 D2): the ONE place the
+    opt-in is decided. ``agent_safari_fill = true`` today; the fill-only
+    class (``agent_fill_only``, tp#1082 B2) implies it and is added HERE."""
+    return item.safari_fill
+
+
+def _find(  # pylint: disable=too-many-arguments
     raw_items: list[Any],
     site: str,
     *,
     dev: bool,
     membership: Membership | None = None,
     gate: str = GATE_COLLECTIONS,
+    fill: bool = False,
 ) -> Mapping[str, Any]:
     """The raw item of `site` from a FRESH read, for a login: a held item
     (``agent_hold``) raises ``Held``; a refused one (its collection
     membership included) and a no-submit one (``SiteItem.no_submit``) are
-    refused — judged on this fresh read, not on a cached list."""
+    refused — judged on this fresh read, not on a cached list.
+
+    `fill` (``fill_secret``): the no-submit refusal is skipped (tp#1082 D3);
+    a refused or username-only item raises ``NotFillable("refused")``, one
+    without the opt-in (`fill_enabled`) ``NotFillable("not_enabled")``."""
     raws = [
         r
         for r in raw_items
@@ -1823,6 +1866,9 @@ def _find(
         if it.site == site:
             if it.hold:
                 raise Held(it.hold)
+            if fill:
+                _fill_check(it)
+                return raw
             if it.refused:
                 raise VaultError(f"site {site!r} is refused: {it.refused}")
             if it.no_submit:
@@ -1832,6 +1878,18 @@ def _find(
                 )
             return raw
     raise VaultError(f"unknown site {site!r}")
+
+
+def _fill_check(it: SiteItem) -> None:
+    """Raise ``NotFillable`` unless ``fill_secret`` may serve `it`."""
+    if it.refused:
+        raise NotFillable("refused", f"site {it.site!r} is refused: {it.refused}")
+    if it.login_mode == USERNAME_ONLY:
+        raise NotFillable(
+            "refused", f"site {it.site!r} is a username-only login: never filled"
+        )
+    if not fill_enabled(it):
+        raise NotFillable("not_enabled", f"site {it.site!r} is not opted in for fill")
 
 
 def membership_rows(
@@ -1985,6 +2043,19 @@ class FixtureVault(_SecretSource):
                 dev=self.dev,
                 membership=self._membership(),
                 gate=self._site_gate(),
+            )
+        )
+
+    def fill_secret(self, site: str) -> Secret:
+        """The fixture secret of `site` for ``safari_fill`` (``Vault.fill_secret``)."""
+        return secret_from_json(
+            _find(
+                self._raw(),
+                site,
+                dev=self.dev,
+                membership=self._membership(),
+                gate=self._site_gate(),
+                fill=True,
             )
         )
 
@@ -2285,6 +2356,22 @@ class BwVault(_SecretSource):
                 dev=False,
                 membership=self._membership(),
                 gate=self._site_gate(),
+            )
+        )
+
+    def fill_secret(self, site: str) -> Secret:
+        """Username, password and TOTP seed of `site` for ``safari_fill`` (fresh
+        unlock, then lock): ``secret`` minus the no-submit refusal, judged on
+        this fresh read (``Vault.fill_secret``)."""
+        raw = self._raw(self.boot.organization_id, self.boot.collection_id)
+        return secret_from_json(
+            _find(
+                raw,
+                site,
+                dev=False,
+                membership=self._membership(),
+                gate=self._site_gate(),
+                fill=True,
             )
         )
 

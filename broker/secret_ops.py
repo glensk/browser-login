@@ -36,6 +36,7 @@ from broker.runs import RunError, RunStateError, RunTable, nonce_prefix
 from broker.variants import VARIANT_POLICY_VERSION
 from broker.vault import (
     BAD_SECRET_GATE,
+    FILL_LABEL_PREFIX,
     GATE_COLLECTIONS,
     GATE_OK,
     GATE_REPORT,
@@ -59,12 +60,25 @@ SECRET_PER_DAY = 1000
 TOTP_PER_HOUR = 20
 SECRET_GLOBAL_PER_HOUR = 600
 GLOBAL_SECRET_KEY = "secret:*"
+# `safari_fill` (tp#1082, broker/fill_ops.py) shares this limiter file.
+FILL_PER_HOUR = 10
+FILL_PER_DAY = 40
+FILL_TOTP_PER_HOUR = 10
+FILL_GLOBAL_PER_HOUR = 20
+FILL_GLOBAL_PER_DAY = 60
+GLOBAL_FILL_KEY = "fill:*"
 SECRET_KEY_CAPS = {
     GLOBAL_SECRET_KEY: (SECRET_GLOBAL_PER_HOUR, 0),
     "secret:": (SECRET_PER_HOUR, SECRET_PER_DAY),
     "totp:": (TOTP_PER_HOUR, 0),
+    GLOBAL_FILL_KEY: (FILL_GLOBAL_PER_HOUR, FILL_GLOBAL_PER_DAY),
+    "fill:": (FILL_PER_HOUR, FILL_PER_DAY),
+    "filltotp:": (FILL_TOTP_PER_HOUR, 0),
 }
-LIMITER_KEY_RE = re.compile(r"^(secret|totp):([a-z0-9][a-z0-9._-]{0,63}|\*)$")
+LIMITER_KEY_PREFIXES = ("secret:", "totp:", "fill:", "filltotp:")
+LIMITER_KEY_RE = re.compile(
+    r"^(secret|totp|fill|filltotp):([a-z0-9][a-z0-9._-]{0,63}|\*)$"
+)
 MAX_SECRET_ITEMS = 16
 MAX_ENV_NAMES = 64
 ENV_NAME_RE = re.compile(r"^[A-Z_][A-Z0-9_]{0,127}$")
@@ -89,7 +103,9 @@ def _is_error(resp: dict[str, Any]) -> bool:
 
 def build_secret_limiter(home: Path) -> Limiter:
     """The secret-op limiter on ``<home>/secret-limiter.json`` (keys
-    ``secret:<item>``, ``totp:<item>``, ``secret:*``; caps SECRET_KEY_CAPS)."""
+    ``secret:<item>``, ``totp:<item>``, ``secret:*``, and the ``safari_fill``
+    keys ``fill:<site>``, ``filltotp:<site>``, ``fill:*``; caps
+    SECRET_KEY_CAPS)."""
     return Limiter(
         home / "secret-limiter.json",
         0,
@@ -441,6 +457,10 @@ class SecretOps:  # pylint: disable=too-few-public-methods
 
         def fetch(item: str, fld: str) -> str | None:
             try:
+                if item.startswith(FILL_LABEL_PREFIX):
+                    # a `safari_fill` label: the login item, read for a fill
+                    sec = self.vault.fill_secret(item[len(FILL_LABEL_PREFIX) :])
+                    return {"username": sec.username, "password": sec.password}.get(fld)
                 return self.vault.secret_values(item).fields.get(fld)
             except VaultError:
                 return None

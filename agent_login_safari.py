@@ -43,7 +43,6 @@ import hashlib
 import hmac
 import json
 import os
-import plistlib
 import re
 import secrets
 import shutil
@@ -57,6 +56,14 @@ from email.utils import getaddresses
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit
+
+from broker.attended import (
+    IDLE_MAX_S,
+    Run,
+    attended,
+    console_state,
+    idle_seconds,
+)
 
 SAFARI_PY_ENV = "SAFARI_PY_BIN"
 DEFAULT_SAFARI_PY = Path.home() / "obsidian/42-Git/home/mydotfiles/bin/safari.py"
@@ -642,66 +649,9 @@ def missing_features(site: str, have: frozenset[str] | None = None) -> frozenset
 # the interactive gate: never on an unattended Mac
 # ---------------------------------------------------------------------------
 
-IDLE_MAX_S = 15 * 60.0
-_Run = Callable[..., subprocess.CompletedProcess]
-
-
-def _ioreg(args: list[str], run: _Run) -> Any:
-    """`ioreg ARGS -a` parsed (a plist), None on any failure."""
-    try:
-        res = run(
-            ["/usr/sbin/ioreg", *args, "-a"],
-            capture_output=True,
-            timeout=10,
-            check=False,
-        )
-    except (OSError, subprocess.SubprocessError):
-        return None
-    if res.returncode != 0 or not res.stdout:
-        return None
-    try:
-        raw = res.stdout if isinstance(res.stdout, bytes) else res.stdout.encode()
-        return plistlib.loads(raw)
-    except (plistlib.InvalidFileException, ValueError):
-        return None
-
-
-def console_state(run: _Run = subprocess.run, uid: int | None = None) -> str:
-    """``unlocked`` / ``locked`` / ``not_on_console`` / ``unknown`` for this
-    user's console session (IORegistry root's ``IOConsoleUsers``). Locked =
-    ``CGSSessionScreenIsLocked`` (the user's session) or ``IOConsoleLocked``
-    (the root's or the session's) is true; either one present but not a
-    boolean = unknown (fail closed). An absent key is "not locked"."""
-    uid = os.getuid() if uid is None else uid
-    root = _ioreg(["-n", "Root", "-d1"], run)
-    users = root.get("IOConsoleUsers") if isinstance(root, dict) else None
-    if not isinstance(users, list) or not isinstance(root, dict):
-        return "unknown"
-    mine = [
-        u for u in users if isinstance(u, dict) and u.get("kCGSSessionUserIDKey") == uid
-    ]
-    if not mine or not any(u.get("kCGSSessionOnConsoleKey") is True for u in mine):
-        return "not_on_console"
-    flags = [root.get("IOConsoleLocked")]
-    for u in mine:
-        flags += [u.get("CGSSessionScreenIsLocked"), u.get("IOConsoleLocked")]
-    present = [f for f in flags if f is not None]
-    if any(not isinstance(f, bool) for f in present):
-        return "unknown"
-    return "locked" if any(present) else "unlocked"
-
-
-def idle_seconds(run: _Run = subprocess.run) -> float | None:
-    """Seconds since the last keyboard / mouse input (HIDIdleTime), None
-    when it cannot be read."""
-    data = _ioreg(["-c", "IOHIDSystem", "-r", "-d1"], run)
-    entries = data if isinstance(data, list) else [data]
-    for entry in entries:
-        if isinstance(entry, dict):
-            ns = entry.get("HIDIdleTime")
-            if isinstance(ns, int) and not isinstance(ns, bool) and ns >= 0:
-                return ns / 1e9
-    return None
+# Moved to broker/attended.py (the broker's `safari_fill` gates on it too);
+# re-exported here for the existing callers.
+_Run = Run
 
 
 def interactive_gate(run: _Run = subprocess.run) -> str | None:
@@ -716,17 +666,7 @@ def interactive_gate(run: _Run = subprocess.run) -> str | None:
     in his session does); the explicit invocation is that part."""
     if scheduled():
         return "scheduled"
-    state = console_state(run)
-    if state != "unlocked":
-        return {"locked": "console_locked", "not_on_console": "not_on_console"}.get(
-            state, "console_unknown"
-        )
-    idle = idle_seconds(run)
-    if idle is None:
-        return "idle_unknown"
-    if idle > IDLE_MAX_S:
-        return "albert_idle"
-    return None
+    return attended(os.getuid(), run)
 
 
 # ---------------------------------------------------------------------------
@@ -1417,6 +1357,7 @@ def scheduled() -> bool:
 
 
 __all__ = [
+    "IDLE_MAX_S",
     "MAGIC_LINK_SITES",
     "RECIPES",
     "Machine",
@@ -1428,10 +1369,12 @@ __all__ = [
     "Reply",
     "Step",
     "available_features",
+    "console_state",
     "detector_js",
     "error_code",
     "features",
     "find_code",
+    "idle_seconds",
     "interactive_gate",
     "load_overrides",
     "mail_baseline",
