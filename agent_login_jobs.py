@@ -36,6 +36,10 @@ SNAPSHOT_INTERVAL_S = 600
 # JWT) between daily checks; never logs in, never submits a password.
 REFRESH_LABEL = "com.albert.agent-login-refresh"
 REFRESH_INTERVAL_S = 6 * 3600
+# tp#1109: the idle-tab reaper (`browser.py reap-idle -A -q`) of every running
+# shared-browser instance: closes unpinned tabs idle past its threshold.
+TAB_REAPER_LABEL = "com.albert.browser-tab-reaper"
+TAB_REAPER_INTERVAL_S = 900
 # Set in every agent-login LaunchAgent: a scheduled run. `-L` (the Safari
 # login, which drives Albert's real Safari) refuses to run with it.
 SCHEDULED_ENV = "AGENT_LOGIN_SCHEDULED"
@@ -63,6 +67,7 @@ def launchagent_plist(
     args: tuple[str, ...] = ("-c",),
     schedule: str = "",
     run_at_load: bool = False,
+    script: Path = SCRIPT,
 ) -> str:
     """A LaunchAgent running this script; default: daily `-c` at 09:15, no mail
     (logged-out sites are an infra/status item). Pure."""
@@ -98,7 +103,7 @@ def launchagent_plist(
     <array>
         <string>/usr/bin/env</string>
         <string>python3</string>
-        <string>{SCRIPT}</string>{arg_xml}
+        <string>{script}</string>{arg_xml}
     </array>
     {schedule}
     <key>StandardOutPath</key>
@@ -131,6 +136,19 @@ def refresh_plist() -> str:
     )
 
 
+def tab_reaper_plist() -> str:
+    """The every-15-min idle-tab reaper LaunchAgent (tp#1109), as text. Pure."""
+    return launchagent_plist(
+        label=TAB_REAPER_LABEL,
+        args=("reap-idle", "-A", "-q"),
+        schedule=(
+            f"<key>StartInterval</key>\n    <integer>{TAB_REAPER_INTERVAL_S}</integer>"
+        ),
+        run_at_load=False,
+        script=BROWSER_PY,
+    )
+
+
 def agent_plists() -> list[tuple[str, str, str]]:
     """(label, plist text, what) of every agent-login LaunchAgent. Pure."""
     return [
@@ -148,6 +166,11 @@ def agent_plists() -> list[tuple[str, str, str]]:
             REFRESH_LABEL,
             refresh_plist(),
             f"every {REFRESH_INTERVAL_S // 3600} h, -R: refresh-only pass",
+        ),
+        (
+            TAB_REAPER_LABEL,
+            tab_reaper_plist(),
+            f"every {TAB_REAPER_INTERVAL_S // 60} min, browser.py reap-idle -A -q",
         ),
     ]
 

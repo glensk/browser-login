@@ -86,14 +86,14 @@ aggregated by severity 1 > 75 > 0.
 
 ## Steps
 
-- [ ] B1 **State module + recording.** `_tabstate_*` helpers in `bin/browser.py`
+- [x] B1 **State module + recording.** `_tabstate_*` helpers in `bin/browser.py`
       (locked load/merge/write, prune rule, opener identity, version check). Record on
       `_open_new_raw` (creation, opener, `via: open`), `eval -T` and `eval --url`
       (`last_used`; for `--url` the tid via `Target.getTargetInfo` on the page's CDP
       session, best effort). `register-exec` adds `session` + `cwd` to its registry
       `extra`. Tests (`tests/test_tab_reaper.py`): env precedence, malformed state,
       stale-snapshot prune, concurrent merge.
-- [ ] B2 **`browser.py tabs`** (all up instances by default; `-1/--this-instance`,
+- [x] B2 **`browser.py tabs`** (all up instances by default; `-1/--this-instance`,
       `-j/--json`, `-f/--full-urls`, `-n/--no-probe`): per instance one
       `Target.getTargets` + a bounded concurrent `performance.timeOrigin` probe
       (skipped with `-n`), records observations (first_seen, url_h, last_change), and
@@ -101,12 +101,12 @@ aggregated by severity 1 > 75 > 0.
       (`created`, or `≥` + first_seen), loaded, idle, flags (`keep`, `attached`,
       `owned`), title → origin. JSON origin-only unless `-f`. Header: live registered
       clients with session. Registers; no lease; closes nothing.
-- [ ] B3 **`browser.py keep`**: `keep TID…` (a full tid or a unique ≥ 8-char prefix;
+- [x] B3 **`browser.py keep`**: `keep TID…` (a full tid or a unique ≥ 8-char prefix;
       ambiguous/none → exit 2, candidates listed origin-only), `-o/--origin ORIGIN`
       (canonical scheme://host[:port]; userinfo/path refused), `-r/--release` (either
       form), `-l/--list`. `open -k/--keep` pins at creation (pin failure: prints
       `target=`, exit 1). Durable writes under `tabs.lock`.
-- [ ] B4 **`browser.py reap-idle`** (`-n/--dry-run`, `-I/--idle-hours H`, `-m/--max N`,
+- [x] B4 **`browser.py reap-idle`** (`-n/--dry-run`, `-I/--idle-hours H`, `-m/--max N`,
       `-A/--all-instances`, `-q/--quiet`) implementing the reap rule. Tests with the
       fake CDP: attached veto, pinned tid / origin, owned marker-only ledger + popup
       descendant, unknown ledger owner, maintenance debris, blank / non-http, last page,
@@ -115,7 +115,7 @@ aggregated by severity 1 > 75 > 0.
       `unknown`. One `launches_chrome` test on a disposable instance: two
       `open -N` tabs (each its own headless window), one pinned, state backdated, real
       reap closes only the unpinned one and `eval-fresh` still attaches afterwards.
-- [ ] B5 **LaunchAgent** `com.albert.browser-tab-reaper` in `agent_plists()`
+- [x] B5 **LaunchAgent** `com.albert.browser-tab-reaper` in `agent_plists()`
       (`launchagent_plist` gains a `script` parameter): every 15 min,
       `browser.py reap-idle -A -q`, own log, `RunAtLoad false`. Installed with
       `agent-login.py --install-daily`.

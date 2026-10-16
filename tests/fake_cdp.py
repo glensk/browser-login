@@ -45,6 +45,8 @@ class FakeTarget:
     # opened it (``openerId`` in ``Target.getTargets``; tp#845 popups).
     type: str = "page"
     opener: str | None = None
+    # ``attached`` in ``Target.getTargets`` (another CDP client on it; tp#1109).
+    attached: bool = False
 
 
 def _ws_accept(key: str) -> str:
@@ -182,7 +184,7 @@ class FakeCdp:
             "type": t.type,
             "title": t.title,
             "url": t.url,
-            "attached": False,
+            "attached": t.attached,
             "canAccessOpener": False,
             "browserContextId": "CTX",
         }

@@ -145,10 +145,12 @@ import argparse
 import atexit
 import base64
 import contextlib
+import copy
 import dataclasses
 import fcntl
 import functools
 import glob
+import hashlib
 import json
 import os
 import queue
@@ -442,6 +444,13 @@ def _add_open_eval_parsers(sub: Any) -> None:
             "with -N."
         ),
     )
+    po.add_argument(
+        "-k",
+        "--keep",
+        action="store_true",
+        help="pin the new tab so `reap-idle` never closes it (tp#1109); a pin "
+        "that cannot be recorded is exit 1 (the tab stays open).",
+    )
     pog.add_argument(
         "-N",
         "--new",
@@ -610,6 +619,110 @@ def _add_reap_parser(sub: Any) -> None:
         action="store_true",
         help="only print what would be closed (`would close:` per tab); close "
         "nothing, change no ledger.",
+    )
+    _add_tab_parsers(sub)  # the other reaper, its pins and the tab list
+
+
+def _add_tab_parsers(sub: Any) -> None:
+    """`tabs`, `keep` and `reap-idle` (tp#1109)."""
+    pt = sub.add_parser(
+        "tabs",
+        help="List every page tab of every running instance: who opened it "
+        "(agent session + cwd, `unknown` for tabs not opened by browser.py, "
+        "e.g. Playwright MCP), age, load age, idle time, keep/attached/owned "
+        "flags; origins only. Records first-seen/URL-change observations; "
+        "closes nothing.",
+    )
+    pt.add_argument(
+        "-1",
+        "--this-instance",
+        action="store_true",
+        help="only this instance (default: every known instance whose CDP port "
+        "answers; an instance env, --cdp-port or cache dir also pins it).",
+    )
+    pt.add_argument("-j", "--json", action="store_true", help="print JSON.")
+    pt.add_argument(
+        "-f",
+        "--full-urls",
+        action="store_true",
+        help="raw URLs instead of origins (human use only — they can carry tokens).",
+    )
+    pt.add_argument(
+        "-n",
+        "--no-probe",
+        action="store_true",
+        help="skip the per-tab `performance.timeOrigin` probe (LOADED column).",
+    )
+    pk = sub.add_parser(
+        "keep",
+        help="Pin tabs (by target id) or whole origins so `reap-idle` never "
+        "closes them; no argument lists the pins. Exit 0 ok, 1 state not "
+        "written, 2 bad target/origin.",
+    )
+    pk.add_argument(
+        "tids",
+        nargs="*",
+        metavar="TID",
+        help="a full CDP target id (from `open -N` / `tabs -j`) or a unique "
+        "prefix of at least 8 characters.",
+    )
+    pk.add_argument(
+        "-o",
+        "--origin",
+        dest="origins",
+        action="append",
+        metavar="ORIGIN",
+        help="pin every tab of this http(s) origin (scheme://host[:port]); repeatable.",
+    )
+    pk.add_argument(
+        "-r",
+        "--release",
+        action="store_true",
+        help="remove the given pins instead of adding them.",
+    )
+    pk.add_argument("-l", "--list", action="store_true", help="list the pins.")
+    pr = sub.add_parser(
+        "reap-idle",
+        help="Close unpinned http(s) page tabs idle longer than the threshold "
+        "(idle = since browser.py opened/used it, its URL changed or it was "
+        "first seen). Only while no CDP client is attached (gate exclusive), "
+        "never an owned-ledger tab, never the last page. Exit 0 ok, 1 a "
+        "failure, 75 busy (client attached, guided login).",
+    )
+    pr.add_argument(
+        "-n",
+        "--dry-run",
+        action="store_true",
+        help="print `would close:` lines; take no lock, write nothing, close nothing.",
+    )
+    pr.add_argument(
+        "-I",
+        "--idle-hours",
+        type=_positive_seconds,
+        default=None,
+        metavar="HOURS",
+        help=f"idle threshold in hours (default ${TAB_IDLE_ENV} or "
+        f"{TAB_IDLE_DEFAULT_H:g}; at least {TAB_IDLE_FLOOR_H:g}).",
+    )
+    pr.add_argument(
+        "-m",
+        "--max",
+        type=int,
+        default=REAP_IDLE_MAX_DEFAULT,
+        metavar="N",
+        help=f"close at most N tabs per instance and run (default {REAP_IDLE_MAX_DEFAULT}).",
+    )
+    pr.add_argument(
+        "-A",
+        "--all-instances",
+        action="store_true",
+        help="run once per known instance whose CDP port answers (never starts one).",
+    )
+    pr.add_argument(
+        "-q",
+        "--quiet",
+        action="store_true",
+        help="print only closes, failures and the summary when something happened.",
     )
 
 
@@ -781,6 +894,10 @@ def parse_args() -> argparse.Namespace:
             "  ./browser.py eval-fresh -t 30 https://claude.ai/ 'location.host'  # own tab\n"
             "  ./browser.py reap-owned -n      # tabs crashed browser.py runs left (dry run)\n"
             "  ./browser.py close -i <id>      # close the tab you opened\n"
+            "  ./browser.py tabs               # every tab: opener session, age, idle\n"
+            "  ./browser.py keep <id>          # pin a tab the idle reaper must keep\n"
+            "  ./browser.py keep -o https://app.example.com  # pin a whole origin\n"
+            "  ./browser.py reap-idle -A -n    # idle tabs it would close (dry run)\n"
             "  ./browser.py close -n https://app.example.com/login  # dry run, by URL\n"
             "  ./browser.py status -p          # + mark tabs that answer no CDP\n"
             "  ./browser.py close-hung         # close such tabs (asks first)\n"
@@ -3672,6 +3789,10 @@ _PREFLIGHT_SKIP_CMDS = frozenset(
         "close",
         "reap-owned",
         "maintenance-watchdog",
+        # Raw CDP only (tp#1109): they never attach Playwright.
+        "tabs",
+        "keep",
+        "reap-idle",
     }
 )
 
@@ -4801,7 +4922,13 @@ def cmd_register_exec(port: int, tool: str, cmd: list[str]) -> int:
         " ".join(cmd)[:160],
         port,
         journal_purpose=_journal_wrapped_cmd(cmd),
-        extra={"kind": "exec", "paused": False},
+        extra={
+            "kind": "exec",
+            "paused": False,
+            # Which agent session runs it (`tabs` shows it; tp#1109).
+            "session": _opener_identity()["session"],
+            "cwd": _opener_identity()["cwd"],
+        },
     )
     try:
         # Own process group (not a new session: the controlling terminal and
@@ -5388,13 +5515,16 @@ def _tab_line(target: dict[str, object], full_urls: bool = False) -> str:
     return f"   - {title}  →  {hint}"
 
 
-def _open_new_raw(port: int, url: str) -> int:
+def _open_new_raw(port: int, url: str, keep: bool = False) -> int:
     """`open` (and `open -N`): a NEW background tab over raw CDP; prints
     ``target=<id>``.
 
     No Playwright attach (it waits for every page target, so one heavy or
     wedged foreign tab would slow this down — tp#786). Registers; takes no
-    lease. Exit 1 when the tab cannot be created.
+    lease. Exit 1 when the tab cannot be created. The tab's opener (agent
+    session, cwd) goes to the tab state (tp#1109, best effort); with `keep`
+    (`-k`) it is also pinned, and a pin that cannot be recorded is exit 1
+    (the tab stays open, its ``target=`` line is printed).
     """
     if not _is_up(port):
         sys.exit(
@@ -5410,6 +5540,12 @@ def _open_new_raw(port: int, url: str) -> int:
         info = _await_target_load(port, tid)
         print(f"✓ Opened: {info.get('url', url)}  (title: {info.get('title', '')!r})")
         print(f"target={tid}")
+        try:
+            _tabstate_record_open(tid, info.get("url", url), keep=keep)
+        except (TabStateError, OSError) as exc:
+            if keep:
+                return _fail(f"pin NOT recorded for {_id8(tid)}: {exc}")
+            print(f"⚠ tab state not updated (open): {exc}", file=sys.stderr)
         return 0
     finally:
         release()
@@ -5435,7 +5571,9 @@ def _reuse_same_url_tab(port: int, url: str) -> bool:
         pw.stop()
 
 
-def cmd_open(port: int, url: str, reuse: bool = False, new: bool = False) -> int:
+def cmd_open(
+    port: int, url: str, reuse: bool = False, new: bool = False, keep: bool = False
+) -> int:
     """Open URL in a NEW background tab; prints ``target=<id>`` (tp#863).
 
     Never navigates a tab it did not create: a blank tab may be another
@@ -5446,7 +5584,7 @@ def cmd_open(port: int, url: str, reuse: bool = False, new: bool = False) -> int
     """
     if reuse and not new and _reuse_same_url_tab(port, url):
         return 0
-    return _open_new_raw(port, url)
+    return _open_new_raw(port, url, keep=keep)
 
 
 def _eval_watchdog_fire(timeout_s: float) -> None:
@@ -5554,6 +5692,7 @@ def _eval_target_raw(port: int, tid: str, js: str, budget_s: float) -> int:
         remote = remote if isinstance(remote, dict) else {}
         value = remote.get("value", remote.get("unserializableValue"))
         print(json.dumps(value, indent=2, default=str))
+        _tabstate_touch(tid)
         return 0
     finally:
         release()
@@ -5584,10 +5723,26 @@ def _eval_attached(port: int, js: str, url_substr: str | None) -> int:
             )
         result = page.evaluate(f"() => ({js})")
         print(json.dumps(result, indent=2, default=str))
+        _touch_page(page)
         return 0
     finally:
         browser.close()
         pw.stop()
+
+
+def _touch_page(page: Any) -> None:
+    """`_tabstate_touch` for a Playwright page (its target id via CDP; best effort)."""
+    try:
+        session = page.context.new_cdp_session(page)
+        try:
+            info = session.send("Target.getTargetInfo").get("targetInfo") or {}
+        finally:
+            session.detach()
+    except Exception:  # pylint: disable=broad-exception-caught
+        return
+    tid = info.get("targetId") if isinstance(info, dict) else None
+    if isinstance(tid, str) and tid:
+        _tabstate_touch(tid)
 
 
 # `eval-fresh`: how long the fresh tab may take to reach readyState "complete".
@@ -8079,8 +8234,6 @@ def _himalaya_extract_magic_link(
 
 def _magic_link_digest(link: str) -> str:
     """sha256 of a magic link — lets us remember a link without keeping it."""
-    import hashlib
-
     return hashlib.sha256(link.encode("utf-8")).hexdigest()
 
 
@@ -16252,6 +16405,991 @@ INSTANCE_ROUTED_ENV = "CLAUDE_BROWSER_INSTANCE_ROUTED"
 INSTANCE_ROUTE_TIMEOUT_S = 10.0
 
 
+# ---------------------------------------------------------------------------
+# Tab ownership, keep pins and the idle reaper (tp#1109, PLAN_tab-reaper.md)
+# ---------------------------------------------------------------------------
+# `<cache>/tabs.json` (per instance, 0600) records who opened which tab
+# (`open`), when a tab was last used through browser.py (`open`, `eval`), the
+# keep pins, and what `tabs`/`reap-idle` observed (first seen, a hash of the
+# fragment-less URL — never the URL itself — and when it last changed). Every
+# update is read-merge-write under the flock on `<cache>/tabs.lock`, always
+# the INNERMOST lock (gate → lease → tabs.lock). `reap-idle` closes an
+# unpinned http(s) page idle longer than the threshold — only holding the
+# registry gate EXCLUSIVELY (no registered client attached, none unknown),
+# the interaction lease, and with a fresh `attached: false` right before each
+# close; never the last page of the browser, never an owned-ledger tab.
+TABSTATE_NAME = "tabs.json"
+TABSTATE_LOCK_NAME = "tabs.lock"
+TABSTATE_VERSION = 1
+TABSTATE_LOCK_WAIT_S = 5.0
+# Idle threshold of `reap-idle` (hours): env override, default and floor.
+TAB_IDLE_ENV = "CLAUDE_BROWSER_TAB_IDLE_H"
+TAB_IDLE_DEFAULT_H = 2.0
+TAB_IDLE_FLOOR_H = 0.25
+REAP_IDLE_MAX_DEFAULT = 20
+# The reaper holds the registry gate EXCLUSIVELY for its whole pass, and every
+# client that registers meanwhile waits for it (REGISTRY_SH_WAIT_S, 15 s) — so
+# gate wait + lease wait + pass stay well below that; tabs it did not reach in
+# time are closed on the next run.
+REAP_IDLE_DEADLINE_S = 8.0
+REAP_IDLE_GATE_WAIT_S = 2.0
+REAP_IDLE_LEASE_WAIT_S = 3.0
+# `tabs`: the shared budget of its `performance.timeOrigin` probe round.
+TABS_PROBE_BUDGET_S = 4.0
+# A child of `tabs` / `reap-idle -A` (one per instance) gets this long.
+TABS_CHILD_TIMEOUT_S = 150.0
+# Env vars naming the agent session that runs this process, in order.
+OPENER_SESSION_ENVS = (
+    "CLAUDE_CODE_SESSION_ID",
+    "CLAUDE_SESSION_ID",
+    "CODEX_SESSION_ID",
+)
+
+
+class TabStateError(Exception):
+    """`tabs.json` is unreadable, malformed, of an unknown version, or locked."""
+
+
+def _tabstate_path() -> Path:
+    return CACHE_DIR / TABSTATE_NAME
+
+
+def _tabstate_empty() -> dict:
+    return {"v": TABSTATE_VERSION, "targets": {}, "keep_origins": []}
+
+
+def _tabstate_read() -> dict:
+    """The state; a missing file is empty, anything else unusable raises."""
+    path = _tabstate_path()
+    try:
+        raw = path.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return _tabstate_empty()
+    except OSError as exc:
+        raise TabStateError(f"{path} unreadable: {exc.strerror or exc}") from None
+    try:
+        data = json.loads(raw)
+    except ValueError:
+        raise TabStateError(f"{path} is not valid JSON") from None
+    if not isinstance(data, dict) or data.get("v") != TABSTATE_VERSION:
+        raise TabStateError(f"{path} has an unknown format/version")
+    targets, origins = data.get("targets"), data.get("keep_origins")
+    if not isinstance(targets, dict) or not isinstance(origins, list):
+        raise TabStateError(f"{path} is malformed")
+    if not all(isinstance(k, str) and isinstance(v, dict) for k, v in targets.items()):
+        raise TabStateError(f"{path} is malformed (targets)")
+    if not all(isinstance(o, str) for o in origins):
+        raise TabStateError(f"{path} is malformed (keep_origins)")
+    return data
+
+
+@contextlib.contextmanager
+def _tabstate_locked(wait_s: float = TABSTATE_LOCK_WAIT_S) -> Iterator[None]:
+    """Hold the state's flock (the innermost lock of every path) for the block."""
+    CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    fd = os.open(str(CACHE_DIR / TABSTATE_LOCK_NAME), os.O_RDWR | os.O_CREAT, 0o600)
+    try:
+        if not _flock_wait(fd, fcntl.LOCK_EX, wait_s):
+            raise TabStateError(f"{TABSTATE_LOCK_NAME} busy for {wait_s:g}s")
+        yield
+    finally:
+        with contextlib.suppress(OSError):
+            fcntl.flock(fd, fcntl.LOCK_UN)
+        os.close(fd)
+
+
+def _tabstate_update(fn: Callable[[dict], object]) -> dict:
+    """Read-merge-write: `fn` edits the fresh state in place; the new state."""
+    with _tabstate_locked():
+        state = _tabstate_read()
+        fn(state)
+        _json_write_atomic(_tabstate_path(), state)
+        return state
+
+
+def _tabstate_try(fn: Callable[[dict], object], what: str) -> bool:
+    """Best-effort `_tabstate_update` (activity, observations): warns, never raises."""
+    try:
+        _tabstate_update(fn)
+        return True
+    except (TabStateError, OSError) as exc:
+        print(f"⚠ tab state not updated ({what}): {exc}", file=sys.stderr)
+        return False
+
+
+def _url_hash(url: object) -> str:
+    """Full sha256 hex of the URL without its fragment (the URL is never stored)."""
+    text = url if isinstance(url, str) else ""
+    return hashlib.sha256(text.split("#", 1)[0].encode("utf-8", "replace")).hexdigest()
+
+
+def _printable_id(value: str, limit: int = 64) -> str | None:
+    value = value.strip()[:limit]
+    return value if value and value.isprintable() else None
+
+
+def _opener_identity() -> dict[str, object]:
+    """Who runs this process: agent session id, cwd, agent pid, tool name."""
+    session = None
+    for key in OPENER_SESSION_ENVS:
+        session = _printable_id(os.environ.get(key, ""))
+        if session:
+            break
+    try:
+        cwd: str | None = os.getcwd()
+    except OSError:
+        cwd = None
+    raw_pid = os.environ.get("CLAUDE_PID", "")
+    pid = int(raw_pid) if raw_pid.isdigit() else os.getppid()
+    agent = os.environ.get("AI_AGENT", "").split("_", 1)[0]
+    return {
+        "session": session,
+        "cwd": cwd,
+        "pid": pid,
+        "tool": _printable_id(agent, 40) or "?",
+    }
+
+
+def _tabstate_record_open(tid: str, url: object, keep: bool = False) -> None:
+    """`open` created `tid`: record opener, creation and (optionally) the pin.
+
+    Raises on failure — the caller decides whether that is fatal (a pin is)."""
+    now = time.time()
+
+    def edit(state: dict) -> None:
+        entry = state["targets"].setdefault(tid, {})
+        entry.update(
+            created=now,
+            via="open",
+            opener=_opener_identity(),
+            last_used=now,
+            first_seen=entry.get("first_seen", now),
+            url_h=_url_hash(url),
+            last_change=now,
+        )
+        if keep:
+            entry["keep"] = True
+
+    _tabstate_update(edit)
+
+
+def _tabstate_touch(tid: str) -> None:
+    """`tid` was just used through browser.py (best effort)."""
+    now = time.time()
+
+    def edit(state: dict) -> None:
+        entry = state["targets"].setdefault(tid, {})
+        entry["last_used"] = now
+        entry.setdefault("first_seen", now)
+
+    _tabstate_try(edit, "last use")
+
+
+def _tabstate_observe(state: dict, pages: Sequence[dict], snap_t0: float) -> None:
+    """Fold one snapshot of page targets into `state` (in place).
+
+    New targets get ``first_seen``; a changed fragment-less URL hash sets
+    ``last_change``. An entry is pruned only when it is absent from this
+    snapshot AND was born (created / first seen) before the snapshot started —
+    a tab `open` recorded meanwhile is kept."""
+    now = time.time()
+    targets: dict = state["targets"]
+    seen: set[str] = set()
+    for info in pages:
+        tid = info.get("targetId")
+        if not isinstance(tid, str) or not tid:
+            continue
+        seen.add(tid)
+        entry = targets.setdefault(tid, {})
+        entry.setdefault("first_seen", now)
+        digest = _url_hash(info.get("url"))
+        if entry.get("url_h") != digest:
+            if "url_h" in entry:
+                entry["last_change"] = now
+            entry["url_h"] = digest
+    for tid in list(targets):
+        if tid in seen:
+            continue
+        entry = targets[tid]
+        born = entry.get("created", entry.get("first_seen", 0.0))
+        if not isinstance(born, (int, float)) or born < snap_t0:
+            del targets[tid]
+
+
+def _tab_idle_s(entry: dict, now: float) -> float | None:
+    """Seconds since the last local sign of use, or None without any record."""
+    refs = [
+        v
+        for k in ("created", "last_used", "last_change", "first_seen")
+        if isinstance(v := entry.get(k), (int, float)) and not isinstance(v, bool)
+    ]
+    return max(0.0, now - max(refs)) if refs else None
+
+
+def _canonical_origin(raw: str) -> str | None:
+    """``scheme://host[:port]`` of an http(s) origin; None for anything else."""
+    try:
+        parts = urllib.parse.urlsplit(raw.strip())
+        host, port = parts.hostname, parts.port
+    except ValueError:
+        return None
+    if parts.scheme not in ("http", "https") or not host or not host.isprintable():
+        return None
+    if parts.username or parts.password or parts.query or parts.fragment:
+        return None
+    if parts.path not in ("", "/"):
+        return None
+    return f"{parts.scheme}://{host}" + (f":{port}" if port is not None else "")
+
+
+def _is_http_url(url: object) -> bool:
+    return isinstance(url, str) and url.split(":", 1)[0] in ("http", "https")
+
+
+def _tab_pinned(state: dict, tid: str, url: object) -> str | None:
+    """``"keep"`` / ``"keep-origin"`` when the tab is pinned, else None."""
+    entry = state["targets"].get(tid) or {}
+    if entry.get("keep") is True:
+        return "keep"
+    origin = _canonical_origin(_tab_hint(str(url))) if _is_http_url(url) else None
+    if origin is not None and origin in state["keep_origins"]:
+        return "keep-origin"
+    return None
+
+
+def _target_infos(port: int, budget_s: float = 3.0) -> list[dict] | None:
+    """``Target.getTargets`` infos (with ``attached``) — raw CDP only; None
+    when that cannot be read (no `/json/list` fallback: it lacks ``attached``)."""
+    ws_url = _browser_ws_url(port, timeout=min(2.0, budget_s))
+    if ws_url is None:
+        return None
+    res = _cdp_ws_call(ws_url, "Target.getTargets", {}, budget_s)
+    infos = (res.result or {}).get("targetInfos") if res.status == "ok" else None
+    if res.error or not isinstance(infos, list):
+        return None
+    return [i for i in infos if isinstance(i, dict)]
+
+
+def _owned_ledger_tids(infos: Sequence[dict]) -> set[str] | None:
+    """Every tab an owned-tab ledger names (any owner state), marker entries
+    resolved through `infos`, plus their page descendants; None when a
+    ledger cannot be read (then nothing may be reaped)."""
+    directory = _owned_dir()
+    if not directory.is_dir():
+        return set()
+    by_url = {i.get("url"): i.get("targetId") for i in infos}
+    tids: set[str] = set()
+    for stem in _ledger_stems(directory):
+        path = directory / f"{stem}.json"
+        if not path.exists():
+            continue
+        rec = _read_json_dict(path)
+        if rec is None:
+            return None
+        for entry in rec.get("entries") or []:
+            if not isinstance(entry, dict):
+                return None
+            tid, marker = entry.get("tid"), entry.get("marker")
+            if isinstance(tid, str) and tid:
+                tids.add(tid)
+            elif isinstance(marker, str) and marker:
+                found = by_url.get(_owned_marker_url(marker))
+                if isinstance(found, str):
+                    tids.add(found)
+    tids.update(t for t, _p, _d in _page_descendants(infos, sorted(tids)))
+    return tids
+
+
+def _fmt_dur(seconds: object) -> str:
+    """``45s`` / ``12m`` / ``3.4h`` / ``2d3h``; ``-`` for no value."""
+    if not isinstance(seconds, (int, float)) or isinstance(seconds, bool):
+        return "-"
+    s = max(0.0, float(seconds))
+    if s < 60:
+        return f"{s:.0f}s"
+    if s < 3600:
+        return f"{s / 60:.0f}m"
+    if s < 86400:
+        return f"{s / 3600:.1f}h"
+    return f"{int(s // 86400)}d{int(s % 86400 // 3600)}h"
+
+
+def _tab_time_origins(port: int, tids: Sequence[str]) -> dict[str, float]:
+    """``performance.timeOrigin`` (epoch s) per answering tab — diagnostic only.
+
+    Read-only ``Runtime.evaluate`` on each target's own websocket, threads
+    under one shared budget (like `_probe_targets`); a tab that does not
+    answer is simply missing from the result."""
+    listing = _cdp_get(port, "/json/list", timeout=2.0)
+    if not isinstance(listing, list):
+        return {}
+    ws_by_id = {
+        t.get("id"): t.get("webSocketDebuggerUrl")
+        for t in listing
+        if isinstance(t, dict) and isinstance(t.get("webSocketDebuggerUrl"), str)
+    }
+    slots: dict[str, list[CdpResult]] = {}
+    threads: list[threading.Thread] = []
+    for tid in list(tids)[:PROBE_MAX_TARGETS]:
+        ws_url = ws_by_id.get(tid)
+        if not ws_url:
+            continue
+        slot: list[CdpResult] = []
+        slots[tid] = slot
+        th = threading.Thread(
+            target=lambda w=ws_url, s=slot: s.append(
+                _cdp_ws_call(
+                    w,
+                    "Runtime.evaluate",
+                    {"expression": "performance.timeOrigin", "returnByValue": True},
+                    TABS_PROBE_BUDGET_S,
+                )
+            ),
+            daemon=True,
+        )
+        th.start()
+        threads.append(th)
+    deadline = time.monotonic() + TABS_PROBE_BUDGET_S + 0.5
+    for th in threads:
+        th.join(timeout=max(0.0, deadline - time.monotonic()))
+    out: dict[str, float] = {}
+    for tid, slot in slots.items():
+        res = slot[0] if slot else None
+        value = ((res.result or {}).get("result") or {}).get("value") if res else None
+        if res and res.status == "ok" and isinstance(value, (int, float)):
+            out[tid] = float(value) / 1000.0
+    return out
+
+
+def _tabs_collect(port: int, *, probe: bool, full_urls: bool) -> dict:
+    """`tabs -1 -j`'s document for THIS instance (also what the fan-out reads)."""
+    doc: dict[str, object] = {"instance": INSTANCE or "default", "port": port}
+    if not _is_up(port):
+        doc["up"] = False
+        return doc
+    doc["up"] = True
+    snap_t0 = time.time()
+    infos = _target_infos(port)
+    if infos is None:
+        doc["error"] = "could not read the target list (Target.getTargets)"
+        return doc
+    pages = [i for i in infos if i.get("type") == "page"]
+    loaded = (
+        _tab_time_origins(port, [str(p.get("targetId")) for p in pages])
+        if probe
+        else {}
+    )
+    warnings: list[str] = []
+    try:
+        state = _tabstate_update(lambda s: _tabstate_observe(s, pages, snap_t0))
+    except (TabStateError, OSError) as exc:
+        warnings.append(f"tab state: {exc}")
+        try:
+            state = _tabstate_read()
+        except TabStateError:
+            state = _tabstate_empty()
+    owned = _owned_ledger_tids(infos)
+    if owned is None:
+        warnings.append("an owned-tab ledger is unreadable")
+        owned = set()
+    now = time.time()
+    rows = []
+    for info in pages:
+        tid = str(info.get("targetId") or "")
+        url = info.get("url")
+        entry = state["targets"].get(tid) or {}
+        opener = entry.get("opener") if isinstance(entry.get("opener"), dict) else None
+        rows.append(
+            {
+                "id": tid,
+                "url": (url if isinstance(url, str) else "")
+                if full_urls
+                else _tab_hint(str(url or "")),
+                "title": _tab_title(info.get("title"), url),
+                "opener": opener,
+                "via": entry.get("via"),
+                "created": entry.get("created"),
+                "first_seen": entry.get("first_seen"),
+                "loaded": loaded.get(tid),
+                "idle_s": _tab_idle_s(entry, now),
+                "keep": _tab_pinned(state, tid, url),
+                "attached": bool(info.get("attached")),
+                "owned": tid in owned,
+            }
+        )
+    clients = [
+        {
+            "tool": rec.get("tool"),
+            "pid": rec.get("pid"),
+            "purpose": _journal_redact(rec.get("purpose") or "", 80),
+            "session": rec.get("session"),
+        }
+        for rec in _registry_live_clients()
+        if rec.get("pid") != os.getpid()  # not this listing's own registration
+    ]
+    doc.update(
+        now=now,
+        tabs=rows,
+        clients=clients,
+        keep_origins=list(state["keep_origins"]),
+        warnings=warnings,
+    )
+    return doc
+
+
+def _tab_opener_cell(opener: object) -> str:
+    if not isinstance(opener, dict) or not opener.get("session"):
+        if isinstance(opener, dict) and opener.get("cwd"):
+            return f"pid {opener.get('pid')} {Path(str(opener['cwd'])).name}"
+        return "unknown"
+    cwd = opener.get("cwd")
+    where = Path(str(cwd)).name or "/" if cwd else "?"
+    return f"{str(opener['session'])[:8]} {where}"
+
+
+def _tabs_render(docs: Sequence[dict]) -> None:
+    """The human `tabs` table, one block per instance."""
+    for doc in docs:
+        name = f"{doc.get('instance')} (CDP {doc.get('port')})"
+        if not doc.get("up"):
+            print(f"{name}: down")
+            continue
+        if doc.get("error"):
+            print(f"{name}: ❌ {doc['error']}")
+            continue
+        tabs = doc.get("tabs") or []
+        now = float(doc.get("now") or time.time())
+        print(f"{name}: {len(tabs)} tab(s)")
+        for c in doc.get("clients") or []:
+            sess = str(c.get("session") or "")[:8] or "?"
+            print(
+                f"   client: {c.get('tool')} pid {c.get('pid')} session {sess} — {c.get('purpose')}"
+            )
+        for origin in doc.get("keep_origins") or []:
+            print(f"   keep origin: {origin}")
+        for w in doc.get("warnings") or []:
+            print(f"   ⚠ {w}")
+        if tabs:
+            print(
+                f"   {'ID':<8}  {'OPENER':<22}  {'AGE':>6}  {'LOADED':>6}  "
+                f"{'IDLE':>6}  FLAGS / TITLE → ORIGIN"
+            )
+        for t in tabs:
+            if t.get("created"):
+                age = _fmt_dur(now - float(t["created"]))
+            elif t.get("first_seen"):
+                age = "≥" + _fmt_dur(now - float(t["first_seen"]))
+            else:
+                age = "-"
+            loaded = _fmt_dur(now - float(t["loaded"])) if t.get("loaded") else "-"
+            flags = [
+                f
+                for f in (
+                    t.get("keep"),
+                    "attached" if t.get("attached") else None,
+                    "owned" if t.get("owned") else None,
+                )
+                if f
+            ]
+            flag_s = f"[{','.join(flags)}] " if flags else ""
+            print(
+                f"   {str(t.get('id'))[:8]:<8}  {_tab_opener_cell(t.get('opener'))[:22]:<22}  "
+                f"{age:>6}  {loaded:>6}  {_fmt_dur(t.get('idle_s')):>6}  "
+                f"{flag_s}{t.get('title')}  →  {t.get('url')}"
+            )
+
+
+def _fanout_pinned(args: argparse.Namespace) -> bool:
+    """True when this run names ONE browser (instance env, port, cache dir)."""
+    return bool(
+        INSTANCE
+        or getattr(args, "cdp_port_given", False)
+        or os.environ.get("CLAUDE_BROWSER_CDP_PORT")
+        or os.environ.get("CLAUDE_BROWSER_CACHE_DIR")
+    )
+
+
+def _instance_children(
+    argv: Sequence[str],
+) -> list[tuple[str, int, int | None, str, str]]:
+    """Run ``browser.py ARGV`` once per known instance whose CDP port answers.
+
+    ``(instance, port, rc, stdout, stderr)`` per instance; ``rc`` None = the
+    instance is down (never launched). Sequential, each bounded."""
+    out: list[tuple[str, int, int | None, str, str]] = []
+    script = os.path.realpath(__file__)
+    for inst, iport in INSTANCE_PORTS.items():
+        if not _is_up(iport):
+            out.append((inst, iport, None, "", ""))
+            continue
+        env = {**os.environ, "CLAUDE_BROWSER_INSTANCE": inst}
+        env.pop("CLAUDE_BROWSER_CDP_PORT", None)
+        try:
+            r = subprocess.run(
+                [sys.executable, script, *argv],
+                env=env,
+                capture_output=True,
+                text=True,
+                timeout=TABS_CHILD_TIMEOUT_S,
+                check=False,
+            )
+            out.append((inst, iport, r.returncode, r.stdout, r.stderr))
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            out.append((inst, iport, 1, "", f"❌ {inst or 'default'}: {exc}\n"))
+    return out
+
+
+def _worst_rc(codes: Sequence[int]) -> int:
+    """Aggregate exit codes: any failure → 1, else any BUSY → 75, else 0."""
+    if any(c not in (0, BUSY_RC) for c in codes):
+        return 1
+    return BUSY_RC if BUSY_RC in codes else 0
+
+
+def _tabs_this_instance(args: argparse.Namespace, port: int) -> int:
+    """`tabs` for this instance alone (also the fan-out's child, `-1 -j`)."""
+    try:
+        release: Callable[[], object] | None = _registry_register(
+            "browser.py", _purpose(), port
+        )
+    except SystemExit:
+        if _is_up(port):
+            raise  # a guided login (75) or a switch in progress
+        release = None
+    try:
+        doc = _tabs_collect(port, probe=not args.no_probe, full_urls=args.full_urls)
+    finally:
+        if release is not None:
+            release()
+    if args.json:
+        print(json.dumps(doc, indent=1, default=str))
+    else:
+        _tabs_render([doc])
+    return 1 if doc.get("error") else 0
+
+
+def cmd_tabs(args: argparse.Namespace, port: int) -> int:
+    """`tabs`: every page tab with opener, age, load age, idle and flags."""
+    if args.this_instance or _fanout_pinned(args):
+        return _tabs_this_instance(args, port)
+    argv = ["tabs", "-1", "-j"]
+    argv += (["-f"] if args.full_urls else []) + (["-n"] if args.no_probe else [])
+    docs: list[dict] = []
+    codes: list[int] = []
+    for inst, iport, rc, stdout, stderr in _instance_children(argv):
+        name = inst or "default"
+        if rc is None:
+            docs.append({"instance": name, "port": iport, "up": False})
+            continue
+        codes.append(rc)
+        try:
+            docs.append(json.loads(stdout))
+        except ValueError:
+            line = (stderr.strip().splitlines() or [f"exit {rc}"])[-1][:200]
+            docs.append({"instance": name, "port": iport, "up": True, "error": line})
+    if args.json:
+        print(json.dumps(docs, indent=1, default=str))
+    else:
+        _tabs_render(docs)
+    return _worst_rc(codes)
+
+
+def _keep_resolve(
+    arg: str, pages: Sequence[dict], state: dict
+) -> tuple[str | None, str]:
+    """``(tid, "")`` for a full target id or a unique ≥ 8-char prefix of a
+    listed tab (a full id also matches a pinned entry of a gone tab), else
+    ``(None, why)``."""
+    ids = [str(p.get("targetId") or "") for p in pages]
+    if arg in ids or arg in state["targets"]:
+        return arg, ""
+    if len(arg) < 8:
+        return None, f"{arg!r}: give a full target id or at least 8 characters of one"
+    hits = [i for i in ids if i.startswith(arg)]
+    if len(hits) == 1:
+        return hits[0], ""
+    if not hits:
+        return None, f"{arg!r}: no tab with that target id"
+    return None, f"{arg!r}: matches {len(hits)} tabs — give more characters"
+
+
+def _keep_list(port: int) -> int:
+    """`keep -l` (and bare `keep`): the pinned tabs and origins."""
+    try:
+        state = _tabstate_read()
+    except TabStateError as exc:
+        return _fail(str(exc))
+    listing = {str(t.get("id")): t for t in _page_targets(port)} if _is_up(port) else {}
+    pinned = [t for t, e in state["targets"].items() if e.get("keep") is True]
+    for tid in pinned:
+        t = listing.get(tid)
+        print(f"keep: {_label_of(t) if t else _id8(tid) + '  (gone)'}")
+    for origin in state["keep_origins"]:
+        print(f"keep origin: {origin}")
+    if not pinned and not state["keep_origins"]:
+        print("No pinned tabs or origins.")
+    return 0
+
+
+def _keep_targets(
+    tids: Sequence[str], origins: Sequence[str], pages: Sequence[dict], state: dict
+) -> tuple[list[str], list[str]] | None:
+    """The resolved ``(tids, canonical origins)``, or None after a ❌ line."""
+    canon: list[str] = []
+    for raw in origins:
+        c = _canonical_origin(raw)
+        if c is None:
+            print(
+                "❌ not an http(s) origin (scheme://host[:port] only): "
+                f"{_tab_hint(raw)}",
+                file=sys.stderr,
+            )
+            return None
+        canon.append(c)
+    resolved: list[str] = []
+    for arg in tids:
+        tid, why = _keep_resolve(arg, pages, state)
+        if tid is None:
+            print(f"❌ {why}", file=sys.stderr)
+            for p in pages:
+                label = _target_label(p.get("url"), p.get("title"), p.get("targetId"))
+                print(f"   {label}", file=sys.stderr)
+            return None
+        resolved.append(tid)
+    return resolved, canon
+
+
+def cmd_keep(
+    port: int,
+    tids: Sequence[str],
+    origins: Sequence[str],
+    *,
+    release: bool,
+    list_only: bool,
+) -> int:
+    """`keep`: pin tabs (by id) or whole origins so `reap-idle` never closes them."""
+    if list_only or (not tids and not origins):
+        return _keep_list(port)
+    pages = [
+        {"targetId": t.get("id"), "url": t.get("url"), "title": t.get("title")}
+        for t in (_page_targets(port) if _is_up(port) else [])
+    ]
+    try:
+        state = _tabstate_read()
+    except TabStateError as exc:
+        return _fail(str(exc))
+    got = _keep_targets(tids, origins, pages, state)
+    if got is None:
+        return 2
+    resolved, canon = got
+    now = time.time()
+
+    def edit(st: dict) -> None:
+        for tid in resolved:
+            entry = st["targets"].setdefault(tid, {"first_seen": now})
+            if release:
+                entry.pop("keep", None)
+            else:
+                entry["keep"] = True
+        for origin in canon:
+            if release:
+                st["keep_origins"] = [o for o in st["keep_origins"] if o != origin]
+            elif origin not in st["keep_origins"]:
+                st["keep_origins"].append(origin)
+
+    try:
+        _tabstate_update(edit)
+    except (TabStateError, OSError) as exc:
+        return _fail(f"pin NOT recorded: {exc}")
+    verb = "released" if release else "kept"
+    by_id = {str(p.get("targetId")): p for p in pages}
+    for tid in resolved:
+        p = by_id.get(tid)
+        label = _target_label(p.get("url"), p.get("title"), tid) if p else _id8(tid)
+        print(f"✅ {verb}: {label}")
+    for origin in canon:
+        print(f"✅ {verb} origin: {origin}")
+    return 0
+
+
+def _tab_idle_threshold_h(cli: float | None) -> float:
+    """The idle threshold in hours: CLI, else env, else default; ≥ the floor."""
+    if cli is None:
+        try:
+            cli = float(os.environ.get(TAB_IDLE_ENV, "") or TAB_IDLE_DEFAULT_H)
+        except ValueError:
+            cli = TAB_IDLE_DEFAULT_H
+    if not 0 < cli < float("inf"):
+        cli = TAB_IDLE_DEFAULT_H
+    return max(TAB_IDLE_FLOOR_H, cli)
+
+
+@dataclass
+class ReapIdleRun:
+    """What one `reap-idle` pass decided and did."""
+
+    closed: list[str] = dataclasses.field(default_factory=list)
+    would: list[str] = dataclasses.field(default_factory=list)
+    failed: list[str] = dataclasses.field(default_factory=list)
+    skipped: dict[str, int] = dataclasses.field(default_factory=dict)
+
+    def skip(self, why: str) -> None:
+        self.skipped[why] = self.skipped.get(why, 0) + 1
+
+
+def _reap_idle_decide(
+    pages: Sequence[dict],
+    state: dict,
+    owned: set[str],
+    min_idle_s: float,
+    run: ReapIdleRun,
+) -> list[tuple[dict, float]]:
+    """The close candidates (info, idle s), longest idle first; skips counted."""
+    now = time.time()
+    cands: list[tuple[dict, float]] = []
+    for info in pages:
+        tid, url = str(info.get("targetId") or ""), info.get("url")
+        if not _is_http_url(url):
+            run.skip("not http(s)")
+        elif tid in owned:
+            run.skip("owned")
+        elif _tab_pinned(state, tid, url):
+            run.skip("pinned")
+        elif info.get("attached") is not False:
+            run.skip("attached")
+        else:
+            idle = _tab_idle_s(state["targets"].get(tid) or {}, now)
+            if idle is None or idle < min_idle_s:
+                run.skip("recent")
+            else:
+                cands.append((info, idle))
+    cands.sort(key=lambda c: -c[1])
+    return cands
+
+
+def _reap_idle_recheck(
+    cur: dict | None, info: dict, pages: Sequence[dict], state: dict
+) -> str | None:
+    """Why the fresh view of a candidate forbids its close, or None."""
+    tid = str(info.get("targetId"))
+    if cur is None:
+        return "gone"
+    if cur.get("attached") is not False:
+        return "attached"
+    if _url_hash(cur.get("url")) != _url_hash(info.get("url")):
+        return "changed"
+    if _tab_pinned(state, tid, cur.get("url")):
+        return "pinned"
+    if len(pages) <= 1:
+        return "last page"
+    return None
+
+
+@dataclass
+class _ReapIdleCtx:
+    """What every close of one `reap-idle` pass shares."""
+
+    port: int
+    ws_url: str
+    run: ReapIdleRun
+    left: Callable[[], float]
+
+
+def _reap_idle_close_one(ctx: _ReapIdleCtx, info: dict, idle: float) -> None:
+    """Re-check `info` under the state lock against a fresh snapshot; close it."""
+    tid = str(info.get("targetId"))
+    label = _target_label(info.get("url"), info.get("title"), tid)
+    with _tabstate_locked():
+        state = _tabstate_read()
+        fresh = _target_infos(ctx.port, budget_s=max(0.1, min(3.0, ctx.left())))
+        if fresh is None:
+            ctx.run.failed.append(label)
+            print(f"❌ failed (target list unreadable): {label}", file=sys.stderr)
+            return
+        pages = [i for i in fresh if i.get("type") == "page"]
+        cur = next((p for p in pages if p.get("targetId") == tid), None)
+        why = _reap_idle_recheck(cur, info, pages, state)
+        if why is not None:
+            ctx.run.skip(why)
+            return
+        budget = max(0.1, min(2.0, ctx.left()))
+        if not _cdp_close_target(ctx.port, tid, budget, ws_url=ctx.ws_url):
+            ctx.run.failed.append(label)
+            print(f"❌ failed: {label}", file=sys.stderr)
+            return
+        entry = state["targets"].pop(tid, None) or {}
+        _json_write_atomic(_tabstate_path(), state)
+    opener = entry.get("opener") if isinstance(entry.get("opener"), dict) else {}
+    _journal(
+        "tab_reaped",
+        origin=_tab_hint(str(info.get("url") or "")),
+        target=_id8(tid),
+        idle_s=int(idle),
+        session=(opener or {}).get("session"),
+    )
+    ctx.run.closed.append(label)
+    print(f"✓ closed (idle {_fmt_dur(idle)}): {label}")
+
+
+def _reap_idle_pass(
+    port: int, *, dry_run: bool, min_idle_s: float, max_n: int
+) -> tuple[int, ReapIdleRun]:
+    """One pass over this instance; the caller holds the coordination (real run)."""
+    deadline = time.monotonic() + REAP_IDLE_DEADLINE_S
+    run = ReapIdleRun()
+    snap_t0 = time.time()
+    infos = _target_infos(port)
+    ws_url = _browser_ws_url(port)
+    if infos is None or ws_url is None:
+        print("❌ could not read the target list — closed nothing.", file=sys.stderr)
+        return 1, run
+    owned = _owned_ledger_tids(infos)
+    if owned is None:
+        print("❌ an owned-tab ledger is unreadable — closed nothing.", file=sys.stderr)
+        return 1, run
+    pages = [i for i in infos if i.get("type") == "page"]
+    try:
+        if dry_run:
+            state = copy.deepcopy(_tabstate_read())
+            _tabstate_observe(state, pages, snap_t0)
+        else:
+            state = _tabstate_update(lambda s: _tabstate_observe(s, pages, snap_t0))
+    except (TabStateError, OSError) as exc:
+        print(f"❌ tab state unusable: {exc} — closed nothing.", file=sys.stderr)
+        return 1, run
+    cands = _reap_idle_decide(pages, state, owned, min_idle_s, run)
+    if dry_run:
+        for info, idle in cands:
+            label = _target_label(
+                info.get("url"), info.get("title"), info.get("targetId")
+            )
+            run.would.append(label)
+            print(f"would close (idle {_fmt_dur(idle)}): {label}")
+        return 0, run
+    ctx = _ReapIdleCtx(port, ws_url, run, lambda: max(0.0, deadline - time.monotonic()))
+    for info, idle in cands[:max_n]:
+        label = _target_label(info.get("url"), info.get("title"), info.get("targetId"))
+        if ctx.left() <= 0:
+            run.failed.append(label)
+            print(f"❌ failed (deadline): {label}", file=sys.stderr)
+            continue
+        try:
+            _reap_idle_close_one(ctx, info, idle)
+        except (TabStateError, OSError) as exc:
+            run.failed.append(label)
+            print(f"❌ failed ({exc}): {label}", file=sys.stderr)
+    for _extra in cands[max_n:]:
+        run.skip("over -m")
+    return (1 if run.failed else 0), run
+
+
+def _reap_idle_fanout(argv: list[str]) -> int:
+    """`reap-idle -A`: one child per running instance, output tagged, rc aggregated."""
+    codes: list[int] = []
+    for inst, _iport, rc, stdout, stderr in _instance_children(argv):
+        if rc is None:
+            continue
+        tag = f"[{inst or 'default'}] "
+        for line in stdout.splitlines():
+            print(tag + line)
+        for line in stderr.splitlines():
+            print(tag + line, file=sys.stderr)
+        codes.append(rc)
+    return _worst_rc(codes)
+
+
+def _reap_idle_coordinated(
+    port: int, *, min_idle_s: float, max_n: int, quiet: bool
+) -> tuple[int, ReapIdleRun | None]:
+    """The real pass under the gate (exclusive), no unknown client, the lease."""
+    busy = "⏸ busy: a guided-login maintenance record exists — not reaping."
+    if MAINTENANCE_FILE.exists():
+        print(busy)
+        return BUSY_RC, None
+    gate = _gate_acquire(fcntl.LOCK_EX, REAP_IDLE_GATE_WAIT_S)
+    if gate is None:
+        if not quiet:
+            print("⏸ busy: registered CDP client(s) attached — not reaping.")
+        return BUSY_RC, None
+    try:
+        unknown = _unknown_cdp_clients(port)
+        if unknown is None or unknown:
+            if not quiet:
+                print(
+                    "⏸ busy: unregistered CDP client(s) attached (or no lsof) "
+                    "— not reaping."
+                )
+            return BUSY_RC, None
+        if MAINTENANCE_FILE.exists():
+            print(busy)
+            return BUSY_RC, None
+        with _interaction_lease("reap-idle", wait_s=REAP_IDLE_LEASE_WAIT_S):
+            return _reap_idle_pass(
+                port, dry_run=False, min_idle_s=min_idle_s, max_n=max_n
+            )
+    finally:
+        _gate_release(gate)
+
+
+def cmd_reap_idle(  # pylint: disable=too-many-arguments
+    port: int,
+    *,
+    dry_run: bool,
+    idle_h: float | None,
+    max_n: int,
+    all_instances: bool,
+    quiet: bool,
+) -> int:
+    """`reap-idle`: close unpinned http(s) tabs idle past the threshold."""
+    if all_instances and not _fanout_pinned_env():
+        argv = ["reap-idle", "-m", str(max_n)]
+        argv += (["-n"] if dry_run else []) + (["-q"] if quiet else [])
+        argv += ["-I", str(idle_h)] if idle_h is not None else []
+        return _reap_idle_fanout(argv)
+    min_idle_s = _tab_idle_threshold_h(idle_h) * 3600.0
+    if not _is_up(port):
+        if not quiet:
+            print("✅ browser is down — nothing to reap.")
+        return 0
+    if dry_run:
+        rc, run = _reap_idle_pass(
+            port, dry_run=True, min_idle_s=min_idle_s, max_n=max_n
+        )
+        _reap_idle_summary(run, dry_run=True, quiet=False)
+        return rc
+    rc, maybe = _reap_idle_coordinated(
+        port, min_idle_s=min_idle_s, max_n=max_n, quiet=quiet
+    )
+    if maybe is not None:
+        _reap_idle_summary(maybe, dry_run=False, quiet=quiet)
+    return rc
+
+
+def _fanout_pinned_env() -> bool:
+    """`reap-idle -A` in a run already pinned to ONE browser acts on it alone."""
+    return bool(
+        INSTANCE
+        or os.environ.get("CLAUDE_BROWSER_CDP_PORT")
+        or os.environ.get("CLAUDE_BROWSER_CACHE_DIR")
+    )
+
+
+def _reap_idle_summary(run: ReapIdleRun, *, dry_run: bool, quiet: bool) -> None:
+    skips = ", ".join(f"{n} {why}" for why, n in sorted(run.skipped.items()))
+    if dry_run:
+        print(
+            f"✅ dry run: {len(run.would)} tab(s) would be closed"
+            + (f"; kept: {skips}" if skips else "")
+        )
+    elif run.closed or run.failed or not quiet:
+        mark = "❌" if run.failed else "✅"
+        print(
+            f"{mark} closed {len(run.closed)} idle tab(s)"
+            + (f", {len(run.failed)} failed" if run.failed else "")
+            + (f"; kept: {skips}" if skips else "")
+        )
+
+
 def _instance_pinned(args: argparse.Namespace) -> bool:
     """This process is pinned to ONE browser: an explicit non-default
     instance, any `--cdp-port` on the command line (`_self_run` always passes
@@ -16462,7 +17600,26 @@ def _dispatch(args: argparse.Namespace, port: int) -> int:
     if args.cmd == "down":
         return cmd_down(port, args.force, getattr(args, "force_maintenance", False))
     if args.cmd == "open":
-        return cmd_open(port, args.url, reuse=args.reuse, new=args.new)
+        return cmd_open(port, args.url, reuse=args.reuse, new=args.new, keep=args.keep)
+    if args.cmd == "tabs":
+        return cmd_tabs(args, port)
+    if args.cmd == "keep":
+        return cmd_keep(
+            port,
+            args.tids,
+            args.origins or [],
+            release=args.release,
+            list_only=args.list,
+        )
+    if args.cmd == "reap-idle":
+        return cmd_reap_idle(
+            port,
+            dry_run=args.dry_run,
+            idle_h=args.idle_hours,
+            max_n=args.max,
+            all_instances=args.all_instances,
+            quiet=args.quiet,
+        )
     if args.cmd == "eval":
         return cmd_eval(
             port, args.js, args.url, timeout_s=args.timeout, target=args.target
