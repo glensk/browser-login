@@ -25,8 +25,10 @@ Checked in this order (every refusal: a code + a detail with names only):
 4. live rotation lease or ``agent_hold`` → ``held``; a fresh read
    (``Vault.fill_secret``: a hold found there is ``held`` too) →
    ``no_password`` / ``unknown_field`` / ``vault_error``;
-5. every value registered with the secretkeeper (labels
-   ``loginbroker:fill.<site>:<field>``) → ``leakcheck_unavailable``;
+5. the password registered with the secretkeeper (label
+   ``loginbroker:fill.<site>:password``) → ``leakcheck_unavailable``; the
+   username too, best effort (the secretkeeper drops values below its
+   length floor; a username is never a refusal);
 6. the attended gate (``broker/attended.py``) → ``unattended``;
 7. the limiter, charged only now: ``fill:<site>`` / ``filltotp:<site>`` and
    ``fill:*``, plus at most ``FILL_DISTINCT_MAX`` distinct sites per rolling
@@ -235,14 +237,21 @@ class FillOps:  # pylint: disable=too-few-public-methods
         read = self._fill_read(site, fields)
         if "error" in read:
             return site, read
-        entries = [
-            (f"{FILL_LABEL_PREFIX}{site}", f, v)
-            for f, v in read.get("values", {}).items()
-        ]
-        try:
-            self.leakcheck.register(entries)
-        except LeakCheckUnavailable as exc:
-            return site, _err("leakcheck_unavailable", str(exc))
+        label = f"{FILL_LABEL_PREFIX}{site}"
+        got = read.get("values", {})
+        # the password must be registered (fail closed); a username is an
+        # identifier the page shows anyway: registered when the secretkeeper
+        # takes it, never a refusal (it drops values below its length floor)
+        if "password" in got:
+            try:
+                self.leakcheck.register([(label, "password", got["password"])])
+            except LeakCheckUnavailable as exc:
+                return site, _err("leakcheck_unavailable", str(exc))
+        if "username" in got:
+            try:
+                self.leakcheck.register([(label, "username", got["username"])])
+            except LeakCheckUnavailable:
+                pass
         if self.allow_uid is None:  # unreachable: _fill_op checked it
             return site, _err("forbidden")
         why = self.attended(self.allow_uid)

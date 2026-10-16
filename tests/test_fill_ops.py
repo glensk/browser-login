@@ -134,6 +134,7 @@ class Events:
         self.log: list[str] = []
         self.attended: str | None = None
         self.leak_down = False
+        self.leak_refuse: set[str] = set()
         self.registered: list[tuple[str, str, str]] = []
 
 
@@ -145,7 +146,7 @@ class FakeLeak:
 
     def register(self, entries: list[tuple[str, str, str]]) -> None:
         self.ev.log.append("leakcheck")
-        if self.ev.leak_down:
+        if self.ev.leak_down or any(f in self.ev.leak_refuse for _i, f, _v in entries):
             raise leakcheck.LeakCheckUnavailable("secretkeeper not reachable")
         self.ev.registered.extend(entries)
 
@@ -232,10 +233,10 @@ def test_fill_returns_requested_values_registers_and_audits_once(env, vals):
         "site": "shop",
         "values": {"username": vals.user, "password": vals.pw},
     }
-    assert ev.log == ["leakcheck", "attended"]
+    assert ev.log == ["leakcheck", "leakcheck", "attended"]
     assert ev.registered == [
-        ("fill.shop", "username", vals.user),
         ("fill.shop", "password", vals.pw),
+        ("fill.shop", "username", vals.user),
     ]
     rows = _audit(home)
     assert len(rows) == 1
@@ -421,7 +422,7 @@ def test_unattended_after_leakcheck_before_limiter(env, why):
     ev.attended = why
     resp = _fill(brk)
     assert resp == {"ok": False, "error": "unattended", "detail": why}
-    assert ev.log == ["leakcheck", "attended"]
+    assert ev.log == ["leakcheck", "leakcheck", "attended"]
     assert _charged(home) == set()
     assert not (home / fill_ops.FILL_DISTINCT_FILE).exists()
 
@@ -605,3 +606,19 @@ def test_attended_reads_the_given_uid():
 
     assert attended.attended(777, run) is None
     assert attended.attended(778, run) == "not_on_console"
+
+
+def test_username_the_secretkeeper_drops_is_no_refusal(env, vals):
+    brk, ev, _home, _vpath, _clock = env
+    ev.leak_refuse = {"username"}
+    resp = _fill(brk)
+    assert resp["ok"] is True
+    assert ev.registered == [("fill.shop", "password", vals.pw)]
+
+
+def test_password_the_secretkeeper_drops_refuses(env):
+    brk, ev, home, _vpath, _clock = env
+    ev.leak_refuse = {"password"}
+    resp = _fill(brk)
+    assert resp["error"] == "leakcheck_unavailable"
+    assert _charged(home) == set()
