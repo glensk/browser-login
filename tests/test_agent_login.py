@@ -609,6 +609,75 @@ def test_check_all_browser_dies_mid_run(monkeypatch) -> None:
     assert seen == ["a"]
 
 
+def _site_fails_run(monkeypatch, *, broker_ok: bool = True) -> list:
+    """`-c` over one ready site that stays logged out; the mails it sent."""
+    monkeypatch.setattr(al, "wait_for_network", lambda: True)
+    monkeypatch.setattr(al, "ensure_browser_up", lambda: True)
+    monkeypatch.setattr(al, "_browser", lambda *a, **_k: 0)  # never a real one
+    monkeypatch.setattr(al, "toolchain_report", list)
+    monkeypatch.setattr(al, "report_psl", lambda: "")
+    monkeypatch.setattr(
+        al,
+        "overview",
+        lambda: {
+            "broker_ok": broker_ok,
+            "broker": "ok" if broker_ok else "not reachable",
+            "rows": [_row("cscs", "ready")],
+        },
+    )
+    monkeypatch.setattr(
+        al, "ensure_logged_in", lambda site, gate=None: (False, "NOT logged in", {})
+    )
+    sent: list = []
+    monkeypatch.setattr(al, "send_mail", lambda *a: sent.append(a))
+    return sent
+
+
+def test_check_all_site_failure_on_record_exits_0(monkeypatch) -> None:
+    """tp#1127: a site that stays logged out is reported by infra/status's
+    mac/agent-login row (last-check.json); the run itself completed, so the
+    daily job exits 0 and launchd-health does not report it again. The mail
+    still goes out."""
+    sent = _site_fails_run(monkeypatch)
+    assert al.check_all(mail=True) == 0
+    assert len(sent) == 1
+    legacy = al.als.read(al.als.LEGACY_FILE)
+    assert legacy["cscs"]["ok"] is False
+
+
+def test_check_all_broker_down_exits_1(monkeypatch) -> None:
+    """A failure no site row carries (the broker) keeps the job red."""
+    _site_fails_run(monkeypatch, broker_ok=False)
+    assert al.check_all() == 1
+
+
+def test_check_all_unrecorded_site_failure_exits_1(monkeypatch) -> None:
+    """A site's ❌ that never reached last-check.json is reported by nobody
+    else: exit 1."""
+    _site_fails_run(monkeypatch)
+    monkeypatch.setattr(al, "record_check", lambda *a, **k: None)
+    assert al.check_all() == 1
+
+
+def test_check_exit_labels(monkeypatch) -> None:
+    """Only site rows with ok=false on record count as reported elsewhere."""
+    del monkeypatch
+    al.als.update(
+        al.als.LEGACY_FILE,
+        lambda d: d.update(
+            {
+                "a": {"ok": False, "how": "x", "at": "2026-10-17 09:15"},
+                "b": {"ok": True, "how": "x", "at": "2026-10-17 09:15"},
+            }
+        ),
+    )
+    assert al.check_exit([]) == 0
+    assert al.check_exit([("a", "x")]) == 0
+    assert al.check_exit([("a", "x"), ("b", "x")]) == 1
+    assert al.check_exit([("a", "x"), ("toolchain", "stale")]) == 1
+    assert al.check_exit([("shared Chromium", "down")]) == 1
+
+
 # --- every browser.py call has an explicit time budget (tp#843) --------------------
 
 _REPO = Path(__file__).resolve().parent.parent

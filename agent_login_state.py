@@ -568,7 +568,8 @@ def scheduled_gate(  # pylint: disable=too-many-return-statements
                 "config_unknown",
                 (
                     "promoted with an older (or no) config record — adopted after "
-                    "a fresh strict check, or re-promote"
+                    "a fresh strict check (logged out: agent-login.py -t gives "
+                    "one), or re-promote"
                 ),
             )
         if stored != config:

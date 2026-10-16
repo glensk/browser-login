@@ -481,9 +481,11 @@ def test_check_all(monkeypatch, capsys) -> None:
 
     monkeypatch.setattr(al, "ensure_logged_in", ensure)
     monkeypatch.setattr(al, "send_mail", send)
-    assert al.check_all(mail=False) == 1
+    # tutti's ❌ is on record in last-check.json (infra/status reports it):
+    # the completed run exits 0 (tp#1127)
+    assert al.check_all(mail=False) == 0
     assert seen == ["anibis", "tutti"] and not mails
-    assert al.check_all(mail=True) == 1
+    assert al.check_all(mail=True) == 0
     assert len(mails) == 1
     subject, body = mails[0]
     assert "1 site(s)" in subject

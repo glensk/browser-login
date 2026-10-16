@@ -2368,7 +2368,8 @@ def schedule_gate(row: dict) -> tuple[str, str] | None:  # pylint: disable=too-m
     if not promoted or row.get("promoted_config_v") != onboarding.CONFIG_V:
         return "config_unknown", (
             "promoted with an older (or no) config record — adopted at the next "
-            "./agent-login.py -S after a fresh strict ✅, or re-promote: "
+            "./agent-login.py -S after a fresh strict ✅ (logged out: "
+            f"./agent-login.py -t {site} gives one), or re-promote: "
             f"./agent-login.py -p {site}"
         )
     if row.get("config") and promoted != row.get("config"):
@@ -2509,9 +2510,9 @@ def _unproven_skipped(row: dict) -> bool:
 def check_all(*, mail: bool = False) -> int:  # pylint: disable=too-many-branches
     """Every usable site (Safari or broker): logged in? If not — and a
     scheduled login is allowed (`schedule_gate`) — ONE `browser.py login -s`.
-    One line per site; exit 1 if any stays logged out (and, with `mail`, ONE
-    mail). Waits for the network first; still offline after 5 min = every
-    row `unknown`, no mail."""
+    One line per site; with `mail`, ONE mail when any stays logged out. The
+    exit code is `check_exit`'s. Waits for the network first; still offline
+    after 5 min = every row `unknown`, no mail."""
     if not wait_for_network():
         print(f"⏸  no network ({NETWORK_HOST} does not resolve) — skipped, no mail")
         _record_unchecked(overview(), "offline", "no network — not checked")
@@ -2551,7 +2552,27 @@ def check_all(*, mail: bool = False) -> int:  # pylint: disable=too-many-branche
         _check_role_instance(inst, by_instance.pop(inst, []), failed)
     if failed and mail:
         send_mail(*failure_mail(failed))
-    return 1 if failed else 0
+    return check_exit(failed)
+
+
+def check_exit(failed: list[tuple[str, str]]) -> int:
+    """`-c`'s exit code: 0 when the run completed and every failure is a site
+    whose ❌ is in last-check.json — infra/status's mac/agent-login row
+    reports those, so the daily job's launchd row must not report them a
+    second time (tp#1127). 1 when anything else failed (broker, a browser,
+    toolchain, Public Suffix List) or a site's ❌ is not on record there; a
+    crash stays an uncaught exit 1."""
+    if not failed:
+        return 0
+    try:
+        legacy = als.read(als.LEGACY_FILE, strict=True)
+    except (als.StateError, OSError):
+        return 1
+    for label, _how in failed:
+        rec = legacy.get(label)
+        if not (isinstance(rec, dict) and rec.get("ok") is False):
+            return 1
+    return 0
 
 
 def check_instance(row: dict) -> str:
@@ -3867,7 +3888,8 @@ def build_parser() -> argparse.ArgumentParser:
         "--check-all",
         action="store_true",
         help="every usable site: logged in? if not, `browser.py login`; one line "
-        "per site, exit 1 if any stays logged out",
+        "per site; exit 0 when every failure is a site on record in "
+        "last-check.json, 1 when the broker, a browser or the check failed",
     )
     ap.add_argument(
         "-m",

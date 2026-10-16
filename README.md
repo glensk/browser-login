@@ -1436,7 +1436,7 @@ Fill-only items (`agent_fill_only = true`, tp#1082): the broker never logs in wi
 | `-t`, `--test` `SITE` | real login test for SITE |
 | `-g`, `--guided` `SITE` | guided login by hand (browser.py assisted-login: confirm on the terminal, remote view of a headless tab; the window as fallback) |
 | `-F`, `--force` | with -g: start even with UNREGISTERED CDP clients attached (browser.py assisted-login -f; they are not paused and keep running); with -D: log out even when another account's item shares the scope in the same browser instance |
-| `-c`, `--check-all` | every usable site: logged in? if not, `browser.py login`; one line per site, exit 1 if any stays logged out |
+| `-c`, `--check-all` | every usable site: logged in? if not, `browser.py login`; one line per site; exit 0 when every failure is a site on record in last-check.json, 1 when the broker, a browser or the check failed |
 | `-m`, `-M`, `--mail` | with -c: mail `albert.glensk@gmail.com` (gog) when a site stays logged out |
 | `-r`, `--refresh` | ask the broker now (re-reads Bitwarden, ~40 s) instead of the snapshot |
 | `-S`, `--snapshot` | recover a stale guided login whose watchdog died (one line), refresh the site-list and secret-run snapshots and the agents file (which also lists the secrets agents can inject), print nothing else (LaunchAgent, every 10 min) |
