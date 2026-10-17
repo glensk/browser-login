@@ -384,15 +384,23 @@ def broker_state(*, fresh: bool = False) -> tuple[str, list[dict]]:
 
 
 def adopt_configs(sites: list[dict]) -> list[str]:
-    """WS3 migration, from a FRESH live listing only: a site promoted before
-    the config digest existed adopts its current digest once (audited)."""
-    digests = {
-        str(s.get("site")): onboarding.config_digest(s)
+    """WS3 migration, from a FRESH live listing only: a site promoted with an
+    older (or no) config digest adopts its current digest once (audited) —
+    at once when its config is unchanged, else after a fresh strict ✅."""
+    listed = [
+        s
         for s in sites
         if s.get("site") and not s.get("refused") and not is_fill_only(s)
+    ]
+    digests = {str(s["site"]): onboarding.config_digest(s) for s in listed}
+    legacy = {
+        str(s["site"]): {
+            v: onboarding.legacy_digests(s, v) for v in range(1, onboarding.CONFIG_V)
+        }
+        for s in listed
     }
     with contextlib.suppress(als.StateError, OSError):
-        return als.adopt_configs(digests)
+        return als.adopt_configs(digests, legacy=legacy)
     return []
 
 

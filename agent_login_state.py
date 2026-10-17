@@ -31,7 +31,7 @@ import subprocess
 import sys
 import tempfile
 import time
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterator, Mapping
 from pathlib import Path
 from typing import Any
 
@@ -483,32 +483,48 @@ def strict_fresh_ok(rec: dict[str, Any] | None, now: float | None = None) -> boo
         return False
 
 
-def adopt_configs(digests: dict[str, str], now: float | None = None) -> list[str]:
+def adopt_configs(
+    digests: dict[str, str],
+    now: float | None = None,
+    legacy: Mapping[str, Mapping[int, frozenset[str]]] | None = None,
+) -> list[str]:
     """WS3 migration: a ``usable`` entry whose promotion was recorded with an
     OLDER digest version (or none: before WS3) adopts its CURRENT digest
-    (`digests`, of the current `CONFIG_V`) — only while its latest check is
-    a fresh strict ✅ (`strict_fresh_ok`), audited. A current-version
-    promotion is never re-adopted (a changed item stays ``changed``). Call
-    it only with a FRESH live listing. Returns the adopting sites."""
+    (`digests`, of the current `CONFIG_V`), audited, when
+
+    - its stored digest is one the item's CURRENT config gives under that
+      older version (`legacy`: site -> version -> digests,
+      ``onboarding.legacy_digests``) — the config is unchanged, so it
+      migrates whatever its last check said (tp#1127: a site that was ❌
+      when the version changed was never migrated and stayed refused); or
+    - its latest check is a fresh strict ✅ (`strict_fresh_ok`) — the only
+      way for a promotion without a recomputable digest.
+
+    A current-version promotion is never re-adopted (a changed item stays
+    ``changed``). Call it only with a FRESH live listing. Returns the
+    adopting sites."""
     ts: float = time.time() if now is None else now
     recs = checks()
     adopted: list[str] = []
+    known = legacy or {}
 
     def put(data: dict[str, Any]) -> None:
         for site, digest in digests.items():
             entry = data.get(site)
             if not isinstance(entry, dict) or entry.get("stage") != "usable":
                 continue
-            if _config_v(entry) >= CONFIG_V or not CONFIG_RE.match(digest or ""):
-                continue
-            if not strict_fresh_ok(recs.get(site), ts):
-                continue
             old = _config_v(entry)
+            if old >= CONFIG_V or not CONFIG_RE.match(digest or ""):
+                continue
+            same = entry.get("config") in known.get(site, {}).get(old, frozenset())
+            if not same and not strict_fresh_ok(recs.get(site), ts):
+                continue
             entry["config"] = digest
             entry["config_v"] = CONFIG_V
-            entry.setdefault("audit", []).append(
-                _audit_entry("adopt_config", f"config_v {old} -> {CONFIG_V}", ts)
+            why = f"config_v {old} -> {CONFIG_V}" + (
+                ", config unchanged" if same else ""
             )
+            entry.setdefault("audit", []).append(_audit_entry("adopt_config", why, ts))
             adopted.append(site)
 
     update(SITE_STATE_FILE, put, strict=True)

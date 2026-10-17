@@ -247,10 +247,19 @@ def _ip(host: str) -> ipaddress.IPv4Address | ipaddress.IPv6Address | None:
 # ---------------------------------------------------------------------------
 
 # The config digest's version (stored with every promotion as `config_v`):
-# bump it whenever `config_canon` changes; a promotion of an older version
-# re-adopts the current digest only after a fresh strict check
-# (agent_login_state.adopt_configs). 2: `fill_only` + `safari_fill` (tp#1082).
-CONFIG_V = 2
+# bump it whenever `config_canon` changes, keeping the older canons
+# computable; a promotion of an older version re-adopts the current digest
+# when its config is unchanged (`legacy_digests`), else only after a fresh
+# strict check (agent_login_state.adopt_configs). 2: `fill_only` + `safari_fill` (tp#1082).
+# 3: `safari_fill` left out again (tp#1127): opting an item in to Safari fill
+# changes nothing the broker's own login does, so it must not demote a site.
+CONFIG_V = 3
+
+# Item fields that only govern filling into Albert's Safari: never part of
+# the digest from version 3 on. An older digest is recomputed with every
+# value they can take (`legacy_digests`), so a site whose config is
+# otherwise unchanged migrates whatever its Safari opt-in is.
+SAFARI_ONLY_FIELDS = ("safari_fill",)
 
 
 def _strs(value: object) -> list[str]:
@@ -271,7 +280,7 @@ def _scope_canon(view: Mapping[str, Any]) -> list[str]:
     return sorted({f"{s.host}{s.path}" for s in scopes})
 
 
-def config_canon(view: Mapping[str, Any]) -> dict[str, Any]:
+def config_canon(view: Mapping[str, Any], version: int = CONFIG_V) -> dict[str, Any]:
     """The configuration a promotion holds for: what the VAULT item says,
     canonicalised - never a view-format detail or a flag the broker's code
     derives (``strict_proof``, a default ``session_refresh``, the built-in
@@ -282,7 +291,12 @@ def config_canon(view: Mapping[str, Any]) -> dict[str, Any]:
     changes what the proof means); a login URL equal to its default (the
     check URL, else the first fill origin's root) is dropped; lists whose
     order carries no meaning are sorted, empty values normalised; `alias`
-    and `name` are labels, not behaviour."""
+    and `name` are labels, not behaviour.
+
+    `version` (1 .. CONFIG_V) gives that version's canon, for the migration
+    of older promotions (`legacy_digests`)."""
+    if not 1 <= version <= CONFIG_V:
+        raise ValueError(f"unknown config version {version}")
     fill = sorted(o.lower() for o in _strs(view.get("fill_origins")))
     check = str(view.get("check_url") or "")
     login = str(view.get("login_url") or "")
@@ -292,8 +306,8 @@ def config_canon(view: Mapping[str, Any]) -> dict[str, Any]:
     pairs = raw_storage.items() if isinstance(raw_storage, Mapping) else []
     storage = {str(o).lower(): sorted(_strs(k)) for o, k in pairs}
     days = view.get("max_session_days")
-    return {
-        "v": CONFIG_V,
+    canon = {
+        "v": version,
         "fill_origins": fill,
         "check_url": check,
         "login_url": "" if login in defaults else login,
@@ -317,13 +331,35 @@ def config_canon(view: Mapping[str, Any]) -> dict[str, Any]:
         "identity": str(view.get("identity") or ""),
         "same_account_as": sorted(set(_strs(view.get("same_account_as")))),
     }
+    if version < 2:
+        del canon["fill_only"], canon["safari_fill"]
+    elif version >= 3:
+        for key in SAFARI_ONLY_FIELDS:
+            del canon[key]
+    return canon
 
 
-def config_digest(view: Mapping[str, Any]) -> str:
+def config_digest(view: Mapping[str, Any], version: int = CONFIG_V) -> str:
     """sha256 (hex) of `config_canon` (canonical JSON; the version is part
     of it, so digests of two versions never compare equal)."""
-    text = json.dumps(config_canon(view), sort_keys=True, separators=(",", ":"))
+    text = json.dumps(
+        config_canon(view, version), sort_keys=True, separators=(",", ":")
+    )
     return hashlib.sha256(text.encode()).hexdigest()
+
+
+def legacy_digests(view: Mapping[str, Any], version: int) -> frozenset[str]:
+    """Every digest `view` could have had under the OLDER `version`, with
+    each field the current version leaves out (`SAFARI_ONLY_FIELDS`) at each
+    value it can take: a promotion stored with one of them holds the item's
+    current config (agent_login_state.adopt_configs). Empty for the current
+    or an unknown version."""
+    if not 1 <= version < CONFIG_V:
+        return frozenset()
+    variants: list[dict[str, Any]] = [dict(view)]
+    for key in SAFARI_ONLY_FIELDS:
+        variants = [{**v, key: flag} for v in variants for flag in (False, True)]
+    return frozenset(config_digest(v, version) for v in variants)
 
 
 # ---------------------------------------------------------------------------
@@ -1131,6 +1167,7 @@ __all__ = [
     "is_public_suffix",
     "item_findings",
     "item_from_view",
+    "legacy_digests",
     "registrable_domain",
     "review_planned",
     "risk_findings",

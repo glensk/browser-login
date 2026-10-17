@@ -803,10 +803,14 @@ that actually happened in October 2026.
    - A promotion holds for ONE configuration: the digest of what the vault
      item says (`onboarding.config_canon`, versioned `CONFIG_V`; never a
      view-format detail or a flag the broker's code derives, so a broker
-     release does not change it). A changed item (another sentinel, scope,
+     release does not change it). Opting an item in to Safari fill
+     (`agent_safari_fill`) is not part of it: it changes nothing the
+     broker's own login does. A changed item (another sentinel, scope,
      URL, instance …) is `changed` and not logged in by `-c` until it is
      promoted again. A promotion of an older (or no) digest version is
-     `config_unknown` and adopts the current digest at the next `-S` — only
+     `config_unknown` and adopts the current digest at the next `-S`: at
+     once when the item's config is unchanged (its digest recomputed under
+     the old version matches, whatever the last check said), else only
      while its latest check is a fresh strict ✅.
    - The client state (stage, budget, quarantine) is policy and audit, not a
      security boundary: every same-uid agent can write it. The boundary is

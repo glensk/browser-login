@@ -170,6 +170,78 @@ def test_adoption_runs_only_from_a_fresh_listing(
     assert als.site_states()["app"]["config"] == onboarding.config_digest(view)
 
 
+def _older(site: str, config: str, version: int) -> None:
+    """Record `site`'s promotion as one of digest `version`."""
+    als.promote(site, config=config)
+
+    def put(data: dict) -> None:
+        data[site]["config_v"] = version
+
+    als.update(als.SITE_STATE_FILE, put)
+
+
+def test_an_unchanged_config_migrates_whatever_its_last_check(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """tp#1127: a site that was ❌ when the version changed migrates when its
+    config is unchanged; one opted in to Safari fill since migrates too."""
+    view = _view()
+    _older("app", onboarding.config_digest(view, 2), 2)
+    als.record_check("app", "failed", "x", proof_v=1)  # its last check: ❌
+    safari = {**view, "site": "shop", "safari_fill": True}
+    _older("shop", onboarding.config_digest(view, 2), 2)  # opted in since
+    monkeypatch.setattr(
+        al,
+        "_broker_state_live",
+        lambda **_k: ("running, Bitwarden readable", [view, safari]),
+    )
+    monkeypatch.setattr(al.os.path, "exists", lambda _p: True)
+    al.broker_state(fresh=True)
+    for site, listed in (("app", view), ("shop", safari)):
+        entry = als.site_states()[site]
+        assert entry["config_v"] == onboarding.CONFIG_V
+        assert entry["config"] == onboarding.config_digest(listed)
+        assert entry["audit"][-1]["why"].endswith("config unchanged")
+        assert als.scheduled_gate(site, config=entry["config"]) == (True, "", "")
+
+
+def test_a_version_1_promotion_with_an_unchanged_config_migrates(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """tp#1127: the 1 -> 2 bump stranded a ❌ site (dsm-albert); a version-1
+    digest recomputed from the unchanged item migrates it now."""
+    view = _view()
+    _older("app", onboarding.config_digest(view, 1), 1)
+    als.record_check("app", "failed", "x", proof_v=1)
+    monkeypatch.setattr(
+        al, "_broker_state_live", lambda **_k: ("running, Bitwarden readable", [view])
+    )
+    monkeypatch.setattr(al.os.path, "exists", lambda _p: True)
+    al.broker_state(fresh=True)
+    entry = als.site_states()["app"]
+    assert entry["config_v"] == onboarding.CONFIG_V
+    assert entry["audit"][-1]["why"] == f"config_v 1 -> {onboarding.CONFIG_V}, " + (
+        "config unchanged"
+    )
+
+
+def test_a_changed_config_still_needs_a_fresh_strict_check(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    view = _view()
+    _older("app", "a" * 64, 2)  # promoted for another config
+    als.record_check("app", "failed", "x", proof_v=1)
+    monkeypatch.setattr(
+        al, "_broker_state_live", lambda **_k: ("running, Bitwarden readable", [view])
+    )
+    monkeypatch.setattr(al.os.path, "exists", lambda _p: True)
+    al.broker_state(fresh=True)
+    assert als.site_states()["app"]["config_v"] == 2
+    assert als.scheduled_gate("app", config=onboarding.config_digest(view))[1] == (
+        "config_unknown"
+    )
+
+
 def test_check_records_keep_only_a_wellformed_digest() -> None:
     assert als.record_check("s", "ok", "x", config="f" * 64)["config"] == "f" * 64
     assert als.record_check("s", "ok", "x", config="not a digest")["config"] == ""

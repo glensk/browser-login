@@ -427,12 +427,28 @@ def test_a_secrets_collection_copy_is_refused_too(tmp_path, vals):
 # ---------------------------------------------------------------------------
 
 
-def test_digest_changes_with_fill_only_and_safari_fill(vals):
+def test_digest_changes_with_fill_only_not_with_safari_fill(vals):
+    """tp#1127: the Safari opt-in never demotes a broker site (version 3)."""
     view = _site(_shop(vals)).public()
     digest = onboarding.config_digest(view)
     assert onboarding.config_digest({**view, "fill_only": True}) != digest
-    assert onboarding.config_digest({**view, "safari_fill": True}) != digest
-    assert onboarding.config_canon(view)["v"] == onboarding.CONFIG_V == 2
+    assert onboarding.config_digest({**view, "safari_fill": True}) == digest
+    assert onboarding.config_canon(view)["v"] == onboarding.CONFIG_V == 3
+    assert "safari_fill" not in onboarding.config_canon(view)
+    # version 2 hashed the opt-in: both of its values are a legacy digest
+    v2 = onboarding.legacy_digests(view, 2)
+    assert v2 == {
+        onboarding.config_digest({**view, "safari_fill": f}, 2) for f in (False, True)
+    }
+    assert len(v2) == 2 and digest not in v2
+    assert onboarding.legacy_digests({**view, "safari_fill": True}, 2) == v2
+    assert onboarding.legacy_digests({**view, "fill_only": True}, 2).isdisjoint(v2)
+    assert "fill_only" not in onboarding.config_canon(view, 1)
+    assert len(onboarding.legacy_digests(view, 1)) == 1  # no excluded field yet
+    assert not onboarding.legacy_digests(view, onboarding.CONFIG_V)
+    assert not onboarding.legacy_digests(view, 0)
+    with pytest.raises(ValueError):
+        onboarding.config_canon(view, onboarding.CONFIG_V + 1)
 
 
 def test_review_has_no_login_findings_for_a_fill_only_item(vals):

@@ -317,7 +317,10 @@ framework. It is a **provider**: other repos depend on it, not the reverse. See
   config (`config_canon`, versioned `CONFIG_V`: never hash a view-format
   detail or a code-derived flag, or a broker release flips every promotion;
   `changed` / `config_unknown` stop `login -s`; an older version re-adopts
-  only after a fresh strict ✅). `-t` of a not-usable broker site takes the
+  at the next `-S` when `onboarding.legacy_digests` shows the config
+  unchanged, whatever the last check said, else only after a fresh strict
+  ✅; Safari-fill-only fields (`SAFARI_ONLY_FIELDS`: `safari_fill`) are
+  never hashed, tp#1127). `-t` of a not-usable broker site takes the
   same budget. Removal is `-D SITE` twice (listed: demote + logout incl.
   storage, skipped when a sibling account shares the scope in the same
   instance unless `-F`; gone: the daemon's `forget` op under its site lock
