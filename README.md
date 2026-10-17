@@ -738,7 +738,14 @@ enrolled Touch ID approval (`vault-touchid enroll -a main`, mydotfiles
 main vault, one after the vault-touchid window has shown every change — and the
 master password never reaches the agent. Without the enrolment it asks for the
 typed master password in a terminal. `-N` (new items from the Keychain) is not
-available through Touch ID; it needs `-P` in a terminal.
+available through Touch ID; it needs `-P` in a terminal. On an item that
+already carries `agent_fill_origins` / `agent_check_url` / `agent_cookie_hosts`,
+a run that derives the login fields (a derive option, a batch row with a
+`site` cell, `-Z`) keeps them unless `-o` / `-c` / `-k` name new ones. A run
+that would drop a fill origin without `-o`, or move the check URL without
+`-c`, is refused (exit 2, nothing written). A re-derivation once moved the
+CSCS check URL onto its Keycloak login origin and broke the broker login
+(tp#1133).
 
 ### Adding a site to the broker (WS3)
 
