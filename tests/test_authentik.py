@@ -67,9 +67,11 @@ REVIEWED = dataclasses.replace(
     admin_false_confirmed=False,
     null_may_be_absent=False,
 )
-# the live recipe plus a confirmed "not admin" answer (no non-admin
-# authentik account exists to confirm it for real)
+# the live recipe: both answers confirmed (the "not admin" one live
+# 2026-10-18 against the non-admin account test3)
 CONFIRMED = dataclasses.replace(RECIPE, admin_false_confirmed=True)
+# the recipe before that: only the "admin" answer confirmed
+ADMIN_ONLY = dataclasses.replace(RECIPE, admin_false_confirmed=False)
 _PW_KEY = "pass" + "word"
 CHROME = pytest.mark.skipif(
     not chromium_available() or shutil.which("openssl") is None,
@@ -630,7 +632,7 @@ def _no_leak(text: str, ak: _Authentik) -> None:
 
 
 def test_the_authentik_items_use_the_flow_executor_recipe() -> None:
-    for site in ("authentik-glensk", "authentik-akadmin"):
+    for site in ("authentik-glensk", "authentik-akadmin", "authentik-test3"):
         assert recipes.recipe_for(site) is authentik.authentik_login
     assert recipes.recipe_for("authentik-other") is recipes.generic_login
     assert recipes.recipe_for("cscs") is recipes.cscs_login
@@ -1120,23 +1122,48 @@ def test_identity_another_origin_is_refused(run_recipe: Any) -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_the_spec_is_live_confirmed_for_admin_items_only() -> None:
+def test_the_spec_is_live_confirmed_both_ways() -> None:
     assert identity.recipe_problem(RECIPE) == ""
     assert RECIPE.id_field == ("user", "username")
     assert RECIPE.admin_field == ("user", "is_superuser")
     assert RECIPE.must_be_null == ("original",) and RECIPE.null_may_be_absent
     assert RECIPE.logged_out_json and RECIPE.origin == ORIGIN
-    # live 2026-10-13: the 200 answer and `is_superuser` true; no non-admin
-    # account exists, so the "not admin" side stays unconfirmed
+    # live 2026-10-13: the 200 answer and `is_superuser` true; live
+    # 2026-10-18: `is_superuser` false for the non-admin account test3
     assert RECIPE.live_confirmed and RECIPE.admin_true_confirmed
-    assert not RECIPE.admin_false_confirmed
+    assert RECIPE.admin_false_confirmed
+    assert RECIPE == CONFIRMED
+    assert RECIPE.allowed_sites == (
+        "authentik-akadmin",
+        "authentik-glensk",
+        "authentik-test3",
+    )
     assert identity.usable_recipe("authentik") is RECIPE
     args = identity.recipe_args(RECIPE, CHECK_URL, "0" * 64)
     assert args["origin"] == ORIGIN and args["path"] == ME
     assert args["logged_out_json"] is True and args["null_may_be_absent"] is True
 
 
-def test_only_privilege_admin_items_may_use_it() -> None:
+def test_every_privilege_may_use_it_on_its_sites() -> None:
+    for site in RECIPE.allowed_sites:
+        for privilege in ("admin", "user", "readonly"):
+            assert (
+                identity.recipe_refusal(
+                    "authentik", site=site, check_url=CHECK_URL, privilege=privilege
+                )
+                == ""
+            )
+            assert identity.proof_ready(_entry(site, privilege))
+    assert "reviewed for" in identity.recipe_refusal(
+        "authentik", site="authentik-other", check_url=CHECK_URL, privilege="user"
+    )
+    assert not identity.proof_ready(_entry("authentik-other", "user"))
+
+
+def test_only_privilege_admin_items_may_use_the_admin_only_recipe(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setitem(identity.IDENTITIES, "authentik", ADMIN_ONLY)
     for site in RECIPE.allowed_sites:
         assert (
             identity.recipe_refusal(
@@ -1148,7 +1175,7 @@ def test_only_privilege_admin_items_may_use_it() -> None:
             identity.item_recipe(
                 "authentik", site=site, check_url=CHECK_URL, privilege="admin"
             )
-            is RECIPE
+            is ADMIN_ONLY
         )
         assert identity.proof_ready(_entry(site, "admin"))
         for privilege in ("user", "readonly"):
@@ -1289,13 +1316,15 @@ def test_the_vault_pair_before_and_after_the_live_check(
         mp.setitem(identity.IDENTITIES, "authentik", REVIEWED)
         items = {it.site: it for it in vault.build_items(_pair(glensk, akadmin))}
         assert all("not live-confirmed" in str(it.refused) for it in items.values())
-    # the live recipe: valid; the admin item is proof-ready, the user item
-    # stays unproven (its "not admin" answer is unconfirmed)
-    items = {it.site: it for it in vault.build_items(_pair(glensk, akadmin))}
-    for it in items.values():
-        assert it.refused is None and it.multi_account
-    assert items["authentik-akadmin"].identity_recipe is RECIPE
-    assert items["authentik-glensk"].identity_recipe is None
+    # the admin-only recipe: valid; the admin item is proof-ready, the user
+    # item stays unproven (its "not admin" answer is unconfirmed)
+    with monkeypatch.context() as mp:
+        mp.setitem(identity.IDENTITIES, "authentik", ADMIN_ONLY)
+        items = {it.site: it for it in vault.build_items(_pair(glensk, akadmin))}
+        for it in items.values():
+            assert it.refused is None and it.multi_account
+        assert items["authentik-akadmin"].identity_recipe is ADMIN_ONLY
+        assert items["authentik-glensk"].identity_recipe is None
     # glensk is a superuser too: as `privilege admin` it is proof-ready
     raws = _pair(glensk, akadmin)
     raws[0]["fields"] = [
@@ -1330,6 +1359,103 @@ def test_the_vault_pair_before_and_after_the_live_check(
     assert "scope conflict" in str(items["authentik-glensk"].refused) + str(
         items["authentik-akadmin"].refused
     )
+
+
+def _trio(glensk: str, akadmin: str, test3: str) -> list[dict]:
+    """The live vault: glensk and akadmin are superusers (`privilege
+    admin`, in the default and the admin instance), test3 the non-admin
+    account (`privilege user`, in the alt instance, no alias)."""
+    ident = {"agent_identity": "authentik"}
+    return [
+        _raw(
+            "authentik-glensk",
+            glensk,
+            agent_privilege="admin",
+            agent_alias="authentik",
+            **ident,
+        ),
+        _raw(
+            "authentik-akadmin",
+            akadmin,
+            agent_privilege="admin",
+            agent_instance="admin",
+            **ident,
+        ),
+        _raw(
+            "authentik-test3",
+            test3,
+            agent_privilege="user",
+            agent_instance="alt",
+            **ident,
+        ),
+    ]
+
+
+def test_the_vault_trio_is_valid_and_proof_ready() -> None:
+    items = {it.site: it for it in vault.build_items(_trio(_name(), _name(), _name()))}
+    for site, privilege, instance in (
+        ("authentik-glensk", "admin", ""),
+        ("authentik-akadmin", "admin", "admin"),
+        ("authentik-test3", "user", "alt"),
+    ):
+        it = items[site]
+        assert it.refused is None and it.multi_account, site
+        assert it.privilege == privilege and it.identity_recipe is RECIPE, site
+        assert it.instance == instance, site
+    assert items["authentik-test3"].alias == ""
+    # test3 in the default instance next to glensk: a scope conflict
+    raws = _trio(_name(), _name(), _name())
+    raws[2]["fields"] = [f for f in raws[2]["fields"] if f["name"] != "agent_instance"]
+    items = {it.site: it for it in vault.build_items(raws)}
+    assert "scope conflict" in str(items["authentik-glensk"].refused) + str(
+        items["authentik-test3"].refused
+    )
+
+
+def _found(nonce: str, name: str, admin: object) -> dict:
+    norm = identity.normalize_identity(name)
+    assert norm is not None
+    return {
+        "state": "found",
+        "digest": identity.challenge_digest(nonce, norm),
+        "admin": admin,
+    }
+
+
+def test_test3_proves_as_user_only_on_a_non_admin_answer() -> None:
+    nonce = secrets.token_hex(32)
+    test3 = _name()
+    # `users/me` names test3 and says not admin: proven as `privilege user`
+    got = _found(nonce, test3, False)
+    assert identity.local_verdict(got, nonce, test3, "user") == identity.MATCH
+    # an admin answer for the user item is refused
+    got = _found(nonce, test3, True)
+    assert (
+        identity.local_verdict(got, nonce, test3, "user") == identity.PRIVILEGE_MISMATCH
+    )
+    # a non-admin answer naming another account is refused
+    got = _found(nonce, _name(), False)
+    assert identity.local_verdict(got, nonce, test3, "user") == identity.WRONG_ACCOUNT
+    # no admin bit (a missing or non-boolean `is_superuser`) proves nothing
+    for admin in (None, "false", 0):
+        got = _found(nonce, test3, admin)
+        assert (
+            identity.local_verdict(got, nonce, test3, "user") == identity.INDETERMINATE
+        )
+
+
+def test_glensk_and_akadmin_still_prove_as_admin_only() -> None:
+    nonce = secrets.token_hex(32)
+    name = _name()
+    got = _found(nonce, name, True)
+    assert identity.local_verdict(got, nonce, name, "admin") == identity.MATCH
+    got = _found(nonce, name, False)
+    assert (
+        identity.local_verdict(got, nonce, name, "admin") == identity.PRIVILEGE_MISMATCH
+    )
+    for site in ("authentik-glensk", "authentik-akadmin"):
+        assert recipes.recipe_for(site) is authentik.authentik_login
+        assert identity.proof_ready(_entry(site, "admin"))
 
 
 # ---------------------------------------------------------------------------

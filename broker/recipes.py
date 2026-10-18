@@ -3098,9 +3098,11 @@ def smartsheet_login(
 
 Recipe = Callable[..., None]
 
-# The broker items that log into authentik (one site, two accounts: WS5);
+# The broker items that log into authentik (one site, three accounts: WS5);
 # their recipe is ``broker.authentik.authentik_login``.
-AUTHENTIK_SITES = frozenset({"authentik-akadmin", "authentik-glensk"})
+AUTHENTIK_SITES = frozenset(
+    {"authentik-akadmin", "authentik-glensk", "authentik-test3"}
+)
 
 
 def recipe_for(site: str) -> Recipe:

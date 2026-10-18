@@ -1174,8 +1174,14 @@ IDENTITIES: dict[str, IdentityRecipe] = {
     # uid, username; `user.username` is the vault username and
     # `user.is_superuser` true — hence `admin_true_confirmed`. glensk is a
     # superuser too, so both items are `privilege admin`, told apart by
-    # username only. No non-admin account exists: `admin_false_confirmed`
-    # stays False, so a `privilege user` / `readonly` item stays unproven.
+    # username only.
+    #
+    # Live 2026-10-18 for the non-admin account test3 (authentik-test3,
+    # `privilege user`, value-free): authentik's own user record answers
+    # `is_superuser` false for it — hence `admin_false_confirmed`. A user
+    # item is proven only when `user.username` digests to the vault
+    # username AND `user.is_superuser` is false; a true answer is a
+    # privilege mismatch (`admin_verdict`).
     "authentik": IdentityRecipe(
         name="authentik",
         path="/api/v3/core/users/me/",
@@ -1184,11 +1190,12 @@ IDENTITIES: dict[str, IdentityRecipe] = {
         must_be_null=("original",),
         null_may_be_absent=True,
         logged_out_json=True,
-        allowed_sites=("authentik-akadmin", "authentik-glensk"),
+        allowed_sites=("authentik-akadmin", "authentik-glensk", "authentik-test3"),
         origin="https://auth.dev.renku.ch",
         live_confirmed=True,
         admin_true_confirmed=True,
-        admin_false_confirmed=False,
+        # confirmed live against the non-admin account test3
+        admin_false_confirmed=True,
         forms=("username",),
     ),
     # Run:ai (S4c B1, live 2026-10-11 as runai-test3, value-free): the SPA
