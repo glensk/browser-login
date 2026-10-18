@@ -48,6 +48,7 @@ Examples:
   ./agent-login.py -L galaxus-de -n  # what -L would do (no import, no Safari login)
   ./agent-login.py -R           # refresh-only pass (NPM tokens; LaunchAgent every 6 h)
   ./agent-login.py -l           # items agents can fill into Albert's Safari (safari.py -L)
+  ./agent-login.py -H runai-test3  # its identity proofs that did not say match (all: -H)
 
 Sites on Albert's session (Safari sites, galaxus-de, Notion, Slack, OpenAI,
 claude.ai) are renewed by AGENTS with -L — never a to-do for Albert, except
@@ -1232,6 +1233,8 @@ def record_check(
             origin_ok=r.get("origin_ok"),
             instance=inst,
             identity=str(r.get("identity") or ""),
+            identity_why=str(r.get("identity_why") or ""),
+            identity_status=r.get("identity_status"),
             config=str(r.get("config") or ""),
             server=str(r.get("server") or ""),
             cookie_days_left=r.get("cookie_days_left"),
@@ -1667,6 +1670,73 @@ def failure_how(res: dict, login_rc: int | None, check_rc: int | None = None) ->
 
 
 def run_test(site: str) -> int:
+    """`-t SITE`: `_test_site`, then the site's latest identity proofs that
+    did not say ``match`` (tp#1137) — the reason the latest record no longer
+    shows."""
+    site = resolve_site(site)
+    rc = _test_site(site)
+    lines = identity_history_lines(site, limit=TEST_HISTORY_LINES)
+    if lines:
+        print(f"ℹ️ {site}: identity proofs that did not say match (newest last):")
+        for line in lines:
+            print(f"  {line}")
+        print(f"  all of them: ./agent-login.py -H {site}")
+    return rc
+
+
+# `-t` shows this many of a site's identity history entries (`-H`: all).
+TEST_HISTORY_LINES = 3
+
+
+def identity_history_lines(site: str, limit: int | None = None) -> list[str]:
+    """One line per recorded non-``match`` identity proof of `site`
+    (``agent_login_state.identity_history``), oldest first; `limit` keeps
+    the newest ones."""
+    with contextlib.suppress(als.StateError, OSError):
+        hist = als.identity_history(site)
+        if limit is not None:
+            hist = hist[-limit:]
+        out = []
+        for e in hist:
+            why = f" why={e['why']}" if e.get("why") else ""
+            status = f" http={e['status']}" if e.get("status") is not None else ""
+            code = f" code={e['code']}" if e.get("code") else ""
+            detail = f" — {e['detail']}" if e.get("detail") else ""
+            out.append(
+                f"{e.get('at_text', '?')}  {e.get('state', '?')}  "
+                f"identity={e.get('identity', '?')}{why}{status}{code}{detail}"
+            )
+        return out
+    return []
+
+
+def identity_history_action(site: str, *, as_json: bool) -> int:
+    """`-H [SITE]`: the recorded identity proofs that did not say ``match``
+    (checks.json ``identity_history``, tp#1137) of SITE, or of every site
+    that has any. Read-only."""
+    try:
+        recs = als.checks()
+    except (als.StateError, OSError) as exc:
+        print(f"❌ checks.json unreadable: {exc}", file=sys.stderr)
+        return 1
+    sites = [resolve_site(site)] if site else sorted(recs)
+    data = {s: list((recs.get(s) or {}).get("identity_history") or []) for s in sites}
+    data = {s: h for s, h in data.items() if h or site}
+    if as_json:
+        print(json.dumps(data, indent=1))
+        return 0
+    if not any(data.values()):
+        where = f" for {site}" if site else ""
+        print(f"(no identity proof on record that did not say match{where})")
+        return 0
+    for s in data:
+        print(f"{s}:")
+        for line in identity_history_lines(s) or ["(none)"]:
+            print(f"  {line}")
+    return 0
+
+
+def _test_site(site: str) -> int:
     """Real end-to-end test: `browser.py login` (Safari session first for the
     SAFARI_SITES, else the login broker) → session in the shared Chromium → the
     client's POSITIVE check (check URL / sentinel, in a background tab).
@@ -1677,7 +1747,6 @@ def run_test(site: str) -> int:
     role instance (WS5) is tested there: the instance is started for the
     test if it was down, and stopped again afterwards (`instance_session`).
     """
-    site = resolve_site(site)
     static = site in ASSISTED_SITES or site in safari_cookies.SAFARI_SITES
     if not static:
         entry = next((s for s in _snapshot_sites() if s.get("site") == site), None)
@@ -4051,6 +4120,19 @@ def build_parser() -> argparse.ArgumentParser:
         help="with -L: report what it would do (no import, no Safari login)",
     )
     ap.add_argument(
+        "-H",
+        "--identity-history",
+        nargs="?",
+        const="",
+        default=None,
+        metavar="SITE",
+        help="read-only: the last identity proofs of SITE (no SITE: of every "
+        "site) that did not say match — when, state, verdict, the recipe's "
+        "reason word, HTTP status, code, redacted detail (checks.json keeps "
+        "the last 10 per site; the latest check overwrites its detail); "
+        "-j: JSON",
+    )
+    ap.add_argument(
         "-R",
         "--refresh-pass",
         action="store_true",
@@ -4099,6 +4181,18 @@ def login_action(args: argparse.Namespace) -> int | None:  # pylint: disable=too
     return None
 
 
+def listing_action(args: argparse.Namespace) -> int | None:
+    """-V / -H / -l (read-only, not even the agents file), or None when none
+    was asked for."""
+    if args.validate:
+        return validate_action(args.item, fresh=args.refresh)
+    if args.identity_history is not None:  # checks.json only
+        return identity_history_action(args.identity_history, as_json=args.json)
+    if args.fillable:  # names and origins only
+        return fillable_action(as_json=args.json, fresh=args.refresh)
+    return None
+
+
 # One early exit per CLI mode.
 def main() -> int:  # pylint: disable=too-many-return-statements,too-many-branches
     """CLI entry point."""
@@ -4130,12 +4224,10 @@ def main() -> int:  # pylint: disable=too-many-return-statements,too-many-branch
             "-L/--safari-login runs alone (not with -c/-S/-R/-I/-U/-t/-g/-p/-Q/-D/-E)"
         )
     rc = launch_action(args)
+    if rc is None:
+        rc = listing_action(args)
     if rc is not None:
         return rc
-    if args.validate:  # read-only: not even the agents file
-        return validate_action(args.item, fresh=args.refresh)
-    if args.fillable:  # read-only: names and origins only
-        return fillable_action(as_json=args.json, fresh=args.refresh)
     if args.snapshot:
         # First, before anything else touches the browser: a guided login
         # whose owner and watchdog both died leaves its record behind.

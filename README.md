@@ -689,6 +689,11 @@ and shows `phase · reason — detail 📷 screenshot` per ❌ row. `agents.md` 
 ever shows the fixed phase/code texts (no page text). `last-check.json` stays
 as a legacy projection (`ok`, `how`, `at`) for infra/status: `ok=false` is red;
 a check that could not tell (offline, busy) is `ok=false` and does not move `at`.
+Each record also keeps `identity_history`: the last 10 identity proofs that did
+not come back `match` (when, state, verdict, the recipe's fixed `why` word, HTTP
+status, code, redacted detail), because the next check overwrites `detail`.
+`agent-login.py -H [SITE]` lists them (`-j`: JSON); `-t SITE` prints the newest
+three after its verdict.
 
 `browser.py login SITE -G` (`--diag`) asks the broker for `bundle_diag` (request
 field `"diag": true`, audit-logged as `diag`): every cookie its profile holds on,
@@ -1430,6 +1435,7 @@ Examples:
 ./agent-login.py -L galaxus-de -n  # what -L would do (no import, no Safari login)
 ./agent-login.py -R           # refresh-only pass (NPM tokens; LaunchAgent every 6 h)
 ./agent-login.py -l           # items agents can fill into Albert's Safari (safari.py -L)
+./agent-login.py -H runai-test3  # its identity proofs that did not say match (all: -H)
 ```
 
 Sites on Albert's session (Safari sites, galaxus-de, Notion, Slack, OpenAI, claude.ai) are renewed by AGENTS with -L — never a to-do for Albert, except a CAPTCHA, an SMS code or a push / security-key approval (exit 4, named) and the Touch ID touch of `~/.local/libexec/vault-touchid unlock-safari -a main` / `broker-add.py`, which the agent runs itself when the vault is locked. myfritz is on demand: never checked daily.
@@ -1467,4 +1473,5 @@ Fill-only items (`agent_fill_only = true`, tp#1082): the broker never logs in wi
 | `-L`, `--safari-login` `SITE` | an AGENT's login through Albert's Safari (WS1b): free check, else import Safari's own session (works without new safari.py features), else log Safari in (safari.py, a new window; the login broker's credentials, else his Vaultwarden tab and clipboard) and import it; claude.ai: the automated magic link. One run, no retries; never from a LaunchAgent. Exit 4 = needs Albert (CAPTCHA, SMS, push / security key); a locked vault is the agent's: `vault-touchid unlock-safari -a main` (Albert touches once); exit 3 = the Mac is locked or idle: retry later |
 | `-l`, `--fillable` | list every item agents can fill into Albert's Safari (fill-only items and login items with agent_safari_fill): site, name, fill origins — names only, never a value (from the broker's site listing; -r asks the broker now; -j: JSON) |
 | `-n`, `--dry-run` | with -L: report what it would do (no import, no Safari login) |
+| `-H`, `--identity-history` `[SITE]` | read-only: the last identity proofs of SITE (no SITE: of every site) that did not say match — when, state, verdict, the recipe's reason word, HTTP status, code, redacted detail (checks.json keeps the last 10 per site; the latest check overwrites its detail); -j: JSON |
 | `-R`, `--refresh-pass` | refresh-only pass: renew every refreshable token (NPM) with < 12 h left; never logs in (LaunchAgent com.albert.agent-login-refresh, every 6 h) |

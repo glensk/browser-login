@@ -7,7 +7,12 @@ process write them:
 
 * ``checks.json`` (v2) — per site the LATEST check: ``state``
   (ok / failed / unknown), when, the phase it stopped at (broker/phases.py),
-  its code, a redacted detail, the failure screenshot, ``last_success``.
+  its code, a redacted detail, the failure screenshot, ``last_success``,
+  and ``identity_history``: the last ``IDENTITY_HISTORY_MAX`` identity
+  proofs that did NOT come back ``match`` (when, state, verdict, the
+  recipe's fixed ``why`` word, HTTP status, code, redacted detail) — the
+  latest check overwrites ``detail``, so a transient "could not tell which
+  account" would otherwise leave no trace (tp#1137; ``agent-login.py -H``).
   The new code reads only this file.
 * ``last-check.json`` — the legacy projection (``ok``/``how``/``at``) for
   older readers; written, never read.
@@ -56,6 +61,10 @@ LOCK_TIMEOUT_S = 10.0
 CONFIG_RE = re.compile(r"^[0-9a-f]{64}$")
 SITE_ID_RE = re.compile(r"^[a-z0-9][a-z0-9._-]{0,63}$")  # broker/vault.py's rule
 AUDIT_FILE = "audit.jsonl"
+# tp#1137: identity proofs kept per site that did not come back `match`.
+IDENTITY_HISTORY_MAX = 10
+# browser.py's `identity_why` words (`_IDENTITY_WHY`, e.g. "no token").
+IDENTITY_WHY_RE = re.compile(r"^[a-z][a-z -]{0,31}$")
 # A trial login's result proves that no broker request reached the password:
 # the login's own free check found the session (route ``already``), or it
 # stopped in one of these phases with ``submitted`` False.
@@ -193,6 +202,8 @@ def record_check(  # pylint: disable=too-many-arguments
     origin_ok: object = None,
     instance: str = "",
     identity: str = "",
+    identity_why: str = "",
+    identity_status: object = None,
     config: str = "",
     server: str = "",
     cookie_days_left: object = None,
@@ -212,6 +223,11 @@ def record_check(  # pylint: disable=too-many-arguments
     +1 at most once per `run_id` and only ``STREAK_SPACING_S`` after the
     previous counted failure; ok resets it, unknown keeps it (the failure
     mail of an assisted site waits for 2).
+
+    tp#1137: an identity verdict other than ``match`` (with its recipe
+    `identity_why` word and `identity_status`) is appended to the site's
+    ``identity_history`` (the last ``IDENTITY_HISTORY_MAX``), which every
+    later record carries over.
     """
     if state not in STATES:
         raise ValueError(f"state must be one of {sorted(STATES)}")
@@ -242,6 +258,9 @@ def record_check(  # pylint: disable=too-many-arguments
         # WS5: the identity proof's verdict (a word of browser.py's fixed set;
         # '' = no proof ran).
         "identity": identity if re.match(r"^[a-z_]{0,32}$", identity or "") else "?",
+        "identity_why": identity_why
+        if IDENTITY_WHY_RE.match(identity_why or "")
+        else "",
         # WS3: the config digest (broker/onboarding.config_digest) of the item
         # the proof ran against ('' = unknown): a promotion holds for it only.
         "config": config if CONFIG_RE.match(config or "") else "",
@@ -259,6 +278,9 @@ def record_check(  # pylint: disable=too-many-arguments
         last = old.get("last_success") if isinstance(old, dict) else None
         rec["last_success"] = ts if state == "ok" else last
         rec.update(_streak(old if isinstance(old, dict) else {}, state, run_id, ts))
+        rec["identity_history"] = _identity_history(
+            old if isinstance(old, dict) else {}, rec, identity_status
+        )
         data[site] = rec
 
     update(CHECKS_FILE, put)
@@ -301,6 +323,38 @@ def _streak(old: dict[str, Any], state: str, run_id: str, now: float) -> dict[st
         "invalid_at": now,
         "invalid_run": run_id[:64],
     }
+
+
+def _identity_history(
+    old: dict[str, Any], rec: dict[str, Any], status: object
+) -> list[dict[str, Any]]:
+    """The ``identity_history`` of a new record (tp#1137): `old`'s entries,
+    plus one for `rec` when its identity proof ran and did not say
+    ``match``; the newest ``IDENTITY_HISTORY_MAX`` are kept."""
+    hist = [e for e in old.get("identity_history") or [] if isinstance(e, dict)]
+    verdict = str(rec.get("identity") or "")
+    if verdict and verdict != "match":
+        hist.append(
+            {
+                "at": rec["at"],
+                "at_text": rec["at_text"],
+                "state": rec["state"],
+                "identity": verdict,
+                "why": rec.get("identity_why") or "",
+                "status": status
+                if isinstance(status, int) and not isinstance(status, bool)
+                else None,
+                "code": rec.get("code") or "",
+                "detail": redact(str(rec.get("detail") or ""), 200),
+            }
+        )
+    return hist[-IDENTITY_HISTORY_MAX:]
+
+
+def identity_history(site: str) -> list[dict[str, Any]]:
+    """`site`'s recorded non-``match`` identity proofs, oldest first."""
+    rec = checks().get(site) or {}
+    return [e for e in rec.get("identity_history") or [] if isinstance(e, dict)]
 
 
 def drop_legacy(site: str) -> None:
