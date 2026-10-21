@@ -213,7 +213,8 @@ class LeakCheck:
 
     def refresh(self, fetch: Callable[[str, str], str | None]) -> int:
         """Re-push every persisted label whose value `fetch` still returns; the
-        persisted set shrinks to those (a removed item stops being re-pushed)."""
+        persisted set shrinks to those (a removed item stops being re-pushed).
+        When `fetch` returns nothing at all, the persisted set is kept."""
         if not self.needs_repush():
             return 0
         entries = []
@@ -222,7 +223,9 @@ class LeakCheck:
             if value:
                 entries.append((item, field, value))
         if not entries:
-            self._persist([], replace=True)
+            # Not one value came back: far likelier an unreadable vault (the
+            # broker just started, bw is down) than every item removed at once.
+            # Keep the names and retry next time instead of forgetting them all.
             return 0
         self.register(entries, replace_persisted=True)
         return len(entries)

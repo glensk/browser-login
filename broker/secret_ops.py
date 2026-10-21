@@ -480,7 +480,7 @@ class SecretOps:  # pylint: disable=too-few-public-methods
                         return None
                     sec = self.vault.fill_secret(item[len(FILL_LABEL_PREFIX) :])
                     return {"username": sec.username, "password": sec.password}.get(fld)
-                if not inventoried(fld, username_is_credential=user_cred(item)):
+                if fld in UNINVENTORIED_FIELDS and not user_cred(item):
                     return None
                 return self.vault.secret_values(item).fields.get(fld)
             except VaultError:

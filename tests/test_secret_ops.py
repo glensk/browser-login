@@ -455,6 +455,22 @@ def test_refresh_drops_labels_of_removed_items(env, vals, tmp_path):
     assert labels == [["github", "password"]]
 
 
+def test_refresh_keeps_the_names_when_the_vault_reads_nothing(env, vals):
+    """A refresh right after a broker start, with bw unreadable, must not
+    forget every label (tp#1138: the refresh now also runs at start)."""
+    brk, keeper, home = env
+    assert _secret(brk, [("plain", "password"), ("github", "password")])["ok"]
+
+    def unreadable(_item):
+        raise vault.VaultError("bw unlock failed")
+
+    brk.vault.secret_values = unreadable
+    keeper.restart()
+    assert brk.refresh_leakcheck() == 0
+    labels = json.loads((home / "leakcheck-labels.json").read_text())["labels"]
+    assert sorted(map(tuple, labels)) == [("github", "password"), ("plain", "password")]
+
+
 def test_refresh_failure_is_audited_by_label_only(env, vals):
     brk, keeper, home = env
     assert _secret(brk, [("plain", "password")])["ok"]
