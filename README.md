@@ -921,6 +921,15 @@ leak a password, lock an account or race a login:
   answers `{"ok": false, "error": "removed"}` for one release, then it is an
   unknown op. To check whether two copies hold the same password, use
   `credctl.py check -T` in mydotfiles (Touch ID window).
+- **Usernames are not inventoried (tp#1138).** Every value the broker serves
+  (`secret-run`, `safari_fill`) is registered with the secretkeeper's
+  live-credential inventory, which the global `secret-check-index` pre-commit
+  hook reads — except a field named `username`: it identifies an account and
+  appears in commits on purpose (a Gmail login). An item whose username IS the
+  credential (an account number, an application key) carries the custom field
+  `agent_secret_username_is_credential = true` and keeps it inventoried; any
+  value other than `true`/`false` refuses the item. The broker re-pushes its
+  labels once at start and then every 10 min.
 - **One item, one collection — the `agent_script` gate (tp#991).** ONE
   Vaultwarden collection holds every agent-usable item. The browser fill is
   unchanged (items with `agent_fill_origins` / `agent_site`, origin binding,

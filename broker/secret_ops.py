@@ -92,6 +92,18 @@ SECRET_OPS = frozenset(
 )
 
 
+# Field names that identify an account rather than prove it: left out of the
+# secretkeeper's live-credential inventory (Albert, 2026-10-18, tp#1138) — an
+# inventoried Gmail login blocked every commit that mentioned the address. An
+# item flagged ``agent_secret_username_is_credential`` keeps its username in.
+UNINVENTORIED_FIELDS = frozenset({"username"})
+
+
+def inventoried(field: str, *, username_is_credential: bool) -> bool:
+    """Whether a served value of ``field`` is registered with the secretkeeper."""
+    return field not in UNINVENTORIED_FIELDS or username_is_credential
+
+
 def _err(code: str, detail: str = "") -> dict[str, Any]:
     return {"ok": False, "error": code, "detail": detail}
 
@@ -306,6 +318,7 @@ class SecretOps:  # pylint: disable=too-few-public-methods
         if _is_error(listing):
             return listing
         allow_short: dict[str, bool] = {}
+        user_cred: dict[str, bool] = {}
         for item, fld in pairs:
             it = listing.get(item)
             if not isinstance(it, SecretItem):
@@ -317,6 +330,7 @@ class SecretOps:  # pylint: disable=too-few-public-methods
             if fld not in it.listed:
                 return _err("unknown_field", f"{item}: field {fld!r} is not exposed")
             allow_short[item] = it.allow_short
+            user_cred[item] = it.username_is_credential
         ids = list(dict.fromkeys(i for i, _f in pairs))
         granted = self.secret_limiter.reserve(
             [f"secret:{i}" for i in ids] + [GLOBAL_SECRET_KEY], self.clock()
@@ -339,8 +353,13 @@ class SecretOps:  # pylint: disable=too-few-public-methods
                 return _err("refused", f"{item}: value too short to mask")
             values.append(value)
             shorts.append(short)
+        inventory = [
+            (i, f, v)
+            for (i, f), v in zip(pairs, values)
+            if inventoried(f, username_is_credential=user_cred[i])
+        ]
         try:
-            self.leakcheck.register([(i, f, v) for (i, f), v in zip(pairs, values)])
+            self.leakcheck.register(inventory)
         except LeakCheckUnavailable as exc:
             return _err("leakcheck_unavailable", str(exc))
         try:
@@ -452,14 +471,25 @@ class SecretOps:  # pylint: disable=too-few-public-methods
         """Re-push issued labels when the secretkeeper lost them (thread body)."""
 
         def fetch(item: str, fld: str) -> str | None:
+            # a name persisted before tp#1138 that is no longer inventoried
+            # returns None, so the persisted set drops it
             try:
                 if item.startswith(FILL_LABEL_PREFIX):
                     # a `safari_fill` label: the login item, read for a fill
+                    if not inventoried(fld, username_is_credential=False):
+                        return None
                     sec = self.vault.fill_secret(item[len(FILL_LABEL_PREFIX) :])
                     return {"username": sec.username, "password": sec.password}.get(fld)
+                if not inventoried(fld, username_is_credential=user_cred(item)):
+                    return None
                 return self.vault.secret_values(item).fields.get(fld)
             except VaultError:
                 return None
+
+        def user_cred(item: str) -> bool:
+            listing = self._secret_listing()
+            it = listing.get(item) if not _is_error(listing) else None
+            return isinstance(it, SecretItem) and it.username_is_credential
 
         try:
             pushed = self.leakcheck.refresh(fetch)

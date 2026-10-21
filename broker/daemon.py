@@ -3294,9 +3294,13 @@ def _home_owner_uid(home: Path) -> int | None:
 
 
 def _leakcheck_loop(broker: Broker, stop: threading.Event) -> None:
-    while not stop.wait(REPUSH_INTERVAL_S):
+    """Re-push at start (a secretkeeper restarted while the broker was down),
+    then every REPUSH_INTERVAL_S (tp#1138 B5)."""
+    while True:
         with contextlib.suppress(Exception):
             broker.refresh_leakcheck()
+        if stop.wait(REPUSH_INTERVAL_S):
+            return
 
 
 # One early exit per CLI mode / guard.

@@ -675,6 +675,10 @@ class SecretItem:  # pylint: disable=too-many-instance-attributes
     listed: tuple[str, ...] = ()
     has_totp: bool = False
     allow_short: bool = False
+    # `agent_secret_username_is_credential`: this item's USERNAME is a live
+    # credential (an account number, an application key), so it stays in the
+    # leak inventory; other usernames are identifiers and are not (tp#1138).
+    username_is_credential: bool = False
     short: bool = False
     refused: str | None = None
     item_id: str = ""
@@ -870,6 +874,11 @@ def secret_item_from_json(
     allow_short = _parse_flag(fields.get("agent_secret_allow_short", ""))
     if allow_short is None:
         return refused("bad agent_secret_allow_short (true or false)")
+    username_is_credential = _parse_flag(
+        fields.get("agent_secret_username_is_credential", "")
+    )
+    if username_is_credential is None:
+        return refused("bad agent_secret_username_is_credential (true or false)")
     listed_raw = ["password", *_split_list(fields.get("agent_secret_fields", ""))]
     listed: list[str] = []
     values: dict[str, str] = {}
@@ -918,6 +927,7 @@ def secret_item_from_json(
         listed=tuple(listed),
         has_totp=seed is not None,
         allow_short=allow_short,
+        username_is_credential=username_is_credential,
         short=short,
         item_id=item_id,
         revision=revision,

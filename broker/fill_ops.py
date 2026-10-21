@@ -240,18 +240,12 @@ class FillOps:  # pylint: disable=too-few-public-methods
         label = f"{FILL_LABEL_PREFIX}{site}"
         got = read.get("values", {})
         # the password must be registered (fail closed); a username is an
-        # identifier the page shows anyway: registered when the secretkeeper
-        # takes it, never a refusal (it drops values below its length floor)
+        # identifier, not a credential, and is never registered (tp#1138)
         if "password" in got:
             try:
                 self.leakcheck.register([(label, "password", got["password"])])
             except LeakCheckUnavailable as exc:
                 return site, _err("leakcheck_unavailable", str(exc))
-        if "username" in got:
-            try:
-                self.leakcheck.register([(label, "username", got["username"])])
-            except LeakCheckUnavailable:
-                pass
         if self.allow_uid is None:  # unreachable: _fill_op checked it
             return site, _err("forbidden")
         why = self.attended(self.allow_uid)

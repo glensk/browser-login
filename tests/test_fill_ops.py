@@ -233,11 +233,9 @@ def test_fill_returns_requested_values_registers_and_audits_once(env, vals):
         "site": "shop",
         "values": {"username": vals.user, "password": vals.pw},
     }
-    assert ev.log == ["leakcheck", "leakcheck", "attended"]
-    assert ev.registered == [
-        ("fill.shop", "password", vals.pw),
-        ("fill.shop", "username", vals.user),
-    ]
+    assert ev.log == ["leakcheck", "attended"]
+    # a username is not a credential: never registered (tp#1138)
+    assert ev.registered == [("fill.shop", "password", vals.pw)]
     rows = _audit(home)
     assert len(rows) == 1
     row = rows[0]
@@ -422,7 +420,7 @@ def test_unattended_after_leakcheck_before_limiter(env, why):
     ev.attended = why
     resp = _fill(brk)
     assert resp == {"ok": False, "error": "unattended", "detail": why}
-    assert ev.log == ["leakcheck", "leakcheck", "attended"]
+    assert ev.log == ["leakcheck", "attended"]
     assert _charged(home) == set()
     assert not (home / fill_ops.FILL_DISTINCT_FILE).exists()
 
@@ -560,12 +558,9 @@ def test_refresh_repushes_fill_labels_through_fill_secret(tmp_path, vals):
                 attended=lambda _uid: None,
             )
             assert _fill(brk, "Nosubmit")["ok"] is True
-            assert set(keeper.labels) == {
-                "loginbroker:fill.nosubmit:username",
-                "loginbroker:fill.nosubmit:password",
-            }
+            assert set(keeper.labels) == {"loginbroker:fill.nosubmit:password"}
             keeper.restart()
-            assert brk.refresh_leakcheck() == 2
+            assert brk.refresh_leakcheck() == 1
             assert keeper.labels["loginbroker:fill.nosubmit:password"][0] == vals.ns_pw
             _assert_clean((home / "audit.log").read_text(), vals)
         finally:
@@ -608,9 +603,9 @@ def test_attended_reads_the_given_uid():
     assert attended.attended(778, run) == "not_on_console"
 
 
-def test_username_the_secretkeeper_drops_is_no_refusal(env, vals):
+def test_fill_never_registers_the_username(env, vals):
     brk, ev, _home, _vpath, _clock = env
-    ev.leak_refuse = {"username"}
+    ev.leak_refuse = {"username"}  # would refuse it, but it is never sent
     resp = _fill(brk)
     assert resp["ok"] is True
     assert ev.registered == [("fill.shop", "password", vals.pw)]

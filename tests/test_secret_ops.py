@@ -586,3 +586,98 @@ def test_run_rows_expire_with_an_audit_line(env, vals):
     done = {"op": "secret_done", "nonce": nonce, "exit": 0, "masked": 0}
     assert brk.handle(done, UID)["error"] == "forbidden"
     assert isinstance(brk.runs, runs.RunTable)
+
+
+# --- tp#1138: login usernames are not inventoried --------------------------
+
+
+def _synced_labels(keeper) -> set[str]:
+    return {sec["label"] for req in keeper.syncs for sec in req["secrets"]}
+
+
+def _synced_values(keeper) -> list[str]:
+    return [sec["value"] for req in keeper.syncs for sec in req["secrets"]]
+
+
+def test_username_is_not_inventoried_password_still_is(env, vals):
+    brk, keeper, home = env
+    resp = _secret(brk, [("github", "username"), ("github", "password")])
+    assert resp["ok"] is True
+    assert _synced_labels(keeper) == {"loginbroker:github:password"}
+    assert vals.user not in _synced_values(keeper)
+    assert vals.pw in _synced_values(keeper)
+    assert set(keeper.labels) == {"loginbroker:github:password"}
+    persisted = json.loads((home / "leakcheck-labels.json").read_text())
+    assert persisted == {"labels": [["github", "password"]]}
+
+
+def test_username_only_secret_is_served_without_a_sync(env, vals):
+    brk, keeper, _home = env
+    resp = _secret(brk, [("github", "username")])
+    assert resp["ok"] is True
+    assert keeper.syncs == []
+
+
+def test_other_fields_stay_inventoried(env, vals):
+    brk, keeper, _home = env
+    assert _secret(brk, [("github", "api_token")])["ok"] is True
+    assert _synced_labels(keeper) == {"loginbroker:github:api_token"}
+
+
+def _flag_items(v: Vals) -> list[dict]:
+    return [
+        sf.secret_item(
+            "Account",
+            v.pw,
+            username=v.user,
+            fields={
+                "agent_secret_fields": "username",
+                "agent_secret_username_is_credential": "true",
+            },
+        ),
+        sf.secret_item(
+            "Odd",
+            v.other,
+            username=v.user,
+            fields={
+                "agent_secret_fields": "username",
+                "agent_secret_username_is_credential": "maybe",
+            },
+        ),
+    ]
+
+
+def test_a_flagged_item_keeps_its_username_inventoried(tmp_path, vals):
+    with sf.sockdir() as d:
+        keeper = sf.FakeSecretkeeper(str(d / "keeper.sock"))
+        vpath = sf.write_vault(tmp_path / "v.json", _flag_items(vals))
+        brk = sf.make_broker(
+            tmp_path / "home", vpath, allow_uid=UID, keeper_sock=keeper.path
+        )
+        try:
+            assert _secret(brk, [("account", "username")])["ok"] is True
+            assert _synced_labels(keeper) == {"loginbroker:account:username"}
+            keeper.restart()
+            assert brk.refresh_leakcheck() == 1  # re-pushed: still a credential
+            # a malformed flag fails closed: the item is refused, nothing served
+            resp = _secret(brk, [("odd", "username")])
+            assert resp["ok"] is False
+            assert vals.user not in json.dumps(resp)
+        finally:
+            keeper.close()
+
+
+def test_refresh_drops_a_username_persisted_before(env, vals):
+    brk, keeper, home = env
+    home.mkdir(parents=True, exist_ok=True)
+    (home / "leakcheck-labels.json").write_text(
+        json.dumps({"labels": [["github", "username"], ["plain", "password"]]})
+    )
+    keeper.restart()
+    assert brk.refresh_leakcheck() == 1
+    assert _synced_labels(keeper) == {"loginbroker:plain:password"}
+    assert vals.user not in _synced_values(keeper)
+    persisted = json.loads((home / "leakcheck-labels.json").read_text())
+    assert persisted == {"labels": [["plain", "password"]]}
+    # the count now matches: no endless re-push of the dropped name
+    assert brk.refresh_leakcheck() == 0
