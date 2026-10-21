@@ -15,6 +15,9 @@ Three failure modes are pinned here:
   reset-token path, a magic-link token or a whole ``data:`` body went into the
   caller's log and the LLM transcript. `_tab_hint` renders origins only,
   fails closed on malformed URLs, and the message never points at `status`.
+* Two consumers attaching at the same moment used to BOTH see zero tabs and
+  each create one (tp#338). The check-and-create is flocked; the second one
+  re-checks under the lock and finds the first one's tab.
 
 Run: python3 -m pytest tests/ -q     (from the repo root)
 """
@@ -28,7 +31,11 @@ from __future__ import annotations
 # pylint: disable=unused-argument
 import importlib.util
 import sys
+import threading
+import time
 from pathlib import Path
+
+import pytest
 
 _BROWSER_PY = Path(__file__).resolve().parent.parent / "bin" / "browser.py"
 
@@ -44,6 +51,12 @@ def _load_browser_module():
 
 
 browser = _load_browser_module()
+
+
+@pytest.fixture(autouse=True)
+def _tab_lock_in_tmp(tmp_path, monkeypatch):
+    """Keep the zero-tab flock out of the real ~/.cache/claude-browser."""
+    monkeypatch.setattr(browser, "TAB_BOOTSTRAP_LOCK", tmp_path / "tab.lock")
 
 
 class _Page:
@@ -327,3 +340,31 @@ def test_target_label_is_origin_only_and_fail_closed():
     )
     assert label == "Reset  →  https://a.example  [id ABCDEF01]"
     assert browser._id8("bad\nid") == "[id ?]"
+
+
+def test_ensure_page_target_creates_one_tab_under_concurrent_consumers(monkeypatch):
+    # tp#338: two consumers connect while the browser has zero tabs. Chrome
+    # takes a moment between PUT /json/new and the tab showing in /json/list;
+    # the stub models that gap so an unlocked check-and-create sees 0 twice.
+    state: dict = {"pages": [], "created": 0}
+    start = threading.Barrier(2)
+
+    def _new_tab(port: int, url: str = "about:blank", timeout: float = 5.0) -> bool:
+        state["created"] += 1
+        time.sleep(0.3)
+        state["pages"] = [{"type": "page", "url": url}]
+        return True
+
+    def _consumer() -> None:
+        start.wait()
+        browser._ensure_page_target(9222)
+
+    monkeypatch.setattr(browser, "_cdp_get", lambda *a, **k: list(state["pages"]))
+    monkeypatch.setattr(browser, "_cdp_new_tab", _new_tab)
+    threads = [threading.Thread(target=_consumer) for _ in range(2)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=10)
+    assert not any(t.is_alive() for t in threads)
+    assert state["created"] == 1, f"concurrent creations={state['created']}"

@@ -288,6 +288,8 @@ PID_FILE = CACHE_DIR / "browser.pid"
 # Single source of truth for "what is the shared browser doing right now" — see
 # the lifecycle section below. NO file means cleanly down.
 LIFECYCLE_FILE = CACHE_DIR / ".browser-lifecycle.json"
+# Serialises the zero-tab recovery in `_ensure_page_target` across consumers.
+TAB_BOOTSTRAP_LOCK = CACHE_DIR / "tab-bootstrap.lock"
 PORTAL_PROFILE_URL = "https://portal.cscs.ch/profile/"
 PORTAL_API_ME = "https://portal.cscs.ch/api/users/me/"
 CSCS_TOKEN_CACHE = Path.home() / ".cache" / "cscs-api" / "portal_token"
@@ -1282,14 +1284,29 @@ def _ensure_page_target(port: int, timeout: float = 5.0) -> None:
     (`_is_blank`) over creating another one. Best effort — if the tab
     cannot be created we fall through and let `connect_over_cdp` raise the real
     error rather than masking it with one of our own.
+
+    The check-and-create runs under an exclusive flock (TAB_BOOTSTRAP_LOCK):
+    two consumers attaching at the same moment otherwise BOTH see zero tabs and
+    each raise a blank foreground tab (tp#338). The second one re-checks under
+    the lock and finds the first one's tab. The wait is bounded like the rest —
+    a holder that never returns must not wedge every consumer behind it.
     """
     if _page_targets(port):
         return
-    if not _cdp_new_tab(port):
-        return
-    deadline = time.time() + timeout
-    while not _page_targets(port) and time.time() < deadline:
-        time.sleep(0.1)
+    TAB_BOOTSTRAP_LOCK.parent.mkdir(parents=True, exist_ok=True)
+    fd = os.open(str(TAB_BOOTSTRAP_LOCK), os.O_RDWR | os.O_CREAT, 0o600)
+    try:
+        if not _flock_wait(fd, fcntl.LOCK_EX, timeout):
+            return  # somebody else is mid-creation; let connect_over_cdp judge
+        if _page_targets(port):
+            return  # the other consumer's tab landed while we waited
+        if not _cdp_new_tab(port):
+            return
+        deadline = time.time() + timeout
+        while not _page_targets(port) and time.time() < deadline:
+            time.sleep(0.1)
+    finally:
+        os.close(fd)  # releases the flock
 
 
 def _is_up(port: int) -> bool:
