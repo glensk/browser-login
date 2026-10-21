@@ -29,6 +29,7 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
+from broker import auditlog
 from broker.leakcheck import LeakCheckUnavailable, Registrar
 from broker.limiter import Denied, Limiter
 from broker.recipes import fresh_totp, parse_totp
@@ -421,13 +422,8 @@ class SecretOps:  # pylint: disable=too-few-public-methods
         if isinstance(n, bool) or not isinstance(n, int) or n < 1:
             return _err("bad_request", "n must be a positive integer")
         n = min(n, AUDIT_MAX_LINES)
-        path = self.home / "audit.log"
         try:
-            with path.open("rb") as fh:
-                fh.seek(0, os.SEEK_END)
-                size = fh.tell()
-                fh.seek(max(0, size - AUDIT_TAIL_BYTES))
-                tail = fh.read()
+            tail = auditlog.tail_bytes(self.home, AUDIT_TAIL_BYTES)
         except FileNotFoundError:
             return {"ok": True, "lines": []}
         except OSError:

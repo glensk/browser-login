@@ -163,6 +163,7 @@ if __package__ in (None, ""):  # run as a script: make `broker` importable
     sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 # pylint: disable=wrong-import-position
+from broker import auditlog  # noqa: E402
 from broker import identity as _identity  # noqa: E402
 from broker.attended import attended as attended_gate  # noqa: E402
 from broker.bundle import (  # noqa: E402
@@ -1942,15 +1943,7 @@ class Broker(SecretOps, FillOps):  # pylint: disable=too-many-instance-attribute
         line = json.dumps(rec, sort_keys=True) + "\n"
         with self._audit_lock:
             self.home.mkdir(parents=True, exist_ok=True)
-            fd = os.open(
-                str(self.home / "audit.log"),
-                os.O_WRONLY | os.O_APPEND | os.O_CREAT,
-                0o600,
-            )
-            try:
-                os.write(fd, line.encode())
-            finally:
-                os.close(fd)
+            auditlog.append_line(self.home, line)
 
     def _site_lock(self, site: str) -> threading.Lock:
         with self._guard:
@@ -3199,11 +3192,7 @@ def _same_account_cli(args: argparse.Namespace, home: Path) -> int:
         "result": answer,
         "uid": os.getuid(),
     }
-    fd = os.open(str(home / "audit.log"), os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
-    try:
-        os.write(fd, (json.dumps(rec, sort_keys=True) + "\n").encode())
-    finally:
-        os.close(fd)
+    auditlog.append_line(home, json.dumps(rec, sort_keys=True))
     print(answer)
     return 0
 
@@ -3233,13 +3222,7 @@ def _membership_cli(args: argparse.Namespace, home: Path) -> int:
         "uid": os.getuid(),
     }
     with contextlib.suppress(OSError):
-        fd = os.open(
-            str(home / "audit.log"), os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600
-        )
-        try:
-            os.write(fd, (json.dumps(rec, sort_keys=True) + "\n").encode())
-        finally:
-            os.close(fd)
+        auditlog.append_line(home, json.dumps(rec, sort_keys=True))
     if not rows:
         print("✅ no dual-member or unreadable item in either collection")
         return 0
@@ -3284,13 +3267,7 @@ def _script_gate_cli(args: argparse.Namespace, home: Path) -> int:
         "uid": os.getuid(),
     }
     with contextlib.suppress(OSError):
-        fd = os.open(
-            str(home / "audit.log"), os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600
-        )
-        try:
-            os.write(fd, (json.dumps(rec, sort_keys=True) + "\n").encode())
-        finally:
-            os.close(fd)
+        auditlog.append_line(home, json.dumps(rec, sort_keys=True))
     if args.json:
         for row in rows:
             print(json.dumps(row.public(), sort_keys=True))
