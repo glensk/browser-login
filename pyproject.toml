@@ -19,6 +19,9 @@ Homepage = "https://github.com/glensk/browser-login"
 Repository = "https://github.com/glensk/browser-login"
 
 [tool.uv]
+# certifi >= 2026.10.19 drops the eMudhra-compromised roots; exempt it from the
+# global 7-day exclude-newer window
+exclude-newer-package = { certifi = "2026-10-21" }
 # This repo ships a single script (bin/browser.py), not an importable package.
 package = false
 # Note: browser.py ALSO self-bootstraps an isolated venv at
