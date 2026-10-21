@@ -23,6 +23,21 @@ from broker import safari_cookies
 
 MAIL_TO = "albert.glensk@gmail.com"
 SCRIPT = Path(__file__).resolve().parent / "agent-login.py"
+# The LaunchAgents name their interpreter instead of `/usr/bin/env python3`:
+# while Homebrew relinks python@3.x, /opt/homebrew/bin/python3 is briefly
+# absent and `env` falls through to /usr/bin/python3 (3.9), which cannot import
+# agent-login.py (tp#947). The repo's uv venv is not touched by brew relinks.
+VENV_PYTHON = SCRIPT.parent / ".venv" / "bin" / "python3"
+
+
+def job_python() -> str:
+    """Absolute interpreter for the generated LaunchAgents: the repo venv when
+    it exists, else the interpreter running the install (never a PATH lookup)."""
+    if VENV_PYTHON.exists():
+        return str(VENV_PYTHON)
+    return sys.executable
+
+
 BROWSER_PY = Path(__file__).resolve().parent / "bin" / "browser.py"
 LAUNCH_LABEL = "com.albert.agent-login-check"
 LAUNCH_PLIST = Path.home() / "Library" / "LaunchAgents" / f"{LAUNCH_LABEL}.plist"
@@ -68,6 +83,7 @@ def launchagent_plist(
     schedule: str = "",
     run_at_load: bool = False,
     script: Path = SCRIPT,
+    python: str | None = None,
 ) -> str:
     """A LaunchAgent running this script; default: daily `-c` at 09:15, no mail
     (logged-out sites are an infra/status item). Pure."""
@@ -101,8 +117,7 @@ def launchagent_plist(
     <string>{label}</string>
     <key>ProgramArguments</key>
     <array>
-        <string>/usr/bin/env</string>
-        <string>python3</string>
+        <string>{python or job_python()}</string>
         <string>{script}</string>{arg_xml}
     </array>
     {schedule}

@@ -524,6 +524,9 @@ def test_plist() -> None:
     assert "<string>-c</string>\n    </array>" in plist
     assert "<string>-m</string>" not in plist
     assert str(Path(al.__file__).resolve()) in plist
+    # tp#947: an absolute interpreter, never `env python3` (brew relink window)
+    assert "/usr/bin/env" not in plist
+    assert "<string>/x/py3</string>" in al.launchagent_plist(python="/x/py3")
 
 
 def test_unattended_import_only_where_safe() -> None:
