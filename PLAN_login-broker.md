@@ -185,32 +185,32 @@ the agent the portal session. Record as Albert's decision of 2026-10-01 in
       `--disable-blink-features=AutomationControlled` → ricardo, toppreise, kleinanzeigen
       (login form), geizhals, cscs (`auth.cscs.ch` login form) all load. ⇒ the broker uses
       that launch profile; the real-login go/no-go as `_loginbroker` is still open.
-- [ ] 0.2 `install/install.sh` (sudo, idempotent, `-U` uninstalls, shellcheck-clean): role account
+- [x] 0.2 `install/install.sh` (sudo, idempotent, `-U` uninstalls, shellcheck-clean): role account
       `_loginbroker` with home `/var/db/login-broker` (0700); `/usr/local/libexec/login-broker`
       (root 0755: code, uv venv, pinned `bw` + Node, Playwright browsers via
       `PLAYWRIGHT_BROWSERS_PATH`); `/var/db/login-broker-run` (root:`_loginbroker` 0775; /var/run is wiped at boot); log
       `/var/log/login-broker.log`; LaunchDaemon `com.albert.login-broker` (`UserName=_loginbroker`).
       Rollout: install into a versioned dir, selfcheck, then swap the `current` symlink; rollback
       = previous symlink.
-- [ ] 0.3 Daemon skeleton: socket, `LOCAL_PEERCRED` check, JSON protocol (`ping`, `sites`,
+- [x] 0.3 Daemon skeleton: socket, `LOCAL_PEERCRED` check, JSON protocol (`ping`, `sites`,
       `login`, `logout`), per-site mutex, audit log. Chromium launched with `--use-mock-keychain`
       and a persistent per-site profile; acceptance: after a broker restart the per-site session
       is still valid (no "new device" login).
-- [ ] 0.4 `broker/selfcheck.py -b`: read-only boundary check run as uid 501: live broker Chromium
+- [x] 0.4 `broker/selfcheck.py -b`: read-only boundary check run as uid 501: live broker Chromium
       argv has no `--remote-debugging-port`/`--no-sandbox`; `/var/db/login-broker` unreadable;
       libexec not writable by 501; socket refuses a request whose peer uid is not 501
       (unit-level); exit non-zero on any violation.
 
 ### Phase 1 — Vaultwarden
 
-- [ ] 1.1 Albert (Bitwarden UI, one time): organization + collection `agent-logins`; invite the
+- [x] 1.1 Albert (Bitwarden UI, one time): organization + collection `agent-logins`; invite the
       broker user; accept the invite (mail via SMTP); **confirm the member** (Admin Console →
       Members → Confirm); give it read-only on `agent-logins` only; create its API key.
-- [ ] 1.2 `sudo login-broker enroll-bootstrap`: getpass in Albert's terminal → bootstrap file
+- [x] 1.2 `sudo login-broker enroll-bootstrap`: getpass in Albert's terminal → bootstrap file
       0600 (never argv/env/clipboard).
-- [ ] 1.3 Broker `bw` with own `BITWARDENCLI_APPDATA_DIR`: `login --apikey`, unlock per request
+- [x] 1.3 Broker `bw` with own `BITWARDENCLI_APPDATA_DIR`: `login --apikey`, unlock per request
       (session key in memory only), list the collection, `get totp`, lock.
-- [ ] 1.4 `sites` op: site ids + fill origins + cookie hosts, never secrets. Items without
+- [x] 1.4 `sites` op: site ids + fill origins + cookie hosts, never secrets. Items without
       `agent_fill_origins` are listed as refused.
 
 ### Phase 2 — login + handoff
@@ -234,7 +234,7 @@ the agent the portal session. Record as Albert's decision of 2026-10-01 in
 
 - [ ] 3.1 Generic-recipe sites that passed 0.1 (expected: kleinanzeigen, geizhals, toppreise,
       ricardo if not captcha-gated); per-site sentinel + cookie allowlist.
-- [ ] 3.2 CSCS recipe from `cmd_cscs_login` / `_submit_keycloak_login` / `_fill_keycloak_otp` with
+- [x] 3.2 CSCS recipe from `cmd_cscs_login` / `_submit_keycloak_login` / `_fill_keycloak_otp` with
       exact host equality (replaces the substring checks at bin/browser.py:4458/4545/4614/4650).
       Bundle = portal.cscs.ch cookies + the Waldur token from portal localStorage (what
       `_scan_token` bin/browser.py:3619-3646 reads); Keycloak `auth.cscs.ch` cookies are NOT
@@ -326,6 +326,8 @@ the agent the portal session. Record as Albert's decision of 2026-10-01 in
       `https://evil.example/?auth.cscs.ch`), cookie/storage filter, peer-cred check, limiter
       persistence, mutex coalescing, name resolution, re-run idempotence.
 - [ ] 4.2 README / AGENTS.md / `browser-login` skill; credplane plan + tp#97 note (D5); memory.
+
+NOTE: boxes ticked 2026-10-21 by the tp sweep from evidence at HEAD: 0.2 — install/install.sh exists and is deployed (broker home 0700, not readable by uid 501); 0.3 — broker/daemon.py: LOCAL_PEERCRED socket, JSON ops, CHROME_ARGS --use-mock-keychain; 0.4 — broker/selfcheck.py checks --remote-debugging-port/--no-sandbox and the boundary; 1.1 — org Shared + collection agent-login in use by the broker (tp#816/tp#889); 1.2 — install/install.sh -e/--enroll-bootstrap; 1.3 — broker/vault.py runs bw with its own appdata dir; 1.4 — sites op live: agent-login.py -l lists ~250 broker sites; 3.2 — broker/recipes.py CSCS recipe (exact CSCS_AUTH_ORIGIN/PORTAL_ORIGIN); cscs logs in via the broker. Still open: 0.1/3.1 (bot-defence sites went the Safari-session route instead), 3.3 (`_op_creds`/1Password path in bin/browser.py), 4.2.
 
 ## Verification
 
