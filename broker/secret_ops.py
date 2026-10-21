@@ -98,9 +98,30 @@ SECRET_OPS = frozenset(
 # item flagged ``agent_secret_username_is_credential`` keeps its username in.
 UNINVENTORIED_FIELDS = frozenset({"username"})
 
+# Field names that hold personal data (the ``albert-identity`` item: name,
+# address, phone, email): never a credential, so never inventoried — no item
+# flag brings them back (tp#1156). They appear legitimately in commands and
+# mails; as leak labels they raised "rotate it" alerts nobody can act on.
+PERSONAL_DATA_FIELDS = frozenset(
+    {
+        "full_name",
+        "first_name",
+        "middle_name",
+        "last_name",
+        "street",
+        "postal_city",
+        "canton",
+        "country",
+        "phone",
+        "email",
+    }
+)
+
 
 def inventoried(field: str, *, username_is_credential: bool) -> bool:
     """Whether a served value of ``field`` is registered with the secretkeeper."""
+    if field in PERSONAL_DATA_FIELDS:
+        return False
     return field not in UNINVENTORIED_FIELDS or username_is_credential
 
 
@@ -471,7 +492,7 @@ class SecretOps:  # pylint: disable=too-few-public-methods
         """Re-push issued labels when the secretkeeper lost them (thread body)."""
 
         def fetch(item: str, fld: str) -> str | None:
-            # a name persisted before tp#1138 that is no longer inventoried
+            # a name persisted before tp#1138/tp#1156 that is no longer inventoried
             # returns None, so the persisted set drops it
             try:
                 if item.startswith(FILL_LABEL_PREFIX):
@@ -480,7 +501,7 @@ class SecretOps:  # pylint: disable=too-few-public-methods
                         return None
                     sec = self.vault.fill_secret(item[len(FILL_LABEL_PREFIX) :])
                     return {"username": sec.username, "password": sec.password}.get(fld)
-                if fld in UNINVENTORIED_FIELDS and not user_cred(item):
+                if not inventoried(fld, username_is_credential=user_cred(item)):
                     return None
                 return self.vault.secret_values(item).fields.get(fld)
             except VaultError:

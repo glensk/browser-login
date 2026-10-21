@@ -25,7 +25,7 @@ import pytest
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import secret_fixtures as sf  # noqa: E402
 
-from broker import daemon, leakcheck, limiter, runs, vault  # noqa: E402
+from broker import daemon, leakcheck, limiter, runs, secret_ops, vault  # noqa: E402
 
 UID = 501
 
@@ -697,3 +697,76 @@ def test_refresh_drops_a_username_persisted_before(env, vals):
     assert persisted == {"labels": [["plain", "password"]]}
     # the count now matches: no endless re-push of the dropped name
     assert brk.refresh_leakcheck() == 0
+
+
+# --- tp#1156: personal-data fields are not inventoried ----------------------
+
+
+def _identity_items(v: Vals) -> list[dict]:
+    personal = {f: sf.sentinel() for f in sorted(secret_ops.PERSONAL_DATA_FIELDS)}
+    return [
+        sf.secret_item(
+            "Identity",
+            v.pw,
+            fields={
+                "agent_secret_fields": ",".join([*personal, "api_token"]),
+                "agent_secret_username_is_credential": "true",
+                "api_token": v.token,
+                **personal,
+            },
+        ),
+        sf.secret_item("Plain", v.other),
+    ]
+
+
+def test_personal_data_fields_are_not_inventoried(tmp_path, vals):
+    fields = sorted(secret_ops.PERSONAL_DATA_FIELDS)
+    with sf.sockdir() as d:
+        keeper = sf.FakeSecretkeeper(str(d / "keeper.sock"))
+        home = tmp_path / "home"
+        vpath = sf.write_vault(tmp_path / "v.json", _identity_items(vals))
+        brk = sf.make_broker(home, vpath, allow_uid=UID, keeper_sock=keeper.path)
+        try:
+            # served, but nothing registered — not even with the username flag
+            assert _secret(brk, [("identity", f) for f in fields])["ok"] is True
+            assert not keeper.syncs
+            # a real credential of the same item and of another item still is
+            resp = _secret(brk, [("identity", "api_token"), ("identity", "password")])
+            assert resp["ok"] is True
+            assert _secret(brk, [("plain", "password")])["ok"] is True
+            assert _synced_labels(keeper) == {
+                "loginbroker:identity:api_token",
+                "loginbroker:identity:password",
+                "loginbroker:plain:password",
+            }
+        finally:
+            keeper.close()
+
+
+def test_refresh_drops_personal_data_persisted_before(tmp_path, vals):
+    with sf.sockdir() as d:
+        keeper = sf.FakeSecretkeeper(str(d / "keeper.sock"))
+        home = tmp_path / "home"
+        home.mkdir(parents=True)
+        (home / "leakcheck-labels.json").write_text(
+            json.dumps(
+                {
+                    "labels": [
+                        ["identity", "email"],
+                        ["identity", "first_name"],
+                        ["plain", "password"],
+                    ]
+                }
+            )
+        )
+        vpath = sf.write_vault(tmp_path / "v.json", _identity_items(vals))
+        brk = sf.make_broker(home, vpath, allow_uid=UID, keeper_sock=keeper.path)
+        try:
+            keeper.restart()
+            assert brk.refresh_leakcheck() == 1
+            assert _synced_labels(keeper) == {"loginbroker:plain:password"}
+            persisted = json.loads((home / "leakcheck-labels.json").read_text())
+            assert persisted == {"labels": [["plain", "password"]]}
+            assert brk.refresh_leakcheck() == 0
+        finally:
+            keeper.close()
