@@ -122,6 +122,107 @@ def test_owned_marker_tabs_are_never_matched_and_never_blank():
     assert browser._match_page(br, None)[1].url == "about:blank"
 
 
+# --- several --url matches: the tab `open` created last (tp#1283) ----------
+
+
+class _IdPage(_Page):
+    """A page whose CDP target id `_page_target_id` (patched) reads."""
+
+    def __init__(self, url: str, tid: str | None) -> None:
+        super().__init__(url)
+        self.tid = tid
+
+
+def _id_browser(pages: list[tuple[str, str | None]]) -> _Browser:
+    br = _Browser([])
+    br.contexts[0].pages = [_IdPage(u, t) for u, t in pages]
+    return br
+
+
+def _with_state(monkeypatch, targets) -> None:
+    monkeypatch.setattr(browser, "_page_target_id", lambda pg: pg.tid)
+
+    def _read() -> dict:
+        if isinstance(targets, Exception):
+            raise targets
+        return {"v": 1, "targets": targets, "keep_origins": []}
+
+    monkeypatch.setattr(browser, "_tabstate_read", _read)
+
+
+def test_several_matches_pick_the_tab_open_created_last(monkeypatch, capsys):
+    br = _id_browser(
+        [
+            ("https://x.test/old", "T_OLD"),
+            ("https://x.test/new", "T_NEW"),
+            ("https://x.test/mid", "T_MID"),
+            ("https://other.test/", "T_OTHER"),
+        ]
+    )
+    _with_state(
+        monkeypatch,
+        {
+            "T_OLD": {"created": 100.0, "last_used": 900.0},
+            "T_NEW": {"created": 300.0},
+            "T_MID": {"created": 200.0},
+            "T_OTHER": {"created": 999.0},  # does not match: never chosen
+        },
+    )
+    _ctx, page = browser._match_page(br, "x.test")
+    assert page is not None and page.tid == "T_NEW"
+    err = capsys.readouterr().err
+    assert err.count("\n") == 1
+    assert "3 tabs match" in err and "target=T_NEW" in err and "-T <id>" in err
+
+
+def test_several_matches_without_records_keep_the_first(monkeypatch, capsys):
+    br = _id_browser([("https://x.test/a", "T_A"), ("https://x.test/b", None)])
+    _with_state(monkeypatch, {"T_A": {"first_seen": 5.0}})  # no `created`
+    _ctx, page = browser._match_page(br, "x.test")
+    assert page is not None and page.tid == "T_A"
+    err = capsys.readouterr().err
+    assert "2 tabs match" in err and "target=T_A" in err and "-T <id>" in err
+
+
+def test_several_matches_on_an_unreadable_state_keep_the_first(monkeypatch, capsys):
+    br = _id_browser([("https://x.test/a", "T_A"), ("https://x.test/b", "T_B")])
+    _with_state(monkeypatch, browser.TabStateError("broken"))
+    _ctx, page = browser._match_page(br, "x.test")
+    assert page is not None and page.tid == "T_A"
+    assert "target=T_A" in capsys.readouterr().err
+
+
+def test_a_single_match_is_unchanged_and_silent(monkeypatch, capsys):
+    br = _id_browser([("https://x.test/a", "T_A"), ("https://y.test/", "T_Y")])
+
+    def _no_lookup(_pg):
+        raise AssertionError("a single match needs no target id")
+
+    monkeypatch.setattr(browser, "_page_target_id", _no_lookup)
+    _ctx, page = browser._match_page(br, "x.test")
+    assert page is not None and page.tid == "T_A"
+    assert capsys.readouterr().err == ""
+
+
+def test_eval_url_with_several_matches_still_exits_0(monkeypatch, capsys):
+    class _EvalPage(_IdPage):
+        def evaluate(self, _js: str) -> str:
+            return self.tid or ""
+
+    br = _Browser([])
+    br.contexts[0].pages = [
+        _EvalPage("https://x.test/a", "T_A"),
+        _EvalPage("https://x.test/b", "T_B"),
+    ]
+    _with_state(monkeypatch, {"T_A": {"created": 1.0}, "T_B": {"created": 2.0}})
+    monkeypatch.setattr(browser, "_connect", lambda port: (_Playwright(), br))
+    monkeypatch.setattr(browser, "_touch_page", lambda page: None)
+    assert browser.cmd_eval(9222, "1", "x.test") == 0
+    out, err = capsys.readouterr()
+    assert out.strip() == '"T_B"'
+    assert "2 tabs match" in err and "target=T_B" in err
+
+
 # --- the zero-tab guard -----------------------------------------------------
 
 

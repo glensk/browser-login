@@ -85,8 +85,11 @@ browser.py close -i <id>…     # close the tab(s) you opened (lease, re-check, 
 browser.py close [-n] URL…    # manual cleanup of leftover tabs by exact URL (query/fragment and
                               #   trailing slash ignored; http(s) only); -n = dry run;
                               #   -w lease wait (30 s), -d overall deadline (20 s)
-browser.py eval 'document.title' [--url SUBSTR]   # run JS in the most recent/matched tab → JSON
-                              #   evaluates only, never navigates; --url with no matching tab
+browser.py eval 'document.title' [-u|--url SUBSTR]  # run JS in the most recent/matched tab → JSON
+                              #   evaluates only, never navigates; several matching tabs → the
+                              #   one `open` created last, plus a ⚠ line on stderr with the
+                              #   count and the chosen target id (tp#1283) — address a tab you
+                              #   opened with `eval -T <id>` instead; --url with no matching tab
                               #   exits 1 (it never falls back to another tab; the error names
                               #   the open tabs by origin only — no path, query or fragment);
                               #   another process's owned tab (about:blank#owned-…) never matches;
@@ -458,8 +461,18 @@ Rules for anything that drives this browser:
   hold a long-lived CDP connection.
 - **Close what you open (tp#786).** A tool that needs a tab of its own opens
   it with `open -N URL`, reads the `target=<id>` line, evaluates with
-  `eval -T <id>`, and closes it with `close -i <id>` in a `finally`. Leftover
-  tabs are not harmless: every Playwright attach waits for every page target,
+  `eval -T <id>`, and closes it with `close -i <id>` in a `finally`.
+  Never follow `open` with `eval --url`: with two tabs on the same site it
+  may read the other one (tp#1283 picks the tab `open` created last and
+  warns, but only `-T` is exact):
+
+  ```commands
+  tid=$(browser.py open https://example.com/ | sed -n 's/^target=//p')
+  browser.py eval -T "$tid" 'document.title'
+  browser.py close -i "$tid"
+  ```
+
+  Leftover tabs are not harmless: every Playwright attach waits for every page target,
   so a few heavy tabs (Smartsheet's desktop app) slow down EVERY consumer of
   the browser. `close` registers, takes the interaction lease (bounded by
   `-w`, inside one `-d` deadline; on a lease timeout it exits 1 and closes

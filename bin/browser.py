@@ -53,6 +53,8 @@ Generic lifecycle:
             a tab it did not create (tp#863). [-N|--new] the same, explicitly;
             [-r|--reuse] (manual use) navigates a tab already on URL instead.
   eval JS   Run a JS expression in the active (or --url-matched) tab; print JSON.
+            [-u|--url SUBSTR] several matches: the tab `open` created last,
+            with a ⚠ line naming its target id — prefer `open` → `eval -T`.
             [-t|--timeout SECONDS] hard deadline (default 60), attach included.
             [-T|--target TID] evaluates in exactly that target over raw CDP
             (JSON-serialisable results only); exit 1 if it is gone.
@@ -466,11 +468,14 @@ def _add_open_eval_parsers(sub: Any) -> None:
     pe.add_argument("js", help="JavaScript expression to evaluate.")
     peg = pe.add_mutually_exclusive_group()
     peg.add_argument(
+        "-u",
         "--url",
         default=None,
         help="Substring to pick the target tab (default: the most recent content "
         "tab). Evaluates only — never navigates it. Exits 1 when no tab "
-        "matches — never evaluates in another tab.",
+        "matches — never evaluates in another tab. Several matches: the tab "
+        "`open` created last, with a ⚠ line on stderr naming its target id — "
+        "prefer -T with the id `open` printed.",
     )
     peg.add_argument(
         "-T",
@@ -5429,12 +5434,14 @@ def _match_page(browser, url_substr: str | None):
 
     Reserved for `eval` (tp#845): it EVALUATES in the tab it finds and never
     navigates it — no in-repo check or login selects a tab by URL any more
-    (they use `_owned_background_page`). With `url_substr`: the first tab
-    whose URL contains it — never another tab (tp#317: falling back silently
-    ran a SharePoint query inside a Slack tab). Without: the most recent
-    content tab, else the most recent tab at all. Tabs still on an owned-tab
-    marker URL (``about:blank#owned-…``, another process's check or login)
-    are never a match.
+    (they use `_owned_background_page`). With `url_substr`: a tab whose URL
+    contains it — never another tab (tp#317: falling back silently ran a
+    SharePoint query inside a Slack tab). Several matches: the one `open`
+    created last (`_newest_opened`, tp#1283), plus one ⚠ line on stderr
+    naming the count, the chosen target id and ``-T``. Without: the most
+    recent content tab, else the most recent tab at all. Tabs still on an
+    owned-tab marker URL (``about:blank#owned-…``, another process's check or
+    login) are never a match.
     """
     ctx = browser.contexts[0] if browser.contexts else None
     pages = [
@@ -5443,11 +5450,63 @@ def _match_page(browser, url_substr: str | None):
         if not _is_owned_marker(pg.url)
     ]
     if url_substr:
-        return ctx, next((pg for pg in pages if url_substr in pg.url), None)
+        matches = [pg for pg in pages if url_substr in pg.url]
+        if len(matches) <= 1:
+            return ctx, (matches[0] if matches else None)
+        tids = [_page_target_id(pg) for pg in matches]
+        pick = _newest_opened(tids)
+        how = "the one `open` created last"
+        if pick is None:
+            pick, how = 0, "no open record — the first in attach order"
+        chosen = tids[pick] or "?"
+        print(
+            f"⚠ eval --url {url_substr!r}: {len(matches)} tabs match — evaluating "
+            f"in target={chosen} ({how}); use -T <id> to address a tab exactly "
+            "(`open` prints target=<id>)",
+            file=sys.stderr,
+        )
+        return ctx, matches[pick]
     content = [pg for pg in pages if not _is_blank(pg.url)]
     if content:
         return ctx, content[-1]
     return ctx, (pages[-1] if pages else None)
+
+
+def _page_target_id(page: Any) -> str | None:
+    """A Playwright page's CDP target id (``Target.getTargetInfo``); None when
+    it cannot be read."""
+    try:
+        session = page.context.new_cdp_session(page)
+        try:
+            info = session.send("Target.getTargetInfo").get("targetInfo") or {}
+        finally:
+            session.detach()
+    except Exception:  # pylint: disable=broad-exception-caught
+        return None
+    tid = info.get("targetId") if isinstance(info, dict) else None
+    return tid if isinstance(tid, str) and tid else None
+
+
+def _newest_opened(tids: Sequence[str | None]) -> int | None:
+    """Index of the target `open` created last, by `tabs.json` ``created``
+    (tp#1283); None when the state is unreadable or no target has a record.
+
+    A lock-free read: a torn or busy state only loses the preference, never
+    the eval."""
+    try:
+        targets = _tabstate_read()["targets"]
+    except (TabStateError, OSError):
+        return None
+    best: int | None = None
+    best_t = float("-inf")
+    for i, tid in enumerate(tids):
+        entry = targets.get(tid) if tid else None
+        created = entry.get("created") if isinstance(entry, dict) else None
+        if isinstance(created, bool) or not isinstance(created, (int, float)):
+            continue
+        if created > best_t:
+            best, best_t = i, float(created)
+    return best
 
 
 def _strip_query(url: str) -> str:
@@ -5579,7 +5638,7 @@ def _reuse_same_url_tab(port: int, url: str) -> bool:
         same = [pg for pg in pages if _strip_query(pg.url) == base]
         if not same:
             return False
-        page = same[0]  # oldest match = the tab `eval --url` would pick
+        page = same[0]  # oldest match
         page.goto(url, wait_until="domcontentloaded")
         print(f"✓ Reused tab: {page.url}  (title: {page.title()!r})")
         return True
@@ -5749,16 +5808,8 @@ def _eval_attached(port: int, js: str, url_substr: str | None) -> int:
 
 def _touch_page(page: Any) -> None:
     """`_tabstate_touch` for a Playwright page (its target id via CDP; best effort)."""
-    try:
-        session = page.context.new_cdp_session(page)
-        try:
-            info = session.send("Target.getTargetInfo").get("targetInfo") or {}
-        finally:
-            session.detach()
-    except Exception:  # pylint: disable=broad-exception-caught
-        return
-    tid = info.get("targetId") if isinstance(info, dict) else None
-    if isinstance(tid, str) and tid:
+    tid = _page_target_id(page)
+    if tid:
         _tabstate_touch(tid)
 
 
