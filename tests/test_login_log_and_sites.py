@@ -341,3 +341,59 @@ def test_login_log_survives_corrupt_lines(logdir, capsys):
 )
 def test_notion_verdict_needs_sidebar_on_app_host(url, sidebar, ok):
     assert browser._notion_verdict(url, sidebar) is ok
+
+
+# --- tp#1307: login cscs names the broker failure before the keychain fallback ---
+
+
+def _keychain_fails(port: int) -> int:
+    print("❌ No CSCS credentials in the macOS keychain.", file=sys.stderr)
+    return 1
+
+
+@pytest.mark.parametrize(
+    "broker, why",
+    [
+        ("down", "BrokerUnavailable: login broker did not answer (refused)"),
+        ("missing", "cscs is not in the broker's agent-logins list"),
+        ("refused", "agent-logins item refused: no TOTP"),
+    ],
+)
+def test_cscs_login_names_broker_failure_before_keychain_error(
+    monkeypatch, capsys, broker, why
+):
+    def broker_site(site):
+        assert site == "cscs"
+        if broker == "down":
+            raise browser.BrokerUnavailable("login broker did not answer (refused)")
+        if broker == "refused":
+            return {"site": "cscs", "refused": True, "reason": "no TOTP"}
+        return None
+
+    monkeypatch.setattr(browser, "_broker_site", broker_site)
+    monkeypatch.setattr(browser, "cmd_cscs_login", _keychain_fails)
+    site = browser._resolve_site("cscs", for_login=True)
+    assert site.name == "cscs"
+    assert site.login(9222) == 1  # the fallback's exit code, unchanged
+    lines = capsys.readouterr().err.splitlines()
+    assert len(lines) == 3
+    assert why in lines[0] and "falling back" in lines[0]
+    assert "No CSCS credentials" in lines[1]
+    assert why in lines[2] and "keychain fallback failed too" in lines[2]
+
+
+def test_cscs_keychain_fallback_success_adds_no_failure_line(monkeypatch, capsys):
+    monkeypatch.setattr(browser, "_broker_site", lambda site: None)
+    monkeypatch.setattr(browser, "cmd_cscs_login", lambda port: 0)
+    assert browser._resolve_site("cscs", for_login=True).login(9222) == 0
+    err = capsys.readouterr().err
+    assert "falling back" in err and "failed" not in err
+
+
+def test_cscs_login_takes_the_broker_path_silently(monkeypatch, capsys):
+    monkeypatch.setattr(
+        browser, "_broker_site", lambda site: {"site": "cscs", "refused": False}
+    )
+    site = browser._resolve_site("cscs", for_login=True)
+    assert site.login.func is browser._broker_login
+    assert capsys.readouterr().err == ""

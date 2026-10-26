@@ -16276,6 +16276,44 @@ def _sites() -> list[Site]:
     ]
 
 
+def _cscs_broker_skip_reason(entry: Mapping[str, Any] | None) -> str | None:
+    """Why ``login cscs`` cannot take the broker path (None: it can)."""
+    if entry is None:
+        return "cscs is not in the broker's agent-logins list"
+    if entry.get("refused"):
+        return f"agent-logins item refused: {entry.get('reason') or '?'}"
+    return None
+
+
+def _cscs_keychain_fallback(site: Site, why: str) -> Site:
+    """The legacy keychain `site`, saying first WHY the broker was skipped (tp#1307).
+
+    The fallback's own error ("No CSCS credentials in the macOS keychain")
+    used to be the only line, hiding the broker failure that caused it. The
+    reason is said on stderr before the fallback runs and once more, broker
+    first, when the fallback fails too. Exit codes are the fallback's own.
+    """
+    print(
+        f"⚠ login cscs: broker path unavailable ({why}) — falling back to the "
+        "legacy keychain login",
+        file=sys.stderr,
+    )
+    login = site.login
+
+    @functools.wraps(login)
+    def _login(port: int) -> int:
+        rc = login(port)
+        if rc:
+            print(
+                f"❌ login cscs: broker path failed ({why}); the keychain "
+                "fallback failed too (its error above)",
+                file=sys.stderr,
+            )
+        return rc
+
+    return dataclasses.replace(site, login=_login)
+
+
 def _resolve_site(name: str, *, for_login: bool = False) -> Site:
     """Find a Site: static registry first, then the login broker's `sites` list.
 
@@ -16294,14 +16332,16 @@ def _resolve_site(name: str, *, for_login: bool = False) -> Site:
             if site.name == "cscs" and for_login:
                 try:
                     entry = _broker_site("cscs")
-                except BrokerUnavailable:
-                    entry = None
-                if entry is not None and not entry.get("refused"):
+                    why = _cscs_broker_skip_reason(entry)
+                except BrokerUnavailable as exc:
+                    entry, why = None, f"{type(exc).__name__}: {exc}"
+                if why is None:
                     return dataclasses.replace(
                         site,
                         blurb="CSCS portal via the login broker",
                         login=functools.partial(_broker_login, site="cscs"),
                     )
+                return _cscs_keychain_fallback(site, why)
             return site
     reason = ""
     try:

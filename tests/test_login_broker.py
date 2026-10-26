@@ -1332,7 +1332,9 @@ def test_resolve_site_broker_down(monkeypatch, sockdir, capsys):
         browser._resolve_site("ricardo")
     assert exc.value.code == 2
     assert "broker down" in capsys.readouterr().err
-    assert browser._resolve_site("cscs", for_login=True).login is browser.cmd_cscs_login
+    login = browser._resolve_site("cscs", for_login=True).login
+    assert login.__wrapped__ is browser.cmd_cscs_login  # tp#1307: names the reason
+    assert "BrokerUnavailable: no login broker" in capsys.readouterr().err
     with pytest.raises(browser.BrokerUnavailable):
         browser._broker_request("ping")
 
