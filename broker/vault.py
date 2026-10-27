@@ -77,6 +77,7 @@ from collections.abc import Callable, Iterator, Mapping
 from contextlib import contextmanager
 from dataclasses import dataclass, field, replace
 from pathlib import Path
+from types import MappingProxyType
 from typing import Any, Protocol
 
 from broker import identity as _identity
@@ -190,6 +191,8 @@ GATE_FILL_ONLY = "fill_only"
 GATE_DUPLICATE = "duplicate_id"
 GATE_UNREADABLE = "membership_unreadable"
 GATE_INVALID = "invalid_item"
+# tp#1303: an item bound to one service (SERVICE_ITEMS): never a secret-run value
+GATE_SERVICE_ONLY = "service_only"
 GATE_CODES = (
     GATE_OK,
     GATE_NO_FLAG,
@@ -201,6 +204,19 @@ GATE_CODES = (
     GATE_DUPLICATE,
     GATE_UNREADABLE,
     GATE_INVALID,
+    GATE_SERVICE_ONLY,
+)
+# tp#1303 (mydotfiles PLAN_mem-hmac-key.md R-A): items bound to ONE service. Root-installed
+# with the release (changing the binding needs `sudo install/install.sh`). Such an item is
+# refused by `secret`/`totp` whatever its agent_script says (gate_code service_only), is left
+# out of the `secrets` listing, and is served only by the `service_secret` op to a request
+# naming its service. Not an authorization boundary against a same-uid process that names
+# both (the plan's R2'); every grant is one audit line.
+SERVICE_ITEMS: Mapping[str, str] = MappingProxyType(
+    {"mem-service-hmac": "com.albert.mem-serve"}
+)
+SERVICE_ONLY_SECRET = (
+    "service-only item: served to its bound service only, never injected"
 )
 # In mode agent_script the "dual" refusal means a script read that reaches an
 # item without the flag (R0: MEMBERSHIP_DUAL becomes this).
@@ -627,6 +643,9 @@ class Vault(Protocol):
     def secret_values(self, secret_id: str) -> SecretValues:
         """The exposed values of one secrets item (VaultError when unknown)."""
 
+    def service_values(self, secret_id: str) -> SecretValues | str:
+        """tp#1303: a ``SERVICE_ITEMS`` item's values, or its refusal code."""
+
     def invalidate(self) -> int:
         """Drop every cached value; returns the new cache generation."""
 
@@ -984,6 +1003,7 @@ _GATE_REASONS = {
     GATE_NO_FLAG: NO_AGENT_SCRIPT,
     GATE_HELD: HELD_SECRET,
     GATE_DUPLICATE: DUPLICATE_SECRET_ID,
+    GATE_SERVICE_ONLY: SERVICE_ONLY_SECRET,
 }
 
 
@@ -1095,10 +1115,57 @@ def build_secret_items(
             it = _refused_copy(it, "duplicate agent_secret_id", GATE_DUPLICATE)
             vals = None
         seen.add(it.secret_id)
+        if it.secret_id in SERVICE_ITEMS:  # tp#1303: never a secret-run value
+            it = replace(
+                _refused_copy(it, SERVICE_ONLY_SECRET, GATE_SERVICE_ONLY),
+                gate_code=GATE_SERVICE_ONLY,
+            )
+            vals = None
         items.append(it)
         if vals is not None and it.refused is None:
             values[it.secret_id] = vals
     return items, values
+
+
+def build_service_values(
+    raw_items: list[Any],
+    *,
+    membership: Membership | None = None,
+    gate: str = GATE_COLLECTIONS,
+    login_raw: list[Any] | None = None,
+) -> dict[str, SecretValues | str]:
+    """tp#1303: {id: its values, or a refusal code} for every ``SERVICE_ITEMS`` id
+    in one secret read. Codes: ``held`` (agent_hold set: a credctl rotation runs),
+    ``duplicate_id`` (two items claim the id), ``membership_unreadable``, or the
+    item's own refusal code (``invalid_item``, ...). The ``agent_script`` flag
+    does not matter: the binding is the table, not the vault field."""
+    strict_mode = gate == GATE_AGENT_SCRIPT
+    entries = secret_entries(raw_items, login_raw if strict_mode else None)
+    out: dict[str, SecretValues | str] = {}
+    n = 0
+    for entry in entries:
+        n += 1
+        it, vals = secret_item_from_json(
+            entry.raw,
+            n,
+            kind=KIND_LOGIN if entry.in_login else KIND_SECRET,
+            login_ids=strict_mode and not entry.in_secrets,
+        )
+        sid = it.secret_id
+        if sid not in SERVICE_ITEMS:
+            continue
+        if sid in out:
+            out[sid] = GATE_DUPLICATE
+            continue
+        if membership_refusal(entry.raw, membership, gate):
+            out[sid] = GATE_UNREADABLE
+        elif item_hold(_fields(entry.raw)):
+            out[sid] = GATE_HELD
+        elif it.refused is not None or vals is None:
+            out[sid] = it.code if it.code != GATE_OK else GATE_INVALID
+        else:
+            out[sid] = vals
+    return out
 
 
 def resolve_secret(items: list[SecretItem], secret_id: str) -> SecretItem | None:
@@ -1185,6 +1252,18 @@ class _SecretSource:
                 self.cache.put(
                     ("values", *key, sid), vals, size=vals.nbytes(), generation=gen
                 )
+            bound = build_service_values(
+                raw,
+                membership=self._membership(),
+                gate=key[0],
+                login_raw=login_raw,
+            )
+            for sid in SERVICE_ITEMS:
+                got = bound.get(sid, "unknown")
+                size = got.nbytes() if isinstance(got, SecretValues) else len(got)
+                self.cache.put(("service", *key, sid), got, size=size, generation=gen)
+            if want[0] == "service":
+                return bound.get(want[-1], "unknown")
             listing = tuple(items)
             size = sum(len(json.dumps(it.public())) for it in items)
             self.cache.put(("items", *key), listing, size=size, generation=gen)
@@ -1211,6 +1290,20 @@ class _SecretSource:
         if hit is None:
             raise VaultError(f"unknown or refused secret {secret_id!r}")
         assert isinstance(hit, SecretValues)
+        return hit
+
+    def service_values(self, secret_id: str) -> SecretValues | str:
+        """tp#1303: the values of a ``SERVICE_ITEMS`` item, or its refusal code
+        (``unknown`` when the read holds no such item). Only the
+        ``service_secret`` op calls this."""
+        if secret_id not in SERVICE_ITEMS:
+            return "unknown"
+        key = self._secrets_key()
+        want = ("service", *key, secret_id)
+        hit = self.cache.get(want)
+        if hit is None:
+            hit = self._fill(key, want)
+        assert isinstance(hit, (SecretValues, str))
         return hit
 
     def invalidate(self) -> int:

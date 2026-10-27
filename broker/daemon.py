@@ -1677,6 +1677,10 @@ class _LazyBwVault:
         """See ``BwVault.secret_values``."""
         return self._vault().secret_values(secret_id)
 
+    def service_values(self, secret_id: str) -> SecretValues | str:
+        """See ``BwVault.service_values`` (tp#1303)."""
+        return self._vault().service_values(secret_id)
+
     def invalidate(self) -> int:
         """Bump the cache generation (no bootstrap read needed)."""
         return self.cache.bump()
@@ -1968,7 +1972,7 @@ class Broker(SecretOps, FillOps):  # pylint: disable=too-many-instance-attribute
         try:
             if op in SECRET_OPS:
                 site = None
-                resp = self._secret_op(op, req, uid, extra)
+                resp = self._secret_op(op, req, uid, extra, pid=pid)
             elif op == "ping":
                 resp = {"ok": True, "pong": True}
             elif op == "sites":

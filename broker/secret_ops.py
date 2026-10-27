@@ -16,6 +16,15 @@ only (``bad_secret_gate``) — ``secret_done``, ``audit`` and ``invalidate``
 keep working. In mode ``report`` every issued item that mode
 ``agent_script`` would refuse gets ONE ``gate_would_refuse`` audit event
 (item + code), written only after the value/code was issued.
+
+tp#1303 (mydotfiles PLAN_mem-hmac-key.md R-A): an item of the root-installed
+``vault.SERVICE_ITEMS`` table is refused by ``secret``/``totp``
+(``gate_code: service_only``) and left out of ``secrets``; ``service_secret
+{item, field, service}`` returns its value only when ``service`` is the item's
+bound service, never while it is held (credctl's ``agent_hold``), under its own
+limiter. It is NOT an authorization boundary against a same-uid process that
+names both; every grant is one audit line with value-free telemetry (peer pid,
+its parent pid, the peer's executable) for ``mem doctor``.
 """
 
 from __future__ import annotations
@@ -23,6 +32,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import subprocess
 import threading
 import time
 from collections.abc import Callable
@@ -41,13 +51,16 @@ from broker.vault import (
     GATE_COLLECTIONS,
     GATE_OK,
     GATE_REPORT,
+    GATE_SERVICE_ONLY,
     NO_SECRETS_COLLECTION,
     SAFE_NAME_RE,
     SECRET_GATES,
+    SERVICE_ITEMS,
     SITE_ID_RE,
     BadSecretGate,
     SecretItem,
     SecretsNotConfigured,
+    SecretValues,
     Vault,
     VaultError,
     is_short,
@@ -61,6 +74,11 @@ SECRET_PER_DAY = 1000
 TOTP_PER_HOUR = 20
 SECRET_GLOBAL_PER_HOUR = 600
 GLOBAL_SECRET_KEY = "secret:*"
+# tp#1303 `service_secret`: one grant per service start; normal is ~1 a day.
+SERVICE_PER_HOUR = 6
+SERVICE_PER_DAY = 24
+SERVICE_NAME_RE = re.compile(r"^[a-z][a-z0-9.-]{2,63}$")
+_EXE_RE = re.compile(r"[A-Za-z0-9._/ +@-]{0,200}")
 # `safari_fill` (tp#1082, broker/fill_ops.py) shares this limiter file.
 FILL_PER_HOUR = 10
 FILL_PER_DAY = 40
@@ -75,10 +93,11 @@ SECRET_KEY_CAPS = {
     GLOBAL_FILL_KEY: (FILL_GLOBAL_PER_HOUR, FILL_GLOBAL_PER_DAY),
     "fill:": (FILL_PER_HOUR, FILL_PER_DAY),
     "filltotp:": (FILL_TOTP_PER_HOUR, 0),
+    "service:": (SERVICE_PER_HOUR, SERVICE_PER_DAY),
 }
-LIMITER_KEY_PREFIXES = ("secret:", "totp:", "fill:", "filltotp:")
+LIMITER_KEY_PREFIXES = ("secret:", "totp:", "fill:", "filltotp:", "service:")
 LIMITER_KEY_RE = re.compile(
-    r"^(secret|totp|fill|filltotp):([a-z0-9][a-z0-9._-]{0,63}|\*)$"
+    r"^(secret|totp|fill|filltotp|service):([a-z0-9][a-z0-9._-]{0,63}|\*)$"
 )
 MAX_SECRET_ITEMS = 16
 MAX_ENV_NAMES = 64
@@ -88,7 +107,15 @@ AUDIT_DEFAULT_LINES = 50
 AUDIT_MAX_LINES = 500
 AUDIT_TAIL_BYTES = 512 * 1024
 SECRET_OPS = frozenset(
-    {"secrets", "secret", "totp", "secret_done", "audit", "invalidate"}
+    {
+        "secrets",
+        "secret",
+        "totp",
+        "secret_done",
+        "audit",
+        "invalidate",
+        "service_secret",
+    }
 )
 
 
@@ -123,6 +150,31 @@ def inventoried(field: str, *, username_is_credential: bool) -> bool:
     if field in PERSONAL_DATA_FIELDS:
         return False
     return field not in UNINVENTORIED_FIELDS or username_is_credential
+
+
+def peer_telemetry(pid: int | None) -> dict[str, Any]:
+    """tp#1303: value-free telemetry of a peer process for the audit line: its
+    pid, parent pid and executable (``/bin/ps``; "" when unknown). Never used to
+    authorize: every field can be reproduced by a same-uid process."""
+    out: dict[str, Any] = {"peer_pid": pid, "peer_ppid": None, "peer_exe": ""}
+    if not isinstance(pid, int) or pid <= 0:
+        return out
+    try:
+        proc = subprocess.run(
+            ["/bin/ps", "-o", "ppid=", "-o", "comm=", "-p", str(pid)],
+            capture_output=True,
+            text=True,
+            timeout=3,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return out
+    parts = proc.stdout.strip().split(None, 1)
+    if proc.returncode == 0 and parts and parts[0].isdigit():
+        out["peer_ppid"] = int(parts[0])
+        exe = parts[1].strip()[-200:] if len(parts) > 1 else ""
+        out["peer_exe"] = exe if _EXE_RE.fullmatch(exe) else "unprintable"
+    return out
 
 
 def _err(code: str, detail: str = "") -> dict[str, Any]:
@@ -173,11 +225,18 @@ class SecretOps:  # pylint: disable=too-few-public-methods
         """Provided by ``Broker``."""
         raise NotImplementedError
 
-    def _secret_op(
-        self, op: str, req: dict[str, Any], uid: int | None, extra: dict[str, Any]
+    def _secret_op(  # pylint: disable=too-many-arguments,too-many-positional-arguments
+        self,
+        op: str,
+        req: dict[str, Any],
+        uid: int | None,
+        extra: dict[str, Any],
+        pid: int | None = None,
     ) -> dict[str, Any]:
         if self.allow_uid is None or uid != self.allow_uid:
             return _err("forbidden")
+        if op == "service_secret":
+            return self._service_secret(req, pid, extra)
         self._expire_runs()
         handlers: dict[str, Callable[[], dict[str, Any]]] = {
             "secrets": self._secrets,
@@ -258,7 +317,10 @@ class SecretOps:  # pylint: disable=too-few-public-methods
             "ok": True,
             "gate": gate,
             "gate_since": since,
-            "secrets": [it.public() for it in items],
+            # tp#1303: a service-only item is not an agent's to see
+            "secrets": [
+                it.public() for it in items if it.gate_code != GATE_SERVICE_ONLY
+            ],
         }
 
     def _gate_events(self, op: str, items: list[SecretItem], uid: int | None) -> None:
@@ -477,6 +539,48 @@ class SecretOps:  # pylint: disable=too-few-public-methods
             if isinstance(rec, dict):
                 lines.append(rec)
         return {"ok": True, "lines": lines}
+
+    # One early return per protocol error code, in the order they are checked.
+    # pylint: disable-next=too-many-return-statements
+    def _service_secret(
+        self, req: dict[str, Any], pid: int | None, extra: dict[str, Any]
+    ) -> dict[str, Any]:
+        """tp#1303: the value of a ``SERVICE_ITEMS`` item for its bound service."""
+        item = req.get("item")
+        fld = req.get("field", "password")
+        service = req.get("service")
+        if not isinstance(item, str) or not SITE_ID_RE.match(item):
+            return _err("bad_request", "missing or invalid item id")
+        if not isinstance(fld, str) or not SAFE_NAME_RE.match(fld):
+            return _err("bad_request", "invalid field name")
+        if not isinstance(service, str) or not SERVICE_NAME_RE.match(service):
+            return _err("bad_request", "missing or invalid service name")
+        extra.update(items=[f"{item}:{fld}"], service=service, **peer_telemetry(pid))
+        if SERVICE_ITEMS.get(item) != service:
+            return _err("forbidden_service", f"{item!r} is not bound to {service!r}")
+        try:
+            got = self.vault.service_values(item)
+        except (SecretsNotConfigured, BadSecretGate, VaultError) as exc:
+            return _err("vault_error", str(exc))
+        if not isinstance(got, SecretValues):
+            return {**_err("refused", f"{item}: {got}"), "gate_code": got}
+        value = got.fields.get(fld)
+        if not value:
+            return _err("unknown_field", f"{item}: field {fld!r} is empty")
+        granted = self.secret_limiter.reserve(
+            [f"service:{item}", GLOBAL_SECRET_KEY], self.clock()
+        )
+        if isinstance(granted, Denied):
+            return _err("rate_limited", granted.reason)
+        try:
+            self.leakcheck.register(
+                [(item, fld, value)]
+                if inventoried(fld, username_is_credential=False)
+                else []
+            )
+        except LeakCheckUnavailable as exc:
+            return _err("leakcheck_unavailable", str(exc))
+        return {"ok": True, "value": value}
 
     def _invalidate(self) -> dict[str, Any]:
         generation = self.invalidate()

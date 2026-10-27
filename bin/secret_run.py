@@ -101,7 +101,13 @@ TICK_S = 0.05
 READ_CHUNK = 65536
 MAX_PENDING_INPUT = 1024 * 1024
 CAPABILITIES_VERSION = 1
-FEATURES = ("capabilities", "agent-script-gate", "login-items", "gate-code")
+FEATURES = (
+    "capabilities",
+    "agent-script-gate",
+    "login-items",
+    "gate-code",
+    "service-secret",
+)
 SERVING_GATES = frozenset({"collections", "report", "agent_script"})
 NAME_RE = re.compile(r"^[A-Z_][A-Z0-9_]*$")
 ITEM_RE = re.compile(r"^[a-z0-9][a-z0-9._-]{0,63}$")

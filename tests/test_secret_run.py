@@ -794,11 +794,8 @@ def test_capabilities_reports_the_gate(world):
     proc = _run(["-V"], world.env())
     assert proc.returncode == 0
     caps = json.loads(proc.stdout)
-    assert caps == {
-        "v": 1,
-        "gate": "collections",
-        "features": ["capabilities", "agent-script-gate", "login-items", "gate-code"],
-    }
+    features = "capabilities agent-script-gate login-items gate-code service-secret"
+    assert caps == {"v": 1, "gate": "collections", "features": features.split()}
     _gate_vault(world, "agent_script")
     assert json.loads(_run(["-V"], world.env()).stdout)["gate"] == "agent_script"
 
