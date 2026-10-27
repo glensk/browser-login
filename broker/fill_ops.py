@@ -274,11 +274,11 @@ class FillOps:  # pylint: disable=too-few-public-methods
         if fields == ["totp"]:
             seed = sec.totp_seed or ""
             otp = parse_totp(seed)
-            code = fresh_totp(seed) if otp is not None else None
-            if otp is None or code is None:
+            totp_code = fresh_totp(seed) if otp is not None else None
+            if otp is None or totp_code is None:
                 return _err("unknown_field", f"{site}: no usable TOTP")
             valid_s = int(otp.interval - (time.time() % otp.interval))
-            return {"code": code, "valid_s": valid_s}
+            return {"code": totp_code, "valid_s": valid_s}
         values: dict[str, str] = {}
         for fld in fields:
             value = sec.username if fld == "username" else sec.password
