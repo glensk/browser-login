@@ -3261,6 +3261,16 @@ def _remove_phase1(site: str, sites: list[dict], *, force: bool = False) -> int:
             f"or the web vault), then ./agent-login.py -D {site} again"
         )
         return 0
+    entry = next((s for s in sites if s.get("site") == site), None)
+    if is_fill_only(entry):
+        # tp#1385: a fill-only item never had a broker browser session, and
+        # `browser.py logout` refuses it — nothing to log out.
+        print(
+            f"✅ {site}: fill-only: no broker session to log out. Next: remove its "
+            "vault item from agent-login (broker-add.py NAME -D, or the web vault), "
+            f"then ./agent-login.py -D {site} again"
+        )
+        return 0
     with site_session(site):
         run = run_browser("logout", site, timeout_s=browser_timeout("logout"))
     if run.rc != 0:

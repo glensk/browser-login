@@ -759,6 +759,19 @@ def test_d_phase_one_demotes_and_logs_out(monkeypatch: pytest.MonkeyPatch) -> No
     assert al.remove_action("app") == 1  # a failed logout stops phase 1
 
 
+def test_d_phase_one_skips_logout_for_fill_only(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """tp#1385: a fill-only item has no broker session; browser.py logout
+    refuses it, so -D phase 1 must not call it and must exit 0."""
+    _listing(monkeypatch, _view(fill_only=True))
+    calls = _no_login(monkeypatch)
+    assert al.remove_action("app") == 0
+    assert not calls
+    assert "fill-only: no broker session" in capsys.readouterr().out
+    assert als.site_states()["app"]["stage"] == "pending"
+
+
 def test_d_phase_one_never_logs_out_a_sibling_account(
     monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:

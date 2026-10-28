@@ -1489,8 +1489,8 @@ Fill-only items (`agent_fill_only = true`, tp#1082): the broker never logs in wi
 
 | Flag | Description |
 |------|-------------|
-| `-t` `SITE`, `--test` `SITE` | real login test for SITE |
-| `-g` `SITE`, `--guided` `SITE` | guided login by hand (browser.py assisted-login: confirm on the terminal, remote view of a headless tab; the window as fallback) |
+| `-t`, `--test` `SITE` | real login test for SITE |
+| `-g`, `--guided` `SITE` | guided login by hand (browser.py assisted-login: confirm on the terminal, remote view of a headless tab; the window as fallback) |
 | `-F`, `--force` | with -g: start even with UNREGISTERED CDP clients attached (browser.py assisted-login -f; they are not paused and keep running); with -D: log out even when another account's item shares the scope in the same browser instance |
 | `-c`, `--check-all` | every usable site: logged in? if not, `browser.py login`; one line per site; exit 0 when every failure is a site on record in last-check.json, 1 when the broker, a browser or the check failed |
 | `-m`, `-M`, `--mail` | with -c: mail `albert.glensk@gmail.com` (gog) when a site stays logged out |
@@ -1503,14 +1503,14 @@ Fill-only items (`agent_fill_only = true`, tp#1082): the broker never logs in wi
 | `-P`, `--print-plist` | print the three LaunchAgent plists (writes nothing) |
 | `-j`, `--json` | print the overview (with -x: the matrix) as JSON |
 | `-x`, `--matrix` | the acceptance matrix: one row per login (consumer, privilege, sentinel, scope, attempt group, refresh, stage, limit, last phase) |
-| `-p` `SITE`, `--promote` `SITE` | the ONE promotion transaction (pending -> usable for scheduled logins): a fresh listing, the onboarding review, then a fresh strict ok of this configuration on record, or ONE budgeted `browser.py login` (no retry); audited |
+| `-p`, `--promote` `SITE` | the ONE promotion transaction (pending -> usable for scheduled logins): a fresh listing, the onboarding review, then a fresh strict ok of this configuration on record, or ONE budgeted `browser.py login` (no retry); audited |
 | `-V`, `--validate`, `--validate-selectors` | the onboarding review (no login, no vault write): selectors the broker refuses, then every listed item's findings (refused / unusable / risk / hint); with -i: a PLANNED change; with -r: ask the broker now and refresh the site-list snapshot first (~40 s) instead of reading it; exit 1 when anything blocks |
-| `-i` `MANIFEST`, `--item` `MANIFEST` | with -V: review a planned item / batch (JSON: {name, fields, replaces?, username_form?, reveals?} or {items: [...], removes: [...]}; '-' = stdin; never a password) against the listing, displacement included |
-| `-E` `SITE`, `--rearm` `SITE` | give SITE its one promotion login back (after reviewing why it failed) — the main session's decision, audited |
-| `-D` `SITE`, `--remove` `SITE` | remove a broker site, run twice: while it is listed -> demote + browser.py logout; after its vault item is gone -> drop every trace (broker `forget`, state files, cache files); audited |
-| `-Q` `SITE`, `--release` `SITE` | release SITE's quarantine (after a failed login that may have submitted the password) — the main session's decision, audited |
-| `-L` `SITE`, `--safari-login` `SITE` | an AGENT's login through Albert's Safari (WS1b): free check, else import Safari's own session (works without new safari.py features), else log Safari in (safari.py, a new window; the login broker's credentials, else his Vaultwarden tab and clipboard) and import it; claude.ai: the automated magic link. One run, no retries; never from a LaunchAgent. Exit 4 = needs Albert (CAPTCHA, SMS, push / security key); a locked vault is the agent's: `vault-touchid unlock-safari -a main` (Albert touches once); exit 3 = the Mac is locked or idle: retry later |
+| `-i`, `--item` `MANIFEST` | with -V: review a planned item / batch (JSON: {name, fields, replaces?, username_form?, reveals?} or {items: [...], removes: [...]}; '-' = stdin; never a password) against the listing, displacement included |
+| `-E`, `--rearm` `SITE` | give SITE its one promotion login back (after reviewing why it failed) — the main session's decision, audited |
+| `-D`, `--remove` `SITE` | remove a broker site, run twice: while it is listed -> demote + browser.py logout; after its vault item is gone -> drop every trace (broker `forget`, state files, cache files); audited |
+| `-Q`, `--release` `SITE` | release SITE's quarantine (after a failed login that may have submitted the password) — the main session's decision, audited |
+| `-L`, `--safari-login` `SITE` | an AGENT's login through Albert's Safari (WS1b): free check, else import Safari's own session (works without new safari.py features), else log Safari in (safari.py, a new window; the login broker's credentials, else his Vaultwarden tab and clipboard) and import it; claude.ai: the automated magic link. One run, no retries; never from a LaunchAgent. Exit 4 = needs Albert (CAPTCHA, SMS, push / security key); a locked vault is the agent's: `vault-touchid unlock-safari -a main` (Albert touches once); exit 3 = the Mac is locked or idle: retry later |
 | `-l`, `--fillable` | list every item agents can fill into Albert's Safari (fill-only items and login items with agent_safari_fill): site, name, fill origins — names only, never a value (from the broker's site listing; -r asks the broker now; -j: JSON) |
 | `-n`, `--dry-run` | with -L: report what it would do (no import, no Safari login) |
-| `-H` `[SITE]`, `--identity-history` `[SITE]` | read-only: the last identity proofs of SITE (no SITE: of every site) that did not say match — when, state, verdict, the recipe's reason word, HTTP status, code, redacted detail (checks.json keeps the last 10 per site; the latest check overwrites its detail); -j: JSON |
+| `-H`, `--identity-history` `[SITE]` | read-only: the last identity proofs of SITE (no SITE: of every site) that did not say match — when, state, verdict, the recipe's reason word, HTTP status, code, redacted detail (checks.json keeps the last 10 per site; the latest check overwrites its detail); -j: JSON |
 | `-R`, `--refresh-pass` | refresh-only pass: renew every refreshable token (NPM) with < 12 h left; never logs in (LaunchAgent com.albert.agent-login-refresh, every 6 h) |
