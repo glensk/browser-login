@@ -7960,6 +7960,11 @@ def _claude_fill_email_and_continue(page, email: str) -> bool:
 # we must use this direct link (not the email's tracking link) and let the SPA read
 # the hash. The link is a bearer secret → never printed/logged.
 _MAGIC_LINK_RE = re.compile(r"https://claude\.ai/magic-link#[A-Za-z0-9:+/=_-]+")
+# The Claude Console sends the same kind of link for its own host (tp#1421; subject
+# "Your secure link to the Claude Console is here").
+_CONSOLE_MAGIC_LINK_RE = re.compile(
+    r"https://platform\.claude\.com/magic-link#[A-Za-z0-9:+/=_-]+"
+)
 
 
 def _himalaya_bin() -> str | None:
@@ -8177,6 +8182,18 @@ def _himalaya_list_folder(
 
 
 _LOGIN_MAIL_FOLDERS = ("INBOX", "Archive")  # a server rule auto-archives them
+
+
+def _login_mail_folders() -> tuple[str, ...]:
+    """The folders searched for login mail: `ANTHROPIC_LOGIN_MAIL_FOLDERS`
+    (comma-separated, e.g. `INBOX` for a Gmail account, which has no
+    `Archive`), else `_LOGIN_MAIL_FOLDERS`. Every listed folder must be
+    listable, or the baseline refuses (old and new mails could mix)."""
+    raw = os.environ.get("ANTHROPIC_LOGIN_MAIL_FOLDERS", "")
+    folders = tuple(f.strip() for f in raw.split(",") if f.strip())
+    return folders or _LOGIN_MAIL_FOLDERS
+
+
 _MAX_REJECTED_SENDERS = 5
 
 
@@ -8204,7 +8221,7 @@ def _himalaya_login_mail_candidates(
         allow = _login_mail_senders()[0]
     ranked: list[tuple[tuple[int, float], str, str]] = []
     seen = looked_like = 0
-    for folder in _LOGIN_MAIL_FOLDERS:
+    for folder in _login_mail_folders():
         envs = _himalaya_list_folder(himalaya, folder, account=account, diag=diag)
         for env in envs or []:
             seen += 1
@@ -8311,7 +8328,10 @@ def _magic_link_digest(link: str) -> str:
 
 
 def _himalaya_login_link_baseline(
-    himalaya: str, account: str | None = None, diag: list[str] | None = None
+    himalaya: str,
+    account: str | None = None,
+    diag: list[str] | None = None,
+    link_re: re.Pattern[str] = _MAGIC_LINK_RE,
 ) -> set[str] | None:
     """Digests of every magic link already in the mailbox BEFORE we trigger a
     new one. Sender-independent on purpose, so a pre-planted forged mail is
@@ -8321,7 +8341,7 @@ def _himalaya_login_link_baseline(
     None when any folder or login-looking body could not be read: then old and
     new mails cannot be told apart, and the caller must not auto-login."""
     digests: set[str] = set()
-    for folder in _LOGIN_MAIL_FOLDERS:
+    for folder in _login_mail_folders():
         envs = _himalaya_list_folder(himalaya, folder, account=account, diag=diag)
         if envs is None:
             return None
@@ -8335,20 +8355,22 @@ def _himalaya_login_link_baseline(
             if body is None:
                 _diag(diag, f"{folder}: could not read login mail id {msg_id}")
                 return None
-            m = _MAGIC_LINK_RE.search(body)
+            m = link_re.search(body)
             if m:
                 digests.add(_magic_link_digest(m.group(0)))
     return digests
 
 
-def _magic_link_email(link: str) -> str | None:
+def _magic_link_email(
+    link: str, link_re: re.Pattern[str] = _MAGIC_LINK_RE
+) -> str | None:
     """The account a magic link names: `#<token>:<base64 email>` → the email,
     lower-cased. Standard or URL-safe base64, padding optional. None when the
     link is not a full `_MAGIC_LINK_RE` match or the part does not decode to
     exactly one address."""
     import binascii
 
-    if not link or not _MAGIC_LINK_RE.fullmatch(link):
+    if not link or not link_re.fullmatch(link):
         return None
     frag = link.partition("#")[2]
     if ":" not in frag:
@@ -8378,6 +8400,7 @@ def _claude_next_magic_link(
     rejected: dict[str, str],
     diag: list[str],
     rejected_senders: list[str],
+    link_re: re.Pattern[str] = _MAGIC_LINK_RE,
 ) -> str | None:
     """One poll round: the newest candidate whose link is new (not in
     `baseline`) and names `email`. Every refused candidate goes to `rejected`
@@ -8402,7 +8425,7 @@ def _claude_next_magic_link(
         if body is None:  # transient read failure → retry next round
             _diag(diag, f"could not read the login mail ({folder} id {msg_id})")
             continue
-        m = _MAGIC_LINK_RE.search(body)
+        m = link_re.search(body)
         if not m:
             rejected[key] = f"found a mail ({folder} id {msg_id}) but no magic link"
             continue
@@ -8413,7 +8436,7 @@ def _claude_next_magic_link(
                 "this attempt"
             )
             continue
-        if _magic_link_email(link) != want:
+        if _magic_link_email(link, link_re) != want:
             # Never print the link or the foreign email it names.
             rejected[key] = (
                 f"found a login mail ({folder} id {msg_id}) whose link is for a "
@@ -8424,7 +8447,15 @@ def _claude_next_magic_link(
     return None
 
 
-def _claude_auto_login(page, email: str, himalaya: str) -> str:
+def _claude_auto_login(  # pylint: disable=too-many-locals,too-many-statements
+    page,
+    email: str,
+    himalaya: str,
+    *,
+    link_re: re.Pattern[str] = _MAGIC_LINK_RE,
+    app_host: str = "claude.ai",
+    logged_in: Callable[[Any], bool] | None = None,
+) -> str:
     """Fully automatic login: trigger the magic-link email, read it via himalaya,
     open the link in the shared browser (the SPA reads the #token and signs in).
     No password, no manual code.
@@ -8435,7 +8466,10 @@ def _claude_auto_login(page, email: str, himalaya: str) -> str:
 
     Three guards against opening someone else's link (login CSRF, tp#490):
     the sender allow-list, the pre-trigger baseline, and the link's embedded
-    email must equal `email` (defense in depth)."""
+    email must equal `email` (defense in depth).
+
+    claude.ai by default; the Claude Console passes its own `link_re`,
+    `app_host` and `logged_in` check (tp#1421) — the guards are the same."""
     # One branch per step of the magic-link handshake (baseline → submit email
     # → poll the mailbox → open the link → confirm the session), each with its
     # own operator message before falling back to assisted login.
@@ -8448,7 +8482,12 @@ def _claude_auto_login(page, email: str, himalaya: str) -> str:
         return "not_submitted"
     account = os.environ.get("ANTHROPIC_LOGIN_HIMALAYA_ACCOUNT")
     diag: list[str] = []
-    baseline = _himalaya_login_link_baseline(himalaya, account=account, diag=diag)
+    # The link pattern is passed only when it is not claude.ai's, so the
+    # claude.ai call keeps its long-standing signature.
+    host_kw: dict[str, Any] = {} if link_re is _MAGIC_LINK_RE else {"link_re": link_re}
+    baseline = _himalaya_login_link_baseline(
+        himalaya, account=account, diag=diag, **host_kw
+    )
     if baseline is None:
         print(
             "  Cannot tell old login mails from new ones — not auto-logging in.",
@@ -8491,6 +8530,7 @@ def _claude_auto_login(page, email: str, himalaya: str) -> str:
             rejected=rejected,
             diag=diag,
             rejected_senders=rejected_senders,
+            **host_kw,
         )
         if link:
             break
@@ -8515,12 +8555,12 @@ def _claude_auto_login(page, email: str, himalaya: str) -> str:
             url = page.url
         except Exception:  # pylint: disable=broad-exception-caught
             url = ""
-        if "claude.ai" in url and "/magic-link" not in url and "/login" not in url:
+        if app_host in url and "/magic-link" not in url and "/login" not in url:
             break
         page.wait_for_timeout(1000)
     page.wait_for_timeout(1500)  # settle the app shell
     for _ in range(3):  # billing surface can be slow to settle after sign-in
-        if _claude_logged_in(page):
+        if (logged_in or _claude_logged_in)(page):
             return "ok"
         page.wait_for_timeout(2000)
     return "submitted"
@@ -9023,15 +9063,59 @@ def cmd_console_logged_in(port: int) -> int:
 
 
 def cmd_console_login(port: int) -> int:
-    """`login console`: never logs in by itself — the Console login is an
-    e-mail code or Google SSO that only the human finishes. A warm session
-    returns 0; a cold one says how to run the guided login (exit 4)."""
-    if _logged_in_page_state(port, _console_state) == "valid":
+    """`login console`: the Claude Console's own magic link, like claude.ai's.
+
+    A warm session returns 0. Else, with ``$CONSOLE_LOGIN_EMAIL`` set and
+    himalaya present (its account ``$ANTHROPIC_LOGIN_HIMALAYA_ACCOUNT``, folders
+    ``$ANTHROPIC_LOGIN_MAIL_FOLDERS``): "Continue with email" on
+    platform.claude.com/login, the link read from that mailbox under the same
+    three guards as claude.ai (sender allow-list, pre-trigger baseline, the
+    link's own e-mail), opened in the owned tab. Never a password, never the
+    Google button. Without that, or when it does not complete: exit 4 naming
+    the guided login. In a fresh owned background tab, under the interaction
+    lease for the login part."""
+    try:
+        with _owned_background_page(port) as page:
+            return _console_login_owned(page)
+    except OwnedTabError as exc:
+        return _fail(f"login console: {exc}")
+
+
+def _console_login_owned(page) -> int:
+    """`cmd_console_login` in its owned tab."""
+    if _console_state(page) == "valid":
         print("✓ Already logged into the Claude Console (platform.claude.com).")
         return 0
+    email = os.environ.get("CONSOLE_LOGIN_EMAIL", "").strip().lower()
+    himalaya = _himalaya_bin()
+    if email and himalaya:
+        with _interaction_lease("login console"):
+            from playwright.sync_api import Error as PlaywrightError
+
+            try:
+                page.goto(CONSOLE_LOGIN_URL, wait_until="domcontentloaded")
+            except PlaywrightError:
+                return _fail("login console: the login page did not load")
+            print(
+                f"Automatic Console login for {email} (magic link via himalaya)…",
+                file=sys.stderr,
+            )
+            result = _claude_auto_login(
+                page,
+                email,
+                himalaya,
+                link_re=_CONSOLE_MAGIC_LINK_RE,
+                app_host="platform.claude.com",
+                logged_in=lambda pg: _console_state(pg) == "valid",
+            )
+        if result == "ok":
+            print("✓ Logged into the Claude Console (platform.claude.com).")
+            _record_login_event("console", "auto")
+            return 0
+        print("  Automatic Console login did not complete.", file=sys.stderr)
     print(
-        "❌ the Claude Console needs your own login: ./agent-login.py -g console "
-        "(work, shared browser) or -g console-private (private instance)",
+        "❌ the Claude Console needs a login: ./agent-login.py -L console[-private] "
+        "(magic link) or -g console[-private] (your own login)",
         file=sys.stderr,
     )
     return NEEDS_ALBERT_RC

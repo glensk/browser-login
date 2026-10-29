@@ -218,3 +218,43 @@ def test_the_hourly_launchagent_runs_the_reader_quietly() -> None:
     assert (
         "<integer>3600</integer>" in text and f"<key>{jobs.SCHEDULED_ENV}</key>" in text
     )
+
+
+def test_console_magic_link_is_its_own_host(monkeypatch: pytest.MonkeyPatch) -> None:
+    import base64
+
+    browser = _load("browser_console_ml_under_test", _REPO / "bin" / "browser.py")
+    tail = base64.b64encode(b"me@example.org").decode()
+    console = f"https://platform.claude.com/magic-link#tok123:{tail}"
+    claude = f"https://claude.ai/magic-link#tok123:{tail}"
+    assert (
+        browser._magic_link_email(console, browser._CONSOLE_MAGIC_LINK_RE)
+        == "me@example.org"
+    )
+    # A claude.ai link never passes for a Console link, nor the other way round.
+    assert browser._magic_link_email(claude, browser._CONSOLE_MAGIC_LINK_RE) is None
+    assert browser._magic_link_email(console) is None
+    monkeypatch.delenv("ANTHROPIC_LOGIN_MAIL_FOLDERS", raising=False)
+    assert browser._login_mail_folders() == ("INBOX", "Archive")
+    monkeypatch.setenv("ANTHROPIC_LOGIN_MAIL_FOLDERS", " INBOX , ")
+    assert browser._login_mail_folders() == ("INBOX",)
+
+
+def test_l_routes_the_console_accounts_to_their_mailbox(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import agent_login_safari as alsafari
+
+    monkeypatch.delenv("CONSOLE_PRIVATE_HIMALAYA_ACCOUNT", raising=False)
+    al = _load("agent_login_console_under_test", _REPO / "agent-login.py")
+    assert {"console", "console-private"} <= alsafari.MAGIC_LINK_SITES
+    env = al._magic_link_env("console-private")
+    assert env["CONSOLE_LOGIN_EMAIL"] == al.CONSOLE_ACCOUNTS["console-private"]
+    assert env["ANTHROPIC_LOGIN_HIMALAYA_ACCOUNT"] == "gmail"
+    assert env["ANTHROPIC_LOGIN_MAIL_FOLDERS"] == "INBOX"
+    assert al._magic_link_env("console") == {
+        "CONSOLE_LOGIN_EMAIL": al.CONSOLE_ACCOUNTS["console"]
+    }
+    assert al._magic_link_env("anthropic") == {
+        "ANTHROPIC_LOGIN_EMAIL": al.CLAUDE_ACCOUNTS["anthropic"]
+    }

@@ -106,6 +106,7 @@ import agent_login_toolchain  # noqa: E402
 from agent_login_claude import (  # noqa: E402
     CLAUDE_ACCOUNTS,
     CONSOLE_ACCOUNTS,
+    CONSOLE_MAILBOX,
     SITE_INSTANCE,
     browser_site,
     claude_account_email,
@@ -3902,8 +3903,24 @@ def _env(**values: str) -> Iterator[None]:
                 os.environ[k] = v
 
 
+def _magic_link_env(site: str) -> dict[str, str]:
+    """The environment `browser.py login` needs for `site`'s magic link: the
+    account's e-mail, and for a Console account its mailbox (himalaya account
+    + folders, `CONSOLE_MAILBOX`)."""
+    if site not in CONSOLE_ACCOUNTS:
+        return {"ANTHROPIC_LOGIN_EMAIL": CLAUDE_ACCOUNTS[site]}
+    env = {"CONSOLE_LOGIN_EMAIL": CONSOLE_ACCOUNTS[site]}
+    account, folders = CONSOLE_MAILBOX.get(site, ("", ""))
+    if account:
+        env["ANTHROPIC_LOGIN_HIMALAYA_ACCOUNT"] = account
+    if folders:
+        env["ANTHROPIC_LOGIN_MAIL_FOLDERS"] = folders
+    return env
+
+
 def magic_link_login(site: str, *, dry_run: bool = False) -> int:
-    """`-L anthropic[-private]`: claude.ai's automated magic link (sender
+    """`-L anthropic[-private]` / `-L console[-private]`: the automated magic
+    link of claude.ai or the Claude Console (sender
     allow-list, baseline, embedded-e-mail check, bin/browser.py
     `_claude_auto_login`) in the account's own browser instance — no Safari.
     Without a readable mailbox it stops with browser.py's "needs Albert"."""
@@ -3922,8 +3939,8 @@ def magic_link_login(site: str, *, dry_run: bool = False) -> int:
         print(f"❌ {site}: {how}")
         return 2
     print(f"▶ {site}: automated magic-link login (mail read by himalaya)")
-    with site_session(site), _env(ANTHROPIC_LOGIN_EMAIL=CLAUDE_ACCOUNTS[site]):
-        rc = _browser("login", "anthropic", timeout_s=browser_timeout("login"))
+    with site_session(site), _env(**_magic_link_env(site)):
+        rc = _browser("login", browser_site(site), timeout_s=browser_timeout("login"))
     ok, how = assisted_check(site)
     if ok is not None:
         record_check(site, ok, how)

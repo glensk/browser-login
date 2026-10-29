@@ -402,7 +402,9 @@ RECIPES: dict[str, Recipe] = {
 # claude.ai: no Safari — its login is the automated magic link in the shared
 # browser (`browser.py login anthropic`, ANTHROPIC_LOGIN_EMAIL); agent-login
 # routes to it.
-MAGIC_LINK_SITES = frozenset({"anthropic", "anthropic-private"})
+MAGIC_LINK_SITES = frozenset(
+    {"anthropic", "anthropic-private", "console", "console-private"}
+)
 
 
 # ---------------------------------------------------------------------------

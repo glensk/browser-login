@@ -386,7 +386,9 @@ def test_recipes_need_the_safety_features_and_name_only_their_hosts() -> None:
             assert step.host in recipe.hosts, (site, step)
     assert not s.RECIPES["ricardo"].import_after
     assert "user_only" in s.RECIPES["galaxus-de"].features()
-    assert {"anthropic", "anthropic-private"} == s.MAGIC_LINK_SITES
+    assert {"anthropic", "anthropic-private", "console", "console-private"} == (
+        s.MAGIC_LINK_SITES
+    )
 
 
 def test_features_and_missing_features(monkeypatch: pytest.MonkeyPatch) -> None:
