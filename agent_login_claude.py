@@ -50,16 +50,19 @@ _CONSOLE_ACCOUNT_JS = (
     ' : (r.status === 401 || r.status === 403 ? "" : "?")).catch(() => "?")'
 )
 CONSOLE_URL = "https://platform.claude.com/settings/billing"
-# Where each Console account's magic-link mail is read (`-L`): the himalaya
-# account and its folders ('' = himalaya's default account and browser.py's
-# default folders). The private address is a Gmail mailbox, which has no
-# `Archive` folder.
-CONSOLE_MAILBOX = {
+# Where each magic-link account's mail is read (`-L`): the himalaya account and
+# its folders ('' = himalaya's default account and browser.py's default
+# folders). The private address is a Gmail mailbox, which has no `Archive`
+# folder, so claude.ai and the Console of that address both read `gmail` INBOX.
+_PRIVATE_MAILBOX = (
+    os.environ.get("CONSOLE_PRIVATE_HIMALAYA_ACCOUNT", "gmail"),
+    "INBOX",
+)
+MAGIC_LINK_MAILBOX = {
+    "anthropic": ("", ""),
+    "anthropic-private": _PRIVATE_MAILBOX,
     "console": ("", ""),
-    "console-private": (
-        os.environ.get("CONSOLE_PRIVATE_HIMALAYA_ACCOUNT", "gmail"),
-        "INBOX",
-    ),
+    "console-private": _PRIVATE_MAILBOX,
 }
 # The Console SPA takes 30-40 s to load in the headless shared browser (measured
 # 2026-10-29) — longer than the generic eval-fresh budget.

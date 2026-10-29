@@ -258,3 +258,10 @@ def test_l_routes_the_console_accounts_to_their_mailbox(
     assert al._magic_link_env("anthropic") == {
         "ANTHROPIC_LOGIN_EMAIL": al.CLAUDE_ACCOUNTS["anthropic"]
     }
+    # tp#1426: claude.ai of the Gmail address reads the same Gmail INBOX
+    env = al._magic_link_env("anthropic-private")
+    assert env == {
+        "ANTHROPIC_LOGIN_EMAIL": al.CLAUDE_ACCOUNTS["anthropic-private"],
+        "ANTHROPIC_LOGIN_HIMALAYA_ACCOUNT": "gmail",
+        "ANTHROPIC_LOGIN_MAIL_FOLDERS": "INBOX",
+    }

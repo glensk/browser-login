@@ -106,7 +106,7 @@ import agent_login_toolchain  # noqa: E402
 from agent_login_claude import (  # noqa: E402
     CLAUDE_ACCOUNTS,
     CONSOLE_ACCOUNTS,
-    CONSOLE_MAILBOX,
+    MAGIC_LINK_MAILBOX,
     SITE_INSTANCE,
     browser_site,
     claude_account_email,
@@ -3905,12 +3905,13 @@ def _env(**values: str) -> Iterator[None]:
 
 def _magic_link_env(site: str) -> dict[str, str]:
     """The environment `browser.py login` needs for `site`'s magic link: the
-    account's e-mail, and for a Console account its mailbox (himalaya account
-    + folders, `CONSOLE_MAILBOX`)."""
-    if site not in CONSOLE_ACCOUNTS:
-        return {"ANTHROPIC_LOGIN_EMAIL": CLAUDE_ACCOUNTS[site]}
-    env = {"CONSOLE_LOGIN_EMAIL": CONSOLE_ACCOUNTS[site]}
-    account, folders = CONSOLE_MAILBOX.get(site, ("", ""))
+    account's e-mail and its mailbox (himalaya account + folders,
+    `MAGIC_LINK_MAILBOX`)."""
+    if site in CONSOLE_ACCOUNTS:
+        env = {"CONSOLE_LOGIN_EMAIL": CONSOLE_ACCOUNTS[site]}
+    else:
+        env = {"ANTHROPIC_LOGIN_EMAIL": CLAUDE_ACCOUNTS[site]}
+    account, folders = MAGIC_LINK_MAILBOX.get(site, ("", ""))
     if account:
         env["ANTHROPIC_LOGIN_HIMALAYA_ACCOUNT"] = account
     if folders:
