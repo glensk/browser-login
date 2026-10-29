@@ -9,7 +9,13 @@ from that page, reads what the billing and spend-limit pages render:
 * every promotional-credit row (remaining, granted, expires, granted on) and
   the purchased credit balance (the page's own ``prepaid/credits`` data);
 * the organisation's monthly spend limit: spent this month, the limit, when it
-  resets (the page's "Organization limit" block, cross-checked with its data).
+  resets (the page's "Organization limit" block, cross-checked with its data);
+* the one-time Claude Code cloud-session credit from claude.ai (tp#1429): a second
+  fresh tab on claude.ai reads ``/v1/code/promo/cloud_credit`` (state, expiry) and
+  the org's ``/usage`` meter that ends at the same minute → ``cloud_credit``
+  (``remaining_usd``, ``granted_usd``, ``expires_at``, ``measured_at``), ``null``
+  when the account has none. A failed claude.ai read never fails the Console
+  reading: the last good ``cloud_credit`` stays, ``cloud_error`` says why.
 
 Read-only: GET requests from the page only — it never clicks buy, adjust,
 auto-reload or notification controls. Each account's result goes to one JSON
@@ -57,6 +63,12 @@ from agent_login_jobs import (  # noqa: E402
 
 SCHEMA = 1
 PAGE_URL = "https://platform.claude.com/settings/spend-limits"
+# The claude.ai side: the one-time Claude Code cloud-session credit (tp#1429).
+CLOUD_URL = "https://claude.ai/new"
+# The credit's `expires_at` (promo endpoint) and its meter's `resets_at` (org usage
+# endpoint) name the same minute; the meter is found by that, never by its
+# obfuscated key (which the page renames between releases).
+CLOUD_MATCH_S = 120
 # account label (ccc's) → agent-login site
 ACCOUNTS = {"work": "console", "private": "console-private"}
 DEFAULT_DIR = Path(
@@ -140,6 +152,52 @@ PAGE_JS = r"""(async () => {
     limits_status: limits.status,
     enforced_limit_minor: limits.body && limits.body.enforced_limit_usd,
     org_limit_text: i >= 0 ? text.slice(i, i + 400) : "",
+  });
+})()"""
+
+# Runs in a fresh claude.ai tab. GETs the account's cloud-session promo
+# (/v1/code/promo/cloud_credit) and, per chat organisation, the usage meters
+# (/api/organizations/<uuid>/usage). Returns ONE JSON string with the promo's
+# state/expiry and each meter's dollar figures only — no ids, names, cookies or
+# conversation data leave the page.
+CLOUD_JS = r"""(async () => {
+  const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+  const get = async (path, headers) => {
+    try {
+      const r = await fetch(path, { credentials: "include", headers: headers || {} });
+      if (!r.ok) return { status: r.status };
+      return { status: r.status, body: await r.json() };
+    } catch (err) { return { status: 0 }; }
+  };
+  let acct = { status: 0 };
+  for (let i = 0; i < 40; i++) {
+    acct = await get("/api/account");
+    if (acct.status === 200 || acct.status === 401 || acct.status === 403) break;
+    await sleep(500);
+  }
+  if (acct.status === 401 || acct.status === 403 || location.pathname.startsWith("/login"))
+    return JSON.stringify({ state: "logged_out" });
+  if (acct.status !== 200 || !acct.body) return JSON.stringify({ state: "page_error", why: "account " + acct.status });
+  const promo = await get("/v1/code/promo/cloud_credit", { "anthropic-version": "2023-06-01" });
+  const pb = promo.body || {};
+  const meters = [];
+  if (pb.state === "active") {
+    for (const m of acct.body.memberships || []) {
+      const o = m.organization || {};
+      if (!(o.capabilities || []).includes("chat")) continue;
+      const u = await get("/api/organizations/" + o.uuid + "/usage");
+      for (const v of Object.values(u.body || {})) {
+        if (v && typeof v === "object" && typeof v.limit_dollars === "number" &&
+            typeof v.used_dollars === "number")
+          meters.push({ limit: v.limit_dollars, used: v.used_dollars,
+                        remaining: v.remaining_dollars, resets_at: v.resets_at });
+      }
+    }
+  }
+  return JSON.stringify({
+    state: "ok", email: acct.body.email_address || "",
+    promo_status: promo.status, promo_state: pb.state || "", expires_at: pb.expires_at || "",
+    meters: meters,
   });
 })()"""
 
@@ -245,6 +303,82 @@ def parse_cap(raw: dict[str, Any]) -> dict[str, Any] | None:
     return cap
 
 
+def parse_cloud(raw: dict[str, Any], now: int) -> dict[str, Any] | None:
+    """CLOUD_JS's answer → the ``cloud_credit`` figures, None when the account
+    has no active credit. Raises ValueError when an active credit's meter cannot
+    be found: a credit is never invented from the promo alone."""
+    if raw.get("promo_status") != 200:
+        raise ValueError(f"cloud_credit promo answered {raw.get('promo_status')}")
+    if raw.get("promo_state") != "active":
+        return None
+    expires = str(raw.get("expires_at") or "")
+    try:
+        end = dt.datetime.fromisoformat(expires.replace("Z", "+00:00")).timestamp()
+    except ValueError as exc:
+        raise ValueError("the cloud credit has no readable expiry") from exc
+    if end <= now:
+        return None
+    for meter in raw.get("meters") or []:
+        try:
+            at = dt.datetime.fromisoformat(
+                str(meter["resets_at"]).replace("Z", "+00:00")
+            ).timestamp()
+            limit, used = float(meter["limit"]), float(meter["used"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        if abs(at - end) <= CLOUD_MATCH_S and limit > 0:
+            return {
+                "remaining_usd": round(max(limit - used, 0.0), 4),
+                "granted_usd": round(limit, 4),
+                "expires_at": expires,
+                "measured_at": now,
+            }
+    raise ValueError("an active cloud credit without a usage meter ending with it")
+
+
+def _run_problem(run: Any) -> str:
+    """Why a browser.py run gave no answer ('' when it did)."""
+    if run.rc == BUSY_RC:
+        return "a guided login holds the browser"
+    if run.killed or run.rc in (124, 125):
+        return f"no answer within {EVAL_S} s"
+    return f"browser.py eval-fresh exit {run.rc}" if run.rc != 0 else ""
+
+
+def _cloud_problem(site: str, run: Any) -> tuple[dict[str, Any], str]:
+    """(page answer, "") or ({}, why the claude.ai run gave no usable answer)."""
+    why = _run_problem(run)
+    raw: Any = None
+    if not why:
+        try:
+            raw = json.loads(json.loads(run.stdout.strip().splitlines()[-1]))
+        except (ValueError, IndexError, TypeError):
+            pass
+        raw = raw if isinstance(raw, dict) else {}
+        state = raw.get("state")
+        if not raw:
+            why = "the page's answer is not a JSON object"
+        elif state == "logged_out":
+            why = "claude.ai is logged out"
+        elif state != "ok":
+            why = str(raw.get("why") or state)
+        elif str(raw.get("email") or "").lower() != CONSOLE_ACCOUNTS[site].lower():
+            why = "claude.ai holds another account"
+    return ({}, why) if why else (raw, "")
+
+
+def interpret_cloud(site: str, run: Any) -> dict[str, Any]:
+    """The claude.ai run → ``{"cloud_credit": …}`` or ``{"cloud_error": why}``.
+    Never raises and never fails the Console reading."""
+    raw, why = _cloud_problem(site, run)
+    if why:
+        return {"cloud_error": why}
+    try:
+        return {"cloud_credit": parse_cloud(raw, _now())}
+    except ValueError as exc:
+        return {"cloud_error": str(exc)}
+
+
 def read_previous(path: Path) -> dict[str, Any]:
     """The account's last file ({} when there is none or it is unreadable)."""
     try:
@@ -325,28 +459,40 @@ def instance(inst: str) -> Iterator[bool]:
             os.environ["CLAUDE_BROWSER_INSTANCE"] = old
 
 
+def _eval(url: str, js: str) -> Any:
+    """One fresh tab on `url` running `js`; the browser.py run."""
+    return run_browser(
+        "eval-fresh",
+        "-t",
+        str(EVAL_S),
+        url,
+        js,
+        timeout_s=EVAL_S + 20,
+        capture=True,
+    )
+
+
 def read_account(label: str) -> tuple[str, str, dict[str, Any] | None]:
-    """(status, error, figures) for one account, from its browser."""
+    """(status, error, figures) for one account, from its browser. A readable
+    Console page also carries the claude.ai cloud-credit reading (same browser
+    run): ``cloud_credit`` (dict or None) or, when that read failed, only
+    ``cloud_error`` — the Console figures are good either way."""
     site = ACCOUNTS[label]
     with instance(SITE_INSTANCE.get(site, "")) as up:
         if not up:
             return "browser_down", "the browser instance did not start", None
-        run = run_browser(
-            "eval-fresh",
-            "-t",
-            str(EVAL_S),
-            PAGE_URL,
-            PAGE_JS,
-            timeout_s=EVAL_S + 20,
-            capture=True,
-        )
+        run = _eval(PAGE_URL, PAGE_JS)
+        cloud = _eval(CLOUD_URL, CLOUD_JS) if run.rc == 0 else None
     if run.rc == BUSY_RC:
         return "busy", "a guided login holds the browser", None
     if run.killed or run.rc in (124, 125):
         return "timeout", f"no answer within {EVAL_S} s", None
     if run.rc != 0:
         return "page_error", f"browser.py eval-fresh exit {run.rc}", None
-    return interpret(site, run.stdout)
+    status, error, figures = interpret(site, run.stdout)
+    if figures is not None and cloud is not None:
+        figures.update(interpret_cloud(site, cloud))
+    return status, error, figures
 
 
 def interpret(site: str, stdout: str) -> tuple[str, str, dict[str, Any] | None]:
@@ -401,6 +547,8 @@ def run_account(
             "source": PAGE_URL,
             **figures,
         }
+        if "cloud_credit" not in figures:  # its read failed: the last good one stays
+            data["cloud_credit"] = previous.get("cloud_credit")
     else:
         data = merge(previous, label, status, error, now)
     if not dry_run:
@@ -429,7 +577,16 @@ def _summary(label: str, status: str, data: dict[str, Any]) -> str:
     )
     purchased = data.get("purchased_usd")
     bought = f"; purchased ${purchased:.2f}" if purchased is not None else ""
-    return f"✅ {label}: promo {promo or 'none'}{bought}{cap_txt}"
+    cloud = data.get("cloud_credit")
+    cloud_txt = (
+        f"; cloud ${cloud['remaining_usd']:.2f} of ${cloud['granted_usd']:.2f} "
+        f"until {str(cloud['expires_at'])[:10]}"
+        if cloud
+        else ""
+    )
+    if data.get("cloud_error"):
+        cloud_txt += f"; cloud credit unread: {data['cloud_error']}"
+    return f"✅ {label}: promo {promo or 'none'}{bought}{cap_txt}{cloud_txt}"
 
 
 def main(argv: list[str] | None = None) -> int:

@@ -1332,6 +1332,17 @@ account is not retried for 6 h (`-f` retries now), so the hourly run does not
 start the private browser for a session only you can restore. Exit 0 all read,
 2 logged out / wrong account, 1 other failure.
 
+Same run, a second fresh tab on `claude.ai/new` reads the one-time **Claude Code
+cloud-session credit** (tp#1429; GET only): `/v1/code/promo/cloud_credit` (state,
+expiry) and, per chat organisation, `/api/organizations/<uuid>/usage`, whose meter
+that ends at the credit's expiry minute (never found by its obfuscated key) gives
+`limit_dollars` / `used_dollars`. The file gains an optional field
+`"cloud_credit": {"remaining_usd", "granted_usd", "expires_at", "measured_at"}` —
+`null` when the account has none (work today); older readers ignore it. A failed
+claude.ai read (logged out, another account, no meter) never fails the Console
+reading: the last good `cloud_credit` stays with its old `measured_at` and
+`"cloud_error"` says why.
+
 ```commands
 ./console-balance.py                  # both accounts, write the files
 ./console-balance.py -a work -n -j    # work only, print the JSON, write nothing

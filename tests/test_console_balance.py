@@ -113,6 +113,26 @@ def test_a_half_reading_is_never_good() -> None:
         cb.parse_page(dict(PAGE, promo=[{"remaining_minor": None, "expires_at": "x"}]))
 
 
+# What CLOUD_JS answers on claude.ai (shape read live 2026-10-29): the private
+# account holds an active cloud-session credit, the meter's key is not sent.
+CLOUD = {
+    "state": "ok",
+    "email": "albert.glensk@epfl.ch",
+    "promo_status": 200,
+    "promo_state": "active",
+    "expires_at": "2099-11-05T07:59:00Z",
+    "meters": [
+        {"limit": 100, "used": 1, "remaining": 99, "resets_at": "2099-11-02T00:00:00Z"},
+        {
+            "limit": 250,
+            "used": 131.603427,
+            "remaining": 118.396673,
+            "resets_at": "2099-11-05T07:59:00+00:00",
+        },
+    ],
+}
+
+
 class _Run:
     def __init__(self, rc: int, stdout: str) -> None:
         self.rc, self.stdout, self.killed = rc, stdout, False
@@ -123,13 +143,17 @@ def _fake_browser(monkeypatch: pytest.MonkeyPatch):
     """`read_account` against a canned page answer; no browser instance."""
     import contextlib
 
-    answer: dict[str, Any] = {"rc": 0, "page": PAGE}
+    answer: dict[str, Any] = {"rc": 0, "page": PAGE, "cloud": CLOUD, "cloud_rc": 0}
 
     @contextlib.contextmanager
     def instance(_inst: str):
         yield True
 
-    def run_browser(*_a: Any, **_k: Any) -> _Run:
+    def run_browser(_verb: str, *args: Any, **_k: Any) -> _Run:
+        if cb.CLOUD_URL in args:
+            return _Run(
+                answer["cloud_rc"], json.dumps(json.dumps(answer["cloud"])) + "\n"
+            )
         return _Run(answer["rc"], json.dumps(json.dumps(answer["page"])) + "\n")
 
     monkeypatch.setattr(cb, "instance", instance)
@@ -265,3 +289,51 @@ def test_l_routes_the_console_accounts_to_their_mailbox(
         "ANTHROPIC_LOGIN_HIMALAYA_ACCOUNT": "gmail",
         "ANTHROPIC_LOGIN_MAIL_FOLDERS": "INBOX",
     }
+
+
+def test_cloud_credit_is_found_by_its_expiry_not_its_key(
+    tmp_path: Path, fake_browser: dict
+) -> None:
+    status, data = cb.run_account("work", tmp_path, force=False, dry_run=False)
+    cloud = data["cloud_credit"]
+    assert status == "ok" and "cloud_error" not in data
+    assert cloud["granted_usd"] == 250 and cloud["remaining_usd"] == 118.3966
+    assert cloud["expires_at"] == "2099-11-05T07:59:00Z" and cloud["measured_at"]
+    assert "✅ work:" in cb._summary(
+        "work", status, data
+    ) and "cloud $118.40 of $250.00" in cb._summary("work", status, data)
+    fake_browser["cloud"] = dict(CLOUD, promo_state="not_claimed", meters=[])
+    assert (
+        cb.run_account("work", tmp_path, force=True, dry_run=True)[1]["cloud_credit"]
+        is None
+    )
+
+
+def test_an_expired_credit_is_none(tmp_path: Path, fake_browser: dict) -> None:
+    fake_browser["cloud"] = dict(CLOUD, expires_at="2020-01-01T00:00:00Z")
+    assert (
+        cb.run_account("work", tmp_path, force=True, dry_run=True)[1]["cloud_credit"]
+        is None
+    )
+
+
+def test_a_failed_cloud_read_keeps_the_last_good_credit(
+    tmp_path: Path, fake_browser: dict
+) -> None:
+    _s, good = cb.run_account("work", tmp_path, force=False, dry_run=False)
+    for bad in (
+        {"state": "logged_out"},
+        dict(CLOUD, email="someone@example.org"),
+        dict(CLOUD, promo_status=500),
+        dict(CLOUD, meters=[]),  # active credit, no meter ending with it
+    ):
+        fake_browser["cloud"] = bad
+        status, data = cb.run_account("work", tmp_path, force=True, dry_run=True)
+        assert status == "ok" and data["cloud_error"]
+        assert data["cloud_credit"] == good["cloud_credit"]
+        assert data["promo"] == good["promo"]  # the Console reading is untouched
+    fake_browser["cloud_rc"] = 124
+    assert (
+        "no answer"
+        in cb.run_account("work", tmp_path, force=True, dry_run=True)[1]["cloud_error"]
+    )
