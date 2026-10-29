@@ -105,10 +105,12 @@ import agent_login_state as als  # noqa: E402
 import agent_login_toolchain  # noqa: E402
 from agent_login_claude import (  # noqa: E402
     CLAUDE_ACCOUNTS,
+    CONSOLE_ACCOUNTS,
     SITE_INSTANCE,
     browser_site,
     claude_account_email,
     claude_login_by_hand,
+    console_account_email,
     instance_session,
 )
 from agent_login_jobs import (  # noqa: E402
@@ -264,6 +266,21 @@ TARGETS = (
         "https://claude.ai",
         ASSISTED_FLOW,
         "claude.ai private account, own browser instance "
+        "(CLAUDE_BROWSER_INSTANCE=private, CDP 9223)",
+    ),
+    Target(
+        "console",
+        "Claude Console work",
+        "https://platform.claude.com",
+        ASSISTED_FLOW,
+        "platform.claude.com work org (billing read by console-balance.py)",
+    ),
+    Target(
+        "console-private",
+        "Claude Console private",
+        "https://platform.claude.com",
+        ASSISTED_FLOW,
+        "platform.claude.com private org (Google SSO), own browser instance "
         "(CLAUDE_BROWSER_INSTANCE=private, CDP 9223)",
     ),
     Target(
@@ -1029,8 +1046,8 @@ def _summary_line(  # pylint: disable=too-many-return-statements
             )
         elif manual_import(site):
             how = f"check only; Albert re-imports (`agent-login.py -t {site}`)"
-        if site in CLAUDE_ACCOUNTS:
-            how += f", {CLAUDE_ACCOUNTS[site]}"
+        if site in CLAUDE_ACCOUNTS or site in CONSOLE_ACCOUNTS:
+            how += f", {CLAUDE_ACCOUNTS.get(site) or CONSOLE_ACCOUNTS[site]}"
         inst = SITE_INSTANCE.get(site, "")
         if inst:
             how += (
@@ -1418,8 +1435,8 @@ def row_state(  # pylint: disable=too-many-return-statements,too-many-branches
     how = f"checked {when}"
     if row["status"] == "safari" and row.get("safari"):
         how += f", Safari session until {row.get('safari_expires')}"
-    elif site in CLAUDE_ACCOUNTS:
-        how += f", logged in as {CLAUDE_ACCOUNTS[site]}"
+    elif site in CLAUDE_ACCOUNTS or site in CONSOLE_ACCOUNTS:
+        how += f", logged in as {CLAUDE_ACCOUNTS.get(site) or CONSOLE_ACCOUNTS[site]}"
     elif row.get("flow") == ASSISTED_FLOW or row["status"] == "assisted":
         how += ", your session"
     else:
@@ -2027,6 +2044,9 @@ def _assisted_check(  # pylint: disable=too-many-return-statements
         if code == "wrong_account":
             return False, "logged in as ANOTHER account — " + hint, res
         return None, "could not tell — " + phases.text("client-proof", code), res
+    if site in CONSOLE_ACCOUNTS:
+        ok, how = _console_check(site, hint)
+        return ok, how, None
     if site not in CLAUDE_ACCOUNTS:
         rc = _browser(
             "logged-in", site, quiet=True, timeout_s=browser_timeout("logged-in")
@@ -2041,6 +2061,23 @@ def _assisted_check(  # pylint: disable=too-many-return-statements
 
 
 BUSY_RECHECK = "busy: guided login in progress — re-check later"
+
+
+def _console_check(site: str, hint: str) -> tuple[bool | None, str]:
+    """`_assisted_check` for a Claude Console account: logged in, and as the
+    right account (one Console session per browser profile)."""
+    email = console_account_email()
+    if email is None:
+        return None, "could not tell — the Console did not answer; re-check later"
+    if not email:
+        return False, f"NOT logged in to the Claude Console — {hint}"
+    want = CONSOLE_ACCOUNTS[site].lower()
+    if email != want:
+        where = SITE_INSTANCE.get(site, "default")
+        return False, (
+            f"the {where} browser instance holds the Console account {email}, not {want}"
+        )
+    return True, f"logged in as {email}"
 
 
 def _claude_check(site: str, hint: str) -> tuple[bool | None, str]:
@@ -3334,6 +3371,8 @@ MATRIX_META = {
     "smartsheet": ("sdsc/smartsheet-api", "user"),
     "slack": ("slack_api.py (users.admin.*)", "admin"),
     "anthropic": ("anthropic-api.py (Team admin)", "admin"),
+    "console": ("console-balance.py (billing, read-only)", "admin"),
+    "console-private": ("console-balance.py (billing, read-only)", "admin"),
     "openai": ("ChatGPT Business admin", "admin"),
     "switch": ("Switch Cloud Portal", "user"),
 }

@@ -574,6 +574,7 @@ manual sign-in — actually happens.
 | `anthropic` (`claude`) | **Magic-link, fully automatic** when `ANTHROPIC_LOGIN_EMAIL` is set and `himalaya` reads that mailbox: triggers the email, extracts the `claude.ai/magic-link#<token>` URL, opens it — only if it passes the three login-CSRF guards below. Otherwise **assisted** (you finish the email login once). `login`/`logged-in` use a fresh owned background tab, closed again (tp#845). |
 | `cscs`                 | **Keycloak, unattended.** `store-creds cscs` caches username/password/TOTP-seed in the macOS keychain (from 1Password, one last Touch ID); thereafter login runs with no fingerprint. TOTP codes are generated locally with `pyotp` only once the OTP field appears (never before the password submit), waiting for the next 30 s step when the current one has under 5 s left; the 1Password fallback likewise fetches its live code at fill time. A flow Keycloak aborts with `authentication_expired` (stale `session_code` on a login page left open for hours) is retried once from a fresh page with a newly generated code; a wrong password still fails on the first attempt. After login every token candidate (`waldur/auth/token` first) is checked against `/api/users/me/` and only a validated one is cached (0600): a rejected token exits 2 (log in again), a network error or an unexpected answer exits 1 with a one-line reason, never a traceback. Through the login broker (`login cscs` whenever the broker lists `cscs`), the session bundle carries `waldur/auth/token` (+ `token_expires_at`, `method`) for `portal.cscs.ch` localStorage — the broker reads it on `/profile/` in the same step that server-validated it, and a bundle without it is refused (`bundle_export`, nothing injected); the client re-checks the token against the API before touching any cookie, writes it with an init script BEFORE the portal app loads on `/profile/` (never `/`, where boot-redirect.js runs) and reads it back. The logged-in proof (broker and client) is a SERVER proof: from the portal page it asks `/api/users/me/` with the stored token (the app's own scheme) — 200 with an identity is logged in, 401/403 is not, a timeout/5xx is undecided; a token's shape proves nothing (an expired one looks the same). It is strict without a DOM sentinel. `login`/`logged-in` use a fresh owned background tab, closed again (tp#845). |
 | `openai` (`chatgpt`)   | **Assisted.** ChatGPT Business logs in via Google SSO + 2FA, which can't be replayed from a stored secret — you complete the SSO once in the shared window; the session persists. Logged-in sentinel: the 'Invite member' button on `chatgpt.com/admin/members`. `login`/`logged-in` use a fresh owned background tab, closed again (tp#845). |
+| `console` (`platform.claude.com`) | **Your own login, never automated.** The Claude Console (platform.claude.com) has a login separate from claude.ai's (e-mail code or Google SSO). `logged-in console` is tri-state from the Console's own `/api/account` on the billing page (401/403 = logged out); `login console` returns 0 when logged in, else exit 4 naming `./agent-login.py -g console` (work, shared browser) / `-g console-private` (private instance, CDP 9223). agent-login checks WHICH account each instance holds. Read by `console-balance.py` (below). |
 | `slack`                | **Assisted.** app.slack.com logs in via email-code / SSO; you sign in once and the session persists. Logged-in sentinel: a team with an `xoxc-` token in `localConfig_v2`. `browser.py slack-session` then prints `{token,cookie,team_domain}` (xoxc + httpOnly `d` cookie via CDP) so `slack-api` can call `users.admin.setInactive` on the Pro plan — where the API token is scope-blocked. Bearer creds → stdout only, never cached. `login`/`logged-in` use a fresh owned background tab, closed again (tp#845). |
 | `notion` (`notion.so`) | **Assisted.** Notion logs in by e-mail code or SSO, which can't be replayed from a stored secret — you sign in once in the shared window (`./agent-login.py -g notion`); the session persists. Logged-in sentinel: the workspace sidebar (`.notion-sidebar` / `.notion-sidebar-switcher`) on `app.notion.com` outside `/login` — notion.so and its `/login` both redirect to that host, so the URL alone proves nothing. `logged-in notion` probes a background tab it closes again. Aliases: `app.notion.com`, `notion.com`. `login`/`logged-in` use a fresh owned background tab, closed again (tp#845). |
 | `biopolwifi`           | **Env email+password, no keychain.** SDSC Biopole WiFi units are managed via a Ruckus Cloudpath MDU portal (`cloudpath.edificom.cloud`, a plain Vue SPA). Run `env-profile-run.py biopol-wifi -- browser.py login biopolwifi`: the profile injects `BIOPOLWIFI_EMAIL` / `BIOPOLWIFI_PASSWORD` from the vault item `biopol-wifi` (the same variables `sdsc/biopol-wifi/biopol-wifi.py` reads); without them `login` exits 1 naming the missing variable, and `store-creds` / `forget-creds biopolwifi` only print that hint. Login fills the form and confirms the `SDSC - Biopole` / `Properties` sentinel. No SSO, no TOTP, no token extracted. Aliases: `biopol`, `cloudpath`, `edificom`. `login`/`logged-in` use a fresh owned background tab, closed again (tp#845). **The portal's session is per tab** (a ~5-min token in the tab's sessionStorage, no session cookie), so it ends with the `login` tab: `login` proves the credential, and `logged-in` answers 2 afterwards, naming that reason when it finds the login form (tp#1059). |
@@ -1312,6 +1313,34 @@ fragment and trailing slash are ignored; output is origin-only):
 browser.py close -n https://app.smartsheet.com/login https://app.smartsheet.com/folders/personal   # dry run
 browser.py close https://app.smartsheet.com/login https://app.smartsheet.com/folders/personal      # close them
 ```
+
+## Claude Console balance (`console-balance.py`, tp#1421)
+
+`console-balance.py` reads, per Console account, what the billing and spend-limit
+pages show — every promotional-credit row (remaining, granted, expiry, grant date),
+the purchased credit balance and the org's monthly spend limit (spent, limit,
+reset) — in ONE fresh tab of its own on
+`platform.claude.com/settings/spend-limits` (GET requests from the page only; it
+never clicks buy, adjust, auto-reload or notification controls). Work runs in the
+shared Chromium; private in the private instance, started headless for the run and
+stopped again. Each account's result is written atomically (0600) to
+`~/.local/state/console-balance/<work|private>.json` (`-o` / `CONSOLE_BALANCE_DIR`),
+the schema ccc reads as `balance_json:<path>`. A failed run keeps the last good
+figures and their `measured_at` and sets a typed `status` (`logged_out`,
+`wrong_account`, `browser_down`, `busy`, `timeout`, `page_error`); a logged-out
+account is not retried for 6 h (`-f` retries now), so the hourly run does not
+start the private browser for a session only you can restore. Exit 0 all read,
+2 logged out / wrong account, 1 other failure.
+
+```commands
+./console-balance.py                  # both accounts, write the files
+./console-balance.py -a work -n -j    # work only, print the JSON, write nothing
+./console-balance.py -a private -f    # retry a logged-out account now
+```
+
+Schedule: LaunchAgent `com.albert.console-balance` (installed by
+`./agent-login.py -I` with the others) runs `console-balance.py -q` every hour and at
+load; log `~/Library/Logs/com.albert.console-balance.log`.
 
 ## How other tools consume it
 

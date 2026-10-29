@@ -55,6 +55,11 @@ REFRESH_INTERVAL_S = 6 * 3600
 # shared-browser instance: closes unpinned tabs idle past its threshold.
 TAB_REAPER_LABEL = "com.albert.browser-tab-reaper"
 TAB_REAPER_INTERVAL_S = 900
+# tp#1421: the Claude Console balance reader (`console-balance.py -q`): writes
+# each account's credit balance + spend limit for ccc's `balance_json` source.
+CONSOLE_BALANCE_LABEL = "com.albert.console-balance"
+CONSOLE_BALANCE_INTERVAL_S = 3600
+CONSOLE_BALANCE_PY = Path(__file__).resolve().parent / "console-balance.py"
 # Set in every agent-login LaunchAgent: a scheduled run. `-L` (the Safari
 # login, which drives Albert's real Safari) refuses to run with it.
 SCHEDULED_ENV = "AGENT_LOGIN_SCHEDULED"
@@ -164,6 +169,20 @@ def tab_reaper_plist() -> str:
     )
 
 
+def console_balance_plist() -> str:
+    """The hourly Claude Console balance LaunchAgent (tp#1421), as text. Pure."""
+    return launchagent_plist(
+        label=CONSOLE_BALANCE_LABEL,
+        args=("-q",),
+        schedule=(
+            "<key>StartInterval</key>\n    "
+            f"<integer>{CONSOLE_BALANCE_INTERVAL_S}</integer>"
+        ),
+        run_at_load=True,
+        script=CONSOLE_BALANCE_PY,
+    )
+
+
 def agent_plists() -> list[tuple[str, str, str]]:
     """(label, plist text, what) of every agent-login LaunchAgent. Pure."""
     return [
@@ -186,6 +205,11 @@ def agent_plists() -> list[tuple[str, str, str]]:
             TAB_REAPER_LABEL,
             tab_reaper_plist(),
             f"every {TAB_REAPER_INTERVAL_S // 60} min, browser.py reap-idle -A -q",
+        ),
+        (
+            CONSOLE_BALANCE_LABEL,
+            console_balance_plist(),
+            f"every {CONSOLE_BALANCE_INTERVAL_S // 60} min, console-balance.py -q",
         ),
     ]
 

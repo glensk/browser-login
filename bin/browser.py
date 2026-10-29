@@ -334,6 +334,11 @@ ANTHROPIC_LOGIN_EMAIL = os.environ.get("ANTHROPIC_LOGIN_EMAIL")  # optional conv
 # directly over CDP). Logged-in sentinel = the 'Invite member' button on
 # /admin/members (same signal openai-team.py relies on).
 CHATGPT_ADMIN_URL = "https://chatgpt.com/admin/members"
+# The Claude Console (platform.claude.com): its own login (e-mail code or Google SSO),
+# separate from claude.ai's. The billing page is the stable post-login surface.
+CONSOLE_ORIGIN = "https://platform.claude.com"
+CONSOLE_LOGIN_URL = CONSOLE_ORIGIN + "/login"
+CONSOLE_BILLING_URL = CONSOLE_ORIGIN + "/settings/billing"
 
 # Slack (assisted login; extracts the session xoxc token + `d` cookie so admin
 # calls like users.admin.setInactive work on the Pro plan — where the xoxp bot
@@ -8966,6 +8971,73 @@ def _tristate_report(what: str, state: str) -> int:
 
 
 # ---------------------------------------------------------------------------
+# Claude Console (platform.claude.com) — the human's own login; read-only checks
+# ---------------------------------------------------------------------------
+
+# The Console's own account endpoint, asked from the page (10 s): 200 with an
+# e-mail = valid, 401/403 = invalid, anything else = indeterminate. Only the
+# enum leaves the page (never the e-mail, ids or cookies).
+CONSOLE_ACCOUNT_JS = r"""async () => {
+  const ctl = new AbortController();
+  const timer = setTimeout(() => ctl.abort(), 10000);
+  try {
+    const r = await fetch("/api/account", { credentials: "include",
+      redirect: "manual", signal: ctl.signal });
+    if (r.status === 401 || r.status === 403) return "invalid";
+    if (r.status !== 200) return "indeterminate";
+    const j = await r.json();
+    return j && typeof j.email_address === "string" && j.email_address
+      ? "valid" : "indeterminate";
+  } catch (err) { return "indeterminate"; } finally { clearTimeout(timer); }
+}"""
+
+
+def _console_state(page) -> str:
+    """valid / invalid / indeterminate for platform.claude.com, from its own
+    account endpoint on the billing page (a Cloudflare challenge that does not
+    clear, or a navigation error, cannot tell). A landing on /login is
+    ``invalid`` only when the endpoint agrees."""
+    from playwright.sync_api import Error as PlaywrightError
+
+    try:
+        page.goto(CONSOLE_BILLING_URL, wait_until="domcontentloaded")
+        page.wait_for_timeout(1500)
+    except PlaywrightError:
+        return "indeterminate"
+    if _challenge_persists(page):
+        return "indeterminate"
+    try:
+        got = page.evaluate(CONSOLE_ACCOUNT_JS)
+    except PlaywrightError:
+        return "indeterminate"
+    return got if got in ("valid", "invalid") else "indeterminate"
+
+
+def cmd_console_logged_in(port: int) -> int:
+    """Exit 0 if the Claude Console is logged in, else 2 (result record:
+    ``logged_out`` or ``indeterminate``)."""
+    return _tristate_report(
+        "the Claude Console (platform.claude.com)",
+        _logged_in_page_state(port, _console_state),
+    )
+
+
+def cmd_console_login(port: int) -> int:
+    """`login console`: never logs in by itself — the Console login is an
+    e-mail code or Google SSO that only the human finishes. A warm session
+    returns 0; a cold one says how to run the guided login (exit 4)."""
+    if _logged_in_page_state(port, _console_state) == "valid":
+        print("✓ Already logged into the Claude Console (platform.claude.com).")
+        return 0
+    print(
+        "❌ the Claude Console needs your own login: ./agent-login.py -g console "
+        "(work, shared browser) or -g console-private (private instance)",
+        file=sys.stderr,
+    )
+    return NEEDS_ALBERT_RC
+
+
+# ---------------------------------------------------------------------------
 # Slack (app.slack.com) — assisted login; extracts session xoxc token + d cookie
 # ---------------------------------------------------------------------------
 
@@ -15004,6 +15076,7 @@ VIEWER_FALLBACK_RC = 5
 GUIDED_START_URLS = {
     "anthropic": CLAUDE_LOGIN_URL,
     "openai": CHATGPT_ADMIN_URL,
+    "console": CONSOLE_LOGIN_URL,
     "slack": SLACK_WORKSPACE_URL,
     "notion": NOTION_LOGIN_URL,
     "switch": SWITCH_ORIGIN + SWITCH_LOGIN_PATH,
@@ -16241,6 +16314,14 @@ def _sites() -> list[Site]:
             blurb="chatgpt.com Business admin (assisted Google-SSO login; no token)",
             login=cmd_openai_login,
             logged_in=cmd_openai_logged_in,
+        ),
+        Site(
+            name="console",
+            aliases=("platform.claude.com", "claude-console", "anthropic-console"),
+            blurb="Claude Console billing (your own e-mail-code / Google-SSO login; "
+            "read-only)",
+            login=cmd_console_login,
+            logged_in=cmd_console_logged_in,
         ),
         Site(
             name="slack",

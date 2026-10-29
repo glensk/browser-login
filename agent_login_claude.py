@@ -35,8 +35,28 @@ _CLAUDE_ACCOUNT_JS = (
 )
 
 
+# The Claude Console (platform.claude.com) accounts: a login of its own (separate
+# from claude.ai's), one per browser profile like claude.ai — the work Console in
+# the shared browser, the private one next to the private claude.ai session.
+CONSOLE_ACCOUNTS = {
+    "console": CLAUDE_ACCOUNTS["anthropic"],
+    "console-private": CLAUDE_ACCOUNTS["anthropic-private"],
+}
+# The Console's account endpoint, asked from a fresh Console tab: the logged-in
+# e-mail, "" when the endpoint refuses (401/403 = logged out), "?" when it cannot
+# tell (any other answer). Only that string leaves the page.
+_CONSOLE_ACCOUNT_JS = (
+    'fetch("/api/account").then(r => r.ok ? r.json().then(a => a.email_address || "?")'
+    ' : (r.status === 401 || r.status === 403 ? "" : "?")).catch(() => "?")'
+)
+CONSOLE_URL = "https://platform.claude.com/settings/billing"
+# The Console SPA takes 30-40 s to load in the headless shared browser (measured
+# 2026-10-29) — longer than the generic eval-fresh budget.
+CONSOLE_EVAL_S = 90.0
+
+
 # Sites that live in their own browser instance (browser.py CLAUDE_BROWSER_INSTANCE).
-SITE_INSTANCE = {"anthropic-private": "private"}
+SITE_INSTANCE = {"anthropic-private": "private", "console-private": "private"}
 CLAUDE_LOGIN_WAIT_S = 15 * 60
 
 
@@ -146,7 +166,35 @@ def instance_session(inst: str) -> Iterator[InstanceSession]:
 
 def browser_site(site: str) -> str:
     """The browser.py site name for an agent-login site id."""
+    if site in CONSOLE_ACCOUNTS:
+        return "console"
     return "anthropic" if site in CLAUDE_ACCOUNTS else site
+
+
+def console_account_email() -> str | None:
+    """The Claude Console account the CURRENT browser instance is logged into:
+    its e-mail (lower case), "" when the Console says logged out, None when it
+    cannot be told (browser error, busy, an unexpected answer). Asked in a fresh
+    tab of its own (`browser.py eval-fresh`), read-only."""
+    run = run_browser(
+        "eval-fresh",
+        "-t",
+        str(int(CONSOLE_EVAL_S)),
+        CONSOLE_URL,
+        _CONSOLE_ACCOUNT_JS,
+        timeout_s=CONSOLE_EVAL_S + 15.0,
+        capture=True,
+    )
+    if run.killed or run.rc != 0:
+        return None
+    lines = run.stdout.strip().splitlines()
+    try:
+        email = json.loads(lines[-1]) if lines else None
+    except ValueError:
+        return None
+    if not isinstance(email, str) or email == "?":
+        return None
+    return email.strip().lower()
 
 
 def claude_account_email() -> str | None:
