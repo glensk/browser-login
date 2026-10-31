@@ -710,6 +710,10 @@ and shows `phase · reason — detail 📷 screenshot` per ❌ row. `agents.md` 
 ever shows the fixed phase/code texts (no page text). `last-check.json` stays
 as a legacy projection (`ok`, `how`, `at`) for infra/status: `ok=false` is red;
 a check that could not tell (offline, busy) is `ok=false` and does not move `at`.
+It holds only the rows the daily run judges: an on-demand site (myfritz), a
+Safari site not imported unattended (`SAFARI_SITES` without `auto`, Ricardo) and
+a multi-account row whose account cannot be proven (`agent-login.py`
+`daily_unjudged`) leave it — their record stays in `checks.json` and agents.md.
 Each record also keeps `identity_history`: the last 10 identity proofs that did
 not come back `match` (when, state, verdict, the recipe's fixed `why` word, HTTP
 status, code, redacted detail), because the next check overwrites `detail`.
@@ -1278,7 +1282,12 @@ homeproxy down, the `; DIRECT` fallback gives today's behaviour (Access).
   about 5 minutes
   ([proxy docs](https://chromium.googlesource.com/chromium/src/net/+/HEAD/docs/proxy.md)):
   after a homeproxy outage the shared browser may keep going DIRECT (→ Access)
-  for up to 5 min. `browser.py down && browser.py up` resets it at once.
+  for up to 5 min. `browser.py down && browser.py up` resets it at once. The
+  daily `-c` re-checks each row that met the Access page on a homeproxy host
+  (`broker/pac.py` `HOMEPROXY_PAC_HOSTS`) ONCE at the end of the run, at least
+  6 min after the newest such result (`recheck_gated`); still gated stays
+  `unknown` (red). On 2026-10-31 the path failed 09:28–09:37 and abs-root and
+  both Navidrome accounts stayed ❌ for the day without it.
 - **When it applies.** Like every PAC change: at the next `browser.py up` of
   each instance (default, `private`, `admin`, `alt` — all launch through the
   same PAC flag); a running browser keeps its old PAC (`status` says

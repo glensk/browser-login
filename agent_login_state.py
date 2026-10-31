@@ -358,8 +358,11 @@ def identity_history(site: str) -> list[dict[str, Any]]:
 
 
 def drop_legacy(site: str) -> None:
-    """Remove `site`'s row from the legacy ``last-check.json`` projection
-    (WS1b: an on-demand site is not judged by infra/status)."""
+    """Remove `site`'s row from the legacy ``last-check.json`` projection:
+    a site intentionally outside the daily status monitoring is not judged
+    by infra/status (WS1b: an on-demand site; also a Safari site not
+    imported unattended and an account-unprovable multi-account row —
+    agent-login.py ``daily_unjudged``). Never a way to hide a failed check."""
 
     def drop(data: dict[str, Any]) -> None:
         data.pop(site, None)

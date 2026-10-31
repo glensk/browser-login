@@ -154,6 +154,7 @@ from agent_login_jobs import (  # noqa: E402
 from broker import (  # noqa: E402
     identity,  # noqa: E402
     onboarding,
+    pac,
     phases,
     safari_cookies,
 )
@@ -2146,6 +2147,9 @@ def assisted_login(site: str, force: bool = False) -> int:
 
 BUSY_HOW = "busy: guided login in progress — skipped, re-check later"
 UNREACHABLE_HOW = "unreachable off-LAN (Cloudflare Access) — not checked"
+# `recheck_gated`: the wait before the one re-check of a gated row — longer
+# than Chromium's ~5 min bad-proxy mark after a failed SOCKS connect.
+GATED_RECHECK_WAIT_S = 360.0
 
 
 Outcome = tuple[bool | None, str, dict | None]
@@ -2596,19 +2600,51 @@ def renew_step(  # pylint: disable=too-many-return-statements
     return True, f"{how} (session renewal: {renewal or 'not needed'})", out
 
 
+def daily_unjudged(row: dict) -> str:
+    """Why the daily run never checks `row` by design ('' = it does): an
+    on-demand site, a Safari site whose session is not imported unattended
+    (`SAFARI_SITES` rule without `auto`), or a multi-account row whose
+    account cannot be proven. Such a row has no place in the legacy
+    projection infra/status judges: a red row there could only ever be a
+    stale record (ricardo kept a 2026-10-13 ❌ for weeks, authentik-test3 an
+    "account unproven" one since 2026-10-18)."""
+    site = row["site"]
+    if site in ON_DEMAND_SITES:
+        return "on demand"
+    rule = safari_cookies.SAFARI_SITES.get(site)
+    if rule is not None and not rule.auto:
+        return "not imported unattended"
+    if row.get("status") in UNPROVEN_STATUSES and account_unproven(row):
+        return "account unproven"
+    return ""
+
+
+# The row statuses `_check_row` reaches `_unproven_skipped` with.
+UNPROVEN_STATUSES = ("ready", "extra", "safari")
+
+
 def _record_unchecked(data: dict | None, code: str, why: str) -> None:
     """A run that could not check anything records `unknown` for every
-    checkable row (never success, never "logged out")."""
+    checkable row (never success, never "logged out") — except a row the
+    daily run never judges (`daily_unjudged`): its legacy row is dropped
+    instead, so an offline morning cannot put a red row back."""
     for row in (data or {}).get("rows") or []:
-        if row["status"] in ("ready", "extra", "safari", "assisted"):
+        if row["status"] in ("ready", "extra", "safari", "assisted", "unchecked"):
+            if daily_unjudged(row):
+                als.drop_legacy(row["site"])
+                continue
+            if row["status"] == "unchecked":
+                continue
             record_check(row["site"], None, why, {"phase": "precheck", "code": code})
 
 
 def _unproven_skipped(row: dict) -> bool:
     """`-c` for a multi-account row (WS5): no check can tell which account the
     browser holds, so it is neither checked nor logged in — recorded as
-    "could not tell" with its code, never as a failure (no mail). True when
-    skipped. A proof-ready one is checked (its check proves the account)."""
+    "could not tell" with its code, never as a failure (no mail): checks.json
+    keeps the record, the legacy projection drops the row
+    (`daily_unjudged`). True when skipped. A proof-ready one is checked (its
+    check proves the account)."""
     if not account_unproven(row):
         return False
     how = unproven_text(row)
@@ -2623,6 +2659,7 @@ def _unproven_skipped(row: dict) -> bool:
             "instance": row_instance(row),  # nothing ran: where it lives
         },
     )
+    als.drop_legacy(row["site"])
     return True
 
 
@@ -2663,12 +2700,14 @@ def check_all(*, mail: bool = False) -> int:  # pylint: disable=too-many-branche
     for row in data["rows"]:
         by_instance.setdefault(check_instance(row), []).append(row)
     deferred: list[str] = []
+    gated: list[tuple[dict, float]] = []
     for row in by_instance.pop("", []):
-        if not _check_row(row, failed, ensure_browser_up, deferred):
+        if not _check_row(row, failed, ensure_browser_up, deferred, gated):
             break
     recheck_deferred(deferred, failed)
     for inst in identity.ROLE_INSTANCES:
-        _check_role_instance(inst, by_instance.pop(inst, []), failed)
+        _check_role_instance(inst, by_instance.pop(inst, []), failed, gated)
+    recheck_gated(gated, failed)
     if failed and mail:
         send_mail(*failure_mail(failed))
     return check_exit(failed)
@@ -2717,14 +2756,60 @@ def _with_instance(res: dict | None, inst: str) -> dict | None:
     return res if isinstance(res.get("instance"), str) else {**res, "instance": inst}
 
 
+def homeproxy_routed(row: dict) -> bool:
+    """Does the browser route `row`'s check page through homeproxy (the
+    broker's PAC constant, parity-tested against bin/pac_hosts.json)? Only
+    then can a Cloudflare Access page be the proxy failing over to DIRECT —
+    any other host behind Access is gated for good and gets no re-check."""
+    host = urllib.parse.urlsplit(str(row.get("check_url") or "")).hostname or ""
+    return host.lower() in pac.HOMEPROXY_PAC_HOSTS
+
+
+def recheck_gated(
+    gated: list[tuple[dict, float]],
+    failed: list[tuple[str, str]],
+    *,
+    clock: Callable[[], float] | None = None,
+    sleep: Callable[[float], None] | None = None,
+) -> None:
+    """End of `-c`: ONE more `_check_row` for each row whose free check came
+    back `access_gated` (the Cloudflare Access page) in this run — on the
+    home LAN that is the homeproxy path failing for a while (2026-10-31
+    09:28-09:37: abs-root, navidrome-*), and a gated row is never logged in,
+    so a lapsed session stayed ❌ until the next day. It waits until
+    `GATED_RECHECK_WAIT_S` after the newest gated result first (Chromium
+    keeps a failed proxy marked bad for about 5 min). Same gates as the
+    first pass; a row still gated stays `unknown`; no third try."""
+    if not gated:
+        return
+    clock = clock or time.monotonic
+    sleep = sleep or time.sleep
+    wait = max(at for _row, at in gated) + GATED_RECHECK_WAIT_S - clock()
+    sites = ", ".join(row["site"] for row, _at in gated)
+    if wait > 0:
+        print(f"⏳ behind Cloudflare Access: {sites} — one re-check in {wait:.0f} s")
+        sleep(wait)
+    shared = [row for row, _at in gated if check_instance(row) == ""]
+    for row in shared:
+        if not _check_row(row, failed, ensure_browser_up):
+            break
+    for inst in identity.ROLE_INSTANCES:
+        rows = [row for row, _at in gated if check_instance(row) == inst]
+        if rows:
+            _check_role_instance(inst, rows, failed)
+
+
 def _check_role_instance(
-    inst: str, rows: list[dict], failed: list[tuple[str, str]]
+    inst: str,
+    rows: list[dict],
+    failed: list[tuple[str, str]],
+    gated: list[tuple[dict, float]] | None = None,
 ) -> None:
     """`-c` for the rows of role instance `inst`: the rows that need no
     browser first, then — only when some row needs one — the instance is
     started if it was down, its rows checked (same gates as the shared
     browser), and stopped again if this run started it and nothing else
-    uses it (`instance_session`)."""
+    uses it (`instance_session`). `gated`: see `_check_row`."""
     busy = [r for r in rows if needs_browser(r)]
     for row in rows:
         if row not in busy:
@@ -2745,7 +2830,9 @@ def _check_role_instance(
                 )
         else:
             for row in busy:
-                if not _check_row(row, failed, lambda: browser_mode() is not None):
+                if not _check_row(
+                    row, failed, lambda: browser_mode() is not None, gated=gated
+                ):
                     break
     for problem in sess.problems:  # a failed stop, an unreadable client list
         print(f"❌ {problem}")
@@ -2758,15 +2845,22 @@ def _check_row(  # pylint: disable=too-many-return-statements
     failed: list[tuple[str, str]],
     alive: Callable[[], bool],
     deferred: list[str] | None = None,
+    gated: list[tuple[dict, float]] | None = None,
 ) -> bool:
     """`-c` for one row in the CURRENT browser instance; False when the
     browser went away (the caller stops: never fail every remaining site).
-    `deferred`: where a first-failed assisted row waits for its re-probe."""
+    `deferred`: where a first-failed assisted row waits for its re-probe;
+    `gated`: where a row whose check met Cloudflare Access waits for its one
+    re-check (`recheck_gated`; it is recorded `unknown` at once all the same)."""
     site, inst = row["site"], row_instance(row)
-    if site in ON_DEMAND_SITES:
-        # WS1b D6: never checked or logged in by the daily run; its row
-        # leaves the legacy projection so infra/status does not judge it.
-        print(f"⏭  {site}: on demand — not checked")
+    unjudged = daily_unjudged(row)
+    if unjudged in ("on demand", "not imported unattended"):
+        # WS1b D6: never checked or logged in by the daily run (an on-demand
+        # site; a Safari site agents work in directly); its row leaves the
+        # legacy projection so infra/status does not judge it. An unproven
+        # row is recorded first (`_unproven_skipped`), then dropped.
+        tail = "(see SAFARI_SITES)" if unjudged != "on demand" else "— not checked"
+        print(f"⏭  {site}: {unjudged} {tail}")
         als.drop_legacy(site)
         return True
     if row["status"] == "assisted":
@@ -2780,7 +2874,7 @@ def _check_row(  # pylint: disable=too-many-return-statements
             {"phase": "precheck", "code": "broker_unavailable", "instance": inst},
         )
         return True
-    if row["status"] not in ("ready", "extra", "safari") or _unproven_skipped(row):
+    if row["status"] not in UNPROVEN_STATUSES or _unproven_skipped(row):
         return True
     held = held_how(row)
     if held:
@@ -2798,10 +2892,6 @@ def _check_row(  # pylint: disable=too-many-return-statements
             },
         )
         return True
-    rule = safari_cookies.SAFARI_SITES.get(site)
-    if rule is not None and not rule.auto:
-        print(f"⏭  {site}: not imported unattended (see SAFARI_SITES)")
-        return True
     if not alive():
         # The browser went away mid-run: stop instead of failing every site.
         how = "the browser went down mid-run and did not restart"
@@ -2812,6 +2902,12 @@ def _check_row(  # pylint: disable=too-many-return-statements
     if ok is None:
         print(f"⏸  {site}: {how}")
         record_check(site, None, how, _with_instance(res, inst))
+        if (
+            gated is not None
+            and (res or {}).get("code") == "access_gated"
+            and homeproxy_routed(row)
+        ):
+            gated.append((row, time.monotonic()))
         return True
     if ok and row.get("session_refresh"):
         how = refresh_step(site, res, how)

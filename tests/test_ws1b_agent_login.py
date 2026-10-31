@@ -1382,3 +1382,207 @@ def test_no_credential_literals_in_this_file() -> None:
     assert "pass" + "word=" not in text.replace(" ", "")
     assert os.environ.get(alsafari.SCHEDULED_ENV) is None
     assert json.loads("{}") == {}
+
+
+# ---------------------------------------------------------------------------
+# rows the daily run never judges leave the legacy projection; gated re-check
+# ---------------------------------------------------------------------------
+
+
+def test_safari_manual_row_drops_its_stale_legacy_row(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # ricardo: a 2026-10-13 "broker unreadable" ❌ stayed red for weeks
+    als.record_check("ricardo", "unknown", "broker unreadable — not checked")
+    assert als.read(als.LEGACY_FILE)["ricardo"]["ok"] is False
+    monkeypatch.setattr(al, "ensure_logged_in", lambda *a, **k: pytest.fail("checked"))
+    failed: list = []
+    for status in ("safari", "unchecked"):
+        als.record_check("ricardo", "unknown", "x")
+        assert al._check_row(_row("ricardo", status=status), failed, lambda: True)
+        assert "ricardo" not in als.read(als.LEGACY_FILE)
+    assert not failed
+    assert "ricardo" in als.checks()  # checks.json keeps the record
+
+
+def test_unproven_row_records_unknown_but_leaves_the_legacy_projection(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(al, "ensure_logged_in", lambda *a, **k: pytest.fail("checked"))
+    row = _row("authentik-test3", shares_login_with=["authentik-glensk"])
+    failed: list = []
+    assert al._check_row(row, failed, lambda: True)
+    assert not failed
+    assert als.checks()["authentik-test3"]["code"] == "identity_unproven"
+    assert "authentik-test3" not in als.read(als.LEGACY_FILE)
+
+
+def test_unchecked_run_does_not_re_add_unjudged_rows() -> None:
+    als.record_check("ricardo", "unknown", "x")
+    rows = [
+        _row("ricardo", status="safari"),
+        _row("authentik-test3", shares_login_with=["authentik-glensk"]),
+        _row("myfritz"),
+        _row("aurral"),
+    ]
+    al._record_unchecked({"rows": rows}, "offline", "no network — not checked")
+    legacy = als.read(als.LEGACY_FILE)
+    assert set(legacy) == {"aurral"} and legacy["aurral"]["ok"] is False
+    assert al.daily_unjudged(_row("aurral")) == ""
+
+
+MUSIC = "https://music.dom42.space/app/"
+
+
+def _gated_probe(answers: list[str]) -> Any:
+    seq = iter(answers)
+
+    def probe(site: str, gate: Any = None) -> Any:
+        code = next(seq)
+        if code == "access_gated":
+            return None, al.UNREACHABLE_HOW, {"phase": "precheck", "code": code}
+        return True, "logged in", {"phase": "ok", "code": "ok"}
+
+    return probe
+
+
+def test_gated_row_is_rechecked_once_after_the_wait(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(al, "ensure_logged_in", _gated_probe(["access_gated", "ok"]))
+    monkeypatch.setattr(al, "check_only_gate", lambda row: None)
+    monkeypatch.setattr(al, "held_how", lambda row: "")
+    monkeypatch.setattr(al, "ensure_browser_up", lambda: True)
+    failed: list = []
+    gated: list = []
+    row = _row("navidrome-albert", check_url=MUSIC)
+    assert al._check_row(row, failed, lambda: True, gated=gated)
+    assert [r["site"] for r, _at in gated] == ["navidrome-albert"]
+    assert als.read(als.LEGACY_FILE)["navidrome-albert"]["ok"] is False
+    slept: list[float] = []
+    now = gated[0][1] + 60.0
+    al.recheck_gated(gated, failed, clock=lambda: now, sleep=slept.append)
+    assert slept == [pytest.approx(al.GATED_RECHECK_WAIT_S - 60.0)]
+    assert als.read(als.LEGACY_FILE)["navidrome-albert"]["ok"] is True
+    assert not failed
+
+
+def test_still_gated_stays_unknown_and_is_not_retried_again(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[str] = []
+    probe = _gated_probe(["access_gated", "access_gated"])
+
+    def counting(site: str, gate: Any = None) -> Any:
+        calls.append(site)
+        return probe(site, gate)
+
+    monkeypatch.setattr(al, "ensure_logged_in", counting)
+    monkeypatch.setattr(al, "check_only_gate", lambda row: None)
+    monkeypatch.setattr(al, "held_how", lambda row: "")
+    monkeypatch.setattr(al, "ensure_browser_up", lambda: True)
+    failed: list = []
+    gated: list = []
+    row = _row("abs-albert", check_url="https://audiobookshelf.dom42.space/x/")
+    al._check_row(row, failed, lambda: True, gated=gated)
+    al.recheck_gated(
+        gated, failed, clock=lambda: 1e12, sleep=lambda s: pytest.fail("slept")
+    )
+    assert calls == ["abs-albert", "abs-albert"]
+    assert len(gated) == 1  # the re-check did not queue another round
+    assert als.checks()["abs-albert"]["state"] == "unknown" and not failed
+
+
+def test_role_instance_gated_rows_recheck_in_their_instance(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    seen: list[tuple[str, list[str]]] = []
+    monkeypatch.setattr(
+        al,
+        "_check_role_instance",
+        lambda inst, rows, failed, gated=None: seen.append(
+            (inst, [r["site"] for r in rows])
+        ),
+    )
+    monkeypatch.setattr(al, "_check_row", lambda *a, **k: pytest.fail("shared"))
+    row = _row("navidrome-root", instance="admin", check_url=MUSIC)
+    al.recheck_gated([(row, 0.0)], [], clock=lambda: 1e12, sleep=lambda s: None)
+    assert seen == [("admin", ["navidrome-root"])]
+
+
+def test_nothing_gated_means_no_wait() -> None:
+    al.recheck_gated([], [], clock=lambda: 0.0, sleep=lambda s: pytest.fail("slept"))
+
+
+def test_access_gated_host_outside_the_homeproxy_pac_gets_no_recheck(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # homeassistant stays behind Access on purpose: gated there is final.
+    monkeypatch.setattr(al, "ensure_logged_in", _gated_probe(["access_gated"]))
+    monkeypatch.setattr(al, "check_only_gate", lambda row: None)
+    monkeypatch.setattr(al, "held_how", lambda row: "")
+    gated: list = []
+    row = _row("homeassistant", check_url="https://homeassistant.dom42.space/")
+    assert al._check_row(row, [], lambda: True, gated=gated)
+    assert not gated
+    assert als.read(als.LEGACY_FILE)["homeassistant"]["ok"] is False
+    assert al.homeproxy_routed(_row("x", check_url="https://MUSIC.dom42.space/a"))
+    assert not al.homeproxy_routed(_row("x"))
+
+
+def test_check_all_rechecks_gated_rows_once_after_one_wait(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Orchestration: shared + admin rows gated in the first pass; ONE wait;
+    the shared row re-checks in the shared browser, the admin row in a fresh
+    admin instance session; a gated-then-logged-out row gets exactly one
+    scheduled login, and none before the wait."""
+    rows = [
+        _row("navidrome-albert", check_url=MUSIC, stage="usable"),
+        _row("komga", check_url="https://komga.dom42.space/", stage="usable"),
+        _row("navidrome-root", check_url=MUSIC, instance="admin", stage="usable"),
+    ]
+    events: list[str] = []
+    answers = {
+        "navidrome-albert": iter(["access_gated", "logged_out", "ok"]),
+        "komga": iter(["ok"]),
+        "navidrome-root": iter(["access_gated", "ok"]),
+    }
+
+    def probe(site: str, *, quiet: bool = True) -> tuple[int, dict]:
+        code = next(answers[site])
+        events.append(f"probe {site} {code}")
+        return (0 if code == "ok" else 2), {"phase": "client-proof", "code": code}
+
+    def run_browser(cmd: str, site: str, *a: Any, **k: Any) -> jobs.BrowserRun:
+        events.append(f"{cmd} {site}")
+        return _run(0, {"phase": "ok", "code": "ok"})
+
+    @contextlib.contextmanager
+    def session(inst: str) -> Any:
+        events.append(f"session {inst}")
+        yield SimpleNamespace(up=True, problems=[])
+
+    monkeypatch.setattr(al, "wait_for_network", lambda: True)
+    monkeypatch.setattr(al, "ensure_browser_up", lambda: True)
+    monkeypatch.setattr(al, "_browser", lambda *a, **k: None)
+    monkeypatch.setattr(al, "overview", lambda **k: {"rows": rows, "broker_ok": True})
+    monkeypatch.setattr(al, "report_psl", lambda: "")
+    monkeypatch.setattr(al, "toolchain_report", lambda: [])
+    monkeypatch.setattr(al, "instance_session", session)
+    monkeypatch.setattr(al, "browser_mode", lambda: "headless")
+    monkeypatch.setattr(al, "check_only_gate", lambda row: None)
+    monkeypatch.setattr(al, "held_how", lambda *a, **k: "")
+    monkeypatch.setattr(al, "probe", probe)
+    monkeypatch.setattr(al, "run_browser", run_browser)
+    monkeypatch.setattr(al.time, "sleep", lambda s: events.append("sleep"))
+    assert al.check_all() == 0
+    first_sleep = events.index("sleep")
+    assert events.count("sleep") == 1
+    assert "login navidrome-albert" not in events[:first_sleep]
+    assert events.count("login navidrome-albert") == 1
+    assert events[first_sleep:].count("session admin") == 1
+    assert events.count("probe komga ok") == 1  # an ungated row: no re-check
+    legacy = als.read(als.LEGACY_FILE)
+    assert legacy["navidrome-albert"]["ok"] is True
+    assert legacy["navidrome-root"]["ok"] is True
