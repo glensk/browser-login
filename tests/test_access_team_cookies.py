@@ -858,6 +858,7 @@ def _free_port() -> int:
         return int(s.getsockname()[1])
 
 
+@pytest.mark.launches_chrome
 @pytest.mark.skipif(
     not __import__("os").environ.get("CLAUDE_BROWSER_TEST_CDP"),
     reason="opt-in: set CLAUDE_BROWSER_TEST_CDP=1 (launches a throwaway Chromium)",
@@ -869,7 +870,16 @@ def test_real_chromium_keeps_only_the_app_cookie(tmp_path: Path) -> None:
     untouched — through the Playwright attach (`_drop_access_team_cookies`,
     as `_access_team_sweep` uses it) and through raw CDP
     (`_access_team_sweep_cdp`, the deadline path).
-    `$CLAUDE_BROWSER_TEST_CHROMIUM` may name the executable."""
+
+    CHIPS listing proof (tp#1468, residual 3): the sweep reads the jar with
+    ``Storage.getCookies``, so it must LIST partitioned cookies — asserted
+    on a partitioned dummy team cookie on ``x.cloudflareaccess.com`` before
+    each sweep, gone after it (``ok``, read-back empty of team cookies),
+    while the partitioned app cookie survives.
+
+    The executable is the one browser.py launches (`_chromium_binary`);
+    `$CLAUDE_BROWSER_TEST_CHROMIUM` may override it. The disposable browser
+    on a free port (never :9222) is closed in a ``finally``."""
     import os  # pylint: disable=import-outside-toplevel
 
     from playwright.sync_api import (  # pylint: disable=import-outside-toplevel
@@ -880,10 +890,12 @@ def test_real_chromium_keeps_only_the_app_cookie(tmp_path: Path) -> None:
     assert port != 9222
     part = {"topLevelSite": "https://example.org", "hasCrossSiteAncestor": False}
     chips = {"secure": True, "sameSite": "None", "partitionKey": part}
+    chips_team = "x.cloudflareaccess.com"
     team_cookies = [
         {"name": "CF_Authorization", "value": "v", "url": f"https://{TEAM}/"},
         {"name": "CF_Session", "value": "v", "domain": f".{TEAM}", "path": "/"},
         {"name": "CF_Device", "value": "v", "url": f"https://{TEAM}/", **chips},
+        {"name": "CF_Chips", "value": "v", "url": f"https://{chips_team}/", **chips},
     ]
     app_cookies = [
         {"name": "CF_Authorization", "value": "a1", "url": f"https://{APP}/"},
@@ -899,28 +911,45 @@ def test_real_chromium_keeps_only_the_app_cookie(tmp_path: Path) -> None:
         )
 
     want = [(d, n, n == "CF_Device") for d, n in APP_LEFT]
-    exe = os.environ.get("CLAUDE_BROWSER_TEST_CHROMIUM") or None
-    with sync_playwright() as pw:
-        owner = pw.chromium.launch_persistent_context(
-            str(tmp_path / "profile"),
-            headless=True,
-            executable_path=exe,
-            args=[f"--remote-debugging-port={port}"],
+    chips_label = (chips_team, "CF_Chips", True)
+
+    def _team_jar(cdp: Any) -> list[tuple[str, str, bool]]:
+        got = cdp.send("Storage.getCookies", {})["cookies"]
+        return sorted(
+            (c["domain"], c["name"], bool(c.get("partitionKey")))
+            for c in got
+            if access_team.is_team_host(str(c["domain"]))
         )
-        attached = pw.chromium.connect_over_cdp(f"http://127.0.0.1:{port}")
+
+    exe = os.environ.get("CLAUDE_BROWSER_TEST_CHROMIUM") or browser._chromium_binary()
+    with sync_playwright() as pw:
+        owner: Any = None
+        attached: Any = None
         try:
+            owner = pw.chromium.launch_persistent_context(
+                str(tmp_path / "profile"),
+                headless=True,
+                executable_path=exe,
+                args=[f"--remote-debugging-port={port}"],
+            )
+            attached = pw.chromium.connect_over_cdp(f"http://127.0.0.1:{port}")
             cdp = attached.new_browser_cdp_session()
             cdp.send("Storage.setCookies", {"cookies": [*team_cookies, *app_cookies]})
-            assert len(cdp.send("Storage.getCookies", {})["cookies"]) == 6
+            assert len(cdp.send("Storage.getCookies", {})["cookies"]) == 7
+            assert chips_label in _team_jar(cdp)  # CHIPS: listed, so sweepable
             # the shared browser, as `_access_team_sweep` passes it (tp#1468)
             sweep = browser._drop_access_team_cookies(attached, "integration")
-            assert sweep.status == "ok" and len(sweep.dropped) == 3, sweep
-            assert _app_jar(cdp) == want
+            assert sweep.status == "ok" and len(sweep.dropped) == 4, sweep
+            assert f"{chips_team} CF_Chips" in sweep.dropped
+            assert not _team_jar(cdp) and _app_jar(cdp) == want
             cdp.send("Storage.setCookies", {"cookies": team_cookies})  # again
+            assert chips_label in _team_jar(cdp)
             sweep = browser._access_team_sweep_cdp(port, "integration (cdp)")
-            assert sweep.status == "ok" and len(sweep.dropped) == 3, sweep
-            assert _app_jar(cdp) == want
+            assert sweep.status == "ok" and len(sweep.dropped) == 4, sweep
+            assert not _team_jar(cdp) and _app_jar(cdp) == want
         finally:
-            with contextlib.suppress(Exception):
-                attached.close()
-            owner.close()
+            if attached is not None:
+                with contextlib.suppress(Exception):
+                    attached.close()
+            if owner is not None:
+                owner.close()
