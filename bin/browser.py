@@ -11068,9 +11068,9 @@ def _background_page_run(
                     # tp#1466: a navigation to an Access-gated app can sign the
                     # shared browser in through Access (a logged-in IdP) and
                     # leave a team session — it goes before the tab closes.
-                    ctx = getattr(page, "context", None)
-                    if ctx is not None:
-                        _drop_access_team_cookies(ctx, "background page", quiet=True)
+                    owner = getattr(getattr(page, "context", None), "browser", None)
+                    if owner is not None:
+                        _drop_access_team_cookies(owner, "background page", quiet=True)
                     _BG_STATUS.pop(id(page), None)
                     _BG_NOCACHE.pop(id(page), None)
                     trail = _BG_TRAIL.pop(id(page), None)
@@ -12709,6 +12709,8 @@ def _cookie_reject_hint(c: Mapping[str, Any]) -> str | None:
 def _cookie_inject_error(exc: BaseException) -> str:
     """A fixed code for an ``add_cookies`` failure (never its message: it
     may quote the cookie)."""
+    if isinstance(exc, SharedJarMissing):
+        return "no_default_context"
     text = str(exc)
     if "Invalid cookie fields" in text:
         return "invalid_cookie_fields"  # Storage.setCookies refused the batch
@@ -12890,8 +12892,10 @@ def _broker_replace_cookies(browser, bundle: dict) -> int:
     """Delete the shared browser's in-scope cookies, add the bundle's; return
     count. In scope = the bundle's cookie scopes (`_cookie_scopes_of`: on a
     path-scoped host only inside its paths and, for the delete, on their
-    ancestor paths — a sibling Keycloak realm's cookies stay)."""
-    ctx = browser.contexts[0] if browser.contexts else browser.new_context()
+    ancestor paths — a sibling Keycloak realm's cookies stay). Raises
+    `SharedJarMissing` (nothing injected) when the attach shows no default
+    context."""
+    ctx = _shared_jar(browser, "broker-login")
     hosts = [str(h) for h in bundle.get("cookie_hosts") or []]
     scopes = _cookie_scopes_of(bundle)
     raw_names = bundle.get("cookie_names")
@@ -12923,7 +12927,7 @@ def _broker_replace_cookies(browser, bundle: dict) -> int:
     ]
     if cookies:
         ctx.add_cookies(cookies)
-    _drop_access_team_cookies(ctx, "broker-login")
+    _drop_access_team_cookies(browser, "broker-login")
     return len(cookies)
 
 
@@ -13064,19 +13068,44 @@ def _sweep_team_cookies(
     return _access_sweep_report(why, dropped, left, error, quiet=quiet)
 
 
+class SharedJarMissing(RuntimeError):
+    """The attached shared browser exposes no default context (tp#1468): an
+    injection refuses rather than write into an isolated ``new_context()``
+    that is not the persistent jar."""
+
+
+def _shared_jar(browser: Any, why: str) -> Any:
+    """The shared browser's persistent default context — the shared cookie
+    jar — for an injection (`why` names it). Raises `SharedJarMissing`
+    (journaled, nothing injected) when the attach shows no context: an
+    isolated ``browser.new_context()`` is never treated as the default jar
+    (tp#1468, residual 1)."""
+    if browser.contexts:
+        return browser.contexts[0]
+    error = "not the default context: the attached browser has no context"
+    _journal_note(shared_jar_refused=why, shared_jar_error=error)
+    raise SharedJarMissing(f"{why}: {error} — nothing injected")
+
+
 def _drop_access_team_cookies(
-    ctx: Any, why: str, *, quiet: bool = False
+    browser: Any, why: str, *, quiet: bool = False
 ) -> AccessSweep:
     """Delete every Cloudflare Access TEAM-domain cookie from the shared
-    browser `ctx` belongs to (tp#1466, `broker.access_team`): the team
-    session would let Access open every app of the team — decide too — while
-    the per-app cookies the home services need stay. `_sweep_team_cookies`
-    over a browser-level CDP session of `ctx`'s Playwright browser (the
-    default context, which is the shared jar). Never raises; `quiet`: a
-    failure is only journaled (the per-tab sweep of every background page),
-    not printed."""
+    Playwright `browser`'s persistent default jar (tp#1466,
+    `broker.access_team`): the team session would let Access open every app
+    of the team — decide too — while the per-app cookies the home services
+    need stay. `_sweep_team_cookies` over a browser-level CDP session (whose
+    ``Storage.getCookies`` reads the default context). Takes the Browser,
+    never a context (tp#1468): a context argument could be an isolated one
+    while the sweep reads the default jar. ``failed`` when the attach shows
+    no context. Never raises; `quiet`: a failure is only journaled (the
+    per-tab sweep of every background page), not printed."""
     try:
-        session = ctx.browser.new_browser_cdp_session()
+        if not browser.contexts:
+            return _access_sweep_report(
+                why, [], [], "not the default context: no context", quiet=quiet
+            )
+        session = browser.new_browser_cdp_session()
     except Exception as exc:  # pylint: disable=broad-exception-caught
         return _access_sweep_report(
             why, [], [], f"no CDP session ({_exc_line(exc)})", quiet=quiet
@@ -13105,9 +13134,8 @@ def _access_team_sweep(port: int, why: str) -> AccessSweep:
             return AccessSweep("down")
         return _access_sweep_report(why, [], [], _exc_line(exc), quiet=False)
     try:
-        if not browser.contexts:
-            return AccessSweep("ok")
-        return _drop_access_team_cookies(browser.contexts[0], why)
+        # No context = the shared jar is not visible: never `ok` (tp#1468).
+        return _drop_access_team_cookies(browser, why)
     finally:
         with contextlib.suppress(Exception):
             browser.close()
@@ -13118,6 +13146,31 @@ def _access_team_sweep(port: int, why: str) -> AccessSweep:
 # The deadline watcher's sweep (`LoginDeadline._fire`): the main thread is
 # stuck inside Playwright, so it talks raw CDP to the browser endpoint.
 ACCESS_SWEEP_CDP_BUDGET_S = 4.0
+
+
+def _sweep_endpoint(port: int, budget_s: float) -> tuple[str, str | None]:
+    """ONE ``/json/version`` lookup inside `budget_s` for the raw sweep
+    (tp#1468, residual 4: no bare `_is_up` with its own 2 s timeout).
+    ``("down", None)`` when nothing listens (connection refused);
+    ``("ok", ws_url)`` on an answer with a browser websocket; else
+    ``(<error>, None)`` — no answer in time, or an answer without a
+    websocket — which the sweep reports as ``failed``."""
+    if budget_s <= 0:
+        return "sweep budget spent before the endpoint lookup", None
+    try:
+        with urllib.request.urlopen(
+            f"http://127.0.0.1:{port}/json/version", timeout=budget_s
+        ) as r:
+            ver: object = json.loads(r.read().decode())
+    except (OSError, ValueError) as exc:  # URLError is an OSError
+        refused = isinstance(exc, ConnectionRefusedError) or isinstance(
+            getattr(exc, "reason", None), ConnectionRefusedError
+        )
+        return ("down" if refused else f"no endpoint answer ({_exc_line(exc)})"), None
+    url = ver.get("webSocketDebuggerUrl") if isinstance(ver, dict) else None
+    if isinstance(url, str) and url:
+        return "ok", url
+    return "no browser websocket", None
 
 
 def _access_team_sweep_cdp(
@@ -13133,11 +13186,11 @@ def _access_team_sweep_cdp(
     def _left() -> float:
         return deadline - time.monotonic()
 
-    if not _is_up(port):
+    probe, ws_url = _sweep_endpoint(port, _left())
+    if probe == "down":
         return AccessSweep("down")
-    ws_url = _browser_ws_url(port, timeout=max(0.01, min(2.0, _left())))
     if not ws_url:
-        return _access_sweep_report(why, [], [], "no browser websocket", quiet=False)
+        return _access_sweep_report(why, [], [], probe, quiet=False)
 
     def _send(method: str, params: dict) -> dict:
         remaining = _left()
@@ -14518,10 +14571,11 @@ def _safari_replace_cookies(
     """Delete the shared browser's cookies for `site`'s domains (bot-check ones
     stay — they are Chromium's own — unless the site sets ``drop_bot_cookies``),
     add `cookies`; return how many were added. Refuses (ValueError, nothing
-    touched) when `cookies` hold none of the site's session cookies."""
+    touched) when `cookies` hold none of the site's session cookies, and
+    with `SharedJarMissing` when the attach shows no default context."""
     if not _safari.has_session(site, cookies):
         raise ValueError(f"{site}: no session cookie in Safari's set")
-    ctx = browser.contexts[0] if browser.contexts else browser.new_context()
+    ctx = _shared_jar(browser, f"import-safari {site}")
     for ck in ctx.cookies():
         if _safari.replaced_on_import(str(ck.get("domain")), str(ck.get("name")), site):
             ctx.clear_cookies(name=ck["name"], domain=ck["domain"], path=ck["path"])
@@ -14531,7 +14585,7 @@ def _safari_replace_cookies(
     ]
     if picked:
         ctx.add_cookies(picked)
-    _drop_access_team_cookies(ctx, f"import-safari {site}")
+    _drop_access_team_cookies(browser, f"import-safari {site}")
     return len(picked)
 
 

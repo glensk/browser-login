@@ -319,6 +319,10 @@ class _Browser:
     def close(self) -> None:
         self.closed = True
 
+    def new_browser_cdp_session(self) -> _Ctx:
+        """The team-cookie sweep takes the Browser (tp#1468)."""
+        return self.contexts[0].new_browser_cdp_session()
+
 
 class _Pw:
     def stop(self) -> None:

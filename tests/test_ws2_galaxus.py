@@ -172,7 +172,12 @@ def chromium(monkeypatch):
         leases.append(purpose)
         yield "owner"
 
-    browser_obj = SimpleNamespace(contexts=[ctx], close=lambda: None)
+    # the team-cookie sweep takes the Browser (tp#1468): its CDP session
+    browser_obj = SimpleNamespace(
+        contexts=[ctx],
+        close=lambda: None,
+        new_browser_cdp_session=ctx.new_browser_cdp_session,
+    )
     monkeypatch.setattr(
         browser,
         "_connect",
@@ -258,7 +263,11 @@ def test_logged_out_safari_never_wipes_chromium(
     monkeypatch.setenv("SAFARI_COOKIES", str(path))
     domain = sc.SAFARI_SITES[site].domains[0]
     ctx = _Ctx([{"domain": f".{domain}", "name": "good-session", "path": "/"}])
-    browser_obj = SimpleNamespace(contexts=[ctx], close=lambda: None)
+    browser_obj = SimpleNamespace(
+        contexts=[ctx],
+        close=lambda: None,
+        new_browser_cdp_session=ctx.new_browser_cdp_session,
+    )
     monkeypatch.setattr(
         browser,
         "_connect",

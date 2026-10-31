@@ -116,6 +116,11 @@ class _Jar:
     def browser(self) -> _Jar:
         return self
 
+    @property
+    def contexts(self) -> list[_Jar]:
+        """As a Playwright Browser: the jar is its own default context."""
+        return [self]
+
     def new_browser_cdp_session(self) -> _Session:
         return _Session(self)
 
@@ -138,8 +143,31 @@ class _Jar:
 
 
 class _Browser:
-    def __init__(self, ctx: _Jar) -> None:
-        self.contexts = [ctx]
+    """A Playwright Browser whose default context is `ctx` (none: no context)."""
+
+    def __init__(self, ctx: _Jar | None) -> None:
+        self.contexts = [ctx] if ctx is not None else []
+        self.sessions = 0
+        self.sent: list[str] = []
+
+    def new_browser_cdp_session(self) -> Any:
+        self.sessions += 1
+        if self.contexts:
+            return _Session(self.contexts[0])
+        browser_self = self
+
+        class _Recording:
+            def send(self, method: str, _params: Any = None) -> dict[str, Any]:
+                browser_self.sent.append(method)
+                return {"cookies": []}
+
+            def detach(self) -> None:
+                return None
+
+        return _Recording()
+
+    def new_context(self) -> Any:
+        raise AssertionError("an isolated context is never the shared jar")
 
 
 @pytest.fixture(autouse=True)
@@ -634,8 +662,7 @@ class _CdpJar(_Jar):
 
 
 def _patch_cdp(monkeypatch: pytest.MonkeyPatch, fake: _CdpJar) -> None:
-    monkeypatch.setattr(browser, "_is_up", lambda _port: True)
-    monkeypatch.setattr(browser, "_browser_ws_url", lambda _port, **_k: "ws://fake")
+    monkeypatch.setattr(browser, "_sweep_endpoint", lambda *_a: ("ok", "ws://fake"))
     monkeypatch.setattr(browser, "_cdp_ws_call", fake)
 
 
@@ -698,6 +725,126 @@ def test_deadline_hard_exit_sweeps_over_cdp(monkeypatch: pytest.MonkeyPatch) -> 
     dl = browser.LoginDeadline(9, "login", "stirling", 1.0)
     dl._fire((0.0, "overall", 1.0), [], "start")
     assert order == ["login stirling (timeout)", f"exit {browser.LOGIN_TIMEOUT_RC}"]
+
+
+# --- tp#1468 B1: the sweep takes the Browser; no context is never `ok` ---
+
+
+def test_sweep_helper_takes_the_browser_and_reads_its_default_jar() -> None:
+    """The helper gets the Playwright Browser (never a context) and sweeps
+    the default jar over one browser-level CDP session."""
+    ctx = _Jar([*TEAM_COOKIES, APP_COOKIE])
+    owner = _Browser(ctx)
+    sweep = browser._drop_access_team_cookies(owner, "login x", quiet=True)
+    assert sweep.status == "ok" and len(sweep.dropped) == 3, sweep
+    assert owner.sessions == 1 and ctx.detached == 1
+    assert [(c["domain"], c["name"]) for c in ctx.jar] == [(APP, "CF_Authorization")]
+
+
+def test_sweep_of_a_browser_without_contexts_is_failed() -> None:
+    owner = _Browser(None)
+    sweep = browser._drop_access_team_cookies(owner, "login x", quiet=True)
+    assert sweep.failed and "not the default context" in sweep.error
+    assert owner.sessions == 0 and not owner.sent
+
+
+def test_post_login_sweep_without_contexts_is_failed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    owner = _Browser(None)
+
+    class _Pw:
+        def stop(self) -> None:
+            return None
+
+    monkeypatch.setattr(browser, "_is_up", lambda _port: True)
+    monkeypatch.setattr(browser, "_connect", lambda _port: (_Pw(), owner))
+    monkeypatch.setattr(owner, "close", lambda: None, raising=False)
+    sweep = browser._access_team_sweep(9, "login x")
+    assert sweep.status == "failed" and "not the default context" in sweep.error
+    assert not owner.sent
+
+
+def test_broker_injection_refuses_a_browser_without_contexts() -> None:
+    """No `new_context()` fallback: nothing is injected into an isolated
+    context, no ``Storage.setCookies`` is sent, the refusal is journaled."""
+    owner = _Browser(None)
+    fake_bundle = {"cookie_hosts": [APP], "cookie_names": None, "cookies": [APP_COOKIE]}
+    with pytest.raises(browser.SharedJarMissing, match="not the default context"):
+        browser._broker_replace_cookies(owner, fake_bundle)
+    assert "Storage.setCookies" not in owner.sent and owner.sessions == 0
+    assert browser._JOURNAL_NOTES.get("shared_jar_refused") == "broker-login"
+    assert browser._cookie_inject_error(browser.SharedJarMissing("x")) == (
+        "no_default_context"
+    )
+
+
+def test_safari_import_refuses_a_browser_without_contexts(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    owner = _Browser(None)
+    monkeypatch.setattr(browser._safari, "has_session", lambda _site, _c: True)
+    with pytest.raises(browser.SharedJarMissing, match="nothing injected"):
+        browser._safari_replace_cookies(owner, "somesite", [])
+    assert not owner.sent and owner.sessions == 0
+    assert browser._JOURNAL_NOTES.get("shared_jar_refused") == "import-safari somesite"
+
+
+def test_cdp_sweep_endpoint_lookup_is_inside_the_budget() -> None:
+    """A ``/json/version`` that accepts and never answers costs at most the
+    sweep budget (no bare `_is_up` with its own 2 s timeout) and is
+    ``failed``; nothing listening is ``down``."""
+    import socket  # pylint: disable=import-outside-toplevel
+    import time  # pylint: disable=import-outside-toplevel
+
+    with socket.socket() as stall:
+        stall.bind(("127.0.0.1", 0))
+        stall.listen(1)  # accepts into the backlog, never answers
+        port = int(stall.getsockname()[1])
+        start = time.monotonic()
+        sweep = browser._access_team_sweep_cdp(port, "login x (timeout)", budget_s=0.3)
+        elapsed = time.monotonic() - start
+    assert sweep.failed and "no endpoint answer" in sweep.error, sweep
+    assert elapsed < 1.5, elapsed  # the budget, not _cdp_get's 2 s
+    closed = _free_port()  # bound then released: nothing listens
+    assert browser._access_team_sweep_cdp(closed, "x", budget_s=0.3).status == "down"
+
+
+def test_cdp_sweep_endpoint_without_a_websocket_is_failed() -> None:
+    import http.server  # pylint: disable=import-outside-toplevel
+    import threading  # pylint: disable=import-outside-toplevel
+
+    class _NoWs(http.server.BaseHTTPRequestHandler):
+        def do_GET(self) -> None:  # noqa: N802 - http.server's name
+            body = b'{"Browser": "fake"}'
+            self.send_response(200)
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, *_a: Any) -> None:
+            return None
+
+    srv = http.server.HTTPServer(("127.0.0.1", 0), _NoWs)
+    thread = threading.Thread(target=srv.serve_forever, daemon=True)
+    thread.start()
+    try:
+        port = int(srv.server_address[1])
+        sweep = browser._access_team_sweep_cdp(port, "x", budget_s=2.0)
+    finally:
+        srv.shutdown()
+        srv.server_close()
+    assert sweep.failed and sweep.error == "no browser websocket"
+
+
+def test_cdp_sweep_with_a_spent_budget_never_probes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        browser.urllib.request, "urlopen", lambda *_a, **_k: pytest.fail("probed")
+    )
+    sweep = browser._access_team_sweep_cdp(9, "x", budget_s=0.0)
+    assert sweep.failed and "budget spent" in sweep.error
 
 
 # --- opt-in: a THROWAWAY real Chromium (never the shared one on :9222) ---
@@ -765,8 +912,8 @@ def test_real_chromium_keeps_only_the_app_cookie(tmp_path: Path) -> None:
             cdp = attached.new_browser_cdp_session()
             cdp.send("Storage.setCookies", {"cookies": [*team_cookies, *app_cookies]})
             assert len(cdp.send("Storage.getCookies", {})["cookies"]) == 6
-            ctx = attached.contexts[0]  # the shared jar, as `_access_team_sweep`
-            sweep = browser._drop_access_team_cookies(ctx, "integration")
+            # the shared browser, as `_access_team_sweep` passes it (tp#1468)
+            sweep = browser._drop_access_team_cookies(attached, "integration")
             assert sweep.status == "ok" and len(sweep.dropped) == 3, sweep
             assert _app_jar(cdp) == want
             cdp.send("Storage.setCookies", {"cookies": team_cookies})  # again
