@@ -1421,6 +1421,26 @@ the `himalaya` helpers. The CDP endpoint is always `http://127.0.0.1:<port>` (ne
   keychain label only.
 - **Magic links / tokens are bearer credentials** — kept in memory, never printed,
   logged, or committed.
+- **No Cloudflare Access team session in the shared browser** (tp#1466). An
+  Access login leaves a per-app `CF_Authorization` on the app's host
+  (`calibre.dom42.space`) and a TEAM session on `<team>.cloudflareaccess.com`
+  (`CF_Authorization`, `CF_Session`, `CF_Device`). The team session lets Access
+  open every app of the team without a new login — decide.dom42.space included,
+  which agents must never open as Albert. So a team-domain cookie (any host on
+  or under `cloudflareaccess.com`, plus the configured team domain) is:
+  never exported by the broker (`broker/bundle.py`, drop reason
+  `access_team`), never injected by the client (`_broker_cookie_in_scope`) or
+  copied from Safari (`safari_cookies.importable`), and deleted from the shared
+  jar after every broker injection, Safari import, `browser.py login` (any
+  flow) and guided login (`_drop_access_team_cookies` / `_access_team_sweep`,
+  journaled as `access_team_sweep`, names only). Only the per-app cookies stay,
+  and the home services keep working on them. `browser.py doctor` prints an
+  `access team cookies` line (❌ with host + name when one is present, never a
+  value). The configured team domain comes from
+  `$CLAUDE_BROWSER_ACCESS_TEAM_DOMAIN`, else `team_domain` in decide's
+  `config/edge.json` (`$CLAUDE_BROWSER_ACCESS_EDGE_FILE` overrides the path);
+  it is informational on top of the suffix rule, so a missing configuration
+  never lets a team cookie through. No Access session is revoked server-side.
 - **Keychain note:** caching a password + TOTP seed in the login keychain collapses
   2FA to 1FA *on this machine*. FileVault + the keychain protect it at rest, not from
   code running as you. This is an explicit, documented trade-off for unattended login.

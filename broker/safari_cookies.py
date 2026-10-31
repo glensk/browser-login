@@ -26,6 +26,8 @@ from collections.abc import Iterable
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from broker.access_team import is_team_host as is_access_team_host
+
 DEFAULT_PATH = (
     "~/Library/Containers/com.apple.Safari/Data/Library/Cookies/Cookies.binarycookies"
 )
@@ -291,8 +293,13 @@ def in_site(domain: str, site: str) -> bool:
 
 def importable(domain: str, name: str, site: str) -> bool:
     """True if a cookie may be copied INTO the shared browser for `site`:
-    in its domains and not a bot-management cookie."""
-    return in_site(domain, site) and not denied(name, rule(site))
+    in its domains, not a bot-management cookie and never a Cloudflare
+    Access team-domain cookie (tp#1466)."""
+    return (
+        in_site(domain, site)
+        and not denied(name, rule(site))
+        and not is_access_team_host(domain)
+    )
 
 
 def replaced_on_import(domain: str, name: str, site: str) -> bool:

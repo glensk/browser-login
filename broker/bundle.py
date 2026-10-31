@@ -7,7 +7,8 @@ the site's ``cookie_hosts`` (or a subdomain of one) — with ``cookie_scopes``
 — and, when the item lists ``cookie_names``, its name is listed.
 Identity-provider hosts are always excluded unless the site names that exact
 host — an IdP session cookie would let the agent log into every other site
-behind that IdP.
+behind that IdP. A Cloudflare Access team-domain cookie (``*.cloudflareaccess.com``)
+is never exported at all (tp#1466, ``broker.access_team``).
 """
 
 from __future__ import annotations
@@ -16,6 +17,7 @@ from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
 from typing import Any
 
+from broker.access_team import is_team_host as is_access_team_host
 from broker.identity import CookieScope, domains_related, scopes_hold
 
 # Exact IdP hosts, plus first-label wildcards (``idp.*``, ``sso.*``, ``keycloak.*``).
@@ -70,7 +72,9 @@ def cookie_drop_reason(
     ('' = it is exported; see the module docstring): ``no_domain``,
     ``out_of_scope`` (not on a scope host or a subdomain of one: a parent
     or unrelated domain), ``out_of_path`` (on a scope host, outside every
-    path of its scopes), ``idp_host`` or ``not_in_cookie_names``. The ONE
+    path of its scopes), ``access_team`` (a Cloudflare Access team-domain
+    cookie, `broker.access_team`: never exported), ``idp_host`` or
+    ``not_in_cookie_names``. The ONE
     rule behind `cookie_in_scope` and `cookie_diag`."""
     d = _norm_host(domain)
     if not d:
@@ -80,11 +84,14 @@ def cookie_drop_reason(
         if any(d == s.host or d.endswith("." + s.host) for s in scopes):
             return "out_of_path"
         return "out_of_scope"
+    if is_access_team_host(d):
+        # tp#1466: a Cloudflare Access team session opens every app of the
+        # team (decide too) — never exported, even for a site naming it.
+        return "access_team"
     if is_idp_host(d) and d not in {s.host for s in scopes}:
         return "idp_host"
-    if spec.cookie_names is not None and name not in spec.cookie_names:
-        return "not_in_cookie_names"
-    return ""
+    unnamed = spec.cookie_names is not None and name not in spec.cookie_names
+    return "not_in_cookie_names" if unnamed else ""
 
 
 def cookie_in_scope(

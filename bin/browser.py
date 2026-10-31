@@ -180,6 +180,7 @@ from typing import Any, NamedTuple, NoReturn
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.realpath(__file__))))
 # pylint: disable=wrong-import-position
 import agent_login_state as _als  # noqa: E402
+from broker import access_team as _access_team  # noqa: E402
 from broker import identity as _identity  # noqa: E402
 from broker import onboarding as _onboarding  # noqa: E402
 from broker import phases as _phases  # noqa: E402
@@ -6620,6 +6621,7 @@ def cmd_doctor(port: int) -> int:
     _doctor_mode(log, port)
     _doctor_coordination(log, port)
     _doctor_owned_ledgers(log)
+    _doctor_access_team(log, port)
     before = _doctor_windows_before(log)
     release = _registry_register("browser.py", _purpose(), port)
     try:
@@ -10668,6 +10670,9 @@ def _broker_cookie_in_scope(
     rule = _identity.scopes_clear if delete else _identity.scopes_hold
     if not d or not rule(scopes, d, path):
         return False
+    if _access_team.is_team_host(d):
+        return False  # tp#1466: never inject an Access team session
+    # (the delete side: `_drop_access_team_cookies` removes them all).
     idp = d in BROKER_IDP_HOSTS or d.split(".", 1)[0] in BROKER_IDP_LABELS
     if idp and d not in {s.host for s in scopes}:
         return False
@@ -11056,6 +11061,12 @@ def _background_page_run(
                     _deadline_step("bg:fn")
                     return fn(page)
                 finally:
+                    # tp#1466: a navigation to an Access-gated app can sign the
+                    # shared browser in through Access (a logged-in IdP) and
+                    # leave a team session — it goes before the tab closes.
+                    ctx = getattr(page, "context", None)
+                    if ctx is not None:
+                        _drop_access_team_cookies(ctx, "background page", quiet=True)
                     _BG_STATUS.pop(id(page), None)
                     _BG_NOCACHE.pop(id(page), None)
                     trail = _BG_TRAIL.pop(id(page), None)
@@ -11840,6 +11851,40 @@ def _doctor_owned_ledgers(log: list[str]) -> None:
         "warn",
         "owned-tab ledgers",
         f"{len(bad)} not live: {listing} — run `browser.py reap-owned`",
+    )
+
+
+def _doctor_access_team(log: list[str], port: int) -> None:
+    """Doctor's Cloudflare Access line (tp#1466): a team-domain cookie in the
+    shared jar is ❌ (it can open decide as Albert) — names and hosts only,
+    read over raw CDP (``Storage.getCookies``, never a value printed); an
+    unreadable jar is ⚠. The team domain's source is shown either way."""
+    team, src = _access_team.configured_team_domain()
+    where = (
+        f"team domain {team} ({src})" if team else f"team domain not configured: {src}"
+    )
+    rule = f"*.{_access_team.ACCESS_TEAM_PARENT} always dropped; {where}"
+    ws_url = _browser_ws_url(port)
+    res = _cdp_ws_call(ws_url, "Storage.getCookies", {}, 5.0) if ws_url else None
+    if res is None or res.status != "ok" or res.error:
+        why = "no browser websocket" if res is None else res.error or res.status
+        _doctor_add(
+            log, "warn", "access team cookies", f"jar unreadable ({why}); {rule}"
+        )
+        return
+    raw = res.result.get("cookies") if isinstance(res.result, dict) else None
+    labels = _access_team.team_cookie_labels(
+        [c for c in raw or [] if isinstance(c, dict)], team
+    )
+    if not labels:
+        _doctor_add(log, "ok", "access team cookies", f"none ({rule})")
+        return
+    _doctor_add(
+        log,
+        "fail",
+        "access team cookies",
+        f"{len(labels)} present: {', '.join(labels)} — a Cloudflare Access team "
+        "session can open decide; the next `browser.py login` drops it",
     )
 
 
@@ -12873,7 +12918,71 @@ def _broker_replace_cookies(browser, bundle: dict) -> int:
     ]
     if cookies:
         ctx.add_cookies(cookies)
+    _drop_access_team_cookies(ctx, "broker-login")
     return len(cookies)
+
+
+def _drop_access_team_cookies(ctx: Any, why: str, *, quiet: bool = False) -> list[str]:
+    """Delete every Cloudflare Access TEAM-domain cookie from `ctx`'s jar
+    (tp#1466, `broker.access_team`): the team session would let Access open
+    every app of the team — decide too — while the per-app cookies the home
+    services need stay. Returns ``"<domain> <name>"`` of each one deleted
+    (never a value); journaled when there were any. Never raises; `quiet`:
+    a failed read is only journaled (the per-tab sweep of every background
+    page), not printed."""
+    gone: list[str] = []
+    try:
+        team, _src = _access_team.configured_team_domain()
+        for ck in ctx.cookies():
+            domain = str(ck.get("domain") or "")
+            if _access_team.is_team_host(domain, team):
+                ctx.clear_cookies(name=ck["name"], domain=ck["domain"], path=ck["path"])
+                gone.append(f"{domain} {ck.get('name')}")
+    except Exception as exc:  # pylint: disable=broad-exception-caught
+        _journal_note(access_team_sweep=why, access_team_error=_exc_line(exc))
+        if not quiet:
+            print(
+                f"⚠️ could not check the Access team cookies ({why}): {_exc_line(exc)}",
+                file=sys.stderr,
+            )
+        return gone
+    if gone:
+        _journal_note(access_team_sweep=why, access_team_dropped=sorted(set(gone)))
+        print(
+            f"Dropped {len(gone)} Cloudflare Access team cookie(s) ({why}; "
+            "values not shown).",
+            file=sys.stderr,
+        )
+    return gone
+
+
+def _access_team_sweep(port: int, why: str) -> list[str] | None:
+    """`_drop_access_team_cookies` on the shared browser at `port` over its
+    own Playwright attach — the backstop after every login, guided login and
+    Safari import. None when the browser is not reachable (nothing to sweep).
+    Never raises."""
+    if not _is_up(port):
+        return None
+    try:
+        pw, browser = _connect(port)
+    except BaseException as exc:  # pylint: disable=broad-exception-caught
+        if isinstance(exc, KeyboardInterrupt):
+            raise
+        _journal_note(access_team_sweep=why, access_team_error=_exc_line(exc))
+        print(
+            f"⚠️ could not check the Access team cookies ({why}): {_exc_line(exc)}",
+            file=sys.stderr,
+        )
+        return None
+    try:
+        if not browser.contexts:
+            return []
+        return _drop_access_team_cookies(browser.contexts[0], why)
+    finally:
+        with contextlib.suppress(Exception):
+            browser.close()
+        with contextlib.suppress(Exception):
+            pw.stop()
 
 
 # The window property where the init script records its own read-back.
@@ -14238,6 +14347,7 @@ def _safari_replace_cookies(
     ]
     if picked:
         ctx.add_cookies(picked)
+    _drop_access_team_cookies(ctx, f"import-safari {site}")
     return len(picked)
 
 
@@ -16196,8 +16306,14 @@ def cmd_assisted_login(port: int, req: GuidedRequest) -> int:
     if tty is None:
         print(GUIDED_NO_TTY, file=sys.stderr)
         return 2
-    with tty:
-        return _assisted_login_tty(tty, port, req)
+    try:
+        with tty:
+            return _assisted_login_tty(tty, port, req)
+    finally:
+        # tp#1466: Albert's own login may have passed Cloudflare Access in the
+        # shared browser; its team session goes (after the transaction ended,
+        # so the sweep's registration is not refused as busy).
+        _access_team_sweep(port, f"assisted-login {req.site.strip().lower()}")
 
 
 def _guided_instance_gate(key: str, port: int) -> int | None:
@@ -16572,6 +16688,9 @@ def cmd_login(  # pylint: disable=too-many-arguments
                 rc = _fail("-F/--refresh-only is for broker sites, never with -x")
             else:
                 rc = _cmd_login(port, site_name)
+            # tp#1466 backstop: whatever the flow did in the shared browser,
+            # no Cloudflare Access team session stays behind.
+            _access_team_sweep(port, f"login {key}")
         return rc
     except SystemExit as exc:
         rc = exc.code if isinstance(exc.code, int) else 1
@@ -17407,6 +17526,7 @@ class ReapIdleRun:
     skipped: dict[str, int] = dataclasses.field(default_factory=dict)
 
     def skip(self, why: str) -> None:
+        """Count one tab skipped for `why`."""
         self.skipped[why] = self.skipped.get(why, 0) + 1
 
 
