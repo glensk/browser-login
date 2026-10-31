@@ -96,6 +96,25 @@ def test_confirm_alone_is_never_clicked_without_the_review_prompt() -> None:
     assert trust_prompt_button(page) is None
 
 
+INFOMANIAK_BACKUP = (
+    "Verification of your back-up email address\nPlease confirm or update your "
+    "backup email address albert@example.org :\nBack-up email address *\n"
+    "Confirm\nVerify later"
+)
+
+
+def test_infomaniak_backup_email_picks_verify_later() -> None:
+    later = FakeButton("Verify later")
+    page = FakePage(INFOMANIAK_BACKUP, [FakeButton("Confirm"), later])
+    assert trust_prompt_button(page) is later
+
+
+def test_infomaniak_backup_email_never_confirms() -> None:
+    hidden_later = FakeButton("Verify later", visible=False)
+    page = FakePage(INFOMANIAK_BACKUP, [FakeButton("Confirm"), hidden_later])
+    assert trust_prompt_button(page) is None
+
+
 def test_stay_signed_in_input_button() -> None:
     yes = FakeButton("", value="Yes")
     page = FakePage("Stay signed in?\nDo this to reduce sign-in prompts.", [yes])

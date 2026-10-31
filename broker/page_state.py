@@ -546,6 +546,11 @@ def diagnose(page: Any, secret: Secret) -> dict[str, Any]:
 # - Zoho's periodic "Review your account details" ("Confirm" | "Remind me
 #   later"): postponed, so the broker never vouches for the account's contact
 #   details; "Confirm" only when no postpone control is shown.
+# - Infomaniak's periodic "Verification of your back-up email address"
+#   (manager.infomaniak.com/…/security-check: "Confirm" | "Verify later"),
+#   which the manager shows on the CHECK page right after a fresh login
+#   (tp#1472, 2026-10-31): only ever postponed — "Confirm" vouches for the
+#   account's backup address, so it is never clicked.
 TRUST_PROMPT_RE = re.compile(
     r"trust this (?:browser|device)\?|stay signed in\?|remember this (?:browser|device)\?",
     re.IGNORECASE,
@@ -553,9 +558,14 @@ TRUST_PROMPT_RE = re.compile(
 TRUST_BUTTON_LABELS = ("trust", "trust browser", "trust this browser", "yes")
 REVIEW_PROMPT_RE = re.compile(r"review your account details", re.IGNORECASE)
 REVIEW_BUTTON_LABELS = ("remind me later", "confirm")
+BACKUP_EMAIL_PROMPT_RE = re.compile(
+    r"verification of your back-?up e-?mail address", re.IGNORECASE
+)
+BACKUP_EMAIL_BUTTON_LABELS = ("verify later",)
 POST_LOGIN_PROMPTS = (
     (TRUST_PROMPT_RE, TRUST_BUTTON_LABELS),
     (REVIEW_PROMPT_RE, REVIEW_BUTTON_LABELS),
+    (BACKUP_EMAIL_PROMPT_RE, BACKUP_EMAIL_BUTTON_LABELS),
 )
 # "Remind me later" is a styled link or span on Zoho, not a button.
 _PROMPT_CONTROLS = (

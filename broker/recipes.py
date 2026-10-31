@@ -737,12 +737,52 @@ def proof_reason_text(reason: str | None) -> str:
     return f"{text} [{reason}]" if text else ""
 
 
-# One return per answer of the proof, in the order they are decided.
-def check_proof_reason(  # pylint: disable=too-many-return-statements
+def check_proof_reason(
     page: Any, item: SiteItem, *, dev: bool = False, wait_s: float = 8.0
 ) -> tuple[str, str]:
     """``check_proof`` with its reason: ``(answer, PROOF_REASONS code)``,
-    the code "" for ``valid``."""
+    the code "" for ``valid``.
+
+    A check page that shows a known post-login prompt instead of the
+    logged-in state (``page_state.POST_LOGIN_PROMPTS``; Infomaniak's
+    "Verification of your back-up email address", tp#1472) gets that
+    prompt answered — on a proof origin, with no challenge showing, at most
+    ``MAX_POST_LOGIN_PROMPTS`` times — and the check page is proven again.
+    Nothing is typed; the login itself is not retried."""
+    answered = 0
+    while True:
+        answer, reason = _check_page_proof(page, item, dev=dev, wait_s=wait_s)
+        if (
+            reason != "not-logged-in"
+            or answered >= MAX_POST_LOGIN_PROMPTS
+            or not _answer_check_page_prompt(page, item, dev=dev)
+        ):
+            return answer, reason
+        answered += 1
+
+
+def _answer_check_page_prompt(page: Any, item: SiteItem, *, dev: bool) -> bool:
+    """Click the control that answers a known post-login prompt on the check
+    page (``trust_prompt_button``); True when one was clicked. Only on a proof
+    origin and while no challenge shows; any error is False (no click)."""
+    try:
+        if url_origin(page.url, dev=dev) not in proof_origins(item, dev=dev):
+            return False
+        button = trust_prompt_button(page)
+        if button is None or challenge_reason(page) is not None:
+            return False
+        button.click(timeout=5000)
+        page.wait_for_timeout(1000)
+    except Exception:  # pylint: disable=broad-exception-caught
+        return False
+    return True
+
+
+# One return per answer of the proof, in the order they are decided.
+def _check_page_proof(  # pylint: disable=too-many-return-statements
+    page: Any, item: SiteItem, *, dev: bool, wait_s: float
+) -> tuple[str, str]:
+    """Load the check page once and prove it (``check_proof_reason``)."""
     url = check_page_url(item)
     if not url:
         return INVALID, "no-check-page"
