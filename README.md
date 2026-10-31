@@ -1433,14 +1433,27 @@ the `himalaya` helpers. The CDP endpoint is always `http://127.0.0.1:<port>` (ne
   copied from Safari (`safari_cookies.importable`), and deleted from the shared
   jar after every broker injection, Safari import, `browser.py login` (any
   flow) and guided login (`_drop_access_team_cookies` / `_access_team_sweep`,
-  journaled as `access_team_sweep`, names only). Only the per-app cookies stay,
+  journaled as `access_team_sweep`, names only). The sweep runs on EVERY exit
+  of `login`, `assisted-login` and `import-safari` — a failure, `SystemExit`
+  or exception included; a `login` deadline (exit 124/125, a hard exit) sweeps
+  over raw CDP from the watcher (`_access_team_sweep_cdp`). After deleting,
+  the sweep re-reads the jar: a jar it cannot read or attach to, a failed
+  delete or a surviving team cookie turns a logged-in exit 0 into exit 1 with
+  result code `access_team_sweep_failed`; a browser that is down is no
+  failure. Only the per-app cookies stay,
   and the home services keep working on them. `browser.py doctor` prints an
   `access team cookies` line (❌ with host + name when one is present, never a
   value). The configured team domain comes from
   `$CLAUDE_BROWSER_ACCESS_TEAM_DOMAIN`, else `team_domain` in decide's
   `config/edge.json` (`$CLAUDE_BROWSER_ACCESS_EDGE_FILE` overrides the path);
-  it is informational on top of the suffix rule, so a missing configuration
-  never lets a team cookie through. No Access session is revoked server-side.
+  a value without a dot (`com`) is rejected from either source, with the
+  reason shown by `doctor`. It is informational on top of the suffix rule, so
+  a missing or rejected configuration never lets a team cookie through. No
+  Access session is revoked server-side. Opt-in real-browser test (a
+  throwaway headless Chromium, never the shared one):
+  `CLAUDE_BROWSER_TEST_CDP=1 uv run pytest tests/test_access_team_cookies.py -k real_chromium`
+  (`$CLAUDE_BROWSER_TEST_CHROMIUM` names the executable when Playwright's own
+  build is missing).
 - **Keychain note:** caching a password + TOTP seed in the login keychain collapses
   2FA to 1FA *on this machine*. FileVault + the keychain protect it at rest, not from
   code running as you. This is an explicit, documented trade-off for unattended login.

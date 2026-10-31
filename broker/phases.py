@@ -94,6 +94,11 @@ CODE_TEXT = {
     "no_cookies": "no cookie could be injected",
     "storage_failed": "localStorage could not be written",
     "followup_failed": "the follow-up step failed",
+    # tp#1466: the post-login sweep could not prove the shared browser holds
+    # no Cloudflare Access team session (one can open every Access app).
+    "access_team_sweep_failed": (
+        "the Cloudflare Access team cookies could not be removed or verified gone"
+    ),
     "no_safari_session": "Safari holds no usable session",
     "manual_import": "the Safari import of this site runs by hand only",
     # WS1b: an agent's login in Albert's Safari (`agent-login.py -L SITE`).

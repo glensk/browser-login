@@ -10869,6 +10869,10 @@ class LoginDeadline:  # pylint: disable=too-many-instance-attributes
             for tid in gone:
                 self.drop_owned(tid)
             rc = LOGIN_TIMEOUT_RC if confirmed else LOGIN_TIMEOUT_DIRTY_RC
+            if self.cmd == "login":
+                # tp#1466: the hard exit skips `cmd_login`'s finally — sweep
+                # the Access team cookies here, over raw CDP (bounded).
+                _access_team_sweep_cdp(self.port, f"login {self.site} (timeout)")
             duration_ms = int((time.monotonic() - self.t0) * 1000)
             _journal(
                 "watchdog",
@@ -11884,7 +11888,8 @@ def _doctor_access_team(log: list[str], port: int) -> None:
         "fail",
         "access team cookies",
         f"{len(labels)} present: {', '.join(labels)} — a Cloudflare Access team "
-        "session can open decide; the next `browser.py login` drops it",
+        "session can open decide; the next `browser.py login` drops it (or "
+        "fails with access_team_sweep_failed when it cannot)",
     )
 
 
@@ -12922,15 +12927,62 @@ def _broker_replace_cookies(browser, bundle: dict) -> int:
     return len(cookies)
 
 
-def _drop_access_team_cookies(ctx: Any, why: str, *, quiet: bool = False) -> list[str]:
+@dataclass(frozen=True)
+class AccessSweep:
+    """Outcome of one Cloudflare Access team-cookie sweep (tp#1466).
+
+    ``status``: ``ok`` (the jar was re-read after the deletes and holds no
+    team cookie), ``failed`` (the jar could not be read, a delete failed or a
+    team cookie is still there — never treat as clean) or ``down`` (the
+    browser is not running: nothing to sweep). `dropped` / `left` are
+    ``"<domain> <name>"`` labels, never a value."""
+
+    status: str
+    dropped: tuple[str, ...] = ()
+    left: tuple[str, ...] = ()
+    error: str = ""
+
+    @property
+    def failed(self) -> bool:
+        """True when the sweep could not prove the jar clean."""
+        return self.status == "failed"
+
+
+def _access_sweep_report(
+    why: str, dropped: list[str], left: list[str], error: str, *, quiet: bool
+) -> AccessSweep:
+    """Journal and print a sweep's outcome (labels only) and build its result."""
+    if dropped:
+        _journal_note(access_team_sweep=why, access_team_dropped=sorted(set(dropped)))
+        print(
+            f"Dropped {len(dropped)} Cloudflare Access team cookie(s) ({why}; "
+            "values not shown).",
+            file=sys.stderr,
+        )
+    if left and not error:
+        error = f"{len(left)} still present after the delete: {', '.join(left)}"
+    if not error:
+        return AccessSweep("ok", tuple(dropped))
+    _journal_note(access_team_sweep=why, access_team_error=error)
+    if not quiet:
+        print(f"⚠️ Access team cookie sweep failed ({why}): {error}", file=sys.stderr)
+    return AccessSweep("failed", tuple(dropped), tuple(left), error)
+
+
+def _drop_access_team_cookies(
+    ctx: Any, why: str, *, quiet: bool = False
+) -> AccessSweep:
     """Delete every Cloudflare Access TEAM-domain cookie from `ctx`'s jar
     (tp#1466, `broker.access_team`): the team session would let Access open
     every app of the team — decide too — while the per-app cookies the home
-    services need stay. Returns ``"<domain> <name>"`` of each one deleted
-    (never a value); journaled when there were any. Never raises; `quiet`:
-    a failed read is only journaled (the per-tab sweep of every background
-    page), not printed."""
+    services need stay. Then the jar is READ AGAIN: ``ok`` only when no team
+    cookie is left; an unreadable jar, a failed delete or a survivor is
+    ``failed``. Journaled; never a value. Never raises; `quiet`: a failure
+    is only journaled (the per-tab sweep of every background page), not
+    printed."""
     gone: list[str] = []
+    left: list[str] = []
+    error = ""
     try:
         team, _src = _access_team.configured_team_domain()
         for ck in ctx.cookies():
@@ -12938,51 +12990,113 @@ def _drop_access_team_cookies(ctx: Any, why: str, *, quiet: bool = False) -> lis
             if _access_team.is_team_host(domain, team):
                 ctx.clear_cookies(name=ck["name"], domain=ck["domain"], path=ck["path"])
                 gone.append(f"{domain} {ck.get('name')}")
+        left = _access_team.team_cookie_labels(list(ctx.cookies()), team)
     except Exception as exc:  # pylint: disable=broad-exception-caught
-        _journal_note(access_team_sweep=why, access_team_error=_exc_line(exc))
-        if not quiet:
-            print(
-                f"⚠️ could not check the Access team cookies ({why}): {_exc_line(exc)}",
-                file=sys.stderr,
-            )
-        return gone
-    if gone:
-        _journal_note(access_team_sweep=why, access_team_dropped=sorted(set(gone)))
-        print(
-            f"Dropped {len(gone)} Cloudflare Access team cookie(s) ({why}; "
-            "values not shown).",
-            file=sys.stderr,
-        )
-    return gone
+        error = _exc_line(exc)
+    return _access_sweep_report(why, gone, left, error, quiet=quiet)
 
 
-def _access_team_sweep(port: int, why: str) -> list[str] | None:
+def _access_team_sweep(port: int, why: str) -> AccessSweep:
     """`_drop_access_team_cookies` on the shared browser at `port` over its
     own Playwright attach — the backstop after every login, guided login and
-    Safari import. None when the browser is not reachable (nothing to sweep).
-    Never raises."""
+    Safari import. ``down`` when the browser is not running (nothing to
+    sweep); an attach that fails while it runs is ``failed``. Never raises
+    (but a Ctrl-C)."""
     if not _is_up(port):
-        return None
+        return AccessSweep("down")
     try:
         pw, browser = _connect(port)
     except BaseException as exc:  # pylint: disable=broad-exception-caught
         if isinstance(exc, KeyboardInterrupt):
             raise
-        _journal_note(access_team_sweep=why, access_team_error=_exc_line(exc))
-        print(
-            f"⚠️ could not check the Access team cookies ({why}): {_exc_line(exc)}",
-            file=sys.stderr,
-        )
-        return None
+        if not _is_up(port):  # it went down meanwhile: nothing left to sweep
+            return AccessSweep("down")
+        return _access_sweep_report(why, [], [], _exc_line(exc), quiet=False)
     try:
         if not browser.contexts:
-            return []
+            return AccessSweep("ok")
         return _drop_access_team_cookies(browser.contexts[0], why)
     finally:
         with contextlib.suppress(Exception):
             browser.close()
         with contextlib.suppress(Exception):
             pw.stop()
+
+
+# The deadline watcher's sweep (`LoginDeadline._fire`): the main thread is
+# stuck inside Playwright, so it talks raw CDP to the browser endpoint.
+ACCESS_SWEEP_CDP_BUDGET_S = 4.0
+
+
+def _access_team_sweep_cdp(
+    port: int, why: str, budget_s: float = ACCESS_SWEEP_CDP_BUDGET_S
+) -> AccessSweep:
+    """The team-cookie sweep over raw CDP, registration-free and bounded by
+    `budget_s` per call — for the deadline watcher, which hard-exits (no
+    ``finally`` of the command runs) while Playwright hangs. Reads the jar
+    (``Storage.getCookies``), expires each team cookie (``Storage.setCookies``
+    with a past ``expires`` deletes it) and reads again. Never raises."""
+    if not _is_up(port):
+        return AccessSweep("down")
+    ws_url = _browser_ws_url(port)
+    if not ws_url:
+        return _access_sweep_report(why, [], [], "no browser websocket", quiet=False)
+    team, _src = _access_team.configured_team_domain()
+
+    def _team_cookies() -> list[dict] | None:
+        res = _cdp_ws_call(ws_url, "Storage.getCookies", {}, budget_s)
+        if res.status != "ok" or res.error or not isinstance(res.result, dict):
+            return None
+        raw = res.result.get("cookies") or []
+        return [
+            c
+            for c in raw
+            if isinstance(c, dict)
+            and _access_team.is_team_host(str(c.get("domain") or ""), team)
+        ]
+
+    found = _team_cookies()
+    if found is None:
+        return _access_sweep_report(why, [], [], "jar unreadable", quiet=False)
+    error = ""
+    if found:
+        keep = ("name", "domain", "path", "secure", "httpOnly", "sameSite")
+        kill = [
+            {
+                **{k: c[k] for k in keep if c.get(k) is not None},
+                "value": "",
+                "expires": 1,
+            }
+            for c in found
+        ]
+        res = _cdp_ws_call(ws_url, "Storage.setCookies", {"cookies": kill}, budget_s)
+        if res.status != "ok" or res.error:
+            error = f"delete failed ({res.error or res.status})"
+    after = _team_cookies()
+    if after is None and not error:
+        error = "jar unreadable after the delete"
+    labels = _access_team.team_cookie_labels(found, team)
+    left = _access_team.team_cookie_labels(after or [], team)
+    dropped = [lb for lb in labels if lb not in left] if after is not None else []
+    return _access_sweep_report(why, dropped, left, error, quiet=False)
+
+
+def _access_team_verdict(rc: int, sweep: AccessSweep) -> int:
+    """A login's exit after its team-cookie sweep (tp#1466): a logged-in 0
+    whose sweep FAILED becomes 1 with result code ``access_team_sweep_failed``
+    — the shared browser may still hold a team session that opens decide.
+    ``down`` and ``ok`` leave `rc` alone; a non-zero `rc` stays (it already
+    failed; the sweep's failure is journaled)."""
+    if rc != 0 or not sweep.failed:
+        return rc
+    print(
+        "❌ logged in, but the Cloudflare Access team cookies could not be "
+        f"removed or verified gone: {sweep.error} — re-run the login or "
+        "`browser.py doctor`",
+        file=sys.stderr,
+    )
+    _result_fail("consumer-followup", "access_team_sweep_failed", sweep.error)
+    return 1
 
 
 # The window property where the init script records its own read-back.
@@ -14393,15 +14507,25 @@ def cmd_import_safari(
     ``safari-agent``, else ``safari-import`` (a copy, not a login).
     A built-in site (``SAFARI_BUILTIN``: notion, slack, openai) takes
     `_import_builtin`: one transaction with an account proof (WS1b).
+    A real import ends with the Access team-cookie sweep on every exit
+    (tp#1466); a failed sweep turns 0 into 1 (``access_team_sweep_failed``).
     """
     site = site_name.strip().lower()
     _result_begin("import-safari", site, result_file)
     rc = 1
     try:
-        if site in _safari.SAFARI_BUILTIN:
-            rc = _import_builtin(port, site, dry_run=dry_run, agent=agent)
-        else:
-            rc = _import_safari(port, site, dry_run=dry_run, agent=agent)
+        try:
+            if site in _safari.SAFARI_BUILTIN:
+                rc = _import_builtin(port, site, dry_run=dry_run, agent=agent)
+            else:
+                rc = _import_safari(port, site, dry_run=dry_run, agent=agent)
+        finally:
+            sweep = (
+                AccessSweep("ok")
+                if dry_run
+                else _access_team_sweep(port, f"import-safari {site}")
+            )
+        rc = _access_team_verdict(rc, sweep)
         return rc
     finally:
         _result_write(rc)
@@ -16294,7 +16418,8 @@ class GuidedRequest:
 def cmd_assisted_login(port: int, req: GuidedRequest) -> int:
     """Guided login for SITE: B (remote view) first, A (window) as fallback.
 
-    Exit 0 logged in (or already was), 1 an error (incl. a failed cleanup),
+    Exit 0 logged in (or already was), 1 an error (incl. a failed cleanup and
+    a failed Access team-cookie sweep, ``access_team_sweep_failed``),
     2 refused (no terminal, not confirmed, busy) or still not logged in,
     130 cancelled with Ctrl-C.
 
@@ -16306,14 +16431,17 @@ def cmd_assisted_login(port: int, req: GuidedRequest) -> int:
     if tty is None:
         print(GUIDED_NO_TTY, file=sys.stderr)
         return 2
+    rc = 1
     try:
         with tty:
-            return _assisted_login_tty(tty, port, req)
+            rc = _assisted_login_tty(tty, port, req)
     finally:
         # tp#1466: Albert's own login may have passed Cloudflare Access in the
-        # shared browser; its team session goes (after the transaction ended,
-        # so the sweep's registration is not refused as busy).
-        _access_team_sweep(port, f"assisted-login {req.site.strip().lower()}")
+        # shared browser; its team session goes — on every exit, an exception
+        # included (after the transaction ended, so the sweep's registration
+        # is not refused as busy).
+        sweep = _access_team_sweep(port, f"assisted-login {req.site.strip().lower()}")
+    return _access_team_verdict(rc, sweep)
 
 
 def _guided_instance_gate(key: str, port: int) -> int | None:
@@ -16680,17 +16808,24 @@ def cmd_login(  # pylint: disable=too-many-arguments
     rc = 1
     try:
         with _login_deadline(port, "login", key, LOGIN_TIMEOUT_S, end_event="login"):
-            if expect is not None:
-                rc = _cmd_login_expect(port, site_name, expect)
-            elif candidate and (scheduled or key in _safari.SAFARI_SITES):
-                rc = _fail("-x/--try-sentinel is a manual broker login (not with -s)")
-            elif refresh_only and (candidate or key in _safari.SAFARI_SITES):
-                rc = _fail("-F/--refresh-only is for broker sites, never with -x")
-            else:
-                rc = _cmd_login(port, site_name)
-            # tp#1466 backstop: whatever the flow did in the shared browser,
-            # no Cloudflare Access team session stays behind.
-            _access_team_sweep(port, f"login {key}")
+            try:
+                if expect is not None:
+                    rc = _cmd_login_expect(port, site_name, expect)
+                elif candidate and (scheduled or key in _safari.SAFARI_SITES):
+                    rc = _fail(
+                        "-x/--try-sentinel is a manual broker login (not with -s)"
+                    )
+                elif refresh_only and (candidate or key in _safari.SAFARI_SITES):
+                    rc = _fail("-F/--refresh-only is for broker sites, never with -x")
+                else:
+                    rc = _cmd_login(port, site_name)
+            finally:
+                # tp#1466 backstop: whatever the flow did in the shared browser
+                # — logged in, failed, exited or raised — no Cloudflare Access
+                # team session stays behind. (A deadline hard exit sweeps in
+                # `LoginDeadline._fire`; this one is still bounded by it.)
+                sweep = _access_team_sweep(port, f"login {key}")
+            rc = _access_team_verdict(rc, sweep)
         return rc
     except SystemExit as exc:
         rc = exc.code if isinstance(exc.code, int) else 1

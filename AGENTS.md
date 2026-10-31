@@ -483,7 +483,9 @@ framework. It is a **provider**: other repos depend on it, not the reverse. See
   and is swept from the shared jar after every injection, import, `login` and
   guided login — it would let Access open decide as Albert. A new path that
   writes cookies into the shared browser calls `_drop_access_team_cookies`
-  (or `_access_team_sweep`) after it. Never add an exemption; per-app Access
+  (or `_access_team_sweep`) after it, in a `finally`, and passes the
+  `AccessSweep` through `_access_team_verdict` (a failed sweep is never a
+  success: `access_team_sweep_failed`). Never add an exemption; per-app Access
   cookies on the app's own host are fine.
 - **No secrets, ever** — this is a public repo. Configuration is env vars + keychain
   *labels* only. gitleaks must stay clean.

@@ -49,9 +49,14 @@ def configured_team_domain() -> tuple[str | None, str]:
 
     ``$CLAUDE_BROWSER_ACCESS_TEAM_DOMAIN`` first, else ``team_domain`` of the
     edge file (``$CLAUDE_BROWSER_ACCESS_EDGE_FILE`` or decide's
-    ``config/edge.json``). Never raises."""
+    ``config/edge.json``). A value without a dot (``com``) is no team domain
+    — it would match a whole TLD — so it is rejected with the reason, from
+    either source, and only the ``*.cloudflareaccess.com`` rule applies.
+    Never raises."""
     env = _norm(os.environ.get(TEAM_DOMAIN_ENV, ""))
     if env:
+        if "." not in env:
+            return None, f"${TEAM_DOMAIN_ENV} {env!r} is not a domain (no dot), ignored"
         return env, f"${TEAM_DOMAIN_ENV}"
     path = Path(os.environ.get(EDGE_FILE_ENV) or DEFAULT_EDGE_FILE).expanduser()
     try:
@@ -77,8 +82,10 @@ def _read_edge(path: Path) -> tuple[str | None, str]:
     except (OSError, ValueError) as exc:
         return None, f"{path} unreadable ({type(exc).__name__})"
     team = _norm(data.get("team_domain", "")) if isinstance(data, dict) else ""
-    if not team or "." not in team:
+    if not team:
         return None, f"{path} has no team_domain"
+    if "." not in team:
+        return None, f"{path} team_domain {team!r} is not a domain (no dot), ignored"
     return team, str(path)
 
 
