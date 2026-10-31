@@ -490,7 +490,13 @@ framework. It is a **provider**: other repos depend on it, not the reverse. See
   `_sweep_team_cookies` (exact identity over CDP), never with Playwright's
   `clear_cookies(filter)` — it clears the whole jar and re-adds the rest.
   Never add an exemption; per-app Access cookies on the app's own host are
-  fine.
+  fine. Agent navigation (Playwright MCP, `open`, `eval`, any CDP client)
+  is covered by the periodic sweep (tp#1468): `browser.py sweep-access -A -q
+  -S` every 60 s (LaunchAgent `com.albert.browser-access-sweep`), raw CDP
+  only, state in `<cache>/access-sweep.json`, read by `doctor`. Keep it
+  attach-free (no Playwright, no `Target.*`/`Page.*`), journal-quiet on a
+  clean pass and value-free on every sink; an injection never falls back
+  to `browser.new_context()` (`_shared_jar`).
 - **No secrets, ever** — this is a public repo. Configuration is env vars + keychain
   *labels* only. gitleaks must stay clean.
 

@@ -1446,9 +1446,22 @@ the `himalaya` helpers. The CDP endpoint is always `http://127.0.0.1:<port>` (ne
   failed delete or a surviving team cookie turns a logged-in exit 0 (also a
   `SystemExit(0)`) into exit 1 with result code `access_team_sweep_failed`; a
   browser that is down is no failure. Only the per-app cookies stay,
-  and the home services keep working on them. `browser.py doctor` prints an
+  and the home services keep working on them. Any other client can still
+  land a team cookie by navigating (Playwright MCP, `open`, `eval`, an
+  unregistered CDP peer), so a periodic sweep covers them (tp#1468):
+  `browser.py sweep-access -A -q -S`, every 60 s from the LaunchAgent
+  `com.albert.browser-access-sweep`, runs the same raw-CDP sweep on every
+  running instance concurrently (each bounded, never starting a browser,
+  never attaching Playwright). It stands down (exit 75; 0 under `-S`) while
+  a guided login owns the browser — that login sweeps at its own end, and
+  its watchdog sweeps in recovery before resuming clients. Each pass writes
+  `<cache>/access-sweep.json` (status ok/dropped/failed/busy/down, host +
+  name labels, never a value); only drops and failures are journaled
+  (`access_sweep`). `browser.py sweep-access -n` lists the team cookies
+  without deleting anything. `browser.py doctor` prints an
   `access team cookies` line (❌ with host + name when one is present, never a
-  value). The configured team domain comes from
+  value) and an `access sweep` line (❌ last pass failed, ⚠ no pass in 5 min,
+  ⚠ a drop in the last 24 h). The configured team domain comes from
   `$CLAUDE_BROWSER_ACCESS_TEAM_DOMAIN`, else `team_domain` in decide's
   `config/edge.json` (`$CLAUDE_BROWSER_ACCESS_EDGE_FILE` overrides the path);
   a value that is not a subdomain of `cloudflareaccess.com` (`com`,

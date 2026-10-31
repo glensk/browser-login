@@ -172,6 +172,11 @@ def _private_mode_state(tmp_path, monkeypatch):
             )
         if getattr(mod, "PAC_FILE", None) is not None:
             monkeypatch.setattr(mod, "PAC_FILE", state / "proxy.pac")
+        # tp#1468: the sweep-access state `doctor` reads.
+        if getattr(mod, "ACCESS_SWEEP_STATE_FILE", None) is not None:
+            monkeypatch.setattr(
+                mod, "ACCESS_SWEEP_STATE_FILE", state / "access-sweep.json"
+            )
     yield
 
 

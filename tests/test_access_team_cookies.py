@@ -12,7 +12,7 @@ Run: uv run --no-sync pytest tests/test_access_team_cookies.py
 from __future__ import annotations
 
 # pylint: disable=protected-access,missing-function-docstring,import-error
-# pylint: disable=wrong-import-position,too-few-public-methods
+# pylint: disable=wrong-import-position,too-few-public-methods,too-many-lines
 import contextlib
 import importlib.util
 import json
@@ -845,6 +845,479 @@ def test_cdp_sweep_with_a_spent_budget_never_probes(
     )
     sweep = browser._access_team_sweep_cdp(9, "x", budget_s=0.0)
     assert sweep.failed and "budget spent" in sweep.error
+
+
+# --- tp#1468 B2: `sweep-access`, the periodic sweep of every instance ---
+
+
+def _journal_events(tmp_path: Path) -> list[dict[str, Any]]:
+    """The test's private journal (conftest points it at tmp_path)."""
+    path = tmp_path / "journal.jsonl"
+    if not path.exists():
+        return []
+    return [json.loads(line) for line in path.read_text().splitlines() if line]
+
+
+def _state() -> dict[str, Any] | None:
+    path = browser.ACCESS_SWEEP_STATE_FILE
+    return json.loads(path.read_text()) if path.exists() else None
+
+
+def _no_value_anywhere(tmp_path: Path, captured: Any) -> None:
+    """The COOKIE_VALUE sentinel reaches no sink: state file, journal JSON,
+    stdout, stderr."""
+    state_path = browser.ACCESS_SWEEP_STATE_FILE
+    sinks = [
+        state_path.read_text() if state_path.exists() else "",
+        json.dumps(_journal_events(tmp_path)),
+        captured.out,
+        captured.err,
+    ]
+    for sink in sinks:
+        assert COOKIE_VALUE not in sink
+
+
+def _sweep(**kw: Any) -> int:
+    args = {
+        "all_instances": False,
+        "quiet": False,
+        "dry_run": False,
+        "scheduled": False,
+    }
+    return int(browser.cmd_sweep_access(9, **{**args, **kw}))
+
+
+def test_sweep_access_never_triggers_the_preflight_revert() -> None:
+    assert browser._preflight_action("sweep-access", "headed", False) is None
+
+
+def test_sweep_access_help_exits_zero() -> None:
+    import subprocess  # pylint: disable=import-outside-toplevel
+
+    r = subprocess.run(
+        [sys.executable, str(REPO / "bin" / "browser.py"), "sweep-access", "-h"],
+        capture_output=True,
+        text=True,
+        timeout=60,
+        check=False,
+    )
+    assert r.returncode == 0, r.stderr
+    for flag in ("--all-instances", "--quiet", "--dry-run", "--scheduled"):
+        assert flag in r.stdout
+
+
+def test_sweep_access_clean_jar_deletes_nothing_and_journals_nothing(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    fake = _CdpJar([APP_COOKIE])
+    _patch_cdp(monkeypatch, fake)
+    assert _sweep(quiet=True) == 0
+    assert not fake.sent  # no Storage.setCookies
+    state = _state()
+    assert state is not None and state["status"] == "ok" and state["dropped"] == []
+    assert _journal_events(tmp_path) == []  # not even (un)register events
+    out = capsys.readouterr()
+    assert out.out == "" and out.err == ""  # -q: a clean pass is silent
+    assert not list(browser.CLIENTS_DIR.glob("*.json"))  # registration released
+
+
+def test_sweep_access_drops_team_cookies_by_identity(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    fake = _CdpJar(_exact_jar())
+    _patch_cdp(monkeypatch, fake)
+    assert _sweep(quiet=True) == 0
+    assert sorted((c["domain"], c["name"]) for c in fake.jar) == APP_LEFT
+    state = _state()
+    assert state is not None and state["status"] == "dropped"
+    assert state["dropped"] == sorted(
+        [f"{TEAM} CF_Authorization", f".{TEAM} CF_Session", f"{TEAM} CF_Device"]
+    )
+    assert state["last_drop"]["labels"] == state["dropped"]
+    events = [e for e in _journal_events(tmp_path) if e["event"] == "access_sweep"]
+    assert len(events) == 1 and events[0]["status"] == "dropped"
+    assert [e["event"] for e in _journal_events(tmp_path)] == ["access_sweep"]
+    captured = capsys.readouterr()
+    assert f"{TEAM} CF_Authorization" in captured.out  # a drop prints even with -q
+    _no_value_anywhere(tmp_path, captured)
+
+
+def test_sweep_access_unreadable_jar_is_a_failure(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    class _Broken(_CdpJar):
+        def read(self) -> dict[str, Any]:
+            raise RuntimeError("Target closed")
+
+    _patch_cdp(monkeypatch, _Broken([*TEAM_COOKIES]))
+    assert _sweep(quiet=True) == 1
+    state = _state()
+    assert state is not None and state["status"] == "failed"
+    assert "jar unreadable" in state["error"]
+    events = [e for e in _journal_events(tmp_path) if e["event"] == "access_sweep"]
+    assert events and events[0]["status"] == "failed"
+    captured = capsys.readouterr()
+    assert "❌" in captured.err
+    _no_value_anywhere(tmp_path, captured)
+
+
+def test_sweep_access_down_browser_is_ok(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(browser, "_sweep_endpoint", lambda *_a: ("down", None))
+    monkeypatch.setattr(
+        browser, "_registry_register", lambda *_a, **_k: pytest.fail("no register")
+    )
+    assert _sweep(quiet=True) == 0
+    state = _state()
+    assert state is not None and state["status"] == "down"
+
+
+@pytest.mark.parametrize(("scheduled", "want"), [(False, 75), (True, 0)])
+def test_sweep_access_is_busy_during_a_guided_login(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    scheduled: bool,
+    want: int,
+) -> None:
+    monkeypatch.setattr(browser, "_maint_live", lambda: {"site": "x"})
+    monkeypatch.setattr(browser, "_sweep_endpoint", lambda *_a: pytest.fail("probed"))
+    monkeypatch.setattr(browser, "_cdp_ws_call", lambda *_a: pytest.fail("CDP call"))
+    assert _sweep(quiet=True, scheduled=scheduled) == want
+    state = _state()
+    assert state is not None and state["status"] == "busy"
+    assert _journal_events(tmp_path) == []
+
+
+def test_sweep_access_registration_refusal_is_busy(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A guided login that started between the check and the registration
+    (75), or a switch holding the gate: busy, never a failure."""
+    fake = _CdpJar([*TEAM_COOKIES])
+    _patch_cdp(monkeypatch, fake)
+    for code in (75, "❌ Cannot attach … it is being switched or stopped right now"):
+
+        def _refuse(*_a: Any, code: Any = code, **_k: Any) -> Any:
+            raise SystemExit(code)
+
+        monkeypatch.setattr(browser, "_registry_register", _refuse)
+        assert _sweep(quiet=True) == 75
+        assert _sweep(quiet=True, scheduled=True) == 0
+        assert not fake.sent and len(fake.jar) == 3
+
+
+def test_sweep_access_dry_run_lists_and_writes_nothing(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    fake = _CdpJar([*TEAM_COOKIES, APP_COOKIE])
+    _patch_cdp(monkeypatch, fake)
+    assert _sweep(dry_run=True) == 0
+    assert not fake.sent and len(fake.jar) == 4
+    assert _state() is None and _journal_events(tmp_path) == []
+    captured = capsys.readouterr()
+    assert f"{TEAM} CF_Session" in captured.out and APP not in captured.out
+    _no_value_anywhere(tmp_path, captured)
+
+
+class _Children:
+    """Fake `-A` children: each records its instance and answers `codes`."""
+
+    def __init__(self, codes: dict[str, int], barrier: Any = None) -> None:
+        self.codes = codes
+        self.seen: list[str] = []
+        self.barrier = barrier
+
+    def __call__(self, inst: str, argv: Any, timeout_s: float) -> Any:
+        assert argv[0] == "sweep-access" and "-A" not in argv
+        assert timeout_s <= browser.ACCESS_SWEEP_CHILD_TIMEOUT_S
+        self.seen.append(inst)
+        if self.barrier is not None:
+            self.barrier.wait(timeout=5)  # breaks unless all run at once
+        rc = self.codes[inst]
+        return browser._SweepChild(rc, f"line {inst or 'default'}\n", "")
+
+
+def _fanout_env(monkeypatch: pytest.MonkeyPatch, down: set[int]) -> None:
+    for var in ("CLAUDE_BROWSER_CDP_PORT", "CLAUDE_BROWSER_CACHE_DIR"):
+        monkeypatch.delenv(var, raising=False)
+    monkeypatch.setattr(browser, "INSTANCE", "")
+    monkeypatch.setattr(
+        browser,
+        "_sweep_endpoint",
+        lambda port, _b: ("down", None) if port in down else ("ok", "ws://x"),
+    )
+
+
+def test_sweep_access_all_runs_every_running_instance_concurrently(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    import threading  # pylint: disable=import-outside-toplevel
+
+    insts = list(browser.INSTANCE_PORTS)
+    assert len(insts) == 4
+    _fanout_env(monkeypatch, down=set())
+    kids = _Children(dict.fromkeys(insts, 0), barrier=threading.Barrier(len(insts)))
+    monkeypatch.setattr(browser, "_sweep_access_child", kids)
+    assert _sweep(all_instances=True, quiet=True) == 0
+    assert sorted(kids.seen) == sorted(insts)
+    out = capsys.readouterr().out
+    assert "[default] line default" in out and "[private] line private" in out
+
+
+def test_sweep_access_all_skips_stopped_instances(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    ports = browser.INSTANCE_PORTS
+    _fanout_env(monkeypatch, down={ports["private"], ports["admin"], ports["alt"]})
+    kids = _Children(dict.fromkeys(ports, 0))
+    monkeypatch.setattr(browser, "_sweep_access_child", kids)
+    assert _sweep(all_instances=True) == 0
+    assert kids.seen == [""]
+
+
+@pytest.mark.parametrize(
+    ("codes", "scheduled", "want"),
+    [
+        ({"": 0, "private": 75}, False, 75),
+        ({"": 0, "private": 75}, True, 0),
+        ({"": 1, "private": 75}, True, 1),
+        ({"": 0, "private": 0}, False, 0),
+    ],
+)
+def test_sweep_access_all_aggregates_with_worst_rc(
+    monkeypatch: pytest.MonkeyPatch,
+    codes: dict[str, int],
+    scheduled: bool,
+    want: int,
+) -> None:
+    ports = browser.INSTANCE_PORTS
+    _fanout_env(monkeypatch, down={ports["admin"], ports["alt"]})
+    monkeypatch.setattr(browser, "_sweep_access_child", _Children(codes))
+    assert _sweep(all_instances=True, quiet=True, scheduled=scheduled) == want
+
+
+def test_sweep_access_all_child_timeout_is_a_journaled_failure(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    import subprocess  # pylint: disable=import-outside-toplevel
+
+    ports = browser.INSTANCE_PORTS
+    _fanout_env(monkeypatch, down={ports["admin"], ports["alt"]})
+    budgets: list[float] = []
+
+    def _run(argv: Any, **kw: Any) -> Any:
+        budgets.append(kw["timeout"])
+        if kw["env"]["CLAUDE_BROWSER_INSTANCE"] == "private":
+            raise subprocess.TimeoutExpired(argv, kw["timeout"])
+        assert "CLAUDE_BROWSER_CDP_PORT" not in kw["env"]
+        return subprocess.CompletedProcess(argv, 0, "", "")
+
+    monkeypatch.setattr(browser.subprocess, "run", _run)
+    rc = browser._sweep_access_fanout(["sweep-access", "-q"], child_timeout_s=60.0)
+    assert rc == 1
+    assert budgets == [20.0, 20.0]  # a caller's 60 s is capped at 20 s
+    err = capsys.readouterr().err
+    assert "[private] ❌ sweep-access timed out" in err
+    events = [e for e in _journal_events(tmp_path) if e["event"] == "access_sweep"]
+    assert [(e["sweep_instance"], e["status"]) for e in events] == [
+        ("private", "failed")
+    ]
+    budgets.clear()  # a dry run's timeout is reported, never journaled
+    assert browser._sweep_access_fanout(["sweep-access", "-q", "-n"]) == 1
+    assert len(_journal_events(tmp_path)) == len(events)
+
+
+def test_sweep_access_all_has_an_overall_deadline(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    import threading  # pylint: disable=import-outside-toplevel
+
+    ports = browser.INSTANCE_PORTS
+    _fanout_env(monkeypatch, down={ports["admin"], ports["alt"]})
+    hold = threading.Event()
+
+    def _child(inst: str, _argv: Any, _t: float) -> Any:
+        if inst == "private":
+            hold.wait(timeout=5)  # never reports inside the deadline
+        return browser._SweepChild(0, "", "")
+
+    monkeypatch.setattr(browser, "_sweep_access_child", _child)
+    try:
+        rc = browser._sweep_access_fanout(["sweep-access"], deadline_s=0.3)
+    finally:
+        hold.set()
+    assert rc == 1
+    assert "[private] ❌ sweep-access: no result within" in capsys.readouterr().err
+
+
+def test_sweep_access_pinned_instance_runs_alone(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("CLAUDE_BROWSER_CDP_PORT", "9")
+    monkeypatch.setattr(
+        browser, "_sweep_access_fanout", lambda *_a, **_k: pytest.fail("fan-out")
+    )
+    seen: list[int] = []
+
+    def _one(port: int, **_k: Any) -> int:
+        seen.append(port)
+        return 0
+
+    monkeypatch.setattr(browser, "_sweep_access_one", _one)
+    assert _sweep(all_instances=True) == 0 and seen == [9]
+
+
+def test_watchdog_recovery_sweeps_before_it_clears_and_resumes(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    order: list[str] = []
+    rec = {"owner_nonce": "n" * 32, "site": "calibre", "paused": [{"pid": 1}]}
+    browser._json_write_atomic(browser.MAINTENANCE_FILE, rec)
+
+    def _sweep_cdp(_port: int, why: str, *_a: Any, **_k: Any) -> Any:
+        present = browser.MAINTENANCE_FILE.exists()
+        order.append(f"sweep {why} (record present={present})")
+        return browser.AccessSweep("ok", (f"{TEAM} CF_Session",))
+
+    def _resume(paused: Any) -> list[str]:
+        order.append(f"resume {len(paused)}")
+        return []
+
+    monkeypatch.setattr(browser, "_gate_acquire", lambda *_a: None)
+    monkeypatch.setattr(browser, "_browser_mode", lambda _p: "headless")
+    monkeypatch.setattr(browser, "_access_team_sweep_cdp", _sweep_cdp)
+    monkeypatch.setattr(browser, "_resume_clients", _resume)
+    assert browser._watchdog_recover(9, rec, "dead pid") == 0
+    assert order == ["sweep watchdog recovery (record present=True)", "resume 1"]
+    assert not browser.MAINTENANCE_FILE.exists()
+    state = _state()
+    assert state is not None and state["status"] == "dropped"
+    assert state["by"] == "watchdog recovery"
+    end = [
+        e
+        for e in _journal_events(tmp_path)
+        if e["event"] == "watchdog_recover" and e.get("phase") == "end"
+    ]
+    assert end and end[0]["access_sweep"] == "ok"
+
+
+def _write_state(**fields: Any) -> None:
+    browser._json_write_atomic(browser.ACCESS_SWEEP_STATE_FILE, fields)
+
+
+NOW = 1_800_000_000.0
+
+
+@pytest.mark.parametrize(
+    ("state", "levels", "words"),
+    [
+        (None, ["warn"], "no pass recorded"),
+        ({"ts": NOW - 30, "status": "ok"}, ["ok"], "ok"),
+        ({"ts": NOW - 30, "status": "busy"}, ["ok"], "busy"),
+        ({"ts": NOW - 30, "status": "down"}, ["ok"], "down"),
+        ({"ts": NOW - 30, "status": "failed", "error": "jar"}, ["fail"], "FAILED"),
+        ({"ts": NOW - 900, "status": "ok"}, ["warn"], "older than 300 s"),
+        (
+            {
+                "ts": NOW - 30,
+                "status": "dropped",
+                "last_drop": {"ts": NOW - 30, "labels": [f"{TEAM} CF_Session"]},
+            },
+            ["ok", "warn"],
+            f"dropped {TEAM} CF_Session",
+        ),
+        (
+            {
+                "ts": NOW - 30,
+                "status": "ok",
+                "last_drop": {"ts": NOW - 90_000, "labels": [f"{TEAM} CF_Session"]},
+            },
+            ["ok"],
+            "ok",
+        ),
+    ],
+)
+def test_doctor_last_pass_line(
+    capsys: pytest.CaptureFixture[str],
+    state: dict[str, Any] | None,
+    levels: list[str],
+    words: str,
+) -> None:
+    if state is not None:
+        _write_state(**state)
+    log: list[str] = []
+    browser._doctor_access_sweep(log, now=NOW)
+    out = capsys.readouterr().out
+    assert log == levels and words in out
+    if levels[0] != "ok":
+        assert "browser.py sweep-access" in out
+
+
+# --- tp#1468 B2 review extras: no isolated-context fallback, no silent skip ---
+
+
+class _Pw:
+    def stop(self) -> None:
+        return None
+
+
+class _ClosableBrowser(_Browser):
+    def close(self) -> None:
+        return None
+
+
+def test_broker_cookie_clear_refuses_a_browser_without_contexts(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    owner = _ClosableBrowser(None)
+    monkeypatch.setattr(browser, "_connect", lambda _port: (_Pw(), owner))
+    monkeypatch.setattr(
+        browser, "_interaction_lease", lambda *_a, **_k: contextlib.nullcontext()
+    )
+    entry = {"cookie_hosts": [APP]}
+    with pytest.raises(browser.SharedJarMissing):
+        browser._broker_clear_cookies(9, "calibre", entry, None, why="logout")
+    suffix = browser._broker_clear_foreign(9, "calibre", entry)
+    assert "could NOT be cleared (SharedJarMissing)" in suffix
+
+
+def test_safari_import_undo_refuses_a_browser_without_contexts(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    owner = _ClosableBrowser(None)
+    monkeypatch.setattr(browser, "_connect", lambda _port: (_Pw(), owner))
+    monkeypatch.setattr(browser, "_builtin_clear_storage", lambda _p, _s: True)
+    assert browser._builtin_clear(9, "somesite") is False
+    assert browser._JOURNAL_NOTES.get("shared_jar_refused") == (
+        "import-safari undo somesite"
+    )
+
+
+def test_background_page_without_an_owner_reports_a_failed_sweep(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    class _Page:
+        context = None
+
+    @contextlib.contextmanager
+    def _owned(_port: int, *, prepare: Any = None) -> Iterator[_Page]:
+        del prepare
+        yield _Page()
+
+    monkeypatch.setattr(browser, "_owned_background_page", _owned)
+    assert browser._background_page_run(9, "about:blank", None, lambda _p: 1) == 1
+    assert "no owning browser" in str(browser._JOURNAL_NOTES.get("access_team_error"))
+    events = [e for e in _journal_events(tmp_path) if e["event"] == "access_sweep"]
+    assert events and events[0]["status"] == "failed"
 
 
 # --- opt-in: a THROWAWAY real Chromium (never the shared one on :9222) ---

@@ -737,6 +737,49 @@ def _add_tab_parsers(sub: Any) -> None:
         action="store_true",
         help="print only closes, failures and the summary when something happened.",
     )
+    _add_sweep_access_parser(sub)
+
+
+def _add_sweep_access_parser(sub: Any) -> None:
+    """`sweep-access` (tp#1468): the periodic Access team-cookie sweep."""
+    ps = sub.add_parser(
+        "sweep-access",
+        help="Delete every Cloudflare Access TEAM-domain cookie (any host under "
+        "cloudflareaccess.com) from a RUNNING shared browser's jar over raw "
+        "CDP (never starts one, never attaches Playwright); records the pass "
+        "in <cache>/access-sweep.json (labels only, never a value) for "
+        "`doctor`. Run every 60 s by the com.albert.browser-access-sweep "
+        "LaunchAgent. Exit 0 ok/down, 1 a failure, 75 busy (a guided login "
+        "owns the browser, or it is being switched). "
+        "Examples: `browser.py sweep-access`, `browser.py sweep-access -A -q`, "
+        "`browser.py sweep-access -n`.",
+    )
+    ps.add_argument(
+        "-A",
+        "--all-instances",
+        action="store_true",
+        help="every known instance whose CDP port answers, concurrently "
+        "(never starts one; an instance env, port or cache dir pins ONE).",
+    )
+    ps.add_argument(
+        "-q",
+        "--quiet",
+        action="store_true",
+        help="print only drops and failures.",
+    )
+    ps.add_argument(
+        "-n",
+        "--dry-run",
+        action="store_true",
+        help="only list the team cookies (domain + name): delete nothing, "
+        "journal nothing, write no state file.",
+    )
+    ps.add_argument(
+        "-S",
+        "--scheduled",
+        action="store_true",
+        help="scheduled run (the LaunchAgent): busy (75) exits 0.",
+    )
 
 
 def _add_login_parsers(sub: Any) -> None:
@@ -3290,6 +3333,9 @@ class Registration:  # pylint: disable=too-many-instance-attributes
         self.gate_held = True
         self.released = False
         self.registered_at = time.monotonic()
+        # False for the once-a-minute `sweep-access` pass (tp#1468): a clean
+        # pass writes no journal event, so its (un)registration writes none.
+        self.journal = True
 
     def __call__(self) -> None:
         self.release()
@@ -3345,6 +3391,8 @@ class Registration:  # pylint: disable=too-many-instance-attributes
                 fcntl.flock(fd, fcntl.LOCK_UN)
             with contextlib.suppress(OSError):
                 os.close(fd)
+        if not self.journal:
+            return
         _journal(
             "unregister",
             client=self.rec.get("tool"),
@@ -3362,6 +3410,7 @@ def _registry_register(
     *,
     journal_purpose: str | None = None,
     extra: dict[str, object] | None = None,
+    journal: bool = True,
 ) -> Registration:
     """Register this process as an attached CDP client; return its `Registration`
     (call it — or its ``release()`` — to unregister).
@@ -3380,7 +3429,8 @@ def _registry_register(
     is exactly the race this layer exists to prevent. Refuses with exit 2 while
     a guided login's maintenance record is live and this process does not
     carry its owner token ($CLAUDE_BROWSER_MAINTENANCE): the guided login owns
-    the browser for its duration.
+    the browser for its duration. `journal` False: no register/unregister
+    journal events (the periodic `sweep-access` pass, tp#1468).
     """
     CLIENTS_DIR.mkdir(parents=True, exist_ok=True)
     gate_fd = os.open(str(REGISTRY_GATE), os.O_RDWR | os.O_CREAT, 0o600)
@@ -3427,15 +3477,18 @@ def _registry_register(
         # A guided login's own client: never paused by its own transaction.
         rec["maintenance"] = os.environ.get(MAINTENANCE_ENV, "")
     os.pwrite(own_fd, (json.dumps(rec) + "\n").encode(), 0)
-    _journal(
-        "register",
-        client=tool,
-        client_pid=os.getpid(),
-        nonce=nonce[:12],
-        purpose=purpose if journal_purpose is None else journal_purpose,
-        port=port,
-    )
-    return Registration(path, nonce, own_fd, gate_fd, rec)
+    reg = Registration(path, nonce, own_fd, gate_fd, rec)
+    reg.journal = journal
+    if journal:
+        _journal(
+            "register",
+            client=tool,
+            client_pid=os.getpid(),
+            nonce=nonce[:12],
+            purpose=purpose if journal_purpose is None else journal_purpose,
+            port=port,
+        )
+    return reg
 
 
 def _gate_acquire(kind: int, wait_s: float) -> int | None:
@@ -3821,6 +3874,9 @@ _PREFLIGHT_SKIP_CMDS = frozenset(
         "tabs",
         "keep",
         "reap-idle",
+        # The periodic team-cookie sweep (tp#1468): never switches or
+        # relaunches a browser, raw CDP only.
+        "sweep-access",
     }
 )
 
@@ -6622,6 +6678,7 @@ def cmd_doctor(port: int) -> int:
     _doctor_coordination(log, port)
     _doctor_owned_ledgers(log)
     _doctor_access_team(log, port)
+    _doctor_access_sweep(log)
     before = _doctor_windows_before(log)
     release = _registry_register("browser.py", _purpose(), port)
     try:
@@ -11071,6 +11128,20 @@ def _background_page_run(
                     owner = getattr(getattr(page, "context", None), "browser", None)
                     if owner is not None:
                         _drop_access_team_cookies(owner, "background page", quiet=True)
+                    else:  # tp#1468: no owning browser is a failed sweep
+                        _access_sweep_report(
+                            "background page",
+                            [],
+                            [],
+                            "the page has no owning browser",
+                            quiet=True,
+                        )
+                        _journal(
+                            "access_sweep",
+                            by="background page",
+                            status="failed",
+                            error="the page has no owning browser",
+                        )
                     _BG_STATUS.pop(id(page), None)
                     _BG_NOCACHE.pop(id(page), None)
                     trail = _BG_TRAIL.pop(id(page), None)
@@ -11888,8 +11959,8 @@ def _doctor_access_team(log: list[str], port: int) -> None:
         "fail",
         "access team cookies",
         f"{len(labels)} present: {', '.join(labels)} — a Cloudflare Access team "
-        "session can open decide; the next `browser.py login` drops it (or "
-        "fails with access_team_sweep_failed when it cannot)",
+        "session can open decide; `browser.py sweep-access` drops it now (the "
+        "LaunchAgent within 60 s; a failure names the cause)",
     )
 
 
@@ -13174,13 +13245,19 @@ def _sweep_endpoint(port: int, budget_s: float) -> tuple[str, str | None]:
 
 
 def _access_team_sweep_cdp(
-    port: int, why: str, budget_s: float = ACCESS_SWEEP_CDP_BUDGET_S
+    port: int,
+    why: str,
+    budget_s: float = ACCESS_SWEEP_CDP_BUDGET_S,
+    *,
+    quiet: bool = False,
 ) -> AccessSweep:
     """`_sweep_team_cookies` over raw CDP websockets — for the deadline
     watcher, which hard-exits (no ``finally`` of the command runs) while
-    Playwright hangs. ONE monotonic deadline of `budget_s` covers the whole
-    sweep (the endpoint lookup and every call); a call that finds it spent
-    fails, and so does the sweep. Never raises."""
+    Playwright hangs, the watchdog's recovery and `sweep-access` (tp#1468).
+    ONE monotonic deadline of `budget_s` covers the whole sweep (the
+    endpoint lookup and every call); a call that finds it spent fails, and
+    so does the sweep. `quiet`: a failure is not printed (the caller reports
+    it). Never raises."""
     deadline = time.monotonic() + budget_s
 
     def _left() -> float:
@@ -13190,7 +13267,7 @@ def _access_team_sweep_cdp(
     if probe == "down":
         return AccessSweep("down")
     if not ws_url:
-        return _access_sweep_report(why, [], [], probe, quiet=False)
+        return _access_sweep_report(why, [], [], probe, quiet=quiet)
 
     def _send(method: str, params: dict) -> dict:
         remaining = _left()
@@ -13201,7 +13278,7 @@ def _access_team_sweep_cdp(
             raise _CdpSendError(res.error or res.status)
         return res.result
 
-    return _sweep_team_cookies(_send, why)
+    return _sweep_team_cookies(_send, why, quiet=quiet)
 
 
 def _access_team_verdict(rc: int, sweep: AccessSweep) -> int:
@@ -13220,6 +13297,385 @@ def _access_team_verdict(rc: int, sweep: AccessSweep) -> int:
     )
     _result_fail("consumer-followup", "access_team_sweep_failed", sweep.error)
     return 1
+
+
+# --- sweep-access (tp#1468): the periodic team-cookie sweep -------------------
+# A team cookie can land through any client (Playwright MCP, `open`, `eval`,
+# an unregistered CDP peer); the LaunchAgent com.albert.browser-access-sweep
+# runs `sweep-access -A -q -S` every 60 s on every running instance. Raw CDP
+# only (`_access_team_sweep_cdp`): no Playwright attach, no `Target.*` /
+# `Page.*` call, so a wedged tab cannot block it and `reap-idle` never sees
+# it as activity.
+
+#: Each instance's last pass (status, labels, error — never a value), read
+#: by `doctor`.
+ACCESS_SWEEP_STATE_FILE = CACHE_DIR / "access-sweep.json"
+#: How long `sweep-access` waits to register (gate shared): a switch or a
+#: shutdown in flight makes the pass busy instead of waiting the usual 15 s.
+ACCESS_SWEEP_REG_WAIT_S = 2.0
+#: The "is anybody listening" lookup before a pass (nothing = down).
+ACCESS_SWEEP_PROBE_S = 2.0
+#: `-A`: at most this per child (a caller may give less, never more) and
+#: this for the whole concurrent fan-out.
+ACCESS_SWEEP_CHILD_TIMEOUT_S = 20.0
+ACCESS_SWEEP_FANOUT_DEADLINE_S = 30.0
+#: `doctor`: a last pass older than this while the browser is up = the
+#: LaunchAgent is not running; a drop younger than the window is shown.
+ACCESS_SWEEP_STALE_S = 300.0
+ACCESS_SWEEP_DROP_WINDOW_S = 86400.0
+ACCESS_SWEEP_REMEDY = (
+    "run `browser.py sweep-access` (the LaunchAgent "
+    "com.albert.browser-access-sweep runs it every 60 s)"
+)
+
+
+def _sweep_access_name() -> str:
+    return INSTANCE or "default"
+
+
+def _sweep_access_write(port: int, status: str, sweep: AccessSweep, why: str) -> bool:
+    """Write this instance's `ACCESS_SWEEP_STATE_FILE` atomically (labels
+    only); the last drop of an earlier pass is carried over for `doctor`'s
+    24 h line. False (and a ❌ line) when it cannot be written."""
+    now = time.time()
+    at = time.strftime("%Y-%m-%dT%H:%M:%S%z", time.localtime(now))
+    prev = _read_json_dict(ACCESS_SWEEP_STATE_FILE) or {}
+    last_drop = (
+        prev.get("last_drop") if isinstance(prev.get("last_drop"), dict) else None
+    )
+    if sweep.dropped:
+        last_drop = {"ts": now, "at": at, "labels": sorted(sweep.dropped)}
+    state: dict[str, object] = {
+        "at": at,
+        "ts": now,
+        "instance": _sweep_access_name(),
+        "port": port,
+        "by": why,
+        "status": status,
+        "dropped": sorted(sweep.dropped),
+        "left": sorted(sweep.left),
+        "error": sweep.error,
+    }
+    if last_drop is not None:
+        state["last_drop"] = last_drop
+    try:
+        _json_write_atomic(ACCESS_SWEEP_STATE_FILE, state)
+    except OSError as exc:
+        print(
+            f"❌ {_sweep_access_name()}: access sweep state not written "
+            f"({ACCESS_SWEEP_STATE_FILE}): {_exc_line(exc)}",
+            file=sys.stderr,
+        )
+        return False
+    return True
+
+
+def _sweep_access_record(
+    port: int, sweep: AccessSweep, *, quiet: bool, why: str = "sweep-access"
+) -> int:
+    """Record one pass: the state file, a journal event ONLY for a drop or a
+    failure (a clean pass writes none), one line. 1 on a failed sweep or an
+    unwritable state file, else 0."""
+    name = _sweep_access_name()
+    status = "dropped" if sweep.status == "ok" and sweep.dropped else sweep.status
+    written = _sweep_access_write(port, status, sweep, why)
+    if status in ("dropped", "failed"):
+        _journal(
+            "access_sweep",
+            by=why,
+            status=status,
+            dropped=sorted(sweep.dropped),
+            left=sorted(sweep.left),
+            error=sweep.error,
+        )
+    if status == "failed":
+        print(
+            f"❌ {name}: Access team cookie sweep failed: {sweep.error} — "
+            "`browser.py doctor` shows the jar",
+            file=sys.stderr,
+        )
+    elif status == "dropped":
+        print(
+            f"⚠ {name}: dropped {len(sweep.dropped)} Cloudflare Access team "
+            f"cookie(s): {', '.join(sorted(sweep.dropped))}"
+        )
+    elif not quiet:
+        print(
+            f"✅ {name}: no Access team cookie"
+            if status == "ok"
+            else f"✅ {name}: browser is down — nothing to sweep"
+        )
+    return 1 if status == "failed" or not written else 0
+
+
+def _sweep_access_busy(port: int, why: str, *, quiet: bool, dry_run: bool) -> int:
+    """A busy pass: nothing swept, state ``busy`` (not in a dry run), 75."""
+    if not dry_run:
+        _sweep_access_write(
+            port, "busy", AccessSweep("busy", error=why), "sweep-access"
+        )
+    if not quiet:
+        print(f"⏸ {_sweep_access_name()}: busy — {why}; not sweeping.")
+    return BUSY_RC
+
+
+def _sweep_access_list(port: int, *, quiet: bool) -> int:
+    """`sweep-access -n`: the team cookies by ``<domain> <name>`` — reads
+    only (``Storage.getCookies``): no delete, no journal, no state file."""
+    name = _sweep_access_name()
+    probe, ws_url = _sweep_endpoint(port, ACCESS_SWEEP_PROBE_S)
+    if probe == "down":
+        if not quiet:
+            print(f"✅ {name}: browser is down — nothing to list")
+        return 0
+    res = (
+        _cdp_ws_call(ws_url, "Storage.getCookies", {}, ACCESS_SWEEP_CDP_BUDGET_S)
+        if ws_url
+        else None
+    )
+    raw = (
+        res.result.get("cookies")
+        if res is not None
+        and res.status == "ok"
+        and not res.error
+        and isinstance(res.result, dict)
+        else None
+    )
+    if not isinstance(raw, list):
+        why = probe if res is None else res.error or res.status or "no cookie list"
+        print(f"❌ {name}: jar unreadable ({why})", file=sys.stderr)
+        return 1
+    team, _src = _access_team.configured_team_domain()
+    labels = _access_team.team_cookie_labels(
+        [c for c in raw if isinstance(c, dict)], team
+    )
+    if labels:
+        print(
+            f"{name}: {len(labels)} team cookie(s) (dry run, kept): {', '.join(labels)}"
+        )
+    elif not quiet:
+        print(f"{name}: no Access team cookie (dry run)")
+    return 0
+
+
+def _sweep_access_one(port: int, *, quiet: bool, dry_run: bool) -> int:
+    """`sweep-access` on THIS instance (also the `-A` child)."""
+    if _maint_live() is not None:
+        return _sweep_access_busy(
+            port, "a guided login owns the browser", quiet=quiet, dry_run=dry_run
+        )
+    if dry_run:
+        return _sweep_access_list(port, quiet=quiet)
+    probe, _ws = _sweep_endpoint(port, ACCESS_SWEEP_PROBE_S)
+    if probe == "down":
+        return _sweep_access_record(port, AccessSweep("down"), quiet=quiet)
+    try:
+        reg = _registry_register(
+            "browser.py",
+            "sweep-access",
+            port,
+            wait_s=ACCESS_SWEEP_REG_WAIT_S,
+            journal=False,
+        )
+    except SystemExit as exc:
+        text = str(exc.code) if isinstance(exc.code, str) else ""
+        if exc.code == BUSY_RC:
+            why = "a guided login owns the browser"
+        elif "being switched or stopped" in text:
+            why = "the browser is being switched or stopped"
+        else:
+            reason = text.splitlines()[0] if text else f"exit {exc.code}"
+            return _sweep_access_record(
+                port, AccessSweep("failed", error=reason), quiet=quiet
+            )
+        return _sweep_access_busy(port, why, quiet=quiet, dry_run=False)
+    try:
+        sweep = _access_team_sweep_cdp(port, "sweep-access", quiet=True)
+    finally:
+        reg.release()
+    return _sweep_access_record(port, sweep, quiet=quiet)
+
+
+class _SweepChild(NamedTuple):
+    """One `sweep-access -A` child's outcome."""
+
+    rc: int
+    stdout: str
+    stderr: str
+    timed_out: bool = False
+
+
+def _sweep_access_child(
+    inst: str, argv: Sequence[str], timeout_s: float
+) -> _SweepChild:
+    """Run ``browser.py ARGV`` pinned to `inst`, bounded by `timeout_s`."""
+    env = {**os.environ, "CLAUDE_BROWSER_INSTANCE": inst}
+    env.pop("CLAUDE_BROWSER_CDP_PORT", None)
+    try:
+        r = subprocess.run(
+            [sys.executable, os.path.realpath(__file__), *argv],
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=timeout_s,
+            check=False,
+        )
+    except subprocess.TimeoutExpired:
+        return _SweepChild(
+            1, "", f"❌ sweep-access timed out after {timeout_s:g}s\n", True
+        )
+    except OSError as exc:
+        return _SweepChild(1, "", f"❌ sweep-access did not start: {exc}\n", True)
+    return _SweepChild(r.returncode, r.stdout, r.stderr)
+
+
+def _sweep_access_fanout(
+    argv: Sequence[str],
+    *,
+    child_timeout_s: float = ACCESS_SWEEP_CHILD_TIMEOUT_S,
+    deadline_s: float = ACCESS_SWEEP_FANOUT_DEADLINE_S,
+) -> int:
+    """`sweep-access -A`: one child per instance whose CDP port answers, ALL
+    AT ONCE (a stalled instance costs its own `child_timeout_s`, capped at
+    ACCESS_SWEEP_CHILD_TIMEOUT_S, never the others' time), bounded overall
+    by `deadline_s`; output tagged per instance, exit `_worst_rc`. A child
+    that times out or never reports is a journaled failure."""
+    child_timeout_s = min(child_timeout_s, ACCESS_SWEEP_CHILD_TIMEOUT_S)
+    results: dict[str, _SweepChild | None] = {}
+    lock = threading.Lock()
+
+    def _run(inst: str, iport: int) -> None:
+        probe, _ws = _sweep_endpoint(iport, ACCESS_SWEEP_PROBE_S)
+        res = (
+            None
+            if probe == "down"
+            else _sweep_access_child(inst, argv, child_timeout_s)
+        )
+        with lock:
+            results[inst] = res
+
+    threads = [
+        threading.Thread(
+            target=_run,
+            args=(inst, iport),
+            name=f"sweep-{inst or 'default'}",
+            daemon=True,
+        )
+        for inst, iport in INSTANCE_PORTS.items()
+    ]
+    end = time.monotonic() + deadline_s
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(max(0.0, end - time.monotonic()))
+    codes: list[int] = []
+    for inst in INSTANCE_PORTS:
+        name = inst or "default"
+        tag = f"[{name}] "
+        with lock:
+            done = inst in results
+            res = results.get(inst)
+        if not done:
+            res = _SweepChild(
+                1, "", f"❌ sweep-access: no result within {deadline_s:g}s\n", True
+            )
+        if res is None:
+            continue  # down: nothing to sweep
+        for line in res.stdout.splitlines():
+            print(tag + line)
+        for line in res.stderr.splitlines():
+            print(tag + line, file=sys.stderr)
+        if res.timed_out and "-n" not in argv:  # a dry run journals nothing
+            _journal(
+                "access_sweep",
+                by="sweep-access -A",
+                sweep_instance=name,
+                status="failed",
+                error=res.stderr.strip()[:200],
+            )
+        codes.append(res.rc)
+    return _worst_rc(codes)
+
+
+def cmd_sweep_access(
+    port: int, *, all_instances: bool, quiet: bool, dry_run: bool, scheduled: bool
+) -> int:
+    """`sweep-access`: delete every Access team cookie of a running shared
+    browser (every instance with `-A`). Exit 0 ok/down, 1 a failure, 75 busy
+    — 0 under `-S` (the LaunchAgent: busy is the next minute's work)."""
+    if all_instances and not _fanout_pinned_env():
+        argv = (
+            ["sweep-access"] + (["-q"] if quiet else []) + (["-n"] if dry_run else [])
+        )
+        rc = _sweep_access_fanout(argv)
+    else:
+        rc = _sweep_access_one(port, quiet=quiet, dry_run=dry_run)
+    return 0 if scheduled and rc == BUSY_RC else rc
+
+
+def _sweep_when(ts: object, now: float) -> str:
+    """``HH:MM:SS (N ago)`` in local time for a state timestamp."""
+    if not isinstance(ts, (int, float)) or isinstance(ts, bool):
+        return "at an unknown time"
+    clock = time.strftime("%H:%M:%S", time.localtime(float(ts)))
+    return f"at {clock} ({_fmt_dur(max(0.0, now - float(ts)))} ago)"
+
+
+def _doctor_access_sweep(log: list[str], now: float | None = None) -> None:
+    """Doctor's last-pass line of `sweep-access` (tp#1468; doctor runs only
+    while the browser is up): ❌ the last pass failed; ⚠ no pass recorded or
+    the last one older than ACCESS_SWEEP_STALE_S (the LaunchAgent is not
+    running); ⚠ a drop in the last 24 h (labels and time); else ✅."""
+    now = time.time() if now is None else now
+    check = "access sweep"
+    state = _read_json_dict(ACCESS_SWEEP_STATE_FILE)
+    if state is None:
+        _doctor_add(log, "warn", check, f"no pass recorded yet — {ACCESS_SWEEP_REMEDY}")
+    else:
+        ts = state.get("ts")
+        when = _sweep_when(ts, now)
+        status = str(state.get("status") or "?")
+        fresh = (
+            isinstance(ts, (int, float))
+            and not isinstance(ts, bool)
+            and now - float(ts) <= ACCESS_SWEEP_STALE_S
+        )
+        if status == "failed":
+            _doctor_add(
+                log,
+                "fail",
+                check,
+                f"last pass {when} FAILED: {state.get('error') or '?'} — "
+                f"{ACCESS_SWEEP_REMEDY}",
+            )
+        elif not fresh:
+            _doctor_add(
+                log,
+                "warn",
+                check,
+                f"last pass {when} ({status}) is older than "
+                f"{ACCESS_SWEEP_STALE_S:.0f} s while the browser is up — is the "
+                f"LaunchAgent running? {ACCESS_SWEEP_REMEDY}",
+            )
+        else:
+            _doctor_add(log, "ok", check, f"last pass {when}: {status}")
+    drop = state.get("last_drop") if state is not None else None
+    if not isinstance(drop, dict):
+        return
+    dts = drop.get("ts")
+    if (
+        not isinstance(dts, (int, float))
+        or now - float(dts) > ACCESS_SWEEP_DROP_WINDOW_S
+    ):
+        return
+    labels = [str(lb) for lb in drop.get("labels") or []]
+    _doctor_add(
+        log,
+        "warn",
+        "access sweep drop",
+        f"dropped {', '.join(labels) or '?'} {_sweep_when(dts, now)} — an "
+        "agent's navigation reached the Access team domain",
+    )
 
 
 # The window property where the init script records its own read-back.
@@ -14210,7 +14666,10 @@ def cmd_broker_logout(port: int, site_name: str) -> int:  # pylint: disable=too-
             "no cookie in the shared browser was touched.",
         )
     names = _item_cookie_names(entry)
-    gone = _broker_clear_cookies(port, site, entry, names, why="logout")
+    try:
+        gone = _broker_clear_cookies(port, site, entry, names, why="logout")
+    except SharedJarMissing as exc:
+        return _broker_fail(2, f"{site}: its cookies could NOT be deleted ({exc})")
     print(f"✓ deleted {gone} {site} cookie(s) from the shared browser.")
     # WS3: a storage-token session (NPM, Jellyfin, ABS …) lives in
     # localStorage — cookies alone do not end it.
@@ -14255,13 +14714,15 @@ def _broker_clear_cookies(
     """Delete `site`'s cookies (its cookie scopes — on a path-scoped host
     only inside its paths; only `names` when given) from THIS browser under
     the interaction lease; how many went. Nothing else: no storage, never
-    the broker's profile."""
+    the broker's profile. Raises `SharedJarMissing` when the attach shows no
+    default context (tp#1468: an isolated ``new_context()`` would delete
+    nothing and look like success)."""
     hosts = [str(h) for h in entry.get("cookie_hosts") or []]
     scopes = _cookie_scopes_of(entry)
     pw, browser = _connect(port)
     try:
         with _interaction_lease(f"{why} {site}"):
-            ctx = browser.contexts[0] if browser.contexts else browser.new_context()
+            ctx = _shared_jar(browser, f"{why} {site}")
             doomed = _scope_cookies(ctx.cookies(), hosts, names, scopes)
             for ck in doomed:
                 ctx.clear_cookies(name=ck["name"], domain=ck["domain"], path=ck["path"])
@@ -14993,12 +15454,13 @@ def _builtin_clear_storage(port: int, site: str) -> bool:
 def _builtin_clear(port: int, site: str) -> bool:
     """Undo an import: delete every in-scope cookie of `site` (Chromium's own
     bot cookies stay unless the rule drops them) and its declared storage
-    keys. True when everything went."""
+    keys. True when everything went; False when the attach shows no default
+    context (`SharedJarMissing`, tp#1468 — never an isolated context)."""
     ok = True
     try:
         pw, browser = _connect(port)
         try:
-            ctx = browser.contexts[0] if browser.contexts else browser.new_context()
+            ctx = _shared_jar(browser, f"import-safari undo {site}")
             for ck in ctx.cookies():
                 if _safari.replaced_on_import(
                     str(ck.get("domain")), str(ck.get("name")), site
@@ -16185,6 +16647,12 @@ def _watchdog_recover(port: int, rec: dict, state: str) -> int:
     if _browser_mode(port) == "headed":
         with _stdout_to_stderr():
             reverted = cmd_switch(port, "headless", revert=True)
+    # tp#1468: the dead login may have left a team cookie, and `sweep-access`
+    # stood down (busy) while its record lived: sweep (raw CDP, no
+    # registration) BEFORE the record goes and the clients resume.
+    sweep = _access_team_sweep_cdp(port, "watchdog recovery", quiet=True)
+    with _stdout_to_stderr():
+        _sweep_access_record(port, sweep, quiet=True, why="watchdog recovery")
     with _maint_locked(5.0):
         cur = _read_json_dict(MAINTENANCE_FILE)
         if cur is not None and cur.get("owner_nonce") == rec.get("owner_nonce"):
@@ -16199,6 +16667,7 @@ def _watchdog_recover(port: int, rec: dict, state: str) -> int:
         closed=len(closed),
         owned=len(owned),
         revert=reverted,
+        access_sweep=sweep.status,
         resumed=len(paused) - len(problems),
         problems=len(problems),
     )
@@ -18279,6 +18748,14 @@ def _dispatch(args: argparse.Namespace, port: int) -> int:
             max_n=args.max,
             all_instances=args.all_instances,
             quiet=args.quiet,
+        )
+    if args.cmd == "sweep-access":
+        return cmd_sweep_access(
+            port,
+            all_instances=args.all_instances,
+            quiet=args.quiet,
+            dry_run=args.dry_run,
+            scheduled=args.scheduled,
         )
     if args.cmd == "eval":
         return cmd_eval(
