@@ -294,6 +294,22 @@ class _Ctx:
     def add_cookies(self, cookies: list[dict]) -> None:
         self.added.extend(cookies)
 
+    @property
+    def browser(self) -> _Ctx:
+        """`ctx.browser`: the Access team-cookie sweep's CDP session (tp#1466)."""
+        return self
+
+    def new_browser_cdp_session(self) -> _Ctx:
+        return self
+
+    def send(self, method: str, params: dict | None = None) -> dict:
+        """``Storage.getCookies`` reads the jar; these jars hold no team cookie."""
+        assert method == "Storage.getCookies", (method, params)
+        return {"cookies": [*self.jar, *self.added]}
+
+    def detach(self) -> None:
+        return None
+
 
 class _Browser:
     def __init__(self, ctx: _Ctx) -> None:

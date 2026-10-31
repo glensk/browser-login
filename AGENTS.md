@@ -478,15 +478,19 @@ framework. It is a **provider**: other repos depend on it, not the reverse. See
   every `agent-login.py` run; a SessionStart hook in mydotfiles' Claude
   settings prints it into each session).
 - **No Cloudflare Access team session in the shared browser (tp#1466)**: a
-  cookie on or under `cloudflareaccess.com` (or the configured team domain,
-  `broker/access_team.py`) is never exported, injected or copied from Safari,
+  cookie on or under `cloudflareaccess.com` (`broker/access_team.py`; a
+  configured team domain outside it is rejected) is never exported, injected
+  or copied from Safari,
   and is swept from the shared jar after every injection, import, `login` and
   guided login — it would let Access open decide as Albert. A new path that
   writes cookies into the shared browser calls `_drop_access_team_cookies`
   (or `_access_team_sweep`) after it, in a `finally`, and passes the
   `AccessSweep` through `_access_team_verdict` (a failed sweep is never a
-  success: `access_team_sweep_failed`). Never add an exemption; per-app Access
-  cookies on the app's own host are fine.
+  success: `access_team_sweep_failed`). Delete team cookies only through
+  `_sweep_team_cookies` (exact identity over CDP), never with Playwright's
+  `clear_cookies(filter)` — it clears the whole jar and re-adds the rest.
+  Never add an exemption; per-app Access cookies on the app's own host are
+  fine.
 - **No secrets, ever** — this is a public repo. Configuration is env vars + keychain
   *labels* only. gitleaks must stay clean.
 

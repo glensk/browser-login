@@ -1427,7 +1427,7 @@ the `himalaya` helpers. The CDP endpoint is always `http://127.0.0.1:<port>` (ne
   (`CF_Authorization`, `CF_Session`, `CF_Device`). The team session lets Access
   open every app of the team without a new login — decide.dom42.space included,
   which agents must never open as Albert. So a team-domain cookie (any host on
-  or under `cloudflareaccess.com`, plus the configured team domain) is:
+  or under `cloudflareaccess.com`) is:
   never exported by the broker (`broker/bundle.py`, drop reason
   `access_team`), never injected by the client (`_broker_cookie_in_scope`) or
   copied from Safari (`safari_cookies.importable`), and deleted from the shared
@@ -1436,19 +1436,26 @@ the `himalaya` helpers. The CDP endpoint is always `http://127.0.0.1:<port>` (ne
   journaled as `access_team_sweep`, names only). The sweep runs on EVERY exit
   of `login`, `assisted-login` and `import-safari` — a failure, `SystemExit`
   or exception included; a `login` deadline (exit 124/125, a hard exit) sweeps
-  over raw CDP from the watcher (`_access_team_sweep_cdp`). After deleting,
-  the sweep re-reads the jar: a jar it cannot read or attach to, a failed
-  delete or a surviving team cookie turns a logged-in exit 0 into exit 1 with
-  result code `access_team_sweep_failed`; a browser that is down is no
-  failure. Only the per-app cookies stay,
+  over raw CDP from the watcher (`_access_team_sweep_cdp`, one 4 s budget for
+  the whole sweep). Both paths run the same CDP sweep (`_sweep_team_cookies`):
+  each team cookie is deleted by its exact identity — `Storage.setCookies`
+  with a past expiry, a host-only cookie addressed by `url` and no `domain`, a
+  `.domain` cookie by its domain, a partitioned (CHIPS) one with its
+  `partitionKey` — so no other cookie is ever cleared and re-added. After
+  deleting, the sweep re-reads the jar: a jar it cannot read or attach to, a
+  failed delete or a surviving team cookie turns a logged-in exit 0 (also a
+  `SystemExit(0)`) into exit 1 with result code `access_team_sweep_failed`; a
+  browser that is down is no failure. Only the per-app cookies stay,
   and the home services keep working on them. `browser.py doctor` prints an
   `access team cookies` line (❌ with host + name when one is present, never a
   value). The configured team domain comes from
   `$CLAUDE_BROWSER_ACCESS_TEAM_DOMAIN`, else `team_domain` in decide's
   `config/edge.json` (`$CLAUDE_BROWSER_ACCESS_EDGE_FILE` overrides the path);
-  a value without a dot (`com`) is rejected from either source, with the
-  reason shown by `doctor`. It is informational on top of the suffix rule, so
-  a missing or rejected configuration never lets a team cookie through. No
+  a value that is not a subdomain of `cloudflareaccess.com` (`com`,
+  `dom42.space`) is rejected from either source — it would match app cookies
+  — with the reason shown by `doctor`. It is informational on top of the
+  suffix rule, so a missing or rejected configuration never lets a team
+  cookie through. No
   Access session is revoked server-side. Opt-in real-browser test (a
   throwaway headless Chromium, never the shared one):
   `CLAUDE_BROWSER_TEST_CDP=1 uv run pytest tests/test_access_team_cookies.py -k real_chromium`

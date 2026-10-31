@@ -12,10 +12,12 @@ domain; the per-app cookies stay and the home services keep working.
 The rule needs no configuration: Cloudflare puts every team domain under
 ``cloudflareaccess.com``, so any cookie on that domain or a subdomain of it
 is a team cookie. The CONFIGURED team domain (decide's ``config/edge.json``
-``team_domain``, or ``$CLAUDE_BROWSER_ACCESS_TEAM_DOMAIN``) is only added on
-top — it is shown by ``browser.py doctor`` and would cover a team domain
-outside that suffix. A missing or unreadable configuration therefore never
-lets a team cookie through (fail safe); it is reported, never fatal.
+``team_domain``, or ``$CLAUDE_BROWSER_ACCESS_TEAM_DOMAIN``) is only shown
+by ``browser.py doctor``; a value that is not a subdomain of
+``cloudflareaccess.com`` is rejected with the reason, so a mistyped
+``dom42.space`` can never sweep app cookies. A missing or unreadable
+configuration therefore never lets a team cookie through (fail safe); it is
+reported, never fatal.
 
 Leaf module: stdlib only, no browser and no secrets — names and hosts in,
 booleans out.
@@ -49,14 +51,16 @@ def configured_team_domain() -> tuple[str | None, str]:
 
     ``$CLAUDE_BROWSER_ACCESS_TEAM_DOMAIN`` first, else ``team_domain`` of the
     edge file (``$CLAUDE_BROWSER_ACCESS_EDGE_FILE`` or decide's
-    ``config/edge.json``). A value without a dot (``com``) is no team domain
-    — it would match a whole TLD — so it is rejected with the reason, from
-    either source, and only the ``*.cloudflareaccess.com`` rule applies.
+    ``config/edge.json``). Cloudflare team domains are always
+    ``<team>.cloudflareaccess.com``; any other value (``com``, ``dom42.space``)
+    would match app cookies, so it is rejected with the reason, from either
+    source, and only the ``*.cloudflareaccess.com`` rule applies.
     Never raises."""
     env = _norm(os.environ.get(TEAM_DOMAIN_ENV, ""))
     if env:
-        if "." not in env:
-            return None, f"${TEAM_DOMAIN_ENV} {env!r} is not a domain (no dot), ignored"
+        bad = _not_a_team_domain(env)
+        if bad:
+            return None, f"${TEAM_DOMAIN_ENV} {env!r} {bad}, ignored"
         return env, f"${TEAM_DOMAIN_ENV}"
     path = Path(os.environ.get(EDGE_FILE_ENV) or DEFAULT_EDGE_FILE).expanduser()
     try:
@@ -84,9 +88,18 @@ def _read_edge(path: Path) -> tuple[str | None, str]:
     team = _norm(data.get("team_domain", "")) if isinstance(data, dict) else ""
     if not team:
         return None, f"{path} has no team_domain"
-    if "." not in team:
-        return None, f"{path} team_domain {team!r} is not a domain (no dot), ignored"
+    bad = _not_a_team_domain(team)
+    if bad:
+        return None, f"{path} team_domain {team!r} {bad}, ignored"
     return team, str(path)
+
+
+def _not_a_team_domain(team: str) -> str:
+    """Why `team` (normalised) is no Cloudflare Access team domain — ``""``
+    when it is ``<team>.cloudflareaccess.com`` (a strict subdomain)."""
+    if team.endswith("." + ACCESS_TEAM_PARENT):
+        return ""
+    return f"is not a subdomain of {ACCESS_TEAM_PARENT}"
 
 
 def is_team_host(domain: str, team: str | None = None) -> bool:

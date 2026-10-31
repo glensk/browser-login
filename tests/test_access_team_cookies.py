@@ -55,12 +55,72 @@ TEAM_COOKIES = [_ck(TEAM, n) for n in ("CF_Authorization", "CF_Session", "CF_Dev
 APP_COOKIE = _ck(APP, "CF_Authorization")
 
 
-class _Jar:
-    """Playwright's cookie API on a list."""
+def _identity(c: dict[str, Any]) -> tuple[str, str, str, str]:
+    """Chromium's cookie identity: name, stored domain (``.x`` = domain
+    cookie, ``x`` = host-only), path, partition key."""
+    return (
+        str(c.get("name")),
+        str(c.get("domain")),
+        str(c.get("path") or "/"),
+        json.dumps(c.get("partitionKey"), sort_keys=True),
+    )
 
-    def __init__(self, cookies: list[dict[str, Any]]) -> None:
+
+def _set_cookies(jar: list[dict[str, Any]], entries: list[dict[str, Any]]) -> None:
+    """``Storage.setCookies`` as Chromium applies it: ``url`` without
+    ``domain`` → host-only; a ``domain`` is ALWAYS stored as ``.domain``; an
+    expired entry deletes the cookie with the same identity (and only it)."""
+    for e in entries:
+        stored = dict(e)
+        if "domain" in e:
+            stored["domain"] = "." + str(e["domain"]).lstrip(".")
+        else:
+            stored["domain"] = str(e["url"]).split("/")[2]
+        stored.pop("url", None)
+        key = _identity(stored)
+        jar[:] = [c for c in jar if _identity(c) != key]
+        if stored.get("expires") != 1:
+            jar.append(stored)
+
+
+class _Session:
+    """A browser-level CDP session on a `_Jar`."""
+
+    def __init__(self, owner: _Jar) -> None:
+        self.owner = owner
+
+    def send(self, method: str, params: Any = None) -> dict[str, Any]:
+        if method == "Storage.getCookies":
+            return self.owner.read()
+        assert method == "Storage.setCookies"
+        self.owner.sent += params["cookies"]
+        if self.owner.deletes:
+            _set_cookies(self.owner.jar, params["cookies"])
+        return {}
+
+    def detach(self) -> None:
+        self.owner.detached += 1
+
+
+class _Jar:
+    """Playwright's cookie API on a list, plus `ctx.browser`'s CDP session."""
+
+    def __init__(self, cookies: list[dict[str, Any]], *, deletes: bool = True) -> None:
         self.jar = [dict(c) for c in cookies]
         self.added: list[str] = []
+        self.sent: list[dict[str, Any]] = []
+        self.deletes = deletes
+        self.detached = 0
+
+    @property
+    def browser(self) -> _Jar:
+        return self
+
+    def new_browser_cdp_session(self) -> _Session:
+        return _Session(self)
+
+    def read(self) -> dict[str, Any]:
+        return {"cookies": [dict(c) for c in self.jar]}
 
     def cookies(self) -> list[dict[str, Any]]:
         return [dict(c) for c in self.jar]
@@ -110,14 +170,51 @@ def test_configured_team_domain_from_the_edge_file(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     edge = tmp_path / "edge.json"
-    edge.write_text(json.dumps({"team_domain": "access.example.org"}))
+    edge.write_text(json.dumps({"team_domain": "myteam.cloudflareaccess.com"}))
     monkeypatch.setenv(access_team.EDGE_FILE_ENV, str(edge))
     team, src = access_team.configured_team_domain()
-    assert team == "access.example.org" and src == str(edge)
-    # A configured team domain outside the suffix is covered too.
-    assert access_team.is_team_host(".access.example.org")
-    monkeypatch.setenv(access_team.TEAM_DOMAIN_ENV, "Other.Example.NET")
-    assert access_team.configured_team_domain()[0] == "other.example.net"
+    assert team == "myteam.cloudflareaccess.com" and src == str(edge)
+    monkeypatch.setenv(access_team.TEAM_DOMAIN_ENV, "Other.CloudflareAccess.COM")
+    assert access_team.configured_team_domain()[0] == "other.cloudflareaccess.com"
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        "dom42.space",
+        "access.example.org",
+        "cloudflareaccess.com",
+        "evilcloudflareaccess.com",
+    ],
+)
+def test_team_domain_outside_cloudflareaccess_is_rejected(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    value: str,
+) -> None:
+    """A team domain is always ``<team>.cloudflareaccess.com``: anything else
+    (``dom42.space`` would match every app cookie) is refused from the env
+    and from the edge file, with the reason in doctor; app cookies stay."""
+    monkeypatch.setenv(access_team.TEAM_DOMAIN_ENV, value)
+    team, why = access_team.configured_team_domain()
+    assert team is None and "not a subdomain of cloudflareaccess.com" in why
+    assert access_team.TEAM_DOMAIN_ENV in why
+    assert not access_team.is_team_host("calibre.dom42.space")
+    assert not access_team.is_team_host(".access.example.org")
+    monkeypatch.delenv(access_team.TEAM_DOMAIN_ENV)
+    edge = tmp_path / "edge.json"
+    edge.write_text(json.dumps({"team_domain": value}))
+    monkeypatch.setenv(access_team.EDGE_FILE_ENV, str(edge))
+    team, why = access_team.configured_team_domain()
+    assert team is None and "not a subdomain" in why and str(edge) in why
+    app = _ck("calibre.dom42.space", "CF_Authorization")
+    monkeypatch.setattr(browser, "_browser_ws_url", lambda _port: "ws://fake")
+    monkeypatch.setattr(browser, "_cdp_ws_call", lambda *_a, **_k: _Res([app]))
+    log: list[str] = []
+    browser._doctor_access_team(log, 9)
+    out = capsys.readouterr().out
+    assert log == ["ok"] and "not a subdomain of cloudflareaccess.com" in out
 
 
 def test_missing_config_still_refuses_team_cookies() -> None:
@@ -273,7 +370,8 @@ def test_dotless_team_domain_from_the_env_is_rejected(
     value, with the reason; the suffix rule still applies."""
     monkeypatch.setenv(access_team.TEAM_DOMAIN_ENV, value)
     team, why = access_team.configured_team_domain()
-    assert team is None and "no dot" in why and access_team.TEAM_DOMAIN_ENV in why
+    assert team is None and "not a subdomain" in why
+    assert access_team.TEAM_DOMAIN_ENV in why
     assert not access_team.is_team_host("calibre.com")
     assert access_team.is_team_host(TEAM)
 
@@ -285,33 +383,75 @@ def test_dotless_team_domain_in_the_edge_file_says_why(
     edge.write_text(json.dumps({"team_domain": "com"}))
     monkeypatch.setenv(access_team.EDGE_FILE_ENV, str(edge))
     team, why = access_team.configured_team_domain()
-    assert team is None and "no dot" in why
-
-
-class _StuckJar(_Jar):
-    """A jar whose deletes silently do nothing."""
-
-    def clear_cookies(self, *, name: Any = None, domain: Any = None, path: Any = None):
-        del name, domain, path
+    assert team is None and "not a subdomain" in why
 
 
 class _BrokenJar(_Jar):
-    def cookies(self) -> list[dict[str, Any]]:
+    def read(self) -> dict[str, Any]:
         raise RuntimeError("Target closed")
 
 
 def test_sweep_that_leaves_a_team_cookie_is_failed(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    sweep = browser._drop_access_team_cookies(_StuckJar([*TEAM_COOKIES]), "login x")
+    jar = _Jar([*TEAM_COOKIES], deletes=False)  # deletes silently do nothing
+    sweep = browser._drop_access_team_cookies(jar, "login x")
     assert sweep.failed and sweep.status == "failed"
     assert f"{TEAM} CF_Session" in sweep.left and "still present" in sweep.error
     assert COOKIE_VALUE not in capsys.readouterr().err + repr(sweep)
+    assert jar.detached == 1
 
 
 def test_sweep_of_an_unreadable_jar_is_failed() -> None:
     sweep = browser._drop_access_team_cookies(_BrokenJar([]), "login x", quiet=True)
     assert sweep.failed and "Target closed" in sweep.error
+
+
+def _exact_jar() -> list[dict[str, Any]]:
+    """Team cookies of every scope next to app cookies that share their
+    names: host-only, ``.domain`` and partitioned (CHIPS)."""
+    part = {"topLevelSite": "https://example.org", "hasCrossSiteAncestor": False}
+    return [
+        _ck(TEAM, "CF_Authorization"),  # host-only
+        _ck(f".{TEAM}", "CF_Session"),  # domain cookie
+        {**_ck(TEAM, "CF_Device"), "secure": True, "partitionKey": part},
+        _ck(APP, "CF_Authorization"),
+        _ck(f".{APP}", "CF_Session"),
+        {**_ck(APP, "CF_Device"), "secure": True, "partitionKey": part},
+    ]
+
+
+#: What `_exact_jar` keeps after a sweep (sorted).
+APP_LEFT = [(f".{APP}", "CF_Session"), (APP, "CF_Authorization"), (APP, "CF_Device")]
+
+
+def test_sweep_deletes_by_exact_identity_and_touches_nothing_else() -> None:
+    """Host-only → ``url`` and no ``domain`` (a ``domain`` would address the
+    ``.domain`` twin and leave the host-only cookie), ``.domain`` → domain,
+    partitionKey passed through; app cookies — even same-named ones — are
+    never deleted and never re-added (no clear-all window)."""
+    jar = _Jar(_exact_jar())
+    sweep = browser._drop_access_team_cookies(jar, "login x")
+    assert sweep.status == "ok" and len(sweep.dropped) == 3, sweep
+    assert sorted((c["domain"], c["name"]) for c in jar.jar) == APP_LEFT
+    by_name = {k["name"]: k for k in jar.sent}
+    assert by_name["CF_Authorization"]["url"] == f"https://{TEAM}/"
+    assert "domain" not in by_name["CF_Authorization"]
+    assert by_name["CF_Session"]["domain"] == f".{TEAM}"
+    assert "url" not in by_name["CF_Session"]
+    assert by_name["CF_Device"]["partitionKey"]["topLevelSite"] == "https://example.org"
+    assert all(k["expires"] == 1 and k["value"] == "" for k in jar.sent)
+    assert jar.added == []  # nothing re-added
+    assert COOKIE_VALUE not in json.dumps(jar.sent)
+
+
+def test_round1_style_delete_would_leave_the_host_only_cookie() -> None:
+    """The fake models Chromium: a ``domain`` on a host-only cookie's kill
+    addresses ``.domain`` — the bug this round fixes — so the exact-identity
+    test above is meaningful."""
+    jar = [_ck(TEAM, "CF_Authorization")]
+    _set_cookies(jar, [{**_ck(TEAM, "CF_Authorization", ""), "expires": 1}])
+    assert [(c["domain"], c["name"]) for c in jar] == [(TEAM, "CF_Authorization")]
 
 
 def test_sweep_attach_failure_is_failed_but_down_is_ok(
@@ -393,6 +533,39 @@ def test_login_exit_after_the_sweep(
         assert rec["code"] == "ok"
 
 
+@pytest.mark.parametrize(
+    ("code", "status", "want"),
+    [(0, "failed", 1), (None, "failed", 1), (0, "ok", 0), (None, "down", 0)],
+)
+def test_login_systemexit_success_keeps_the_sweep_verdict(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    code: int | None,
+    status: str,
+    want: int,
+) -> None:
+    """A flow that leaves through ``SystemExit(0)`` / ``SystemExit()`` still
+    gets the sweep's verdict: a failed sweep exits 1 with
+    access_team_sweep_failed, never 0."""
+    monkeypatch.setattr(
+        browser,
+        "_access_team_sweep",
+        lambda _p, _w: browser.AccessSweep(status, error="jar unreadable"),
+    )
+    monkeypatch.setattr(browser, "_login_deadline", _no_deadline)
+
+    def _exit(_port: int, _site: str) -> int:
+        raise SystemExit(code)
+
+    monkeypatch.setattr(browser, "_cmd_login", _exit)
+    out = tmp_path / "result.json"
+    with pytest.raises(SystemExit) as got:
+        browser.cmd_login(9, "stirling", result_file=str(out))
+    assert (got.value.code or 0) == want
+    rec = json.loads(out.read_text())
+    assert rec["code"] == ("access_team_sweep_failed" if want else "ok")
+
+
 class _Tty:
     def __enter__(self) -> _Tty:
         return self
@@ -440,37 +613,40 @@ def test_import_safari_sweeps_and_fails_on_a_failed_sweep(
     assert seen == ["import-safari somesite"]  # a dry run writes nothing
 
 
-class _CdpJar:
-    """`_cdp_ws_call` on a cookie list: getCookies / setCookies(expired)."""
+class _CdpJar(_Jar):
+    """`_cdp_ws_call` on a `_Jar` (Chromium's identity rules); records the
+    budget of every call and advances a fake clock by `cost` per call."""
 
-    def __init__(self, cookies: list[dict[str, Any]], *, deletes: bool = True) -> None:
-        self.jar = [dict(c) for c in cookies]
-        self.deletes = deletes
-        self.sent: list[dict[str, Any]] = []
+    def __init__(self, cookies: list[dict[str, Any]], **kw: Any) -> None:
+        super().__init__(cookies, **kw)
+        self.budgets: list[float] = []
+        self.clock = 0.0
+        self.cost = 0.0
 
-    def __call__(self, _ws: str, method: str, params: Any = None, _b: float = 0) -> Any:
-        if method == "Storage.getCookies":
-            return _Res([dict(c) for c in self.jar])
-        assert method == "Storage.setCookies"
-        self.sent += params["cookies"]
-        if self.deletes:
-            gone = {(c["domain"], c["name"], c["path"]) for c in params["cookies"]}
-            self.jar = [
-                c for c in self.jar if (c["domain"], c["name"], c["path"]) not in gone
-            ]
-        return _Res([])
+    def __call__(
+        self, _ws: str, method: str, params: Any = None, budget: float = 0
+    ) -> Any:
+        self.budgets.append(budget)
+        self.clock += self.cost
+        res = _Res([])
+        res.result = _Session(self).send(method, params)
+        return res
+
+
+def _patch_cdp(monkeypatch: pytest.MonkeyPatch, fake: _CdpJar) -> None:
+    monkeypatch.setattr(browser, "_is_up", lambda _port: True)
+    monkeypatch.setattr(browser, "_browser_ws_url", lambda _port, **_k: "ws://fake")
+    monkeypatch.setattr(browser, "_cdp_ws_call", fake)
 
 
 def test_cdp_sweep_expires_team_cookies_and_verifies(
     monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    fake = _CdpJar([*TEAM_COOKIES, APP_COOKIE])
-    monkeypatch.setattr(browser, "_is_up", lambda _port: True)
-    monkeypatch.setattr(browser, "_browser_ws_url", lambda _port: "ws://fake")
-    monkeypatch.setattr(browser, "_cdp_ws_call", fake)
+    fake = _CdpJar(_exact_jar())
+    _patch_cdp(monkeypatch, fake)
     sweep = browser._access_team_sweep_cdp(9, "login x (timeout)")
     assert sweep.status == "ok" and len(sweep.dropped) == 3
-    assert [(c["domain"], c["name"]) for c in fake.jar] == [(APP, "CF_Authorization")]
+    assert sorted((c["domain"], c["name"]) for c in fake.jar) == APP_LEFT
     assert all(c["expires"] == 1 and c["value"] == "" for c in fake.sent)
     assert COOKIE_VALUE not in json.dumps(fake.sent) + capsys.readouterr().err
 
@@ -478,11 +654,38 @@ def test_cdp_sweep_expires_team_cookies_and_verifies(
 def test_cdp_sweep_that_cannot_delete_is_failed(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setattr(browser, "_is_up", lambda _port: True)
-    monkeypatch.setattr(browser, "_browser_ws_url", lambda _port: "ws://fake")
-    monkeypatch.setattr(browser, "_cdp_ws_call", _CdpJar(TEAM_COOKIES, deletes=False))
+    _patch_cdp(monkeypatch, _CdpJar(TEAM_COOKIES, deletes=False))
     sweep = browser._access_team_sweep_cdp(9, "login x (timeout)")
     assert sweep.failed and len(sweep.left) == 3
+
+
+def test_cdp_sweep_has_one_total_budget(monkeypatch: pytest.MonkeyPatch) -> None:
+    """4 s for the WHOLE deadline sweep, not per call: each call gets only
+    what is left, and a sweep that runs out fails (never ``ok``)."""
+    real_time = browser.time
+
+    def _run(cost: float) -> tuple[Any, list[float]]:
+        fake = _CdpJar([*TEAM_COOKIES, APP_COOKIE])
+        fake.cost = cost  # every CDP call "takes" `cost` s on the fake clock
+
+        class _Clock:  # only browser.py's clock is fake, not pytest's
+            def __getattr__(self, name: str) -> Any:
+                return getattr(real_time, name)
+
+            def monotonic(self) -> float:
+                return fake.clock
+
+        _patch_cdp(monkeypatch, fake)
+        monkeypatch.setattr(browser, "time", _Clock())
+        sweep = browser._access_team_sweep_cdp(9, "login x (timeout)", budget_s=4.0)
+        return sweep, fake.budgets
+
+    sweep, budgets = _run(1.5)
+    assert budgets == [4.0, 2.5, 1.0]  # get, set, re-read: all inside 4 s
+    assert sweep.status == "ok"
+    sweep, budgets = _run(3.0)
+    assert budgets == [4.0, 1.0]  # the re-read finds the budget spent
+    assert sweep.failed and "budget" in sweep.error
 
 
 def test_deadline_hard_exit_sweeps_over_cdp(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -513,10 +716,13 @@ def _free_port() -> int:
     reason="opt-in: set CLAUDE_BROWSER_TEST_CDP=1 (launches a throwaway Chromium)",
 )
 def test_real_chromium_keeps_only_the_app_cookie(tmp_path: Path) -> None:
-    """Real cookie semantics: a ``.team…`` domain cookie and a host-only team
-    cookie go, the app cookie stays — through Playwright (`_drop_access_team_
-    cookies`) and through raw CDP (`_access_team_sweep_cdp`, the deadline
-    path). `$CLAUDE_BROWSER_TEST_CHROMIUM` may name the executable."""
+    """Real cookie semantics: a host-only team cookie, a ``.team…`` domain
+    cookie and a partitioned (CHIPS) team cookie go; the app cookies — a
+    same-named host-only one, a ``.app`` one and a partitioned one — stay,
+    untouched — through the Playwright attach (`_drop_access_team_cookies`,
+    as `_access_team_sweep` uses it) and through raw CDP
+    (`_access_team_sweep_cdp`, the deadline path).
+    `$CLAUDE_BROWSER_TEST_CHROMIUM` may name the executable."""
     import os  # pylint: disable=import-outside-toplevel
 
     from playwright.sync_api import (  # pylint: disable=import-outside-toplevel
@@ -525,32 +731,49 @@ def test_real_chromium_keeps_only_the_app_cookie(tmp_path: Path) -> None:
 
     port = _free_port()
     assert port != 9222
-    # Any: Playwright's SetCookieParam TypedDict (the dicts match it).
-    team_cookies: list[Any] = [
+    part = {"topLevelSite": "https://example.org", "hasCrossSiteAncestor": False}
+    chips = {"secure": True, "sameSite": "None", "partitionKey": part}
+    team_cookies = [
+        {"name": "CF_Authorization", "value": "v", "url": f"https://{TEAM}/"},
         {"name": "CF_Session", "value": "v", "domain": f".{TEAM}", "path": "/"},
-        {"name": "CF_Device", "value": "v", "url": f"https://{TEAM}/"},
+        {"name": "CF_Device", "value": "v", "url": f"https://{TEAM}/", **chips},
     ]
-    app: Any = {"name": "CF_Authorization", "value": "v", "url": f"https://{APP}/"}
+    app_cookies = [
+        {"name": "CF_Authorization", "value": "a1", "url": f"https://{APP}/"},
+        {"name": "CF_Session", "value": "a2", "domain": f".{APP}", "path": "/"},
+        {"name": "CF_Device", "value": "a3", "url": f"https://{APP}/", **chips},
+    ]
+
+    def _app_jar(cdp: Any) -> list[tuple[str, str, bool]]:
+        """The jar by identity only (domain, name, partitioned) — no value."""
+        got = cdp.send("Storage.getCookies", {})["cookies"]
+        return sorted(
+            (c["domain"], c["name"], bool(c.get("partitionKey"))) for c in got
+        )
+
+    want = [(d, n, n == "CF_Device") for d, n in APP_LEFT]
     exe = os.environ.get("CLAUDE_BROWSER_TEST_CHROMIUM") or None
     with sync_playwright() as pw:
-        ctx = pw.chromium.launch_persistent_context(
+        owner = pw.chromium.launch_persistent_context(
             str(tmp_path / "profile"),
             headless=True,
             executable_path=exe,
             args=[f"--remote-debugging-port={port}"],
         )
+        attached = pw.chromium.connect_over_cdp(f"http://127.0.0.1:{port}")
         try:
-            ctx.add_cookies([*team_cookies, app])
+            cdp = attached.new_browser_cdp_session()
+            cdp.send("Storage.setCookies", {"cookies": [*team_cookies, *app_cookies]})
+            assert len(cdp.send("Storage.getCookies", {})["cookies"]) == 6
+            ctx = attached.contexts[0]  # the shared jar, as `_access_team_sweep`
             sweep = browser._drop_access_team_cookies(ctx, "integration")
-            assert sweep.status == "ok" and len(sweep.dropped) == 2
-            assert [(c["domain"], c["name"]) for c in ctx.cookies()] == [
-                (APP, "CF_Authorization")
-            ]
-            ctx.add_cookies(team_cookies)  # again, for the raw-CDP path
+            assert sweep.status == "ok" and len(sweep.dropped) == 3, sweep
+            assert _app_jar(cdp) == want
+            cdp.send("Storage.setCookies", {"cookies": team_cookies})  # again
             sweep = browser._access_team_sweep_cdp(port, "integration (cdp)")
-            assert sweep.status == "ok" and len(sweep.dropped) == 2
-            assert [(c["domain"], c["name"]) for c in ctx.cookies()] == [
-                (APP, "CF_Authorization")
-            ]
+            assert sweep.status == "ok" and len(sweep.dropped) == 3, sweep
+            assert _app_jar(cdp) == want
         finally:
-            ctx.close()
+            with contextlib.suppress(Exception):
+                attached.close()
+            owner.close()

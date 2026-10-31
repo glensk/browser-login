@@ -12969,31 +12969,123 @@ def _access_sweep_report(
     return AccessSweep("failed", tuple(dropped), tuple(left), error)
 
 
+#: The cookie fields copied into the expiring ``Storage.setCookies`` entry so
+#: it names exactly the stored cookie (scope, partition, scheme binding).
+_TEAM_KILL_FIELDS = (
+    "secure",
+    "httpOnly",
+    "sameSite",
+    "partitionKey",
+    "sourceScheme",
+    "sourcePort",
+)
+
+
+def _team_cookie_kill(ck: dict) -> dict:
+    """The ``Storage.setCookies`` entry that deletes exactly `ck` (tp#1466).
+
+    The browser-level CDP target has no ``Network.deleteCookies``; setting
+    the same cookie with a past ``expires`` deletes it — but only when the
+    identity matches: a host-only cookie (stored domain without a leading
+    dot) is named by ``url=https://<domain><path>`` and NO ``domain`` (a
+    ``domain`` would address the ``.domain`` cookie and leave it), a domain
+    cookie by its ``.domain``; ``partitionKey`` (CHIPS) and the scheme
+    binding go through unchanged. Never a value."""
+    domain = str(ck.get("domain") or "")
+    path = str(ck.get("path") or "/")
+    kill: dict[str, Any] = {
+        "name": ck.get("name"),
+        "value": "",
+        "path": path,
+        "expires": 1,
+    }
+    if domain.startswith("."):
+        kill["domain"] = domain
+    else:
+        kill["url"] = f"https://{domain}{path}"
+    for key in _TEAM_KILL_FIELDS:
+        if ck.get(key) is not None:
+            kill[key] = ck[key]
+    return kill
+
+
+class _CdpSendError(RuntimeError):
+    """A CDP command of the team-cookie sweep got no usable reply."""
+
+
+def _sweep_team_cookies(
+    send: Callable[[str, dict], dict], why: str, *, quiet: bool = False
+) -> AccessSweep:
+    """THE team-cookie sweep (tp#1466) on any browser-level CDP transport
+    `send(method, params) -> result` (raises on failure): read the jar
+    (``Storage.getCookies``), delete each team cookie by its exact identity
+    (`_team_cookie_kill`; nothing else in the jar is touched — no
+    clear-all-and-re-add window), READ AGAIN. ``ok`` only when no team
+    cookie is left; an unreadable jar, a failed delete or a survivor is
+    ``failed``. Journaled; never a value. Never raises."""
+    team, _src = _access_team.configured_team_domain()
+
+    def _team_cookies() -> list[dict]:
+        res = send("Storage.getCookies", {})
+        raw = res.get("cookies") if isinstance(res, dict) else None
+        if not isinstance(raw, list):
+            raise _CdpSendError("no cookie list")
+        return [
+            c
+            for c in raw
+            if isinstance(c, dict)
+            and _access_team.is_team_host(str(c.get("domain") or ""), team)
+        ]
+
+    try:
+        found = _team_cookies()
+    except Exception as exc:  # pylint: disable=broad-exception-caught
+        return _access_sweep_report(
+            why, [], [], f"jar unreadable ({_exc_line(exc)})", quiet=quiet
+        )
+    error = ""
+    if found:
+        kills = [_team_cookie_kill(c) for c in found]
+        try:
+            send("Storage.setCookies", {"cookies": kills})
+        except Exception as exc:  # pylint: disable=broad-exception-caught
+            error = f"delete failed ({_exc_line(exc)})"
+    try:
+        after: list[dict] | None = _team_cookies()
+    except Exception as exc:  # pylint: disable=broad-exception-caught
+        after = None
+        error = error or f"jar unreadable after the delete ({_exc_line(exc)})"
+    left = _access_team.team_cookie_labels(after or [], team)
+    dropped = (
+        [lb for lb in _access_team.team_cookie_labels(found, team) if lb not in left]
+        if after is not None
+        else []
+    )
+    return _access_sweep_report(why, dropped, left, error, quiet=quiet)
+
+
 def _drop_access_team_cookies(
     ctx: Any, why: str, *, quiet: bool = False
 ) -> AccessSweep:
-    """Delete every Cloudflare Access TEAM-domain cookie from `ctx`'s jar
-    (tp#1466, `broker.access_team`): the team session would let Access open
-    every app of the team — decide too — while the per-app cookies the home
-    services need stay. Then the jar is READ AGAIN: ``ok`` only when no team
-    cookie is left; an unreadable jar, a failed delete or a survivor is
-    ``failed``. Journaled; never a value. Never raises; `quiet`: a failure
-    is only journaled (the per-tab sweep of every background page), not
-    printed."""
-    gone: list[str] = []
-    left: list[str] = []
-    error = ""
+    """Delete every Cloudflare Access TEAM-domain cookie from the shared
+    browser `ctx` belongs to (tp#1466, `broker.access_team`): the team
+    session would let Access open every app of the team — decide too — while
+    the per-app cookies the home services need stay. `_sweep_team_cookies`
+    over a browser-level CDP session of `ctx`'s Playwright browser (the
+    default context, which is the shared jar). Never raises; `quiet`: a
+    failure is only journaled (the per-tab sweep of every background page),
+    not printed."""
     try:
-        team, _src = _access_team.configured_team_domain()
-        for ck in ctx.cookies():
-            domain = str(ck.get("domain") or "")
-            if _access_team.is_team_host(domain, team):
-                ctx.clear_cookies(name=ck["name"], domain=ck["domain"], path=ck["path"])
-                gone.append(f"{domain} {ck.get('name')}")
-        left = _access_team.team_cookie_labels(list(ctx.cookies()), team)
+        session = ctx.browser.new_browser_cdp_session()
     except Exception as exc:  # pylint: disable=broad-exception-caught
-        error = _exc_line(exc)
-    return _access_sweep_report(why, gone, left, error, quiet=quiet)
+        return _access_sweep_report(
+            why, [], [], f"no CDP session ({_exc_line(exc)})", quiet=quiet
+        )
+    try:
+        return _sweep_team_cookies(session.send, why, quiet=quiet)
+    finally:
+        with contextlib.suppress(Exception):
+            session.detach()
 
 
 def _access_team_sweep(port: int, why: str) -> AccessSweep:
@@ -13031,54 +13123,32 @@ ACCESS_SWEEP_CDP_BUDGET_S = 4.0
 def _access_team_sweep_cdp(
     port: int, why: str, budget_s: float = ACCESS_SWEEP_CDP_BUDGET_S
 ) -> AccessSweep:
-    """The team-cookie sweep over raw CDP, registration-free and bounded by
-    `budget_s` per call — for the deadline watcher, which hard-exits (no
-    ``finally`` of the command runs) while Playwright hangs. Reads the jar
-    (``Storage.getCookies``), expires each team cookie (``Storage.setCookies``
-    with a past ``expires`` deletes it) and reads again. Never raises."""
+    """`_sweep_team_cookies` over raw CDP websockets — for the deadline
+    watcher, which hard-exits (no ``finally`` of the command runs) while
+    Playwright hangs. ONE monotonic deadline of `budget_s` covers the whole
+    sweep (the endpoint lookup and every call); a call that finds it spent
+    fails, and so does the sweep. Never raises."""
+    deadline = time.monotonic() + budget_s
+
+    def _left() -> float:
+        return deadline - time.monotonic()
+
     if not _is_up(port):
         return AccessSweep("down")
-    ws_url = _browser_ws_url(port)
+    ws_url = _browser_ws_url(port, timeout=max(0.01, min(2.0, _left())))
     if not ws_url:
         return _access_sweep_report(why, [], [], "no browser websocket", quiet=False)
-    team, _src = _access_team.configured_team_domain()
 
-    def _team_cookies() -> list[dict] | None:
-        res = _cdp_ws_call(ws_url, "Storage.getCookies", {}, budget_s)
+    def _send(method: str, params: dict) -> dict:
+        remaining = _left()
+        if remaining <= 0:
+            raise _CdpSendError(f"sweep budget of {budget_s:g}s spent before {method}")
+        res = _cdp_ws_call(ws_url, method, params, remaining)
         if res.status != "ok" or res.error or not isinstance(res.result, dict):
-            return None
-        raw = res.result.get("cookies") or []
-        return [
-            c
-            for c in raw
-            if isinstance(c, dict)
-            and _access_team.is_team_host(str(c.get("domain") or ""), team)
-        ]
+            raise _CdpSendError(res.error or res.status)
+        return res.result
 
-    found = _team_cookies()
-    if found is None:
-        return _access_sweep_report(why, [], [], "jar unreadable", quiet=False)
-    error = ""
-    if found:
-        keep = ("name", "domain", "path", "secure", "httpOnly", "sameSite")
-        kill = [
-            {
-                **{k: c[k] for k in keep if c.get(k) is not None},
-                "value": "",
-                "expires": 1,
-            }
-            for c in found
-        ]
-        res = _cdp_ws_call(ws_url, "Storage.setCookies", {"cookies": kill}, budget_s)
-        if res.status != "ok" or res.error:
-            error = f"delete failed ({res.error or res.status})"
-    after = _team_cookies()
-    if after is None and not error:
-        error = "jar unreadable after the delete"
-    labels = _access_team.team_cookie_labels(found, team)
-    left = _access_team.team_cookie_labels(after or [], team)
-    dropped = [lb for lb in labels if lb not in left] if after is not None else []
-    return _access_sweep_report(why, dropped, left, error, quiet=False)
+    return _sweep_team_cookies(_send, why)
 
 
 def _access_team_verdict(rc: int, sweep: AccessSweep) -> int:
@@ -16806,6 +16876,7 @@ def cmd_login(  # pylint: disable=too-many-arguments
         scheduled=scheduled, candidate=candidate, refresh_only=refresh_only, diag=diag
     )
     rc = 1
+    sweep: AccessSweep | None = None
     try:
         with _login_deadline(port, "login", key, LOGIN_TIMEOUT_S, end_event="login"):
             try:
@@ -16828,6 +16899,13 @@ def cmd_login(  # pylint: disable=too-many-arguments
             rc = _access_team_verdict(rc, sweep)
         return rc
     except SystemExit as exc:
+        if exc.code in (0, None):
+            # A flow that exits "success" still owes the sweep's verdict: a
+            # failed sweep must not leave as exit 0 (tp#1466).
+            rc = _access_team_verdict(0, sweep) if sweep is not None else 0
+            if rc != 0:
+                raise SystemExit(rc) from exc
+            raise
         rc = exc.code if isinstance(exc.code, int) else 1
         raise
     finally:
