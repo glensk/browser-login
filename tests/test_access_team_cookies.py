@@ -1222,7 +1222,27 @@ NOW = 1_800_000_000.0
     [
         (None, ["warn"], "no pass recorded"),
         ({"ts": NOW - 30, "status": "ok"}, ["ok"], "ok"),
-        ({"ts": NOW - 30, "status": "busy"}, ["ok"], "busy"),
+        (
+            {
+                "ts": NOW - 30,
+                "status": "busy",
+                "last_real": {"ts": NOW - 90, "status": "ok"},
+            },
+            ["ok"],
+            "busy",
+        ),
+        # B3 extra: fresh busy passes hide no stale real sweep
+        (
+            {
+                "ts": NOW - 30,
+                "status": "busy",
+                "error": "a guided login owns the browser",
+                "last_real": {"ts": NOW - 4000, "status": "ok"},
+            },
+            ["warn"],
+            "stuck maintenance record",
+        ),
+        ({"ts": NOW - 30, "status": "busy"}, ["warn"], "no real sweep is recorded"),
         ({"ts": NOW - 30, "status": "down"}, ["ok"], "down"),
         ({"ts": NOW - 30, "status": "failed", "error": "jar"}, ["fail"], "FAILED"),
         ({"ts": NOW - 900, "status": "ok"}, ["warn"], "older than 300 s"),
@@ -1260,6 +1280,107 @@ def test_doctor_last_pass_line(
     assert log == levels and words in out
     if levels[0] != "ok":
         assert "browser.py sweep-access" in out
+
+
+# --- tp#1468 B3 extras: busy passes keep the last real sweep; journal throttle ---
+
+
+def test_busy_passes_carry_the_last_real_sweep_to_doctor(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    _patch_cdp(monkeypatch, _CdpJar([APP_COOKIE]))
+    assert _sweep(quiet=True) == 0
+    first = _state()
+    assert first is not None and first["last_real"]["status"] == "ok"
+    real_ts = first["last_real"]["ts"]
+    monkeypatch.setattr(browser, "_maint_live", lambda: {"site": "x"})
+    assert _sweep(quiet=True, scheduled=True) == 0
+    assert _sweep(quiet=True, scheduled=True) == 0
+    state = _state()
+    assert state is not None and state["status"] == "busy"
+    assert state["last_real"]["ts"] == real_ts  # busy passes are no sweep
+    capsys.readouterr()
+    log: list[str] = []
+    browser._doctor_access_sweep(log, now=state["ts"] + 10)
+    assert log == ["ok"]
+    # the busy record stays fresh, the real sweep goes stale
+    _write_state(**{**state, "ts": real_ts + 3600})
+    log = []
+    browser._doctor_access_sweep(log, now=real_ts + 3610)
+    out = capsys.readouterr().out
+    assert log == ["warn"] and "last real sweep ran" in out
+
+
+def _access_events(tmp_path: Path) -> list[dict[str, Any]]:
+    return [e for e in _journal_events(tmp_path) if e["event"] == "access_sweep"]
+
+
+def test_a_repeating_failure_journals_once_an_hour(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    class _Broken(_CdpJar):
+        def read(self) -> dict[str, Any]:
+            raise RuntimeError("Target closed")
+
+    _patch_cdp(monkeypatch, _Broken([APP_COOKIE]))
+    assert _sweep(quiet=True) == 1
+    assert _sweep(quiet=True) == 1  # same status, journaled < 1 h ago: quiet
+    assert len(_access_events(tmp_path)) == 1
+    # a busy pass between two failures does not count as a status change
+    monkeypatch.setattr(browser, "_maint_live", lambda: {"site": "x"})
+    assert _sweep(quiet=True, scheduled=True) == 0
+    monkeypatch.setattr(browser, "_maint_live", lambda: None)
+    assert _sweep(quiet=True) == 1
+    assert len(_access_events(tmp_path)) == 1
+    # the last journaled failure is an hour old: journal again
+    state = _state()
+    assert state is not None
+    _write_state(**{**state, "failure_journal_ts": state["ts"] - 3601})
+    assert _sweep(quiet=True) == 1
+    assert len(_access_events(tmp_path)) == 2
+    # a clean pass in between: the next failure is a status change
+    _patch_cdp(monkeypatch, _CdpJar([APP_COOKIE]))
+    assert _sweep(quiet=True) == 0
+    _patch_cdp(monkeypatch, _Broken([APP_COOKIE]))
+    assert _sweep(quiet=True) == 1
+    assert [e["status"] for e in _access_events(tmp_path)] == ["failed"] * 3
+
+
+def test_every_drop_journals(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    for _ in range(2):
+        _patch_cdp(monkeypatch, _CdpJar(_exact_jar()))
+        assert _sweep(quiet=True) == 0
+    assert [e["status"] for e in _access_events(tmp_path)] == ["dropped"] * 2
+
+
+def test_a_repeating_child_timeout_journals_once_an_hour(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    ports = browser.INSTANCE_PORTS
+    _fanout_env(monkeypatch, down={ports["admin"], ports["alt"]})
+    stalled = {"private"}
+
+    def _child(inst: str, _argv: Any, _t: float) -> Any:
+        if inst in stalled:
+            return browser._SweepChild(1, "", "❌ sweep-access timed out\n", True)
+        return browser._SweepChild(0, "", "")
+
+    monkeypatch.setattr(browser, "_sweep_access_child", _child)
+    for _ in range(3):
+        assert browser._sweep_access_fanout(["sweep-access", "-q"]) == 1
+    assert [e["sweep_instance"] for e in _access_events(tmp_path)] == ["private"]
+    # an hour later it journals again
+    doc = json.loads(browser.ACCESS_SWEEP_TIMEOUTS_FILE.read_text())
+    doc["private"]["journal_ts"] -= 3601
+    browser._json_write_atomic(browser.ACCESS_SWEEP_TIMEOUTS_FILE, doc)
+    assert browser._sweep_access_fanout(["sweep-access", "-q"]) == 1
+    assert len(_access_events(tmp_path)) == 2
+    # one pass without a timeout, then a timeout again: a status change
+    stalled.clear()
+    assert browser._sweep_access_fanout(["sweep-access", "-q"]) == 0
+    stalled.add("private")
+    assert browser._sweep_access_fanout(["sweep-access", "-q"]) == 1
+    assert len(_access_events(tmp_path)) == 3
 
 
 # --- tp#1468 B2 review extras: no isolated-context fallback, no silent skip ---

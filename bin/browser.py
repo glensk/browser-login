@@ -13323,6 +13323,12 @@ ACCESS_SWEEP_FANOUT_DEADLINE_S = 30.0
 #: LaunchAgent is not running; a drop younger than the window is shown.
 ACCESS_SWEEP_STALE_S = 300.0
 ACCESS_SWEEP_DROP_WINDOW_S = 86400.0
+#: A failure that repeats (same status as the last non-busy pass) is
+#: journaled again only after this long; a drop always journals.
+ACCESS_SWEEP_REJOURNAL_S = 3600.0
+#: `-A`: per instance, whether its last child timed out and when that was
+#: last journaled (the throttle of a repeating timeout).
+ACCESS_SWEEP_TIMEOUTS_FILE = CACHE_DIR / "access-sweep-timeouts.json"
 ACCESS_SWEEP_REMEDY = (
     "run `browser.py sweep-access` (the LaunchAgent "
     "com.albert.browser-access-sweep runs it every 60 s)"
@@ -13333,18 +13339,67 @@ def _sweep_access_name() -> str:
     return INSTANCE or "default"
 
 
-def _sweep_access_write(port: int, status: str, sweep: AccessSweep, why: str) -> bool:
+def _is_ts(value: object) -> bool:
+    """A usable epoch timestamp from a state file (a number, not a bool)."""
+    return isinstance(value, (int, float)) and not isinstance(value, bool)
+
+
+def _sweep_last_real(state: dict) -> dict | None:
+    """The last NON-busy pass of a state record (``{"ts", "at", "status"}``):
+    its ``last_real``, else (a record written before it existed) the record
+    itself when it is not busy; None when unknown."""
+    real = state.get("last_real")
+    if isinstance(real, dict) and _is_ts(real.get("ts")):
+        return real
+    if state.get("status") not in (None, "busy") and _is_ts(state.get("ts")):
+        return {"ts": state["ts"], "at": state.get("at"), "status": state["status"]}
+    return None
+
+
+def _sweep_failure_due(prev_failed: bool, last_journal_ts: object, now: float) -> bool:
+    """Journal this failure? Yes when the previous (non-busy) pass did not
+    fail, or the last journaled failure is older than ACCESS_SWEEP_REJOURNAL_S
+    (or unknown): a repeating failure journals once an hour, not every pass."""
+    if (
+        not prev_failed
+        or not isinstance(last_journal_ts, (int, float))
+        or isinstance(last_journal_ts, bool)
+    ):
+        return True
+    return now - float(last_journal_ts) >= ACCESS_SWEEP_REJOURNAL_S
+
+
+def _sweep_access_write(
+    port: int,
+    status: str,
+    sweep: AccessSweep,
+    why: str,
+    *,
+    now: float | None = None,
+    prev: dict | None = None,
+    failure_journaled: bool = False,
+) -> bool:
     """Write this instance's `ACCESS_SWEEP_STATE_FILE` atomically (labels
-    only); the last drop of an earlier pass is carried over for `doctor`'s
-    24 h line. False (and a ❌ line) when it cannot be written."""
-    now = time.time()
+    only). Carried over from the earlier record: the last drop (`doctor`'s
+    24 h line), the last non-busy pass (``last_real``: a run of busy passes
+    is no sweep) and when a failure was last journaled (``failure_journal_ts``,
+    set to `now` when `failure_journaled`). False (and a ❌ line) when it
+    cannot be written."""
+    now = time.time() if now is None else now
     at = time.strftime("%Y-%m-%dT%H:%M:%S%z", time.localtime(now))
-    prev = _read_json_dict(ACCESS_SWEEP_STATE_FILE) or {}
+    if prev is None:
+        prev = _read_json_dict(ACCESS_SWEEP_STATE_FILE) or {}
     last_drop = (
         prev.get("last_drop") if isinstance(prev.get("last_drop"), dict) else None
     )
     if sweep.dropped:
         last_drop = {"ts": now, "at": at, "labels": sorted(sweep.dropped)}
+    last_real = (
+        _sweep_last_real(prev)
+        if status == "busy"
+        else {"ts": now, "at": at, "status": status}
+    )
+    journal_ts = now if failure_journaled else prev.get("failure_journal_ts")
     state: dict[str, object] = {
         "at": at,
         "ts": now,
@@ -13358,6 +13413,10 @@ def _sweep_access_write(port: int, status: str, sweep: AccessSweep, why: str) ->
     }
     if last_drop is not None:
         state["last_drop"] = last_drop
+    if last_real is not None:
+        state["last_real"] = last_real
+    if _is_ts(journal_ts):
+        state["failure_journal_ts"] = journal_ts
     try:
         _json_write_atomic(ACCESS_SWEEP_STATE_FILE, state)
     except OSError as exc:
@@ -13373,13 +13432,31 @@ def _sweep_access_write(port: int, status: str, sweep: AccessSweep, why: str) ->
 def _sweep_access_record(
     port: int, sweep: AccessSweep, *, quiet: bool, why: str = "sweep-access"
 ) -> int:
-    """Record one pass: the state file, a journal event ONLY for a drop or a
-    failure (a clean pass writes none), one line. 1 on a failed sweep or an
-    unwritable state file, else 0."""
+    """Record one pass: the state file, a journal event ONLY for a drop
+    (always) or a failure (when the last non-busy pass did not fail, or the
+    last journaled failure is an hour old: `_sweep_failure_due`; a clean pass
+    writes none), one line. 1 on a failed sweep or an unwritable state file,
+    else 0."""
     name = _sweep_access_name()
     status = "dropped" if sweep.status == "ok" and sweep.dropped else sweep.status
-    written = _sweep_access_write(port, status, sweep, why)
-    if status in ("dropped", "failed"):
+    now = time.time()
+    prev = _read_json_dict(ACCESS_SWEEP_STATE_FILE) or {}
+    prev_real = _sweep_last_real(prev)
+    journal_failure = status == "failed" and _sweep_failure_due(
+        prev_real is not None and prev_real.get("status") == "failed",
+        prev.get("failure_journal_ts"),
+        now,
+    )
+    written = _sweep_access_write(
+        port,
+        status,
+        sweep,
+        why,
+        now=now,
+        prev=prev,
+        failure_journaled=journal_failure,
+    )
+    if status == "dropped" or journal_failure:
         _journal(
             "access_sweep",
             by=why,
@@ -13569,6 +13646,9 @@ def _sweep_access_fanout(
     for t in threads:
         t.join(max(0.0, end - time.monotonic()))
     codes: list[int] = []
+    dry_run = "-n" in argv  # a dry run journals and records nothing
+    now = time.time()
+    timeouts = {} if dry_run else _read_json_dict(ACCESS_SWEEP_TIMEOUTS_FILE) or {}
     for inst in INSTANCE_PORTS:
         name = inst or "default"
         tag = f"[{name}] "
@@ -13585,15 +13665,32 @@ def _sweep_access_fanout(
             print(tag + line)
         for line in res.stderr.splitlines():
             print(tag + line, file=sys.stderr)
-        if res.timed_out and "-n" not in argv:  # a dry run journals nothing
-            _journal(
-                "access_sweep",
-                by="sweep-access -A",
-                sweep_instance=name,
-                status="failed",
-                error=res.stderr.strip()[:200],
-            )
+        if not dry_run:
+            seen = timeouts.get(name)
+            prev: dict = seen if isinstance(seen, dict) else {}
+            entry = {"timed_out": res.timed_out, "journal_ts": prev.get("journal_ts")}
+            if res.timed_out and _sweep_failure_due(
+                bool(prev.get("timed_out")), prev.get("journal_ts"), now
+            ):
+                _journal(
+                    "access_sweep",
+                    by="sweep-access -A",
+                    sweep_instance=name,
+                    status="failed",
+                    error=res.stderr.strip()[:200],
+                )
+                entry["journal_ts"] = now
+            timeouts[name] = entry
         codes.append(res.rc)
+    if not dry_run:
+        try:
+            _json_write_atomic(ACCESS_SWEEP_TIMEOUTS_FILE, timeouts)
+        except OSError as exc:
+            print(
+                f"❌ sweep-access: {ACCESS_SWEEP_TIMEOUTS_FILE} not written: "
+                f"{_exc_line(exc)}",
+                file=sys.stderr,
+            )
     return _worst_rc(codes)
 
 
@@ -13625,21 +13722,29 @@ def _doctor_access_sweep(log: list[str], now: float | None = None) -> None:
     """Doctor's last-pass line of `sweep-access` (tp#1468; doctor runs only
     while the browser is up): ❌ the last pass failed; ⚠ no pass recorded or
     the last one older than ACCESS_SWEEP_STALE_S (the LaunchAgent is not
-    running); ⚠ a drop in the last 24 h (labels and time); else ✅."""
+    running); ⚠ only busy passes for longer than that (a stuck maintenance
+    record or switch: no real sweep ran); ⚠ a drop in the last 24 h (labels
+    and time); else ✅."""
     now = time.time() if now is None else now
     check = "access sweep"
     state = _read_json_dict(ACCESS_SWEEP_STATE_FILE)
+
+    def _fresh(value: object) -> bool:
+        return (
+            isinstance(value, (int, float))
+            and not isinstance(value, bool)
+            and now - float(value) <= ACCESS_SWEEP_STALE_S
+        )
+
     if state is None:
         _doctor_add(log, "warn", check, f"no pass recorded yet — {ACCESS_SWEEP_REMEDY}")
     else:
         ts = state.get("ts")
         when = _sweep_when(ts, now)
         status = str(state.get("status") or "?")
-        fresh = (
-            isinstance(ts, (int, float))
-            and not isinstance(ts, bool)
-            and now - float(ts) <= ACCESS_SWEEP_STALE_S
-        )
+        fresh = _fresh(ts)
+        real = _sweep_last_real(state)
+        real_ts = real.get("ts") if real is not None else None
         if status == "failed":
             _doctor_add(
                 log,
@@ -13656,6 +13761,21 @@ def _doctor_access_sweep(log: list[str], now: float | None = None) -> None:
                 f"last pass {when} ({status}) is older than "
                 f"{ACCESS_SWEEP_STALE_S:.0f} s while the browser is up — is the "
                 f"LaunchAgent running? {ACCESS_SWEEP_REMEDY}",
+            )
+        elif not _fresh(real_ts):
+            last = (
+                f"the last real sweep ran {_sweep_when(real_ts, now)}"
+                if real is not None
+                else "no real sweep is recorded"
+            )
+            _doctor_add(
+                log,
+                "warn",
+                check,
+                f"last pass {when} was busy ({state.get('error') or '?'}) and "
+                f"{last} — older than {ACCESS_SWEEP_STALE_S:.0f} s: a stuck "
+                "maintenance record or switch keeps every pass busy "
+                f"(`browser.py status`); {ACCESS_SWEEP_REMEDY}",
             )
         else:
             _doctor_add(log, "ok", check, f"last pass {when}: {status}")

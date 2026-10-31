@@ -531,7 +531,14 @@ browser.py reap-idle -A -n          # what the reaper would close (dry run)
   `browser.py reap-idle -A -q` every 15 min over every running instance (it
   never starts one); log `~/Library/Logs/com.albert.browser-tab-reaper.log`
   (quiet: only closes and failures). It is one of `agent-login.py`'s
-  LaunchAgents (`agent_login_jobs.agent_plists()`).
+  LaunchAgents (`agent_login_jobs.agent_plists()`). Its sibling
+  `com.albert.browser-access-sweep` runs `browser.py sweep-access -A -q -S`
+  every 60 s (not at load) at background priority (`ProcessType Background`,
+  `LowPriorityIO`): it drops any Cloudflare Access team cookie from every
+  running instance (Security, tp#1468); log
+  `~/Library/Logs/com.albert.browser-access-sweep.log` (quiet: only drops and
+  failures). All six jobs (`agent-login.py -P` prints them) are installed as
+  one transaction by `agent-login.py -I` and removed by `-U`.
 - **Agents that need a tab for long** (a dashboard they come back to) pin it:
   `open -N -k URL`, `keep <id>` or `keep -o <origin>`. A closed tab costs only
   a reload — the session lives in the profile's cookies.
@@ -1456,12 +1463,16 @@ the `himalaya` helpers. The CDP endpoint is always `http://127.0.0.1:<port>` (ne
   a guided login owns the browser — that login sweeps at its own end, and
   its watchdog sweeps in recovery before resuming clients. Each pass writes
   `<cache>/access-sweep.json` (status ok/dropped/failed/busy/down, host +
-  name labels, never a value); only drops and failures are journaled
-  (`access_sweep`). `browser.py sweep-access -n` lists the team cookies
+  name labels, never a value, and the last non-busy pass); every drop is
+  journaled (`access_sweep`), a failure only when the previous non-busy pass
+  did not fail or the last journaled failure is an hour old (likewise a
+  repeating `-A` child timeout, `<cache>/access-sweep-timeouts.json`), a
+  clean pass never. `browser.py sweep-access -n` lists the team cookies
   without deleting anything. `browser.py doctor` prints an
   `access team cookies` line (❌ with host + name when one is present, never a
   value) and an `access sweep` line (❌ last pass failed, ⚠ no pass in 5 min,
-  ⚠ a drop in the last 24 h). The configured team domain comes from
+  ⚠ only busy passes and no real sweep in 5 min — a stuck maintenance record
+  or switch, ⚠ a drop in the last 24 h). The configured team domain comes from
   `$CLAUDE_BROWSER_ACCESS_TEAM_DOMAIN`, else `team_domain` in decide's
   `config/edge.json` (`$CLAUDE_BROWSER_ACCESS_EDGE_FILE` overrides the path);
   a value that is not a subdomain of `cloudflareaccess.com` (`com`,
@@ -1591,9 +1602,9 @@ Fill-only items (`agent_fill_only = true`, tp#1082): the broker never logs in wi
 | `-S`, `--snapshot` | recover a stale guided login whose watchdog died (one line), refresh the site-list and secret-run snapshots and the agents file (which also lists the secrets agents can inject), print nothing else (LaunchAgent, every 10 min) |
 | `-K`, `--keychain` | rescan the login keychain (~15 s) and list every item (names only) with whether agents can read it |
 | `-A`, `--agents` | print the summary agent sessions get at start (the agents file) |
-| `-I`, `--install-daily` | install + load the LaunchAgents com.albert.agent-login-check (`-c` daily 09:15), com.albert.agent-login-snapshot (`-S` every 10 min) and com.albert.agent-login-refresh (`-R` every 6 h) as one transaction (any failure restores the previous set) |
-| `-U`, `--uninstall-daily` | unload + remove all three LaunchAgents |
-| `-P`, `--print-plist` | print the three LaunchAgent plists (writes nothing) |
+| `-I`, `--install-daily` | install + load the LaunchAgents com.albert.agent-login-check (`-c` daily 09:15), com.albert.agent-login-snapshot (`-S` every 10 min), com.albert.agent-login-refresh (`-R` every 6 h), com.albert.browser-tab-reaper (`browser.py reap-idle` every 15 min), com.albert.console-balance (`console-balance.py` every 60 min) and com.albert.browser-access-sweep (`browser.py sweep-access` every 60 s) as one transaction (any failure restores the previous set) |
+| `-U`, `--uninstall-daily` | unload + remove all 6 LaunchAgents of -I |
+| `-P`, `--print-plist` | print all 6 LaunchAgent plists of -I (writes nothing) |
 | `-j`, `--json` | print the overview (with -x: the matrix) as JSON |
 | `-x`, `--matrix` | the acceptance matrix: one row per login (consumer, privilege, sentinel, scope, attempt group, refresh, stage, limit, last phase) |
 | `-p`, `--promote` `SITE` | the ONE promotion transaction (pending -> usable for scheduled logins): a fresh listing, the onboarding review, then a fresh strict ok of this configuration on record, or ONE budgeted `browser.py login` (no retry); audited |

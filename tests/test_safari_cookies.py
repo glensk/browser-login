@@ -536,7 +536,8 @@ def test_check_all_broker_down_fails(monkeypatch) -> None:
 
 
 def test_plist() -> None:
-    plist = al.launchagent_plist()
+    jobs = sys.modules["agent_login_jobs"]  # loaded by agent-login.py
+    plist = jobs.launchagent_plist()
     assert "<string>com.albert.agent-login-check</string>" in plist
     assert "<key>Hour</key>\n        <integer>9</integer>" in plist
     assert "<key>Minute</key>\n        <integer>15</integer>" in plist
@@ -546,7 +547,7 @@ def test_plist() -> None:
     assert str(Path(al.__file__).resolve()) in plist
     # tp#947: an absolute interpreter, never `env python3` (brew relink window)
     assert "/usr/bin/env" not in plist
-    assert "<string>/x/py3</string>" in al.launchagent_plist(python="/x/py3")
+    assert "<string>/x/py3</string>" in jobs.launchagent_plist(python="/x/py3")
 
 
 def test_unattended_import_only_where_safe() -> None:

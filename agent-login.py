@@ -35,7 +35,7 @@ Examples:
   ./agent-login.py -g anthropic # your login (email code) in the shown shared Chromium
   ./agent-login.py -g galaxus-de # your login, straight in the shown window (bot check)
   ./agent-login.py -g notion -F # the same, even with unregistered CDP clients attached
-  ./agent-login.py -P           # print the daily LaunchAgent (-I installs, -U removes)
+  ./agent-login.py -P           # print every LaunchAgent plist (-I installs, -U removes)
   ./agent-login.py -j           # the same overview as JSON
   ./agent-login.py -x           # acceptance matrix (-x -j: as JSON)
   ./agent-login.py -p github    # promote (one budgeted login at most): -c may log it in
@@ -115,7 +115,11 @@ from agent_login_claude import (  # noqa: E402
     instance_session,
 )
 from agent_login_jobs import (  # noqa: E402
+    ACCESS_SWEEP_INTERVAL_S,
+    ACCESS_SWEEP_LABEL,
     BUSY_RC,
+    CONSOLE_BALANCE_INTERVAL_S,
+    CONSOLE_BALANCE_LABEL,
     KILLED_RC,
     LAUNCH_HOUR,
     LAUNCH_LABEL,
@@ -128,22 +132,22 @@ from agent_login_jobs import (  # noqa: E402
     REFRESH_LABEL,
     SNAPSHOT_INTERVAL_S,
     SNAPSHOT_LABEL,
+    TAB_REAPER_INTERVAL_S,
+    TAB_REAPER_LABEL,
     BrowserRun,
     _browser,
+    agent_plists,
     browser_mode,
     browser_timeout,
     daily_loaded,
     guided_busy,
     guided_window,
     install_daily,
-    launchagent_plist,
     login_timeout_s,
     recover_stale_guided_login,
-    refresh_plist,
     run_browser,
     safari_sessions,
     send_mail,
-    snapshot_plist,
     uninstall_daily,
     wait_for_network,
 )
@@ -4076,21 +4080,26 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help=f"install + load the LaunchAgents {LAUNCH_LABEL} "
         f"(`-c` daily {LAUNCH_HOUR:02d}:{LAUNCH_MINUTE:02d}), {SNAPSHOT_LABEL} "
-        f"(`-S` every {SNAPSHOT_INTERVAL_S // 60} min) and {REFRESH_LABEL} "
-        f"(`-R` every {REFRESH_INTERVAL_S // 3600} h) as one transaction "
-        "(any failure restores the previous set)",
+        f"(`-S` every {SNAPSHOT_INTERVAL_S // 60} min), {REFRESH_LABEL} "
+        f"(`-R` every {REFRESH_INTERVAL_S // 3600} h), {TAB_REAPER_LABEL} "
+        f"(`browser.py reap-idle` every {TAB_REAPER_INTERVAL_S // 60} min), "
+        f"{CONSOLE_BALANCE_LABEL} (`console-balance.py` every "
+        f"{CONSOLE_BALANCE_INTERVAL_S // 60} min) and {ACCESS_SWEEP_LABEL} "
+        f"(`browser.py sweep-access` every {ACCESS_SWEEP_INTERVAL_S} s) as one "
+        "transaction (any failure restores the previous set)",
     )
     ap.add_argument(
         "-U",
         "--uninstall-daily",
         action="store_true",
-        help="unload + remove all three LaunchAgents",
+        help=f"unload + remove all {len(agent_plists())} LaunchAgents of -I",
     )
     ap.add_argument(
         "-P",
         "--print-plist",
         action="store_true",
-        help="print the three LaunchAgent plists (writes nothing)",
+        help=f"print all {len(agent_plists())} LaunchAgent plists of -I "
+        "(writes nothing)",
     )
     ap.add_argument(
         "-j",
@@ -4213,9 +4222,8 @@ def build_parser() -> argparse.ArgumentParser:
 def launch_action(args: argparse.Namespace) -> int | None:
     """-P / -I / -U, or None when none was asked for."""
     if args.print_plist:
-        print(launchagent_plist(), end="")
-        print(snapshot_plist(), end="")
-        print(refresh_plist(), end="")
+        for _label, text, _what in agent_plists():
+            print(text, end="")
         return 0
     if args.install_daily:
         return install_daily()

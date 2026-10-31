@@ -658,6 +658,108 @@ def test_install_rolls_back_a_failed_write(
     assert not any(agents.iterdir())  # every new plist went again
 
 
+# tp#1468 B3: the every-minute Access team-cookie sweep
+
+
+def test_access_sweep_plist_runs_sweep_access_every_minute_in_background() -> None:
+    plists = {label: text for label, text, _what in jobs.agent_plists()}
+    text = plists[jobs.ACCESS_SWEEP_LABEL]
+    assert "<string>com.albert.browser-access-sweep</string>" in text
+    assert str(jobs.BROWSER_PY) in text
+    args = "".join(f"<string>{a}</string>" for a in ("sweep-access", "-A", "-q", "-S"))
+    assert args in text.replace("\n", "").replace(" ", "")
+    assert "<key>StartInterval</key>\n    <integer>60</integer>" in text
+    assert "<key>RunAtLoad</key>\n    <false/>" in text
+    assert "<key>ProcessType</key>\n    <string>Background</string>" in text
+    assert "<key>LowPriorityIO</key>\n    <true/>" in text
+    log = f"{Path.home()}/Library/Logs/com.albert.browser-access-sweep.log"
+    assert text.count(f"<string>{log}</string>") == 2  # stdout + stderr
+    # the priority keys are this job's alone
+    for label, other in plists.items():
+        if label != jobs.ACCESS_SWEEP_LABEL:
+            assert "ProcessType" not in other and "LowPriorityIO" not in other
+
+
+def test_access_sweep_plist_is_valid_plist() -> None:
+    import plistlib  # pylint: disable=import-outside-toplevel
+
+    doc = plistlib.loads(jobs.access_sweep_plist().encode())
+    assert doc["Label"] == jobs.ACCESS_SWEEP_LABEL
+    assert doc["ProgramArguments"][1:] == [
+        str(jobs.BROWSER_PY),
+        "sweep-access",
+        "-A",
+        "-q",
+        "-S",
+    ]
+    assert doc["StartInterval"] == 60 and doc["RunAtLoad"] is False
+    assert doc["ProcessType"] == "Background" and doc["LowPriorityIO"] is True
+    assert doc["EnvironmentVariables"][jobs.SCHEDULED_ENV] == "1"
+
+
+def test_uninstall_removes_the_access_sweep(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(jobs, "_plist_path", lambda label: tmp_path / f"{label}.plist")
+    booted: list[str] = []
+
+    def fake(*args: str) -> int:
+        booted.append(args[-1])
+        return 0
+
+    monkeypatch.setattr(jobs, "_launchctl", fake)
+    for label, text, _what in jobs.agent_plists():
+        (tmp_path / f"{label}.plist").write_text(text)
+    assert jobs.uninstall_daily() == 0
+    assert not list(tmp_path.glob("*.plist"))
+    assert any(b.endswith(jobs.ACCESS_SWEEP_LABEL) for b in booted)
+
+
+def test_install_rolls_back_when_the_access_sweep_itself_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The NEW job fails to bootstrap: every agent goes back to its old plist
+    and load state; the sweep's own plist (none before) is gone again."""
+    monkeypatch.setattr(jobs, "_plist_path", lambda label: tmp_path / f"{label}.plist")
+    labels = [label for label, _t, _w in jobs.agent_plists()]
+    assert labels[-1] == jobs.ACCESS_SWEEP_LABEL
+    old = [label for label in labels if label != jobs.ACCESS_SWEEP_LABEL]
+    for label in old:
+        (tmp_path / f"{label}.plist").write_text(f"old {label}")
+    calls: list[tuple[str, ...]] = []
+
+    def fake(*args: str) -> int:
+        calls.append(args)
+        if args[0] == "print":
+            return 113 if args[1].endswith(jobs.ACCESS_SWEEP_LABEL) else 0
+        if args[0] == "bootstrap" and jobs.ACCESS_SWEEP_LABEL in args[-1]:
+            return 5
+        return 0
+
+    monkeypatch.setattr(jobs, "_launchctl", fake)
+    assert jobs.install_daily() == 1
+    assert not (tmp_path / f"{jobs.ACCESS_SWEEP_LABEL}.plist").exists()
+    for label in old:
+        assert (tmp_path / f"{label}.plist").read_text() == f"old {label}"
+    fail = max(
+        i
+        for i, c in enumerate(calls)
+        if c[0] == "bootstrap" and jobs.ACCESS_SWEEP_LABEL in c[-1]
+    )
+    reloaded = {Path(c[-1]).stem for c in calls[fail + 1 :] if c[0] == "bootstrap"}
+    assert reloaded == set(old)  # every agent loaded before is loaded again
+
+
+def test_print_plist_prints_every_agent(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.setattr(sys, "argv", ["agent-login.py", "-P"])
+    assert al.main() == 0
+    out = capsys.readouterr().out
+    for label, _text, _what in jobs.agent_plists():
+        assert f"<string>{label}</string>" in out
+
+
 # ---------------------------------------------------------------------------
 # toolchain
 # ---------------------------------------------------------------------------

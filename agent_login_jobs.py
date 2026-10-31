@@ -60,6 +60,13 @@ TAB_REAPER_INTERVAL_S = 900
 CONSOLE_BALANCE_LABEL = "com.albert.console-balance"
 CONSOLE_BALANCE_INTERVAL_S = 3600
 CONSOLE_BALANCE_PY = Path(__file__).resolve().parent / "console-balance.py"
+# tp#1468: the Access team-cookie sweep (`browser.py sweep-access -A -q -S`) of
+# every running shared-browser instance: drops a Cloudflare Access team-domain
+# cookie within a minute, whichever client navigated there. `-S`: a busy pass
+# (guided login, gate held) exits 0 instead of 75. Background priority.
+ACCESS_SWEEP_LABEL = "com.albert.browser-access-sweep"
+ACCESS_SWEEP_INTERVAL_S = 60
+ACCESS_SWEEP_LOG = Path.home() / "Library" / "Logs" / f"{ACCESS_SWEEP_LABEL}.log"
 # Set in every agent-login LaunchAgent: a scheduled run. `-L` (the Safari
 # login, which drives Albert's real Safari) refuses to run with it.
 SCHEDULED_ENV = "AGENT_LOGIN_SCHEDULED"
@@ -89,9 +96,12 @@ def launchagent_plist(
     run_at_load: bool = False,
     script: Path = SCRIPT,
     python: str | None = None,
+    background: bool = False,
 ) -> str:
     """A LaunchAgent running this script; default: daily `-c` at 09:15, no mail
-    (logged-out sites are an infra/status item). Pure."""
+    (logged-out sites are an infra/status item). `background`: launchd runs
+    it at background priority (`ProcessType Background` + `LowPriorityIO`).
+    Pure."""
     if not schedule:
         schedule = f"""<key>StartCalendarInterval</key>
     <dict>
@@ -113,6 +123,12 @@ def launchagent_plist(
             "/usr/sbin",
             "/sbin",
         ]
+    )
+    priority = (
+        "\n    <key>ProcessType</key>\n    <string>Background</string>"
+        "\n    <key>LowPriorityIO</key>\n    <true/>"
+        if background
+        else ""
     )
     return f"""<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -138,7 +154,7 @@ def launchagent_plist(
         <string>1</string>
     </dict>
     <key>RunAtLoad</key>
-    <{"true" if run_at_load else "false"}/>
+    <{"true" if run_at_load else "false"}/>{priority}
 </dict>
 </plist>
 """
@@ -183,6 +199,22 @@ def console_balance_plist() -> str:
     )
 
 
+def access_sweep_plist() -> str:
+    """The every-minute Access team-cookie sweep LaunchAgent (tp#1468), as
+    text, at background priority. Pure."""
+    return launchagent_plist(
+        label=ACCESS_SWEEP_LABEL,
+        args=("sweep-access", "-A", "-q", "-S"),
+        schedule=(
+            "<key>StartInterval</key>\n    "
+            f"<integer>{ACCESS_SWEEP_INTERVAL_S}</integer>"
+        ),
+        run_at_load=False,
+        script=BROWSER_PY,
+        background=True,
+    )
+
+
 def agent_plists() -> list[tuple[str, str, str]]:
     """(label, plist text, what) of every agent-login LaunchAgent. Pure."""
     return [
@@ -210,6 +242,12 @@ def agent_plists() -> list[tuple[str, str, str]]:
             CONSOLE_BALANCE_LABEL,
             console_balance_plist(),
             f"every {CONSOLE_BALANCE_INTERVAL_S // 60} min, console-balance.py -q",
+        ),
+        (
+            ACCESS_SWEEP_LABEL,
+            access_sweep_plist(),
+            f"every {ACCESS_SWEEP_INTERVAL_S} s, browser.py sweep-access -A -q -S; "
+            f"log {ACCESS_SWEEP_LOG}",
         ),
     ]
 
@@ -241,8 +279,9 @@ def daily_loaded() -> bool:
 
 
 def install_daily() -> int:
-    """Write + (re)load every agent-login LaunchAgent (daily check, snapshot,
-    refresh pass) as ONE transaction: on any failure every label it touched
+    """Write + (re)load every LaunchAgent of `agent_plists()` (daily check,
+    snapshot, refresh pass, tab reaper, Console balance, Access team-cookie
+    sweep) as ONE transaction: on any failure every label it touched
     is booted out, the previous plist files are restored and the agents
     that were loaded before are loaded again — never a partial set."""
     jobs = agent_plists()

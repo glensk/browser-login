@@ -277,7 +277,7 @@ def test_agent_summary_never_renders_free_text() -> None:
 
 
 def test_snapshot_plist() -> None:
-    plist = al.snapshot_plist()
+    plist = jobs.snapshot_plist()
     assert "<string>com.albert.agent-login-snapshot</string>" in plist
     assert "<string>-S</string>" in plist
     assert "<key>StartInterval</key>" in plist and "<true/>" in plist

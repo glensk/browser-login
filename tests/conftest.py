@@ -177,6 +177,12 @@ def _private_mode_state(tmp_path, monkeypatch):
             monkeypatch.setattr(
                 mod, "ACCESS_SWEEP_STATE_FILE", state / "access-sweep.json"
             )
+        if getattr(mod, "ACCESS_SWEEP_TIMEOUTS_FILE", None) is not None:
+            monkeypatch.setattr(
+                mod,
+                "ACCESS_SWEEP_TIMEOUTS_FILE",
+                state / "access-sweep-timeouts.json",
+            )
     yield
 
 
