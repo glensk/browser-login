@@ -475,6 +475,11 @@ STATIC_SITE_NAMES = frozenset(
         "notion.so",
         "app.notion.com",
         "notion.com",
+        # Claude Console sites (tp#1421)
+        "console",
+        "claude-console",
+        "anthropic-console",
+        "platform.claude.com",
         "biopolwifi",
         "biopol",
         "cloudpath",
