@@ -33,7 +33,7 @@ same challenge with ``response_errors``. Stages handled:
   decides;
 - ``ak-stage-access-denied`` / ``ak-stage-flow-error`` / anything else: fail.
 
-Rules (AGENTS.md): every request runs in a FRESH CDP isolated world of the
+Rules (docs/AGENTS_REFERENCE.md): every request runs in a FRESH CDP isolated world of the
 login page (the page's scripts cannot hook its ``fetch``), same-origin only
 (``mode: 'same-origin'``, the final URL must be the executor URL itself), on
 the item's fill origin (checked in Python and in the page). The answer the
