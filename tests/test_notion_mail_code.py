@@ -86,16 +86,38 @@ def test_mail_reader_passes_the_notion_env_on_top_of_ours(
     assert s.NOTION_MAIL_ENV == {"SDSC_EMAIL_NO_AUTO_AUTH": "1"}
 
 
-def test_the_safari_fill_scripts_are_unchanged() -> None:
-    """objection 6: safari.py evaluates these texts; they stay byte-identical."""
+def test_the_safari_fill_scripts_are_pinned() -> None:
+    """objection 6: safari.py evaluates these texts; a change is deliberate.
+    EMAIL_FILL_JS is unchanged. CODE_FILL_JS changed on purpose (tp#1633 B10
+    canary 3): Notion's code button is a div[role=button] "Continue", which
+    the old exact-label <button>-only search missed — it now searches like
+    CODE_FILL_FN (role=button, label variants, a lone button, fill first and
+    tolerate an auto-submit), synchronously (Safari cannot await)."""
     assert (
         hashlib.sha256(s.EMAIL_FILL_JS.encode()).hexdigest()
         == "14e7fb9c52966e134eb38c50ba2eb2003a49b3bb97bc052da50bccfe7c3c6996"
     )
     assert (
         hashlib.sha256(s.CODE_FILL_JS.encode()).hexdigest()
-        == "ae875b663e6b81b7eb8d7600e24e7cd52e3e81a9899e69249e96707e5d844b58"
+        == "d132036ca7cd4c63231807e24ec0e9ae49c24d5283f23a0103b261e933dc5e27"
     )
+
+
+def test_the_safari_code_fill_searches_like_the_function_form() -> None:
+    lines = s.CODE_FILL_JS.splitlines()
+    assert lines[:3] == ["// agent-login:code", "(() => {", "  const P = __PARAMS__;"]
+    assert lines[-1] == "})()"
+    assert "await" not in s.CODE_FILL_JS  # Safari's do JavaScript cannot await
+    assert '[role="button"]' in s.CODE_FILL_JS
+    assert "P.alts" in s.CODE_FILL_JS and '"lone"' in s.CODE_FILL_JS
+    # the search block is the function form's, line for line
+    fn = s.CODE_FILL_FN.splitlines()
+    block = fn[
+        fn.index("  let hit = null;") : fn.index(
+            "  if (!hit && !ambiguous && scope && wanted.length) {"
+        )
+    ]
+    assert "\n".join(block) in s.CODE_FILL_JS
 
 
 def test_the_email_function_form_has_the_same_body() -> None:
@@ -281,6 +303,62 @@ def test_the_code_fill_variants() -> None:
                 )
             )
             assert (got["ok"], got["why"]) == (False, "field")
+        finally:
+            chrome.close()
+
+
+_LATE = (
+    '<form><input name="code" '
+    'oninput="setTimeout(() => { b.disabled = false; }, 0)">'
+    '<button id="b" type="button" disabled onclick="go()">Continue</button></form>'
+)
+
+
+@pytest.mark.launches_chrome
+@CHROME
+def test_the_safari_code_fill_variants() -> None:
+    """CODE_FILL_JS (the text safari.py evaluates) on the same pages as the
+    function form, plus a button the page enables only after the fill
+    (clicked 400 ms later, ``deferred``)."""
+    from playwright.sync_api import (  # pylint: disable=import-outside-toplevel
+        sync_playwright,
+    )
+
+    code = secrets.token_urlsafe(6)[:6]
+    params = {
+        "otp": s._OTP_FIELD,
+        "code": code,
+        "submit": "Continue with login code",
+        "alts": list(s.CODE_SUBMIT_VARIANTS),
+    }
+    body_js = s.CODE_FILL_JS.replace("__PARAMS__", json.dumps(params))
+    with sync_playwright() as pw:
+        chrome = pw.chromium.launch(headless=True)
+        try:
+            page = chrome.new_page()
+            for name, (body, want) in _CODE_PAGES.items():
+                page.set_content(_SENT + body)
+                got = json.loads(page.evaluate(body_js))
+                why, how, clicked, _labels, sent = want
+                assert got == {
+                    "ok": True,
+                    "clicked": clicked,
+                    "why": why,
+                    "how": how,
+                }, name
+                assert page.evaluate("window.sent") == sent, name
+            page.set_content(_SENT + _LATE)
+            got = json.loads(page.evaluate(body_js))
+            assert got == {
+                "ok": True,
+                "clicked": True,
+                "deferred": True,
+                "why": "",
+                "how": "variant",
+            }
+            assert page.evaluate("window.sent") == 0
+            page.wait_for_timeout(700)
+            assert page.evaluate("window.sent") == 1
         finally:
             chrome.close()
 
@@ -1369,3 +1447,131 @@ def test_an_unopenable_tab_has_no_sentinel(monkeypatch: pytest.MonkeyPatch) -> N
         "",
         False,
     )
+
+
+# ---------------------------------------------------------------------------
+# B10 canary 3: the post-submit proof waits for the session (cookie + server)
+# ---------------------------------------------------------------------------
+
+
+def _no_sidebar(
+    rig: Rig, monkeypatch: pytest.MonkeyPatch, cookie: bool, tab: dict[str, str]
+) -> list[float]:
+    """The login tab never shows the sidebar; its cookie / server probe as
+    given. Returns the fake-clock times the tab probe ran at."""
+    probes: list[float] = []
+
+    def _tab(_page: Any, expected: str) -> dict[str, str]:
+        assert expected == EMAIL
+        probes.append(rig.clock.t)
+        rig.clock.t += 10.0  # the fetch's own abort bound
+        return dict(tab)
+
+    monkeypatch.setattr(browser, "_notion_wait_for_login", lambda *_a, **_k: False)
+    monkeypatch.setattr(browser, "_notion_session_cookie", lambda _p: cookie)
+    monkeypatch.setattr(browser, "_nmc_tab_server", _tab)
+    return probes
+
+
+def test_a_valid_server_in_the_login_tab_proves_a_slow_first_load(
+    rig: Rig, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    probes = _no_sidebar(
+        rig, monkeypatch, True, {"server": "valid", "identity": "match"}
+    )
+    rig.checks = [_check("invalid"), _check("indeterminate")]
+    rc, rec = rig.run()
+    assert (rc, rec["code"], rec["route"]) == (0, "ok", "mail-code")
+    assert (rec["proof"], rec["server"], rec["proof_source"]) == (
+        "server",
+        "valid",
+        "login-tab",
+    )
+    assert len(probes) == 1
+    assert "proof_rechecked" not in rec
+    assert browser._als.quarantined("notion") is None
+
+
+@pytest.mark.parametrize(
+    ("cookie", "tab"),
+    [
+        (False, {"server": "valid", "identity": "match"}),  # no session cookie
+        (True, {"server": "valid", "identity": "mismatch"}),
+        (True, {"server": "valid", "identity": "unknown"}),
+        (True, {"server": "indeterminate", "identity": "unknown"}),
+        (True, {}),
+    ],
+)
+def test_no_proven_session_in_the_tab_still_quarantines(
+    rig: Rig, monkeypatch: pytest.MonkeyPatch, cookie: bool, tab: dict[str, str]
+) -> None:
+    probes = _no_sidebar(rig, monkeypatch, cookie, tab)
+    rig.checks = [_check("invalid"), _check("indeterminate")]
+    rc, rec = rig.run()
+    assert (rc, rec["code"], rec["quarantined"]) == (2, "login_failed", True)
+    assert "proof_source" not in rec
+    assert not probes if not cookie else probes
+
+
+def test_the_session_wait_keeps_the_sidebar_cap(
+    rig: Rig, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    probes = _no_sidebar(
+        rig, monkeypatch, True, {"server": "indeterminate", "identity": "unknown"}
+    )
+    start = rig.clock.t
+    assert browser._nmc_session_wait(rig.page, EMAIL) == {}
+    cap = browser.NOTION_MAIL_CODE_SIDEBAR_S
+    assert rig.clock.t - start <= cap + 1.0
+    # every probe started while its fetch still fitted the cap
+    assert probes
+    assert all(start + cap - t >= browser.NOTION_MAIL_CODE_TAB_PROBE_S for t in probes)
+
+
+def test_the_session_wait_ends_on_the_sidebar(
+    rig: Rig, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    probes = _no_sidebar(rig, monkeypatch, True, {"server": "valid"})
+    monkeypatch.setattr(browser, "_notion_wait_for_login", lambda *_a, **_k: True)
+    assert browser._nmc_session_wait(rig.page, EMAIL) == {"sidebar": "yes"}
+    assert not probes
+
+
+@pytest.mark.parametrize(
+    ("url", "answer", "want"),
+    [
+        (
+            "https://app.notion.com/x",
+            {"server": "valid", "identity": "match"},
+            {"server": "valid", "identity": "match"},
+        ),
+        (
+            "https://app.notion.com/x",
+            {"server": "valid", "identity": "?"},
+            {"server": "valid", "identity": "unknown"},
+        ),
+        ("https://app.notion.com/x", {"server": "bogus"}, {}),
+        ("https://www.notion.so/login", {"server": "valid"}, {}),
+    ],
+)
+def test_the_tab_server_probe_runs_on_the_app_host_only(
+    monkeypatch: pytest.MonkeyPatch, url: str, answer: dict, want: dict
+) -> None:
+    monkeypatch.setattr(browser, "_notion_probe_verified", lambda: True)
+    page = _CheckPage("valid", url)
+    page.answer = answer
+    assert browser._nmc_tab_server(page, EMAIL) == want
+
+
+def test_the_session_cookie_is_read_by_name_only() -> None:
+    class _Ctx:
+        def __init__(self, names: list[str]) -> None:
+            self.names = names
+            self.context = self
+
+        def cookies(self, _origins: list[str]) -> list[dict[str, Any]]:
+            return [{"name": n, "value": "x"} for n in self.names]
+
+    assert browser._notion_session_cookie(_Ctx(["notion_browser_id", "token_v2"]))
+    assert not browser._notion_session_cookie(_Ctx(["notion_browser_id"]))
+    assert not browser._notion_session_cookie(object())

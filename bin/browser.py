@@ -16177,7 +16177,11 @@ NOTION_MAIL_CODE_HINT = "mail-code-submitted"
 # also cut to leave NOTION_MAIL_CODE_PROOF_RESERVE_S for everything after it.
 NOTION_MAIL_CODE_BASELINE_CAP_S = 45.0  # all baseline mailbox reads together
 NOTION_MAIL_CODE_ARCHIVE_CAP_S = 15.0
-NOTION_MAIL_CODE_SIDEBAR_S = 45.0  # the passive post-submit sidebar wait
+NOTION_MAIL_CODE_SIDEBAR_S = 45.0  # the passive post-submit session wait
+# Inside that wait: sidebar polls of this length; between them the login
+# tab's own server probe, started only while its 10 s fetch still fits.
+NOTION_MAIL_CODE_SESSION_POLL_S = 3.0
+NOTION_MAIL_CODE_TAB_PROBE_S = 11.0
 # B10 canary 3: a fresh session's first loads are slow — the post-submit
 # check came back indeterminate, a minute later valid. One more check, only
 # after a submit, only on indeterminate, only with this much deadline left
@@ -16698,15 +16702,90 @@ def _nmc_submit(  # pylint: disable=too-many-arguments,too-many-positional-argum
     return _nmc_proof(port, page, reader, expected, True)
 
 
+def _notion_session_cookie(page: Any) -> bool:
+    """The tab's context holds Notion's ``token_v2`` (name only, the value
+    is never kept)."""
+    try:
+        cookies = page.context.cookies([NOTION_APP_ORIGIN])
+    except Exception:  # pylint: disable=broad-exception-caught
+        return False
+    held = any(c.get("name") == "token_v2" for c in cookies)
+    cookies.clear()
+    return held
+
+
+def _nmc_tab_server(page: Any, expected: str) -> dict[str, str]:
+    """The server probe (`NOTION_SERVER_JS`) in the login tab itself, only
+    on app.notion.com (its same-origin fetch); ``{}`` when it cannot run
+    (the tab mid-navigation, another host)."""
+    try:
+        if urllib.parse.urlsplit(page.url).hostname != NOTION_APP_HOST:
+            return {}
+        raw = page.evaluate(
+            NOTION_SERVER_JS,
+            {
+                "expected": expected,
+                "verified": _notion_probe_verified(),
+                "mine": _notion_user_id(page),
+            },
+        )
+    except Exception:  # pylint: disable=broad-exception-caught
+        return {}
+    if not isinstance(raw, dict) or raw.get("server") not in NOTION_SERVER_VERDICTS:
+        return {}
+    ident = raw.get("identity")
+    return {
+        "server": str(raw["server"]),
+        "identity": ident if ident in ("match", "mismatch") else "unknown",
+    }
+
+
+def _nmc_session_wait(page: Any, expected: str) -> dict[str, str]:
+    """The post-submit wait, within ``NOTION_MAIL_CODE_SIDEBAR_S`` (B3):
+    until the login tab shows the sidebar (``{"sidebar": "yes"}``), or the
+    session cookie is set AND the server probe in the tab answers valid
+    (its ``server`` / ``identity``). A fresh session's first loads are slow
+    (B10 canary 3: the sidebar never showed within 45 s and the fresh-tab
+    check came back indeterminate, a minute later valid) — the server, not
+    the sidebar, is the authority. ``{}`` when neither showed in time."""
+    end = _nmc_clock() + NOTION_MAIL_CODE_SIDEBAR_S
+    while True:
+        left = end - _nmc_clock()
+        if left <= 0:
+            return {}
+        chunk = min(NOTION_MAIL_CODE_SESSION_POLL_S, left)
+        if _notion_wait_for_login(page, timeout_s=chunk, poll_s=1.0):
+            return {"sidebar": "yes"}
+        # a probe starts only when its fetch (10 s abort) fits the cap
+        if end - _nmc_clock() >= NOTION_MAIL_CODE_TAB_PROBE_S and (
+            _notion_session_cookie(page)
+        ):
+            got = _nmc_tab_server(page, expected)
+            if got.get("server") == "valid":
+                return got
+        _nmc_sleep(min(1.0, max(0.0, end - _nmc_clock())))
+
+
 def _nmc_proof(
     port: int, page: Any, reader: Any, expected: str, submitted: bool | None
 ) -> int:
-    """Design step 10: the passive sidebar wait, then the server proof with
-    the account; anything but valid + match after a submit quarantines."""
+    """Design step 10: wait for the session (sidebar, or cookie + server
+    valid in the login tab), then the server proof with the account in a
+    fresh tab; anything but valid + match after a submit quarantines."""
     del reader
     _deadline_step("notion:proof")
-    _notion_wait_for_login(page, timeout_s=NOTION_MAIL_CODE_SIDEBAR_S, poll_s=1.0)
+    tab = _nmc_session_wait(page, expected)
     res = _notion_check(port, expected)
+    if (
+        res["verdict"] == "indeterminate"
+        and tab.get("server") == "valid"
+        and tab.get("identity") == "match"
+    ):
+        # the fresh tab could not tell, the login tab's server probe could:
+        # Notion's server said valid for the expected account (D8)
+        _result_set(proof_source="login-tab")
+        res = {**res, "verdict": "valid", "proof": "server", "server": "valid"}
+        res["identity"] = "match"
     left = _deadline_left()
     if (
         submitted

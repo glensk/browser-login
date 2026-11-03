@@ -1161,31 +1161,65 @@ EMAIL_FILL_JS = r"""// agent-login:email
 })()
 """
 
+# The Safari code fill (tp#1633 B10 canary 3: Notion's code button is a
+# ``div[role=button]`` labelled "Continue"): fill FIRST, then the ONE button
+# labelled `submit`, else the one labelled with the first matching `alts`
+# entry, else the one live button (or the one submit button) of the field's
+# form / nearest container; an ambiguous label never falls back. Safari's
+# ``do JavaScript`` cannot await, so — unlike CODE_FILL_FN — there is no tick
+# between the fill and the search: a button the fill has not enabled yet is
+# clicked 400 ms later, only if it is live by then (``deferred: true``). No
+# button: ``ok: true, clicked: false, why: "button"`` — the page may submit
+# on the last character; the Machine's sentinel read decides.
 CODE_FILL_JS = r"""// agent-login:code
 (() => {
   const P = __PARAMS__;
   const vis = (e) => !!e && e.getClientRects().length > 0;
-  const field = [...document.querySelectorAll(P.otp)].find(vis);
-  if (!field) return JSON.stringify({ ok: false, why: "field" });
   const norm = (s) => String(s || "").replace(/\s+/g, " ").trim();
-  const scope = field.form || document;
-  const hits = P.submit ? [...scope.querySelectorAll('button,input[type="submit"]')]
-    .filter((b) => vis(b) && (norm(b.innerText) === P.submit || norm(b.value) === P.submit)) : [];
-  if (P.submit && hits.length !== 1) return JSON.stringify({ ok: false, why: "button" });
+  const field = [...document.querySelectorAll(P.otp)].find(vis);
+  if (!field) return JSON.stringify({ ok: false, why: "field", how: "none" });
+  const BTN = 'button,[role="button"],input[type="submit"]';
+  const text = (b) => norm(b.tagName === "INPUT" ? b.value : b.innerText);
   const set = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value").set;
   set.call(field, P.code);
   for (const t of ["input", "change", "keyup"]) field.dispatchEvent(new Event(t, { bubbles: true }));
-  if (field.value !== P.code) return JSON.stringify({ ok: false, why: "stick" });
-  if (!P.submit) return JSON.stringify({ ok: true, clicked: false });
-  hits[0].click();
-  return JSON.stringify({ ok: true, clicked: true });
+  if (field.value !== P.code) return JSON.stringify({ ok: false, why: "stick", how: "none" });
+  let scope = field.isConnected ? field.form : null;
+  for (let n = field.parentElement, i = 0; field.isConnected && !scope && n && i < 8; n = n.parentElement, i += 1) {
+    if ([...n.querySelectorAll(BTN)].some(vis)) scope = n;
+  }
+  const pool = [...(scope || document).querySelectorAll(BTN)].filter(vis);
+  const live = (b) => !b.disabled && b.getAttribute("aria-disabled") !== "true";
+  let hit = null;
+  let how = "none";
+  let ambiguous = false;
+  const wanted = [P.submit, ...(P.alts || [])].filter(Boolean);
+  for (let i = 0; i < wanted.length && !hit && !ambiguous; i += 1) {
+    const hits = pool.filter((b) => text(b) === wanted[i]);
+    if (hits.length === 1) [hit, how] = [hits[0], i === 0 ? "exact" : "variant"];
+    else if (hits.length > 1) ambiguous = true;
+  }
+  if (!hit && !ambiguous && scope && wanted.length) {
+    const en = pool.filter(live);
+    const subs = pool.filter((b) => b.type === "submit");
+    const one = en.length === 1 ? en[0] : pool.length === 1 ? pool[0] : subs.length === 1 ? subs[0] : null;
+    if (one) [hit, how] = [one, "lone"];
+  }
+  if (!hit) return JSON.stringify({ ok: true, clicked: false, why: wanted.length ? "button" : "", how });
+  if (live(hit)) {
+    hit.click();
+    return JSON.stringify({ ok: true, clicked: true, why: "", how });
+  }
+  setTimeout(() => { if (hit.isConnected && live(hit)) hit.click(); }, 400);
+  return JSON.stringify({ ok: true, clicked: true, deferred: true, why: "", how });
 })()
 """
 
 # Function forms of the two fills for a Playwright page
 # (``page.evaluate(EMAIL_FILL_FN, params)``): same bodies, the params travel
 # as the evaluate argument — the e-mail / code never enter the script text.
-# The Safari constants above stay byte-identical (safari.py evaluates text).
+# EMAIL_FILL_JS stays byte-identical (safari.py evaluates text); CODE_FILL_JS
+# follows CODE_FILL_FN's button search since B10 canary 3 (sha256 pins both).
 EMAIL_FILL_FN = r"""// agent-login:email-fn
 (P) => {
   const vis = (e) => !!e && e.getClientRects().length > 0;
@@ -1203,7 +1237,7 @@ EMAIL_FILL_FN = r"""// agent-login:email-fn
 # whose text is not pinned down live).
 CODE_SUBMIT_VARIANTS = ("Continue", "Verify", "Sign in")
 
-# The headless code fill (tp#1633 D-b) differs from CODE_FILL_JS: it fills
+# The headless code fill (tp#1633 D-b) — CODE_FILL_JS's async twin: it fills
 # FIRST, waits one tick (the page re-renders, a disabled button enables, an
 # auto-submit may start), then clicks the ONE button labelled `submit`, else
 # the one labelled with the first matching `alts` entry, else the one live
@@ -1498,7 +1532,12 @@ class Machine:  # pylint: disable=too-many-instance-attributes
         if code is None:
             return self._end(2, "email_code")
         self.out.credential = True
-        params = {"otp": _OTP_FIELD, "code": code, "submit": step.submit}
+        params = {
+            "otp": _OTP_FIELD,
+            "code": code,
+            "submit": step.submit,
+            "alts": list(CODE_SUBMIT_VARIANTS),
+        }
         body = CODE_FILL_JS.replace("__PARAMS__", json.dumps(params))
         try:
             # the RECIPE's host, never one read off the tab
