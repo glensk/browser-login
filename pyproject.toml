@@ -32,6 +32,10 @@ package = false
 # LaunchAgent, which runs bin/focus_watch.py with this project's .venv python.
 default-groups = ["dev", "focus"]
 
+[tool.pytest.ini_options]
+# Any test that runs this long dumps every thread's stack (tp#1655).
+faulthandler_timeout = 120
+
 [dependency-groups]
 # pylint and pytest must run inside this venv: browser.py's deferred imports
 # (playwright, pyotp, requests) resolve only here — otherwise pylint reports E0401

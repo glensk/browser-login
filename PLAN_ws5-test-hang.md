@@ -174,12 +174,12 @@ Follow-up candidate (overseer to file, not built here): production
 
 ## Boxes
 
-- [ ] B1 Instrumented run: `DEBUG=pw:api,pw:browser timeout 300 uv run pytest
+- [x] B1 Instrumented run: `DEBUG=pw:api,pw:browser timeout 300 uv run pytest
       tests/test_ws5_client_s2.py -x -s -m launches_chrome -p no:cacheprovider -o
       faulthandler_timeout=200 > /tmp/ws5-b1.log 2>&1`. Allow a second run only if the
       first does not hang. Record the stuck call and its class (launch-side, close-side, or
       unknown) in the Root cause section; the overseer edits the plan.
-- [ ] B2 Add the main-thread SIGALRM bound fixture (90 s, autouse for `launches_chrome`).
+- [x] B2 Add the main-thread SIGALRM bound fixture (90 s, autouse for `launches_chrome`).
       Add the `dead` flag, the teardown that makes no sync call on a dead instance, and the
       driver-pid kill (the pid comes from Playwright's transport, then a `pgrep -P` walk
       from that pid only). The test fails with `pytest.fail("Playwright lifecycle hung in
@@ -188,7 +188,7 @@ Follow-up candidate (overseer to file, not built here): production
       `pyproject.toml`. This makes `pyproject.toml` the inifile for the whole suite;
       confirm that `uv run pytest --collect-only -q` still collects the same number of
       tests as before the change.
-- [ ] B3 Add a module-scoped `_pw` holder (one driver, one headless Chromium,
+- [x] B3 Add a module-scoped `_pw` holder (one driver, one headless Chromium,
       `launch(timeout=30_000)`), with its own 60 s bound around setup and teardown and a
       relaunch when the browser is disconnected or dead. Port `chrome` and `storage_chrome`
       to a fresh context per test, closed in `finally`.

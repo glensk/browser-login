@@ -15,13 +15,16 @@ from __future__ import annotations
 # pylint: disable=import-error,wrong-import-position,redefined-outer-name
 # pylint: disable=too-many-lines  # one file: the client proof end to end
 import argparse
+import asyncio
 import base64
 import contextlib
+import faulthandler
 import importlib.util
 import json
 import os
 import secrets
 import shutil
+import signal
 import socket
 import subprocess
 import sys
@@ -31,6 +34,7 @@ import time
 import urllib.request
 from collections.abc import Iterator
 from pathlib import Path
+from types import FrameType
 from typing import Any
 
 import pytest
@@ -132,7 +136,7 @@ class FakeBroker:  # pylint: disable=too-many-instance-attributes
                 self.secrets += [
                     str(req[k]) for k in ("challenge_id", "digest") if req.get(k)
                 ]
-            reply = real(req, uid, pid)
+            reply: dict = real(req, uid, pid)
             self.secrets += [
                 str(reply[k]) for k in ("challenge_id", "nonce") if reply.get(k)
             ]
@@ -233,6 +237,257 @@ CHROME = pytest.mark.skipif(
 )
 
 
+# ---------------------------------------------------------------------------
+# A bounded Playwright lifecycle (tp#1655): no launching test can wedge the run
+# ---------------------------------------------------------------------------
+
+TEST_BOUND_S = 90  # one launching test: setup, body and teardown
+HOLDER_BOUND_S = 60  # the shared instance's own start and stop
+BACKSTOP_S = 600  # faulthandler: dump every stack and exit
+_REFIRE_S = 10  # a stalled bound fires again (breaks a dead instance's spin)
+
+
+class PlaywrightStall(BaseException):
+    """A bound ran out. A BaseException, so no `except Exception` (the code
+    under test, the storage tab) swallows it."""
+
+
+class _BoundState:  # pylint: disable=too-few-public-methods
+    """The innermost armed bound: its phase, whether it fired, and every
+    phase that stalled so far (a test's bound reads its own slice)."""
+
+    phase = ""
+    fired = False
+    stalls: list[str] = []
+
+
+def _in_playwright(frame: FrameType | None) -> bool:
+    while frame is not None:
+        if f"{os.sep}playwright{os.sep}" in frame.f_code.co_filename:
+            return True
+        frame = frame.f_back
+    return False
+
+
+def _on_alarm(_signum: int, frame: FrameType | None) -> None:
+    """SIGALRM in the main thread: it interrupts the dispatcher's `select()`
+    and `time.sleep`. The first fire marks the shared instance dead and
+    raises; a re-fire raises only inside Playwright code (a later sync call
+    on the dead instance spins in `_sync_base`)."""
+    if not _BoundState.fired:
+        _BoundState.fired = True
+        _BoundState.stalls.append(_BoundState.phase)
+        if _HOLDER is not None:
+            _HOLDER.dead = True
+        raise PlaywrightStall(f"Playwright lifecycle hung in {_BoundState.phase}")
+    if _in_playwright(frame):
+        raise PlaywrightStall(f"Playwright lifecycle hung in {_BoundState.phase}")
+
+
+@contextlib.contextmanager
+def _bounded(seconds: float, phase: str) -> Iterator[None]:
+    """Arm a `seconds` SIGALRM bound named `phase`; an outer bound is
+    restored afterwards with what is left of it."""
+    old_handler = signal.signal(signal.SIGALRM, _on_alarm)
+    old_left, _interval = signal.getitimer(signal.ITIMER_REAL)
+    old_phase, old_fired = _BoundState.phase, _BoundState.fired
+    start = time.monotonic()
+    _BoundState.phase, _BoundState.fired = phase, False
+    signal.setitimer(signal.ITIMER_REAL, seconds, _REFIRE_S)
+    try:
+        yield
+    finally:
+        signal.setitimer(signal.ITIMER_REAL, 0)
+        _BoundState.phase, _BoundState.fired = old_phase, old_fired
+        if old_left:
+            left = max(old_left - (time.monotonic() - start), 0.001)
+            signal.setitimer(signal.ITIMER_REAL, left, _REFIRE_S)
+        signal.signal(signal.SIGALRM, old_handler)
+
+
+def _set_phase(phase: str) -> None:
+    """Rename the innermost bound (a fixture moves from setup to call to
+    teardown)."""
+    _BoundState.phase = phase
+
+
+def _descendants(pid: int) -> list[int]:
+    """Every descendant of `pid` (a `pgrep -P` walk from `pid` only)."""
+    found = subprocess.run(
+        ["pgrep", "-P", str(pid)],
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=10,
+    ).stdout.split()
+    kids = [int(k) for k in found if k.isdigit()]
+    for kid in list(kids):
+        kids += _descendants(kid)
+    return kids
+
+
+def _kill_tree(pid: int) -> None:
+    """SIGKILL the driver `pid` and its descendants (its Chromium). The tree
+    is read before the first kill: an orphan's parent is no longer `pid`."""
+    for victim in [pid, *_descendants(pid)]:
+        with contextlib.suppress(ProcessLookupError, PermissionError):
+            os.kill(victim, signal.SIGKILL)
+
+
+def _driver_pid(manager: Any) -> int | None:
+    """The Node driver's pid, from Playwright's own transport."""
+    try:
+        return int(manager._connection._transport._proc.pid)
+    except (AttributeError, TypeError, ValueError):
+        return None
+
+
+def _dispatcher(manager: Any) -> Any:
+    """The instance's dispatcher greenlet (None before it exists)."""
+    return getattr(getattr(manager, "_connection", None), "_dispatcher_fiber", None)
+
+
+class _PwHolder:
+    """One driver and one headless Chromium for the module; every test gets
+    a fresh context of it. `dead` is set by a stall: from then on no sync
+    call reaches this instance (it would spin), only a kill of its driver."""
+
+    def __init__(self) -> None:
+        self.manager: Any = None
+        self.pw: Any = None
+        self.browser_: Any = None
+        self.pid: int | None = None
+        self.dead = False
+        self.starts = 0
+
+    def _start(self) -> None:
+        from playwright.sync_api import (  # pylint: disable=import-outside-toplevel
+            sync_playwright,
+        )
+
+        self.starts += 1
+        self.manager = sync_playwright()
+        self.pw = self.manager.start()
+        self.pid = _driver_pid(self.manager)
+        self.browser_ = self.pw.chromium.launch(headless=True, timeout=30_000)
+
+    def _usable(self) -> bool:
+        """Not marked dead, and its dispatcher greenlet still runs (a sync
+        call on a finished dispatcher spins forever)."""
+        dispatcher = _dispatcher(self.manager)
+        return not self.dead and dispatcher is not None and not dispatcher.dead
+
+    def ensure(self) -> Any:
+        """The live browser; a dead or disconnected one is killed and
+        relaunched. A relaunch that stalls too ends the run."""
+        if (
+            self.browser_ is not None
+            and self._usable()
+            and self.browser_.is_connected()
+        ):
+            return self.browser_
+        relaunch = self.starts > 0
+        if self.manager is not None:
+            self.kill()
+        phase = "relaunch" if relaunch else "launch"
+        try:
+            with _bounded(HOLDER_BOUND_S, phase):
+                self._start()
+        except BaseException:  # pylint: disable=broad-exception-caught
+            stalled = self.dead
+            self.kill()
+            if stalled and relaunch:
+                pytest.exit(f"Playwright cannot start: {phase}", returncode=1)
+            raise
+        return self.browser_
+
+    def kill(self) -> None:
+        """SIGKILL this instance's driver tree; no sync call on it."""
+        pid = self.pid or _driver_pid(self.manager)
+        if pid is not None:
+            _kill_tree(pid)
+        # A dispatcher greenlet still suspended inside its loop keeps that
+        # loop "running" for this thread, and every new sync_playwright()
+        # refuses. Unwind it (GreenletExit runs asyncio's own cleanup).
+        dispatcher = _dispatcher(self.manager)
+        if dispatcher is not None and not dispatcher.dead:
+            with contextlib.suppress(Exception):
+                dispatcher.throw()
+        loop = getattr(self.manager, "_loop", None)
+        if loop is not None and not loop.is_running():
+            with contextlib.suppress(Exception):
+                loop.close()
+        # Every sync call leaves its loop set as this thread's running loop
+        # (`_sync_base._sync`); a new sync_playwright() would adopt it.
+        if loop is not None and asyncio._get_running_loop() is loop:
+            asyncio._set_running_loop(None)
+        self.manager = self.pw = self.browser_ = None
+        self.pid = None
+        self.dead = False
+
+    def stop(self, phase: str = "module teardown") -> None:
+        """A clean close under its own bound, else a kill."""
+        if self.manager is None:
+            return
+        if not self._usable():
+            self.kill()
+            return
+        try:
+            with _bounded(HOLDER_BOUND_S, phase):
+                if self.browser_ is not None:
+                    self.browser_.close()
+                self.pw.stop()
+        except BaseException:  # pylint: disable=broad-exception-caught
+            stalled = self.dead
+            self.kill()
+            if not stalled:
+                raise
+            pytest.fail(f"Playwright lifecycle hung in {phase}")
+        self.manager = self.pw = self.browser_ = None
+        self.pid = None
+
+
+_HOLDER: _PwHolder | None = None
+
+
+@pytest.fixture(scope="module")
+def _pw() -> Iterator[_PwHolder]:
+    """The module's shared Playwright instance (started on first use)."""
+    global _HOLDER  # pylint: disable=global-statement
+    holder = _PwHolder()
+    _HOLDER = holder
+    try:
+        yield holder
+    finally:
+        try:
+            holder.stop()
+        finally:
+            _HOLDER = None
+
+
+@pytest.fixture(autouse=True)
+def _playwright_bound(request: pytest.FixtureRequest) -> Iterator[None]:
+    """Every `launches_chrome` test runs under a 90 s main-thread bound. A
+    stall fails that test (`Playwright lifecycle hung in <phase>`); the
+    shared instance's driver is killed and the next test relaunches it.
+    faulthandler (dump + exit) is the last resort for a stall the signal
+    cannot reach."""
+    if request.node.get_closest_marker("launches_chrome") is None:
+        yield
+        return
+    # pytest's own faulthandler_timeout re-arms (and cancels) the one
+    # faulthandler timer per test: the backstop is armed here, per test.
+    faulthandler.dump_traceback_later(BACKSTOP_S, exit=True)
+    before = len(_BoundState.stalls)
+    with _bounded(TEST_BOUND_S, "setup"):
+        yield
+    stalled = _BoundState.stalls[before:]
+    if stalled:
+        if _HOLDER is not None and _HOLDER.dead:
+            _HOLDER.kill()
+        pytest.fail(f"Playwright lifecycle hung in {stalled[0]}")
+
+
 class _Api:
     """Routes every request: the check page (with the sentinel while
     `logged_in`) and the identity endpoint (`body`, `status`, `ctype`).
@@ -264,43 +519,41 @@ class _Api:
 
 
 @pytest.fixture
-def chrome(monkeypatch: pytest.MonkeyPatch) -> Iterator[tuple[Any, _Api]]:
-    """A throwaway headless Chromium whose page stands in for the probe tab
-    (`_with_prepared_background_page`): it loads the check URL, records its
-    status like the real helper, and runs the probe's callback."""
-    from playwright.sync_api import (  # pylint: disable=import-outside-toplevel
-        sync_playwright,
-    )
-
+def chrome(
+    monkeypatch: pytest.MonkeyPatch, _pw: _PwHolder
+) -> Iterator[tuple[Any, _Api]]:
+    """A fresh context of the module's headless Chromium whose page stands
+    in for the probe tab (`_with_prepared_background_page`): it loads the
+    check URL, records its status like the real helper, and runs the
+    probe's callback."""
     api = _Api()
-    with sync_playwright() as pw:
-        chromium = pw.chromium.launch(headless=True)
-        try:
-            ctx = chromium.new_context()
-            ctx.route("**/*", api.handle)
-            page = ctx.new_page()
+    ctx = _pw.ensure().new_context()
+    try:
+        ctx.route("**/*", api.handle)
+        page = ctx.new_page()
 
-            def probe_tab(_port: int, url: str, _prepare: Any, fn: Any) -> Any:
-                resp = page.goto(url)
-                browser._BG_STATUS[id(page)] = getattr(resp, "status", None)
-                try:
-                    return fn(page)
-                finally:
-                    browser._BG_STATUS.pop(id(page), None)
+        def probe_tab(_port: int, url: str, _prepare: Any, fn: Any) -> Any:
+            resp = page.goto(url)
+            browser._BG_STATUS[id(page)] = getattr(resp, "status", None)
+            try:
+                return fn(page)
+            finally:
+                browser._BG_STATUS.pop(id(page), None)
 
-            def clear(
-                _port: int, site: str, _entry: dict, names: Any, *, why: str
-            ) -> int:
-                api.cleared.append((site, names, why))
-                api.logged_in = False  # its cookies are gone
-                return 2
+        def clear(_port: int, site: str, _entry: dict, names: Any, *, why: str) -> int:
+            api.cleared.append((site, names, why))
+            api.logged_in = False  # its cookies are gone
+            return 2
 
-            monkeypatch.setattr(browser, "_with_prepared_background_page", probe_tab)
-            monkeypatch.setattr(browser, "_broker_note_session_age", lambda *_a: None)
-            monkeypatch.setattr(browser, "_broker_clear_cookies", clear)
-            yield page, api
-        finally:
-            chromium.close()
+        monkeypatch.setattr(browser, "_with_prepared_background_page", probe_tab)
+        monkeypatch.setattr(browser, "_broker_note_session_age", lambda *_a: None)
+        monkeypatch.setattr(browser, "_broker_clear_cookies", clear)
+        _set_phase("call")
+        yield page, api
+    finally:
+        _set_phase("teardown")
+        if not _pw.dead:
+            ctx.close()
 
 
 def _leak_free(
@@ -1194,54 +1447,53 @@ class _StorageApp:
 @pytest.fixture
 def storage_chrome(
     monkeypatch: pytest.MonkeyPatch,
+    _pw: _PwHolder,
 ) -> Iterator[tuple[Any, _StorageApp]]:
-    """A throwaway headless Chromium standing in for THIS browser: every
-    background tab (`_with_prepared_background_page`) is a fresh page of its
-    one context — `prepare` first, then the URL, then `fn`, None on any
-    failure like the real helper — and the cookie clear's `_connect` reaches
-    the same context."""
-    from playwright.sync_api import (  # pylint: disable=import-outside-toplevel
-        sync_playwright,
-    )
-
+    """A fresh context of the module's headless Chromium standing in for
+    THIS browser: every background tab (`_with_prepared_background_page`)
+    is a fresh page of that context — `prepare` first, then the URL, then
+    `fn`, None on any failure like the real helper — and the cookie clear's
+    `_connect` reaches the same context."""
     app = _StorageApp()
-    with sync_playwright() as pw:
-        chromium = pw.chromium.launch(headless=True)
-        try:
-            ctx = chromium.new_context()
-            ctx.route("**/*", app.handle)
+    ctx = _pw.ensure().new_context()
+    try:
+        ctx.route("**/*", app.handle)
 
-            def tab(_port: int, url: str, prepare: Any, fn: Any) -> Any:
-                page = ctx.new_page()
-                try:
-                    if prepare is not None:
-                        prepare(page)
-                    resp = page.goto(url)
-                    browser._BG_STATUS[id(page)] = getattr(resp, "status", None)
-                    return fn(page)
-                except Exception:  # pylint: disable=broad-exception-caught
-                    return None
-                finally:
-                    browser._BG_STATUS.pop(id(page), None)
-                    browser._BG_NOCACHE.pop(id(page), None)
+        def tab(_port: int, url: str, prepare: Any, fn: Any) -> Any:
+            page = ctx.new_page()
+            try:
+                if prepare is not None:
+                    prepare(page)
+                resp = page.goto(url)
+                browser._BG_STATUS[id(page)] = getattr(resp, "status", None)
+                return fn(page)
+            except Exception:  # pylint: disable=broad-exception-caught
+                return None
+            finally:
+                browser._BG_STATUS.pop(id(page), None)
+                browser._BG_NOCACHE.pop(id(page), None)
+                if not _pw.dead:
                     page.close()
 
-            class _Browser:
-                contexts = [ctx]
+        class _Browser:
+            contexts = [ctx]
 
-                def close(self) -> None:
-                    pass
+            def close(self) -> None:
+                pass
 
-            class _Pw:
-                def stop(self) -> None:
-                    pass
+        class _Pw:
+            def stop(self) -> None:
+                pass
 
-            monkeypatch.setattr(browser, "_with_prepared_background_page", tab)
-            monkeypatch.setattr(browser, "_broker_note_session_age", lambda *_a: None)
-            monkeypatch.setattr(browser, "_connect", lambda _port: (_Pw(), _Browser()))
-            yield ctx, app
-        finally:
-            chromium.close()
+        monkeypatch.setattr(browser, "_with_prepared_background_page", tab)
+        monkeypatch.setattr(browser, "_broker_note_session_age", lambda *_a: None)
+        monkeypatch.setattr(browser, "_connect", lambda _port: (_Pw(), _Browser()))
+        _set_phase("call")
+        yield ctx, app
+    finally:
+        _set_phase("teardown")
+        if not _pw.dead:
+            ctx.close()
 
 
 def _set_storage(ctx: Any, origin: str, kv: dict[str, str]) -> None:
@@ -1426,7 +1678,7 @@ def test_the_bypass_keeps_a_service_worker_out_of_the_clear_tab(
 
 @pytest.fixture
 def cdp_chromium(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, _pw: _PwHolder
 ) -> Iterator[tuple[int, Any]]:
     """A throwaway headless Chromium with a DevTools port (never 9222-9225)
     and every coordination file of browser.py in `tmp_path`; yields
@@ -1435,6 +1687,11 @@ def cdp_chromium(
     from playwright.sync_api import (  # pylint: disable=import-outside-toplevel
         sync_playwright,
     )
+
+    # A live module instance makes every nested sync_playwright() (here and
+    # in the real `_connect`) refuse: its loop counts as running. Stop it;
+    # the next `chrome` / `storage_chrome` test relaunches it.
+    _pw.stop("stop before cdp")
 
     files = {
         "CACHE_DIR": "",
