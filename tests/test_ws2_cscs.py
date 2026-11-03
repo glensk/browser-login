@@ -202,7 +202,9 @@ class Portal:
                 f"<div id=app>loading</div><script>{app}</script></body></html>",
             )
 
-    def _auth(self, route: Any, req: Any, url: Any) -> None:
+    def _auth(  # pylint: disable=too-many-return-statements
+        self, route: Any, req: Any, url: Any
+    ) -> None:
         done = PORTAL + "/oauth_login_completed/?state=s"
         if url.path.endswith("/restart"):  # "Restart login": the full form
             self.restarts += 1
@@ -1066,6 +1068,85 @@ def test_a_username_alone_is_username_first() -> None:
     page = _UserOnlyPage()
     form = recipes._cscs_form_or_portal(page, 0.5)
     assert form is not None and form.user is page.user and form.password is None
+
+
+class _ScriptedKcPage(_NoFormPage):
+    """Keycloak's fields poll by poll: each ``#password`` query (a poll's
+    first) moves to the next shape, the last shape stays. A shape maps a
+    field to "shown" or "raise" (its query raises, as when a navigation
+    destroys the execution context); each poll's field is a new handle."""
+
+    def __init__(self, *shapes: dict[str, str]) -> None:
+        self.shapes = shapes
+        self.poll = -1
+        self.handles: dict[tuple[int, str], _Visible] = {}
+
+    def handle(self, poll: int, field: str) -> _Visible:
+        return self.handles.setdefault((poll, field), _Visible())
+
+    def query_selector_all(self, sel: str) -> list[Any]:
+        field = {"#password": "password", "#username": "username"}.get(sel)
+        if field is None:
+            return []
+        if field == "password":
+            self.poll += 1
+        poll = max(0, self.poll)
+        state = self.shapes[min(poll, len(self.shapes) - 1)].get(field)
+        if state == "raise":
+            raise RuntimeError("Execution context was destroyed")
+        return [self.handle(poll, field)] if state == "shown" else []
+
+
+_PW = {"password": "shown"}
+_BOTH = {"password": "shown", "username": "shown"}
+
+
+@pytest.mark.parametrize(
+    "first", [_PW, {"password": "shown", "username": "raise"}], ids=["gone", "raises"]
+)
+def test_a_navigation_between_keycloak_polls_is_not_reauth(
+    first: dict[str, str],
+) -> None:
+    page = _ScriptedKcPage(first, _BOTH)
+    form = recipes._cscs_form_or_portal(page, 5.0)
+    assert form is not None
+    assert form.user is page.handle(1, "username")
+    assert form.password is page.handle(1, "password")
+
+
+def test_a_stable_password_only_page_is_reauth() -> None:
+    page = _ScriptedKcPage(_PW)
+    form = recipes._cscs_form_or_portal(page, 5.0)
+    assert form is not None and form.user is None
+    assert form.password is page.handle(1, "password")  # the confirming poll's
+
+
+def test_a_password_only_page_first_seen_on_the_last_tick_is_reauth() -> None:
+    page = _ScriptedKcPage({}, _PW)  # 0.5 s: polls 0 and 1, then one more look
+    form = recipes._cscs_form_or_portal(page, 0.5)
+    assert form is not None and form.user is None
+    assert form.password is page.handle(2, "password") and page.poll == 2
+
+
+def test_the_reauth_fallback_takes_only_fresh_handles() -> None:
+    secret = vault.Secret(username="someone", password=secrets.token_hex(8))
+    stale = _Visible()
+    page = _ScriptedKcPage(_BOTH)
+    got = recipes._cscs_reauth(
+        page, recipes.KeycloakForm(None, stale), secret, [AUTH], dev=False
+    )
+    assert got is not None and got.password is not stale
+    assert got.user is page.handle(0, "username")
+    assert got.password is page.handle(0, "password")
+    with pytest.raises(recipes.LoginFailed, match="without naming") as err:
+        recipes._cscs_reauth(
+            _ScriptedKcPage(_PW),
+            recipes.KeycloakForm(None, stale),
+            secret,
+            [AUTH],
+            dev=False,
+        )
+    assert err.value.submitted is False
 
 
 def test_the_cscs_item_layout_is_checked() -> None:

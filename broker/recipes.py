@@ -2725,32 +2725,49 @@ def _kc_page_hint(page: Any) -> str:
     return f" (on {path or '/'}; fields: {', '.join(fields) or 'none'})"
 
 
+def _kc_last_look(page: Any, needed: str) -> KeycloakForm | None:
+    """One more poll for a one-field shape first seen on the last tick: the
+    form from this read (``#password`` first) when `needed` still shows."""
+    page.wait_for_timeout(CSCS_POLL_MS)
+    password = _visible(page, "#password")
+    user = _visible(page, "#username")
+    if (password if needed == "#password" else user) is None:
+        return None
+    return KeycloakForm(user, password)
+
+
 def _cscs_form_or_portal(page: Any, timeout_s: float) -> KeycloakForm | None:
     """Wait for Keycloak's login page — the combined form (username +
     password), a username-first page (only the username; two polls in a row,
     so a form still rendering is not mistaken for one) or the
-    re-authentication page (only the password) — or for the portal with a
-    token the server accepts (a silent SSO through the IdP's own session, or a
-    session that still works): then None, nothing to type. Raises
-    ``LoginFailed`` ("Keycloak login form not found", pre-submit, with a
-    value-free page hint) when neither shows, after a final server check; a
-    bot challenge raises ``NeedsHuman``. Bounded by about `timeout_s` +
-    ``CSCS_FINAL_CHECK_S`` (+ 2 × ``CSCS_MIN_CHECK_S``): every in-page check
-    gets only what is left."""
+    re-authentication page (only the password; also two polls in a row, so
+    the portal's own redirect to Keycloak landing between the two field
+    queries is not mistaken for one) — or for the portal with a token the
+    server accepts (a silent SSO through the IdP's own session, or a session
+    that still works): then None, nothing to type. Each poll reads
+    ``#password`` before ``#username``, and a confirmed form's handles come
+    from the confirming poll. Raises ``LoginFailed`` ("Keycloak login form
+    not found", pre-submit, with a value-free page hint) when neither shows,
+    after a final server check; a bot challenge raises ``NeedsHuman``.
+    Bounded by about `timeout_s` + ``CSCS_FINAL_CHECK_S`` (+ 2 ×
+    ``CSCS_MIN_CHECK_S``): every in-page check gets only what is left."""
     ticks = max(1, math.ceil(timeout_s * 1000 / CSCS_POLL_MS))
     deadline = time.monotonic() + timeout_s
     user_only = False
+    pw_only = False
     for tick in range(ticks + 1):
-        user = _visible(page, "#username")
         password = _visible(page, "#password")
+        user = _visible(page, "#username")
         if password is not None:
-            return KeycloakForm(user, password)
-        if user is not None:
+            if user is not None or pw_only:
+                return KeycloakForm(user, password)
+            pw_only, user_only = True, False
+        elif user is not None:
             if user_only:
                 return KeycloakForm(user, None)
-            user_only = True
+            pw_only, user_only = False, True
         else:
-            user_only = False
+            pw_only = user_only = False
         if cscs_on_portal(str(page.url or "")):
             left = deadline - time.monotonic()
             if cscs_token_state(page, budget_s=left).get("state") == VALID:
@@ -2759,11 +2776,10 @@ def _cscs_form_or_portal(page: Any, timeout_s: float) -> KeycloakForm | None:
         if tick >= ticks or time.monotonic() >= deadline:
             break
         page.wait_for_timeout(CSCS_POLL_MS)
-    if user_only:  # seen on the last poll: one more look decides
-        page.wait_for_timeout(CSCS_POLL_MS)
-        user = _visible(page, "#username")
-        if user is not None:
-            return KeycloakForm(user, _visible(page, "#password"))
+    if pw_only or user_only:  # seen on the last poll: one more look decides
+        form = _kc_last_look(page, "#password" if pw_only else "#username")
+        if form is not None:
+            return form
     if cscs_token_proof(page, wait_s=CSCS_FINAL_CHECK_S) == VALID:
         return None
     raise LoginFailed("Keycloak login form not found" + _kc_page_hint(page))
@@ -2881,8 +2897,10 @@ def _cscs_reauth(
     password for: this item's username (compared in-process, case-folded) →
     the page as it is; any other (or none) → "Restart login" and the full form
     again — a password is never typed for an account the page names
-    differently. No restart link, or no form after it → ``LoginFailed``
-    (pre-submit). None: the portal took over (silent SSO)."""
+    differently. No restart link: the combined form when a fresh read shows
+    both fields (its handles, never `form`'s), else ``LoginFailed``
+    (pre-submit), as when no form follows the restart. None: the portal took
+    over (silent SSO)."""
     shown = ""
     try:
         el = _visible(page, KEYCLOAK_ATTEMPTED_USER)
@@ -2893,6 +2911,12 @@ def _cscs_reauth(
         return form
     restart = _visible(page, KEYCLOAK_RESTART)
     if restart is None:
+        # The combined form after all (a navigation hid its username from the
+        # earlier read): only fresh handles, never `form`'s password.
+        password = _visible(page, "#password")
+        user = _visible(page, "#username")
+        if user is not None and password is not None:
+            return KeycloakForm(user, password)
         raise LoginFailed(
             "Keycloak asks for a password without naming this item's account"
             + _kc_page_hint(page)

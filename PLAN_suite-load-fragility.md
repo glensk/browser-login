@@ -254,7 +254,7 @@ Build rounds (at most 3 boxes per round, one writer agent per round, rounds in o
 - **R3** = B5, B7: the npm stale-build test, durations and the README tiers. The B7
   low-load full run is the overseer's, after R1 and R2 have landed.
 
-- [ ] B1 `broker/recipes.py`: in `_cscs_form_or_portal`, query `#password` before
+- [x] B1 `broker/recipes.py`: in `_cscs_form_or_portal`, query `#password` before
   `#username`. Add a `pw_only` flag next to `user_only`: a password-only shape must be
   seen on two consecutive polls, and the handles come from the confirming poll. The
   post-loop "one more look" also covers `pw_only` (first seen on the last tick). In
