@@ -1336,6 +1336,10 @@ class Machine:  # pylint: disable=too-many-instance-attributes
     done: set[int] = field(default_factory=set)
     out: Outcome = field(default_factory=lambda: Outcome(2, "recipe_stuck"))
     baseline: Baseline | None = None
+    # tp#1643: called right BEFORE the mail-code trigger click; a returned
+    # code (state_unwritable / cooldown / quarantined) ends the run with it
+    # and NO click (no code mail); None goes on and clicks.
+    before_trigger: Callable[[], str | None] | None = None
 
     # -- safari.py calls ---------------------------------------------------
 
@@ -1522,6 +1526,10 @@ class Machine:  # pylint: disable=too-many-instance-attributes
                 EMAIL_FILL_JS.replace("__PARAMS__", json.dumps(params)), step.host
             ):
                 return self._end(2, "recipe_stuck")
+        if self.before_trigger is not None:
+            stop = self.before_trigger()
+            if stop:
+                return self._end(2, stop)
         if step.trigger:
             reply = self.call(
                 ["--click", step.trigger, "--row", step.trigger, *self._on(step.host)]

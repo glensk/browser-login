@@ -27,6 +27,7 @@ beyond the redacted detail; agents.md renders only fixed vocabulary.
 
 from __future__ import annotations
 
+# pylint: disable=too-many-lines
 import contextlib
 import fcntl
 import json
@@ -611,6 +612,94 @@ def quarantined(site: str) -> dict[str, Any] | None:
         return None
     q = entry.get("quarantine") if entry else None
     return q if isinstance(q, dict) else None
+
+
+# ---------------------------------------------------------------------------
+# tp#1643: the per-site code-mail cooldown, shared by every route that sends a
+# login code (browser.py's headless `login notion -M`, agent-login's Safari
+# drive). Own files (prune() never rewrites them); the stamp is written BEFORE
+# the trigger click, so a failed write sends nothing.
+# ---------------------------------------------------------------------------
+
+MAIL_CODE_COOLDOWN_S = 900.0  # one code mail per site per 15 min at most
+
+
+def mail_code_file(site: str) -> str:
+    """The cooldown stamp's file name (notion: ``notion-mail-code.json``)."""
+    return f"{site}-mail-code.json"
+
+
+def mail_code_lock_file(site: str) -> str:
+    """The code-mail flock's file name (notion: ``notion-mail-code.lock``)."""
+    return f"{site}-mail-code.lock"
+
+
+@contextlib.contextmanager
+def mail_code_lock(site: str) -> Iterator[bool | None]:
+    """`site`'s code-mail flock (non-blocking): True held, False busy, None
+    when the state dir cannot be written (or `site` is no valid site id)."""
+    if not SITE_ID_RE.match(site):
+        yield None
+        return
+    path = state_dir() / mail_code_lock_file(site)
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        fd = os.open(str(path), os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+    except OSError:
+        yield None
+        return
+    try:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            yield False
+            return
+        yield True
+    finally:
+        os.close(fd)
+
+
+def mail_code_cooldown_left(site: str, now: float) -> float | None:
+    """Seconds of `site`'s code-mail cooldown left (0: none); None when the
+    stamp exists but cannot be read (fail closed). A stamp from the future
+    (the clock moved) counts as the full cooldown."""
+    if not SITE_ID_RE.match(site):
+        return None
+    path = state_dir() / mail_code_file(site)
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return 0.0
+    except (OSError, ValueError):
+        return None
+    at = data.get("at") if isinstance(data, dict) else None
+    if not isinstance(at, (int, float)) or isinstance(at, bool):
+        return None
+    if at > now:
+        return MAIL_CODE_COOLDOWN_S
+    return max(0.0, MAIL_CODE_COOLDOWN_S - (now - at))
+
+
+def mail_code_stamp(site: str, now: float) -> bool:
+    """Write `site`'s cooldown stamp ``{"at": now}`` (atomic, 0600); False on
+    failure."""
+    if not SITE_ID_RE.match(site):
+        return False
+    path = state_dir() / mail_code_file(site)
+    tmp = ""
+    try:
+        fd, tmp = tempfile.mkstemp(prefix=f".{path.name}.", dir=str(path.parent))
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            json.dump({"at": now}, fh)
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(tmp, path)
+    except Exception:  # pylint: disable=broad-exception-caught
+        if tmp:
+            with contextlib.suppress(OSError):
+                Path(tmp).unlink(missing_ok=True)
+        return False
+    return True
 
 
 # One early return per refusal, in the order they are checked.

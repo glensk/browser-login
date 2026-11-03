@@ -3663,9 +3663,6 @@ MAIL_CODE_FALLTHROUGH = frozenset(
         "recipe_stuck",
     }
 )
-# Mirrors bin/browser.py (NOTION_MAIL_CODE_FILE / _COOLDOWN_S): read-only here.
-MAIL_CODE_STAMP = "notion-mail-code.json"
-MAIL_CODE_COOLDOWN_S = 900.0
 # `safari fp` (`-L notion -n`): a value-free HMAC of Safari's session
 # fingerprint, keyed per host so two runs on this Mac compare.
 SAFARI_FP_SALT = "agent-login safari fp v1"
@@ -4188,19 +4185,6 @@ def _safari_fp(site: str, cookies: list) -> str:
     return hmac.new(key, fp, hashlib.sha256).hexdigest()[:8]
 
 
-def _mail_code_cooldown_left(now: float | None = None) -> float | None:
-    """Seconds left of the code-mail cooldown (0 = free); None = unreadable."""
-    path = als.state_dir() / MAIL_CODE_STAMP
-    try:
-        at = float(json.loads(path.read_text(encoding="utf-8")).get("at"))
-    except FileNotFoundError:
-        return 0.0
-    except (OSError, ValueError, TypeError, AttributeError):
-        return None
-    left = MAIL_CODE_COOLDOWN_S - ((time.time() if now is None else now) - at)
-    return max(0.0, left)
-
-
 def _mail_code_dry_run(site: str) -> None:
     """`-L notion -n`: is the headless route ready? READ-ONLY — the expected
     e-mail, himalaya, a mailbox baseline (no trigger), the cooldown."""
@@ -4240,7 +4224,7 @@ def _mail_code_dry_run(site: str) -> None:
             + ")"
         )
     )
-    left = _mail_code_cooldown_left()
+    left = als.mail_code_cooldown_left(site, time.time())
     print(
         f"ℹ️ {site}: code-mail cooldown "
         + (
@@ -4266,9 +4250,16 @@ def _wait_flush(site: str, before: str) -> bool:
 
 # One return per thing the Safari run needs before it can start.
 def _drive_safari(  # pylint: disable=too-many-return-statements
-    site: str, recipe: alsafari.Recipe
+    site: str,
+    recipe: alsafari.Recipe,
+    *,
+    env: dict[str, str] | None = None,
+    before_trigger: Callable[[], str | None] | None = None,
 ) -> alsafari.Outcome:
-    """Resolve what the recipe needs, check safari.py, run the step machine."""
+    """Resolve what the recipe needs, check safari.py, run the step machine.
+    `env`: extra environment for the MailReader's himalaya (a site's mail
+    env); `before_trigger`: the Machine's hook right before a code-mail
+    trigger click (tp#1643). Both default to today's behaviour."""
     binary = alsafari.safari_py_bin()
     if binary is None:
         return alsafari.Outcome(3, "safari_py_missing")
@@ -4285,17 +4276,22 @@ def _drive_safari(  # pylint: disable=too-many-return-statements
     except alsafari.OverrideError as exc:
         print(f"   {exc}")
         return alsafari.Outcome(2, "identity_unconfigured")
-    plan = _safari_plan(site, recipe, over)
+    plan = _safari_plan(site, recipe, over, env=env)
     if plan is None:
         return alsafari.Outcome(2, "safari_no_recipe")
     print(f"▶ {site}: logging in in Albert's Safari (a new window; his clipboard)")
-    return alsafari.Machine(recipe, plan, call).run()
+    return alsafari.Machine(recipe, plan, call, before_trigger=before_trigger).run()
 
 
 def _safari_plan(
-    site: str, recipe: alsafari.Recipe, over: dict
+    site: str,
+    recipe: alsafari.Recipe,
+    over: dict,
+    *,
+    env: dict[str, str] | None = None,
 ) -> alsafari.Plan | None:
-    """The run's start page, sentinel, vault item, account and mailbox."""
+    """The run's start page, sentinel, vault item, account and mailbox
+    (`env`: extra environment for its himalaya; None = inherit)."""
     entry: dict = {}
     if recipe.broker:
         _health, sites = broker_state()
@@ -4313,6 +4309,7 @@ def _safari_plan(
                 himalaya,
                 str(over.get("mailbox") or "")
                 or os.environ.get("ANTHROPIC_LOGIN_HIMALAYA_ACCOUNT"),
+                env=env,
             )
     return alsafari.Plan(
         start_url=start,

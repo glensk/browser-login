@@ -619,6 +619,49 @@ def _add_guided_parsers(sub: Any) -> None:
     )
 
 
+def _add_import_safari_parser(sub: Any) -> None:
+    """`import-safari SITE [-a] [-n] [-P] [-R PATH]` (its own helper: parse_args' size)."""
+    pis = sub.add_parser(
+        "import-safari",
+        help="Copy SITE's session cookies from Safari into the shared browser "
+        "(sites in broker/safari_cookies.SAFARI_SITES that the broker lists; "
+        "bot-check cookies never travel; values are never printed).",
+    )
+    pis.add_argument(
+        "site",
+        help=f"Site to import ({', '.join([*_safari.SAFARI_SITES, *_safari.SAFARI_BUILTIN])}).",
+    )
+    pis.add_argument(
+        "-a",
+        "--agent-login",
+        action="store_true",
+        help="an agent just logged Safari in (agent-login.py -L): record the "
+        "login event as safari-agent (default: safari-import, a copy)",
+    )
+    pis.add_argument(
+        "-n",
+        "--dry-run",
+        action="store_true",
+        help="only list the cookies that would be copied (names, never values)",
+    )
+    pis.add_argument(
+        "-P",
+        "--prove-only",
+        action="store_true",
+        help="prove Safari's session in a throwaway context; the shared browser "
+        f"is not touched ({', '.join(_safari.SAFARI_BUILTIN)} only; exit 0 = "
+        "match, 2 = logged_out / wrong_account / indeterminate)",
+    )
+    pis.add_argument(
+        "-R",
+        "--result-file",
+        metavar="PATH",
+        default=None,
+        help="write where the import stopped (phase, code) as JSON to PATH "
+        "(agent-login.py -t reads it)",
+    )
+
+
 def _add_reap_parser(sub: Any) -> None:
     """`reap-owned`: close the tabs crashed browser.py processes left (tp#845)."""
     pro = sub.add_parser(
@@ -1160,37 +1203,7 @@ def parse_args() -> argparse.Namespace:
         help="Broker site, or a built-in site "
         f"({', '.join(_safari.SAFARI_BUILTIN)}), to log out.",
     )
-    pis = sub.add_parser(
-        "import-safari",
-        help="Copy SITE's session cookies from Safari into the shared browser "
-        "(sites in broker/safari_cookies.SAFARI_SITES that the broker lists; "
-        "bot-check cookies never travel; values are never printed).",
-    )
-    pis.add_argument(
-        "site",
-        help=f"Site to import ({', '.join([*_safari.SAFARI_SITES, *_safari.SAFARI_BUILTIN])}).",
-    )
-    pis.add_argument(
-        "-a",
-        "--agent-login",
-        action="store_true",
-        help="an agent just logged Safari in (agent-login.py -L): record the "
-        "login event as safari-agent (default: safari-import, a copy)",
-    )
-    pis.add_argument(
-        "-n",
-        "--dry-run",
-        action="store_true",
-        help="only list the cookies that would be copied (names, never values)",
-    )
-    pis.add_argument(
-        "-R",
-        "--result-file",
-        metavar="PATH",
-        default=None,
-        help="write where the import stopped (phase, code) as JSON to PATH "
-        "(agent-login.py -t reads it)",
-    )
+    _add_import_safari_parser(sub)
     _add_guided_parsers(sub)
     _add_reap_parser(sub)
     sub.add_parser(
@@ -15240,6 +15253,7 @@ def cmd_import_safari(
     dry_run: bool = False,
     result_file: str | None = None,
     agent: bool = False,
+    prove_only: bool = False,
 ) -> int:
     """Copy SITE's Safari session into the shared browser, then the positive check.
 
@@ -15254,8 +15268,14 @@ def cmd_import_safari(
     `_import_builtin`: one transaction with an account proof (WS1b).
     A real import ends with the Access team-cookie sweep on every exit
     (tp#1466); a failed sweep turns 0 into 1 (``access_team_sweep_failed``).
+    `prove_only` (`-P`, tp#1643): the read-only proof `cmd_prove_safari` —
+    it branches off BEFORE the sweep's try/finally (it writes no cookie).
     """
     site = site_name.strip().lower()
+    if prove_only:
+        if dry_run or agent:
+            return _broker_fail(2, "import-safari -P takes neither -n nor -a")
+        return cmd_prove_safari(port, site, result_file=result_file)
     _result_begin("import-safari", site, result_file)
     rc = 1
     try:
@@ -15786,6 +15806,90 @@ def _import_builtin_leased(  # pylint: disable=too-many-return-statements
     )
 
 
+# tp#1643: `import-safari SITE -P` — is Albert's SAFARI logged in? The proof
+# of `_import_builtin_leased` alone, read-only: Safari's cookies in a THROWAWAY
+# context, never the shared jar (no `_builtin_replace`, no storage clear, no
+# login event, no Access sweep). Exit 0 only on `match`.
+PROVE_ONLY_CODES = {
+    "match": "ok",
+    "mismatch": "wrong_account",
+    "logged_out": "logged_out",
+}
+
+
+def cmd_prove_safari(port: int, site: str, *, result_file: str | None = None) -> int:
+    """`import-safari SITE -P`: the account proof of Safari's session; the
+    result record carries ``safari`` (match / mismatch / logged_out /
+    indeterminate). Exit 0 match, 2 otherwise (75 / 1 when the gate or the
+    lease refused the attach)."""
+    _result_begin("import-safari", site, result_file)
+    _result_set(route="safari-prove")
+    rc = 2
+    try:
+        rc = _prove_safari(port, site)
+        return rc
+    except SystemExit as exc:  # the gate / lease refused (it printed why)
+        rc = exc.code if isinstance(exc.code, int) else 1
+        raise
+    finally:
+        _result_write(rc)
+
+
+# One early return per stop, in the order they are checked.
+def _prove_safari(  # pylint: disable=too-many-return-statements
+    port: int, site: str
+) -> int:
+    """`cmd_prove_safari`'s body (one early return per stop)."""
+    if site not in _safari.SAFARI_BUILTIN:
+        _result_fail("precheck", "unknown_site", "no account proof (-P)")
+        return _broker_fail(
+            2,
+            f"{site}: -P proves only {', '.join(_safari.SAFARI_BUILTIN)} — nothing done.",
+        )
+    cookies, rc = _safari_site_cookies(site)
+    if rc:
+        _result_fail("safari-source", "no_safari_session", "cookie file unreadable")
+        return rc
+    if not _safari.has_session(site, cookies):
+        _result_set(safari="logged_out")
+        _result_fail("safari-source", "no_safari_session")
+        return _broker_fail(2, f"{site}: Safari holds no session — safari: logged_out")
+    expected, why = _builtin_expected(site)
+    if not expected:
+        _result_fail("precheck", "identity_unconfigured", why)
+        return _broker_fail(2, f"{site}: no expected account — nothing proven ({why})")
+    if not _is_up(port):
+        _result_set(safari="indeterminate")
+        _result_fail("client-proof", "indeterminate", "shared browser down")
+        return _broker_fail(
+            2, f"{site}: the shared browser is down — safari: indeterminate"
+        )
+    # Gate (registration) FIRST, lease second — the lock order of every client.
+    reg = _registry_register("browser.py", f"import-safari {site} -P", port)
+    try:
+        with _interaction_lease(f"import-safari {site} -P"):
+            try:
+                verdict = _builtin_prove_isolated(port, site, cookies, expected)
+            except Exception:  # pylint: disable=broad-exception-caught
+                verdict = "indeterminate"  # attach timeout, Playwright error
+    finally:
+        reg()
+    if verdict not in PROVE_ONLY_CODES:
+        verdict = "indeterminate"
+    _result_set(
+        safari=verdict, identity=verdict if verdict in ("match", "mismatch") else ""
+    )
+    if verdict != "match":
+        _result_fail("client-proof", PROVE_ONLY_CODES.get(verdict, "indeterminate"))
+        return _broker_fail(
+            2, f"{site}: safari: {verdict} (proven in a throwaway context)"
+        )
+    print(
+        f"✅ {site}: safari: match (proven in a throwaway context; shared browser untouched)"
+    )
+    return 0
+
+
 def _safari_login(port: int, site: str) -> int:
     """`login SITE` for a Safari-import site: Safari session first, then — only
     for sites with ``broker_fallback`` and a non-refused broker item — the broker.
@@ -16165,9 +16269,11 @@ def cmd_notion_logged_in(port: int) -> int:
 # per process; the cooldown stamp is written BEFORE the trigger click (a failed
 # write sends nothing); a failure after the submit quarantines notion. The code
 # never leaves this process: not in output, the result file or the journal.
-NOTION_MAIL_CODE_COOLDOWN_S = 900.0  # D3: one code mail per 15 min at most
-NOTION_MAIL_CODE_FILE = "notion-mail-code.json"  # own file: prune() never rewrites it
-NOTION_MAIL_CODE_LOCK = "notion-mail-code.lock"
+# tp#1643: the cooldown lives in agent_login_state (shared with agent-login's
+# Safari drive); these names stay as aliases of notion's entries.
+NOTION_MAIL_CODE_COOLDOWN_S = _als.MAIL_CODE_COOLDOWN_S  # D3: one mail per 15 min
+NOTION_MAIL_CODE_FILE = _als.mail_code_file("notion")  # prune() never rewrites it
+NOTION_MAIL_CODE_LOCK = _als.mail_code_lock_file("notion")
 NOTION_MAIL_CODE_HOSTS = ("www.notion.so", "app.notion.com")
 NOTION_MAIL_CODE_GOTO_S = 15.0
 # The submit set this hint; a LoginDeadline expiry after it quarantines notion.
@@ -16279,63 +16385,21 @@ def _nmc_quarantine(code: str) -> None:
     _RESULT["quarantined"] = True
 
 
-@contextlib.contextmanager
-def _nmc_lock() -> Iterator[bool | None]:
-    """The per-site flock (non-blocking): True held, False busy, None when
-    the state dir cannot be written."""
-    path = _als.state_dir() / NOTION_MAIL_CODE_LOCK
-    try:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        fd = os.open(str(path), os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
-    except OSError:
-        yield None
-        return
-    try:
-        try:
-            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except OSError:
-            yield False
-            return
-        yield True
-    finally:
-        os.close(fd)
+def _nmc_lock() -> contextlib.AbstractContextManager[bool | None]:
+    """notion's code-mail flock (non-blocking): True held, False busy, None
+    when the state dir cannot be written (shared: `_als.mail_code_lock`)."""
+    return _als.mail_code_lock("notion")
 
 
 def _nmc_cooldown_left(now: float) -> float | None:
-    """Seconds of the code-mail cooldown left (0: none); None when the
+    """Seconds of notion's code-mail cooldown left (0: none); None when the
     cooldown file exists but cannot be read (fail closed)."""
-    path = _als.state_dir() / NOTION_MAIL_CODE_FILE
-    try:
-        data = json.loads(path.read_text(encoding="utf-8"))
-    except FileNotFoundError:
-        return 0.0
-    except (OSError, ValueError):
-        return None
-    at = data.get("at") if isinstance(data, dict) else None
-    if not isinstance(at, (int, float)) or isinstance(at, bool):
-        return None
-    if at > now:  # a stamp from the future: the clock moved — wait it out
-        return NOTION_MAIL_CODE_COOLDOWN_S
-    return max(0.0, NOTION_MAIL_CODE_COOLDOWN_S - (now - at))
+    return _als.mail_code_cooldown_left("notion", now)
 
 
 def _nmc_stamp(now: float) -> bool:
-    """Write the cooldown stamp ``{"at": now}`` (atomic, 0600); False on failure."""
-    path = _als.state_dir() / NOTION_MAIL_CODE_FILE
-    tmp = ""
-    try:
-        fd, tmp = tempfile.mkstemp(prefix=f".{path.name}.", dir=str(path.parent))
-        with os.fdopen(fd, "w", encoding="utf-8") as fh:
-            json.dump({"at": now}, fh)
-            fh.flush()
-            os.fsync(fh.fileno())
-        os.replace(tmp, path)
-    except Exception:  # pylint: disable=broad-exception-caught
-        if tmp:
-            with contextlib.suppress(OSError):
-                Path(tmp).unlink(missing_ok=True)
-        return False
-    return True
+    """Write notion's cooldown stamp ``{"at": now}`` (atomic, 0600); False on failure."""
+    return _als.mail_code_stamp("notion", now)
 
 
 def _nmc_page(page: Any, recipe: Any, als_s: Any) -> tuple[bool, dict | None]:
@@ -19717,6 +19781,7 @@ def _dispatch(args: argparse.Namespace, port: int) -> int:  # pylint: disable=to
             dry_run=args.dry_run,
             result_file=args.result_file,
             agent=args.agent_login,
+            prove_only=args.prove_only,
         )
     if args.cmd == "login-cscs-assisted":
         return cmd_login_cscs_assisted(port)

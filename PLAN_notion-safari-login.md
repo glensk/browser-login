@@ -286,7 +286,7 @@ names `-L notion -s` ("Albert says 'log me into notion' → run
 
 ## Boxes
 
-- [ ] B1 `agent_login_state.py`: move the mail-code cooldown helpers out of browser.py,
+- [x] B1 `agent_login_state.py`: move the mail-code cooldown helpers out of browser.py,
   keyed by site: `mail_code_lock(site)` (context manager, True/False/None as
   `_nmc_lock`), `mail_code_cooldown_left(site, now)` (fail closed, future stamp = full
   cooldown) and `mail_code_stamp(site, now)` (atomic 0600); files
@@ -299,13 +299,13 @@ names `-L notion -s` ("Albert says 'log me into notion' → run
   `browser._nmc_stamp`) passes unchanged. agent-login.py drops its mirror
   (`MAIL_CODE_STAMP`, `MAIL_CODE_COOLDOWN_S`, `_mail_code_cooldown_left`) and reads
   the shared one.
-- [ ] B2 `agent_login_safari.py`: `Machine` gains `before_trigger: Callable[[], str |
+- [x] B2 `agent_login_safari.py`: `Machine` gains `before_trigger: Callable[[], str |
   None] | None = None`, called in `_mail_code` after the e-mail fill and right before
   the trigger click; a returned code (`state_unwritable` / `cooldown` / `quarantined`)
   → `_end(2, code)`, no click; None → click. `_drive_safari` (agent-login.py) passes
   `before_trigger` and a MailReader `env` through (defaults unchanged for every other
   caller). `EMAIL_FILL_JS` / `CODE_FILL_JS` untouched.
-- [ ] B3 `bin/browser.py`: `import-safari SITE -P/--prove-only` as in Design (help
+- [x] B3 `bin/browser.py`: `import-safari SITE -P/--prove-only` as in Design (help
   text: "prove Safari's session in a throwaway context; the shared browser is not
   touched"); `-P` returns before the sweep try/finally. **Check first (unverified by
   the critique):** (a) does `_builtin_prove_isolated` / `_connect` start the shared
