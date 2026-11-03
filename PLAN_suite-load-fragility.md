@@ -1,12 +1,17 @@
 # PLAN: browser-login suite load fragility (tp#1672)
 
-> **Resume here.** Status: root-caused and planned. Nothing is built yet. Next box: B1.
+> **Resume here.** Status: root-caused, planned, debated (Opus adversary, 2026-11-03) and
+> reconciled. Nothing is built yet. Next round: R1 (B1, B2, B6).
 > B1 changes `broker/recipes.py`, which is broker code. The launchd broker runs from the
 > installed copy (`${LIBEXEC}/current/broker/daemon.py`, `install/install.sh:448`), not from
-> this checkout. That means the file is not live here, but the fix only reaches production
-> after a reinstall, which Albert does as root. All other boxes are test-only. Work in a
-> worktree anyway (`.worktrees.noindex/<name>`), because other agents build and run
-> browser-login tests in this repo concurrently. Only one writer may work in the repo at a time.
+> this checkout. That means the file is not live here, and the fix only reaches production
+> through B6, which reinstalls with `sudo -n` (root is available, no ask) and keeps a
+> rollback target. All other boxes are test-only. Work in a worktree anyway
+> (`.worktrees.noindex/<name>`), because other agents build and run browser-login tests in
+> this repo concurrently. Only one writer may work in the repo at a time. tp#1659 is
+> changing `bin/browser.py` concurrently: cite browser.py by symbol and step label, never by
+> line number, and start R2 (which depends on browser.py internals) only after tp#1659 has
+> landed.
 
 ## Session
 
@@ -152,16 +157,27 @@ from load.
 
 ## Fix design (tests made deterministic without loosening what they prove)
 
-- **C1 (code):** classify the Keycloak page from **one stable observation**. A
-  password-only shape (`user is None`, `password` visible) now has to be seen on **two
-  polls in a row**, like the username-only shape already is (`user_only`, :2741-2751). The
-  handles come from the second poll. On the second poll the combined form shows both fields
-  and is taken as combined. A real re-auth page is stable and still classifies as re-auth
-  after one more `CSCS_POLL_MS`. As a second safety net, `_cscs_reauth` re-checks
-  `_visible(page, "#username")` before raising "without naming…". If the username field is
-  visible, it returns the full form instead of failing. What stays true: a password is never
-  typed for an account the page names differently, and the reauth tests (:656, :669) are
-  unchanged.
+- **C1 (code):** classify the Keycloak page from **one stable observation**.
+  1. Swap the query order: `#password` first, then `#username`, so a navigation that
+     commits between the two queries reads the username from the settled Keycloak document
+     (this removes the race direction that caused C1 without adding latency).
+  2. Because `_visible` also returns None when the username query *raises* (execution
+     context destroyed), the order swap alone is not enough. A password-only shape
+     (`user is None`, `password` visible) must still be seen on **two polls in a row**,
+     through a `pw_only` flag next to the existing `user_only` flag (:2741-2751). The
+     handles come from the confirming poll. A real re-auth page is stable and still
+     classifies as re-auth after one more `CSCS_POLL_MS`.
+  3. Loop edge: a password-only shape first seen on the final tick (`tick >= ticks`) gets
+     the same post-loop "one more look" that `user_only` has today (:2759-2763), so a
+     late-rendering re-auth page still becomes a re-auth form, not "Keycloak login form not
+     found".
+  4. Safety net in `_cscs_reauth`: before raising "without naming…", **re-query both**
+     `#username` and `#password`. Only when both are visible does it return
+     `KeycloakForm(user, password)` with those fresh handles (never the stale `password`
+     handle from the earlier poll). Otherwise it falls through to the existing
+     restart/raise logic.
+  What stays true: a password is never typed for an account the page names differently,
+  and the reauth tests (:656, :669) are unchanged.
 - **C2 (test):** add a `Portal.leave_without_token: bool = True` fixture switch. `_APP_JS`
   gets `away()` only when it is true. The wrong-key test sets it to False and asserts at the
   end that `page.url` is still `PORTAL + "/profile/"`. That way the test provably runs all
@@ -177,53 +193,120 @@ from load.
   - The watcher then fires inside the stuck step every time. Keep the `step`, `scope`,
     `owned` and rc assertions. Measure `exits.at[0]` from the start of the stall, still
     under 2.0 s.
-  - Add one hermetic assertion, by spying `_deadline_push` and `_deadline_step`: the push
-    of `(BG_PAGE_STEP_S, "background_page")` comes before `bg:create`, and its pop comes
-    after `bg:close`. This keeps the claim that the step budget covers create and close.
+  - Add one hermetic test, by spying `_deadline_push` and `_deadline_step`. `_deadline_push`
+    returns a `@contextmanager` (`LoginDeadline.push`), so the spy must **wrap the returned
+    context manager** and record its enter and exit in the same event list as the
+    `_deadline_step` labels. Assert the order
+    `push(BG_PAGE_STEP_S, "background_page") enter < bg:create < bg:close < exit`. A spy
+    on the call alone would not prove that the budget still covers close.
 - **C3 side (test):** measure `test_disarm_racing…`. If `_fire`'s side effects dominate, stub
   `_close_owned_targets` / `_access_team_sweep_cdp` / `_result_write` in that test only. It
   pins the lock protocol, not cleanup. Keep 200 iterations, `not late` and `fired > 0`.
 - **C4 (test):** replace login 1, whose only job is "the broker profile caches build a",
   with a direct visit through `rig.brk.runner._launch(pw, profile_dir("npmfix"))` plus
   `goto(origin)` and `ctx.close()`. This is the pattern `test_a_stale_expiry_is_refreshed`
-  already uses (`test_ws2_cscs.py:600-613`). It saves one proof window and one
-  limiter round. The broken login and the reuse login stay as they are, because they are
-  what the test proves. Expected saving is about 6-10 s at load 20. The rest is inherent.
+  already uses (`test_ws2_cscs.py:600-613`). Chromium writes its disk cache
+  asynchronously, so before `ctx.close()` the direct visit waits for `load` and checks
+  in-page that `main-a.js` loaded (the same signal the broker visit relied on); otherwise the
+  cache may be empty and the "broken" login would wrongly succeed. It saves one proof
+  window and one limiter round. The broken login and the reuse login stay as they are,
+  because they are what the test proves. Expected saving is about 6-10 s at load 20. The
+  rest is inherent.
 - **C5 (suite):**
-  1. One shared Chromium per module for the throwaway-browser fixtures in
-     `test_ws2_cscs.py` (`_page`, `_client`). Each test keeps a **fresh context** (its own
-     storage, its own routes), so isolation is unchanged. This saves driver start plus
-     launch for about 15 tests. Do not touch `tests/test_ws5_client_s2.py`: tp#1655 owns
-     it. Other files are listed as follow-ups, not done here.
+  1. ~~One shared Chromium per module in `test_ws2_cscs.py`~~ **dropped after the
+     debate**: the module mixes `_page`/`_client` tests with in-process broker tests that
+     open their own `sync_playwright()` (`broker/daemon.py:1426`, :1511;
+     `test_ws2_cscs.py:605`), and a nested `sync_playwright()` raises inside the outer
+     one's event loop (`broker/daemon.py:1388-1389`). The saving (about 15 × 5-8 s out of
+     more than 3600 s) does not justify splitting the module now. It becomes a follow-up
+     together with the other Chromium-heavy files (see Not in scope).
   2. Make durations visible: `addopts = "--durations=25"` in `[tool.pytest.ini_options]`.
   3. Document a two-tier run in `README.md`'s test section: the quick tier is
      `-m "not launches_chrome"` and runs in minutes; the full tier runs at low load under
      `nice -n 15`, with the expected wall time recorded from one low-load run. This changes
      no test and gates nothing.
+- **C6 (test, folded in from tp#1659):**
+  `tests/test_connect_hang.py::test_real_connect_times_out_and_names_the_hung_tab_origin_only`
+  asserts `took < 2 + PROBE_BUDGET_S + 12` (:127), where `took` is the wall time of the
+  whole `subprocess.run` (`_run_cli`, :98-107). That includes interpreter start-up and the
+  `bin/browser.py` import. Under load ~20 the test took 21-22 s with old and new browser.py
+  alike, so this is start-up cost, not a regression. Fix (test-only, no browser.py change,
+  so no conflict with tp#1659): in the same test, first time a start-up baseline with the
+  same interpreter and env, a `browser.py` invocation that exits before any CDP work (for
+  example `eval -t 0 1`, the early-reject path that
+  `test_eval_rejects_a_non_positive_timeout` already uses). Then assert
+  `took - startup < 2 + PROBE_BUDGET_S + 4`. The bound on the attach-plus-probe work gets
+  tighter than today's 12 s slack, while start-up noise drops out. Apply the same baseline
+  to `test_eval_watchdog_exits_at_its_deadline_while_the_attach_is_stuck` (:153,
+  `took < 2 + 10`), which has the same exposure.
 
 ## Boxes
 
-- [ ] B1 `broker/recipes.py`: in `_cscs_form_or_portal`, the password-only shape has to be
-  seen on two consecutive polls, and the handles come from the confirming poll. In
-  `_cscs_reauth`, a visible `#username` returns the combined form instead of raising.
-  New hermetic test in `tests/test_ws2_cscs.py`: a scripted fake page whose first poll
-  shows only `#password` (a navigation mid-poll) and whose second shows both. It must give
-  a combined `KeycloakForm` with no `LoginFailed`. A stable password-only page must still
-  give a re-auth form. Run the cscs reauth tests (:656, :669) plus the 3 ticket tests.
+Build rounds (at most 3 boxes per round, one writer agent per round, rounds in order):
+
+- **R1** = B1, B2, B6: the cscs fixes plus landing B1 in production. B1 and B2 both edit
+  `tests/test_ws2_cscs.py`, so one agent builds them in that order. B6 runs after B1 is
+  merged to `origin/main`, because `install.sh` installs `git archive HEAD` and refuses a
+  HEAD that is not in `origin/main`.
+- **R2** = B3, B4, B8: the timing and budget work. It starts only after tp#1659 has landed
+  its `bin/browser.py` changes. The builder first rebases, then re-checks the `bg:*` step
+  labels and the `_background_page_run` / `_deadline_push` symbols.
+- **R3** = B5, B7: the npm stale-build test, durations and the README tiers. The B7
+  low-load full run is the overseer's, after R1 and R2 have landed.
+
+- [ ] B1 `broker/recipes.py`: in `_cscs_form_or_portal`, query `#password` before
+  `#username`. Add a `pw_only` flag next to `user_only`: a password-only shape must be
+  seen on two consecutive polls, and the handles come from the confirming poll. The
+  post-loop "one more look" also covers `pw_only` (first seen on the last tick). In
+  `_cscs_reauth`, before raising "without naming…", re-query both `#username` and
+  `#password`, and return `KeycloakForm(user, password)` with those fresh handles only when
+  both are visible. New hermetic tests in `tests/test_ws2_cscs.py`, each on a scripted fake
+  page (no Chromium):
+  `test_a_navigation_between_keycloak_polls_is_not_reauth` (first poll password-only or
+  username query raising, second poll both → combined form, no `LoginFailed`);
+  `test_a_stable_password_only_page_is_reauth`; and
+  `test_a_password_only_page_first_seen_on_the_last_tick_is_reauth`. Also run the cscs
+  reauth tests (:656, :669) and the 3 ticket tests by name.
 - [ ] B2 `tests/test_ws2_cscs.py`: add `Portal.leave_without_token` and make `_APP_JS`'s
-  `away()` conditional on it. The wrong-key test sets it to False and asserts the page is
-  still on `/profile/` at the end.
+  `away()` conditional on it. The wrong-key test sets it to False and asserts that the page
+  is still on `PORTAL + "/profile/"` at the end. That assertion is what tells the new test
+  apart from the old one, which passes on a lucky run.
+- [ ] B6 Landing of B1 in production, after B1 and B2 are merged to `origin/main`. (1)
+  Record the current release: `readlink /usr/local/libexec/login-broker/current`, in the
+  report. (2) `sudo -n install/install.sh -n` (dry run), then
+  `sudo -n install/install.sh` from a clean checkout at `origin/main`. It installs a new
+  release, swaps `current` atomically, restarts the daemon and runs the boundary selfcheck,
+  which rolls back on failure. (3) Confirm that the new release dir holds the B1
+  `_cscs_form_or_portal`, that the daemon restarted (`sudo -n launchctl print
+  system/com.albert.login-broker` shows a fresh pid), and the install line in
+  `/var/log/login-broker.log`. (4) A live `browser.py login cscs` canary runs only after the
+  main session has released the `cscs` quarantine (`agent-login.py -Q cscs`). Otherwise
+  the box reports "canary pending: quarantine" and the main session runs the canary.
+  Rollback: re-point `current` to the recorded release with `sudo -n ln -sfn <old>
+  /usr/local/libexec/login-broker/current.tmp` plus `mv -h` over `current`, then
+  `sudo -n launchctl kickstart -k system/com.albert.login-broker`.
 - [ ] B3 `tests/test_login_timeout.py`: move the short budget into the stalled call for
-  :206, :227 and :246 (`push(0.3, "background_page")`), with `BG_PAGE_STEP_S = 30`. Add the
-  hermetic push/step order assertion.
+  the three tests `test_stuck_evaluate_fires_closes_the_owned_tab_and_exits_124`,
+  `test_stalled_raw_create_fires_on_bg_create_and_leaks_no_target` and
+  `test_failed_close_still_listed_is_125_unconfirmed`
+  (`browser._active_deadline().push(0.3, "background_page")` around the wait), with
+  `BG_PAGE_STEP_S = 30`. Add `test_bg_step_budget_covers_create_and_close`: the spy wraps
+  the context manager that `_deadline_push` returns and asserts
+  `push enter < bg:create < bg:close < push exit`.
 - [ ] B4 `tests/test_login_timeout.py`: time `test_disarm_racing…` per iteration (one run).
   If `_fire` side effects dominate, stub them in that test. Keep 200 iterations and both
   assertions. If the time is sleep granularity instead, report back and change nothing.
+- [ ] B8 `tests/test_connect_hang.py` (C6, test-only): in
+  `test_real_connect_times_out_and_names_the_hung_tab_origin_only` and
+  `test_eval_watchdog_exits_at_its_deadline_while_the_attach_is_stuck`, time a start-up
+  baseline first (same interpreter and env, `browser.py eval -t 0 1`, which exits before
+  any CDP work). Assert `took - startup < 2 + PROBE_BUDGET_S + 4` and
+  `took - startup < 2 + 4`. Every other assertion stays. No `bin/browser.py` change.
 - [ ] B5 `tests/test_ws2_npm.py`: replace the stale-build test's first login with a direct
-  profile visit through `runner._launch`, and keep the asserts on logins 2 and 3.
-- [ ] B6 `tests/test_ws2_cscs.py`: a module-scoped Playwright + Chromium fixture shared by
-  `_page`/`_client`, with a fresh context per test. The browser closes at module teardown,
-  so no Chrome is left behind (conftest `launches_chrome` contract).
+  profile visit through `runner._launch`. Before `ctx.close()`, wait for `load` and check
+  in-page that `main-a.js` loaded. Keep the asserts on logins 2 and 3. If the "broken"
+  login then stops failing (the cache was not populated), revert B5 and record the test as
+  an inherently slow full-tier member.
 - [ ] B7 `pyproject.toml` `--durations=25`, plus a `README.md` two-tier test section with
   the low-load wall time from one full run done by the overseer at load < 8 (the overseer
   makes that run, not an agent under load).
@@ -231,24 +314,81 @@ from load.
 ## Verification
 
 ```commands
-cd /Users/albert/obsidian/42-Git/home/browser-login && ruff format --check /Users/albert/obsidian/42-Git/home/browser-login/broker/recipes.py /Users/albert/obsidian/42-Git/home/browser-login/tests/test_ws2_cscs.py /Users/albert/obsidian/42-Git/home/browser-login/tests/test_login_timeout.py /Users/albert/obsidian/42-Git/home/browser-login/tests/test_ws2_npm.py
-cd /Users/albert/obsidian/42-Git/home/browser-login && ruff check /Users/albert/obsidian/42-Git/home/browser-login/broker/recipes.py /Users/albert/obsidian/42-Git/home/browser-login/tests/test_ws2_cscs.py /Users/albert/obsidian/42-Git/home/browser-login/tests/test_login_timeout.py /Users/albert/obsidian/42-Git/home/browser-login/tests/test_ws2_npm.py
+cd /Users/albert/obsidian/42-Git/home/browser-login && ruff format --check /Users/albert/obsidian/42-Git/home/browser-login/broker/recipes.py /Users/albert/obsidian/42-Git/home/browser-login/tests/test_ws2_cscs.py /Users/albert/obsidian/42-Git/home/browser-login/tests/test_login_timeout.py /Users/albert/obsidian/42-Git/home/browser-login/tests/test_ws2_npm.py /Users/albert/obsidian/42-Git/home/browser-login/tests/test_connect_hang.py
+cd /Users/albert/obsidian/42-Git/home/browser-login && ruff check /Users/albert/obsidian/42-Git/home/browser-login/broker/recipes.py /Users/albert/obsidian/42-Git/home/browser-login/tests/test_ws2_cscs.py /Users/albert/obsidian/42-Git/home/browser-login/tests/test_login_timeout.py /Users/albert/obsidian/42-Git/home/browser-login/tests/test_ws2_npm.py /Users/albert/obsidian/42-Git/home/browser-login/tests/test_connect_hang.py
 cd /Users/albert/obsidian/42-Git/home/browser-login && uv run --project /Users/albert/obsidian/42-Git/home/browser-login mypy /Users/albert/obsidian/42-Git/home/browser-login/broker/recipes.py /Users/albert/obsidian/42-Git/home/browser-login/tests/test_ws2_cscs.py
-cd /Users/albert/obsidian/42-Git/home/browser-login && uv run --project /Users/albert/obsidian/42-Git/home/browser-login pylint /Users/albert/obsidian/42-Git/home/browser-login/broker/recipes.py /Users/albert/obsidian/42-Git/home/browser-login/tests/test_ws2_cscs.py /Users/albert/obsidian/42-Git/home/browser-login/tests/test_login_timeout.py /Users/albert/obsidian/42-Git/home/browser-login/tests/test_ws2_npm.py
-cd /Users/albert/obsidian/42-Git/home/browser-login && timeout 600 uv run --project /Users/albert/obsidian/42-Git/home/browser-login pytest -q -rs -p no:cacheprovider /Users/albert/obsidian/42-Git/home/browser-login/tests/test_ws2_cscs.py
-cd /Users/albert/obsidian/42-Git/home/browser-login && timeout 600 uv run --project /Users/albert/obsidian/42-Git/home/browser-login pytest -q -rs -p no:cacheprovider /Users/albert/obsidian/42-Git/home/browser-login/tests/test_login_timeout.py
-cd /Users/albert/obsidian/42-Git/home/browser-login && timeout 600 uv run --project /Users/albert/obsidian/42-Git/home/browser-login pytest -q -rs -p no:cacheprovider /Users/albert/obsidian/42-Git/home/browser-login/tests/test_ws2_npm.py
+cd /Users/albert/obsidian/42-Git/home/browser-login && uv run --project /Users/albert/obsidian/42-Git/home/browser-login pylint /Users/albert/obsidian/42-Git/home/browser-login/broker/recipes.py /Users/albert/obsidian/42-Git/home/browser-login/tests/test_ws2_cscs.py /Users/albert/obsidian/42-Git/home/browser-login/tests/test_login_timeout.py /Users/albert/obsidian/42-Git/home/browser-login/tests/test_ws2_npm.py /Users/albert/obsidian/42-Git/home/browser-login/tests/test_connect_hang.py
+cd /Users/albert/obsidian/42-Git/home/browser-login && grep -n leave_without_token /Users/albert/obsidian/42-Git/home/browser-login/tests/test_ws2_cscs.py
+cd /Users/albert/obsidian/42-Git/home/browser-login && grep -n pw_only /Users/albert/obsidian/42-Git/home/browser-login/broker/recipes.py
+cd /Users/albert/obsidian/42-Git/home/browser-login && grep -n durations=25 /Users/albert/obsidian/42-Git/home/browser-login/pyproject.toml
+cd /Users/albert/obsidian/42-Git/home/browser-login && timeout 900 uv run --project /Users/albert/obsidian/42-Git/home/browser-login pytest -q -rs -p no:cacheprovider /Users/albert/obsidian/42-Git/home/browser-login/tests/test_ws2_cscs.py -k "keycloak_polls or password_only or another_key or fresh_login_exports or stale_expiry_is_refreshed or silent_sso_with_a_failed_export or reauth"
+cd /Users/albert/obsidian/42-Git/home/browser-login && timeout 900 uv run --project /Users/albert/obsidian/42-Git/home/browser-login pytest -q -rs -p no:cacheprovider /Users/albert/obsidian/42-Git/home/browser-login/tests/test_login_timeout.py
+cd /Users/albert/obsidian/42-Git/home/browser-login && timeout 900 uv run --project /Users/albert/obsidian/42-Git/home/browser-login pytest -q -rs -p no:cacheprovider /Users/albert/obsidian/42-Git/home/browser-login/tests/test_connect_hang.py -k "real_connect_times_out or eval_watchdog_exits"
+cd /Users/albert/obsidian/42-Git/home/browser-login && timeout 900 uv run --project /Users/albert/obsidian/42-Git/home/browser-login pytest -q -rs -p no:cacheprovider /Users/albert/obsidian/42-Git/home/browser-login/tests/test_ws2_npm.py -k stale_cached_build
 ```
 
-Each file must pass at the current load (~20) on two normal runs. That is the "under load"
-claim, and it uses no load generator. The timing bounds that stay in the tests (< 2.0 s
-from the stall) are measured from the stall, not from the setup. The full-suite wall time
-(B7) is one overseer run at low load and is not part of this block.
+The targeted runs must pass at the current load (~20) on two normal runs. That is the
+"under load" claim, and it uses no load generator. The tests that tell old code from new
+are named in the `-k` filters: the new hermetic C1 tests (they fail with exit 5, "no tests
+collected", before B1, and on the old `_cscs_form_or_portal` the navigation case raises
+`LoginFailed`), the wrong-key test with its `page.url` assertion (B2),
+`test_bg_step_budget_covers_create_and_close` (B3), and the start-up baseline (B8). The
+`grep` lines fail (exit 1) until B1, B2 and B7 have landed. Whole-file runs of
+`test_ws2_cscs.py` and `test_ws2_npm.py` (about 600-1500 s at load 20) belong to B7's
+low-load overseer run, not to this block. The timing bounds that stay in the tests (< 2.0 s
+from the stall, the attach-plus-probe bound after start-up) are measured from the work they
+bound, not from process or setup start. B6's live checks are in its box; they need root and
+are not part of this read-only block.
 
 ## Not in scope
 
 - `tests/test_ws5_client_s2.py` (tp#1655, its own plan).
-- Shared-Chromium fixtures for the other Chromium-heavy files (`test_authentik.py`,
-  `test_ws5_runai.py`, `test_ws5_keycloak_admin.py`, …): follow-up ticket once B6 shows
-  the saving.
+- Shared-Chromium fixtures (dropped from this plan, see C5.1): for `test_ws2_cscs.py`
+  this would mean splitting the `_page`/`_client` tests into their own module first; also
+  for the other Chromium-heavy files (`test_authentik.py`, `test_ws5_runai.py`,
+  `test_ws5_keycloak_admin.py`, …). This becomes a follow-up ticket once B7's durations show
+  where the time goes.
 - Releasing the live `cscs` quarantine (`agent-login.py -Q cscs`): the main session's call.
+
+## Debate outcome (Opus adversary)
+
+Critic: fresh Opus subagent, 2026-11-03, 1 round. Codex round 0 was refused three times
+with `debate_seat_unknown` (no fresh five-hour reading for any seat), so the
+`opus-plan-critique` stand-in ran. Verdict: sound-with-fixes.
+
+1. [blocker] B6's module-scoped Chromium would coexist with the in-process broker tests'
+   own `sync_playwright()`, and a nested one raises (`broker/daemon.py:1388-1389`).
+   Accepted: the shared Chromium is dropped (C5.1, Not in scope). The B6 id now holds the
+   production landing box.
+2. [major] No box for the folded-in `test_connect_hang.py` 20 s limit. Accepted: new
+   cause C6 and box B8 (start-up baseline subtracted, tighter attach-plus-probe bound, the
+   same fix for the eval-watchdog test). It is in R2 with the other timing work.
+3. [major] No landing/reinstall box for B1 and no rollback. Accepted: B6 records the old
+   release, runs a dry run, then the real `sudo -n install/install.sh` from `origin/main`,
+   checks the restart and the log, runs the canary after the quarantine is released, and
+   names the rollback.
+4. [major] Whole-file Verification runs cannot tell old code from new. Accepted:
+   targeted `-k` runs on the discriminating tests, plus `grep` checks for the new symbols.
+5. [major] `timeout 600` is below the measured whole-file cost at load 20. Accepted: the
+   Chromium files run only the targeted tests (timeout 900); whole files go to B7's
+   low-load run.
+6. [minor] The two-poll rule misses the last-tick edge and the order-swap option.
+   Accepted: B1 swaps the query order, adds `pw_only` with the post-loop confirm, and adds a
+   last-tick hermetic test. The two-poll confirm stays, because a raising username query
+   still returns None after the swap.
+7. [minor] The `_cscs_reauth` safety net could fill a stale password handle. Accepted:
+   it re-queries both fields and uses only the fresh handles.
+8. [minor] The order spy must wrap the context manager to prove the pop comes after
+   `bg:close`. Accepted: B3 spells this out.
+9. [minor] browser.py line anchors are stale because of tp#1659 (35a7a79). Accepted:
+   cite by symbol and label, and R2 starts after tp#1659 lands, with a rebase and a label
+   re-check. The C3 line numbers in Causes are historical (pre-35a7a79).
+10. [minor] B5's immediate `ctx.close()` may leave the disk cache empty. Accepted: wait
+    for `load` plus an in-page `main-a.js` check before closing, and if it still flakes,
+    revert and keep the test as slow full-tier.
+11. [minor] No round grouping, and the landing order was unclear. Accepted: R1/R2/R3 are
+    defined at the top of Boxes.
+
+No rejections, so no round 2. Still unverified (the builder checks these): the C1 root
+cause rests on one failing run's page hint (B1's hermetic tests pin the mechanism, not the
+live occurrence); the B4 hypothesis is unmeasured (B4 measures it first).
