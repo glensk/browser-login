@@ -951,7 +951,8 @@ def _summary_reason(  # pylint: disable=too-many-return-statements
 def _route_header(rows: list[dict]) -> str:
     """agents.md's sentence on sites that live on Albert's session, built from
     `agent_route` (SF2): `-L` is promised only for the sites it can renew
-    now; the rest keep "ask Albert"."""
+    now; the rest keep "ask Albert". It ends with the `-L SITE -s` sentence
+    (`safari_route_sentence`)."""
     routed = sorted(
         {
             r["site"]
@@ -963,6 +964,9 @@ def _route_header(rows: list[dict]) -> str:
         "for the other sites on Albert's session do NOT start a login — ask "
         "Albert to run `agent-login.py -g <site>`."
     )
+    safari = safari_route_sentence()  # tp#1643: from SAFARI_ROUTES
+    if safari:
+        rest += f" {safari}"
     if not routed:
         return rest
     return (
@@ -1043,6 +1047,44 @@ def _broker_logs_in(row: dict | None) -> bool:
         row.get("status") in ("ready", "extra")
         and not is_fill_only(row)
         and not account_unproven(row)
+    )
+
+
+# The overview's two capability columns (tp#1643) and their one-line legend.
+SAFARI_COL = "Safari"
+CHROMIUM_COL = "Chromium"
+LOGIN_COLUMNS_LEGEND = (
+    "Safari = -L SITE -s logs Albert's Safari in and opens the page · "
+    "Chromium = an agent gets the shared Chromium logged in itself"
+)
+
+
+def _yes_no_cell(yes: bool, header: str) -> str:
+    """✅ / ❌ padded to `header`'s display width (both icons are two
+    terminal columns wide, like the status icon)."""
+    return ("✅" if yes else "❌") + " " * (len(header) - 2)
+
+
+def with_login_columns(rows: list[dict]) -> list[dict]:
+    """`-j`: each row gains ``login_columns`` {"safari", "chromium"}."""
+    for row in rows:
+        row["login_columns"] = asdict(login_columns(str(row.get("site") or ""), row))
+    return rows
+
+
+def safari_route_sentence() -> str:
+    """agents.md's `-L SITE -s` sentence, its sites from `SAFARI_ROUTES`
+    (only sites with a recipe; '' when none)."""
+    sites = sorted(s for s in SAFARI_ROUTES if s in alsafari.RECIPES)
+    if not sites:
+        return ""
+    says = "; ".join(
+        f"Albert says 'log me into {s}' → run `agent-login.py -L {s} -s`" for s in sites
+    )
+    return (
+        f"{says} (his own Safari, attended — exit 3 = the Mac is locked or idle; "
+        "`-s URL` also opens that page of the site; the Safari code fill is not "
+        "proven live yet)."
     )
 
 
@@ -1637,11 +1679,22 @@ def print_overview(data: dict) -> None:
         "held": "⏸ ",
         "unproven": "⚠️",
     }
-    print(_c("2", f"     {'login'.ljust(width)}  {col}  status"))
+    print(
+        _c(
+            "2",
+            f"     {'login'.ljust(width)}  {SAFARI_COL}  {CHROMIUM_COL}  {col}  status",
+        )
+    )
+    print(_c("2", f"     {LOGIN_COLUMNS_LEGEND}"))
     for r, state, why in judged:
         bw = str(bool(r.get("in_bitwarden"))).ljust(len(col))
         icon = icons.get(state, "❌")
-        line = f"  {icon} {_c('1', r['name'].ljust(width))}  {bw}  "
+        cols = login_columns(r["site"], r)
+        line = (
+            f"  {icon} {_c('1', r['name'].ljust(width))}  "
+            f"{_yes_no_cell(cols.safari, SAFARI_COL)}  "
+            f"{_yes_no_cell(cols.chromium, CHROMIUM_COL)}  {bw}  "
+        )
         rec = checks.get(r["site"]) or {}
         if state == "failed":
             if rec.get("detail"):
@@ -4212,6 +4265,67 @@ def _safari_py_ready(recipe: alsafari.Recipe) -> tuple[alsafari.Runner | None, s
     return call, ""
 
 
+def safari_target_dry_run(site: str, recipe: alsafari.Recipe) -> int:
+    """`-L SITE -s [URL] -n`: READ-ONLY — the gate, safari.py (only
+    `--capabilities` / `--status`), Safari's session (`safari fp`), the
+    quarantine, the cooldown, the mailbox, and the step a real run takes.
+    No proof run, no lease, no mail, no record."""
+    gate = alsafari.interactive_gate()
+    print(
+        f"ℹ️ {site}: interactive gate "
+        + ("open" if gate is None else f"closed — {phases.CODE_TEXT.get(gate, gate)}")
+    )
+    _call, stop = _safari_py_ready(recipe)
+    print(
+        f"ℹ️ {site}: safari.py "
+        + (
+            "ready (the recipe's features incl. open, JavaScript on)"
+            if not stop
+            else f"NOT ready — {phases.CODE_TEXT.get(stop, stop)} ({stop})"
+        )
+    )
+    cookies, why = _safari_jar(site)
+    held = why is None and safari_cookies.has_session(site, cookies)
+    if why is not None:
+        print(
+            f"ℹ️ {site}: Safari's cookie file unreadable ({why}) — counts as logged out"
+        )
+    else:
+        print(
+            f"ℹ️ {site}: Safari {'holds' if held else 'holds NO'} session — "
+            f"safari fp: {_safari_fp(site, cookies)}"
+        )
+    cookies.clear()
+    q = als.quarantined(site)
+    print(
+        f"ℹ️ {site}: "
+        + (
+            "not quarantined"
+            if q is None
+            else f"quarantined after {q.get('phase')} — ./agent-login.py -Q {site}"
+        )
+    )
+    block = ""
+    if site in MAIL_CODE_SITES:
+        _mail_code_dry_run(site)
+        block = _mail_code_block(site)
+    if gate is not None or stop:
+        nxt = f"stop with exit 3 ({gate or stop}), nothing done"
+    elif held:
+        nxt = (
+            "prove Safari's session, import if the shared Chromium is logged "
+            "out, then open"
+        )
+    elif block:
+        nxt = f"try Safari without a code mail ({block}), then open"
+    elif site in MAIL_CODE_SITES:
+        nxt = "log Safari in with the e-mail code, then open"
+    else:
+        nxt = "log Safari in, then open"
+    print(f"ℹ️ {site}: -s would {nxt}")
+    return 0
+
+
 # One return per stage of the -s pipeline (tp#1643 Design).
 def safari_target_action(  # pylint: disable=too-many-return-statements
     site: str, url: str, *, dry_run: bool = False
@@ -4243,7 +4357,7 @@ def safari_target_action(  # pylint: disable=too-many-return-statements
     what = "the given page" if url else "the landing page"
     print(f"▶ {site}: Safari target {_origin(target)} ({what})")
     if dry_run:
-        return safari_dry_run(site, recipe)
+        return safari_target_dry_run(site, recipe)
     gate = alsafari.interactive_gate()
     if gate is not None:
         print(f"❌ {site}: {phases.CODE_TEXT.get(gate, gate)} ({gate})")
@@ -4303,7 +4417,7 @@ def _safari_target_locked(
     return 0
 
 
-def _safari_proof(site: str) -> tuple[str | int, str]:  # pylint: disable=too-many-return-statements  # pylint: disable=too-many-return-statements
+def _safari_proof(site: str) -> tuple[str | int, str]:  # pylint: disable=too-many-return-statements
     """(Safari's state, its session fingerprint before any login): "match",
     "logged_out" (no / unreadable session, or the proof said so), or the
     exit code when `-s` stops (mismatch 2, busy 75, cannot tell 2)."""
@@ -5158,6 +5272,7 @@ def main() -> int:  # pylint: disable=too-many-return-statements,too-many-branch
         return 0
     if args.json:
         data["credentials"] = agent_login_cred.summary(agent_login_cred.load())
+        with_login_columns(data["rows"])  # tp#1643
         print(json.dumps(data, indent=1))
     else:
         print_overview(data)

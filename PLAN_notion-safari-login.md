@@ -335,8 +335,8 @@ names `-L notion -s` ("Albert says 'log me into notion' → run
   visible) when Safari is logged in, so the no-trigger mode can succeed? If it does
   not, no-trigger mode with a stale on-disk cookie ends in `cooldown` /
   `quarantined` — note it in README; (c) as B3 (b) for the fallback's timeouts.
-- [ ] B7 `agent-login.py`: `-L SITE -s [URL] -n` dry run as in Design.
-- [ ] B8 tests (unit, no network, no real Safari / Chrome; fakes as in
+- [x] B7 `agent-login.py`: `-L SITE -s [URL] -n` dry run as in Design.
+- [x] B8 tests (unit, no network, no real Safari / Chrome; fakes as in
   `test_ws1b_safari.py` / `test_notion_l_pipeline.py`) in new
   `tests/test_notion_safari_target.py`:
   Safari proof `match` → zero Machine calls, zero mail reads, cooldown file untouched,
@@ -375,7 +375,7 @@ names `-L notion -s` ("Albert says 'log me into notion' → run
   present, `-j` rows carry `login_columns`. B1: browser.py and agent-login.py read the
   same stamp; `mail_code_*("notion")` uses the existing file names; B2:
   `before_trigger` returning a code → no click, `_end` code = that code.
-- [ ] B9 `agent-login.py`: overview `Safari` / `Chromium` columns + legend line + `-j`
+- [x] B9 `agent-login.py`: overview `Safari` / `Chromium` columns + legend line + `-j`
   `login_columns` + agents.md route sentence from `SAFARI_ROUTES` (Design).
 - [ ] B10 docs: README notion row (~586: "`-L notion -s [URL]` logs Albert's Safari in
   (attended) and opens the page"), §"Agents renew…" (~1075: a step "Safari target"

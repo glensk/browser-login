@@ -11,13 +11,16 @@ from __future__ import annotations
 
 # pylint: disable=missing-function-docstring,import-error,wrong-import-position
 # pylint: disable=protected-access,redefined-outer-name,unused-argument
+# pylint: disable=too-many-lines
 import contextlib
 import importlib.util
+import io
 import json
 import os
 import secrets
 import sys
 import time
+import unicodedata
 from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
@@ -830,12 +833,79 @@ def test_an_import_failure_still_opens(pipe: dict[str, Any]) -> None:
     assert _kinds(pipe) == ["browser", "import", "open"]
 
 
+def _dry(
+    pipe: dict[str, Any], monkeypatch: pytest.MonkeyPatch, site: str = "notion"
+) -> tuple[str, list[str]]:
+    """`-L SITE -s -n` with every safari.py argument recorded; (stdout, args)."""
+    seen: list[str] = []
+    inner = alsafari.run_safari_py("safari-fake")
+
+    def call(args: list[str]) -> alsafari.Reply:
+        seen.append(args[0])
+        return inner(args)
+
+    def features(c: Any) -> frozenset[str]:
+        c(["--capabilities"])
+        return alsafari.BASE_FEATURES | alsafari.RECIPES[site].features()
+
+    monkeypatch.setattr(alsafari, "run_safari_py", lambda _b: call)
+    monkeypatch.setattr(alsafari, "features", features)
+    monkeypatch.setattr(al, "_mail_code_dry_run", lambda s: print(f"MAILBOX {s}"))
+    out = io.StringIO()
+    with contextlib.redirect_stdout(out):
+        assert al.safari_target_action(site, "", dry_run=True) == 0
+    return out.getvalue(), seen
+
+
 def test_dry_run_calls_nothing(
     pipe: dict[str, Any], monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    monkeypatch.setattr(al, "_mail_code_dry_run", lambda _s: None)
-    assert al.safari_target_action("notion", "", dry_run=True) == 0
+    text, seen = _dry(pipe, monkeypatch)
+    # no -P proof, no Machine, no -o, no import, no record, no stamp
+    assert not pipe["log"] and not pipe["records"]
+    assert set(seen) <= {"--capabilities", "--status"}
+    assert not _stamp_path().exists()
+    assert "▶ notion: Safari target https://app.notion.com (the landing page)" in text
+    assert "interactive gate open" in text and "safari.py ready" in text
+    assert "safari fp: " in text and "not quarantined" in text
+    assert "MAILBOX notion" in text
+    assert "-s would prove Safari's session" in text
+    assert pipe["jar"][0].value not in text
+
+
+@pytest.mark.parametrize(
+    ("setup", "want"),
+    [
+        ("no_session", "-s would log Safari in with the e-mail code, then open"),
+        ("cooldown", "-s would try Safari without a code mail (cooldown)"),
+        ("quarantined", "-s would try Safari without a code mail (quarantined)"),
+        ("gate", "-s would stop with exit 3 (console_locked)"),
+        ("old_safari_py", "-s would stop with exit 3 (safari_py_outdated)"),
+    ],
+)
+def test_dry_run_names_the_next_step(
+    pipe: dict[str, Any], monkeypatch: pytest.MonkeyPatch, setup: str, want: str
+) -> None:
+    pipe["jar"] = []
+    if setup == "cooldown":
+        assert als.mail_code_stamp("notion", time.time())
+    elif setup == "quarantined":
+        als.quarantine("notion", "submit", "recipe_stuck")
+    elif setup == "gate":
+        pipe["gate"] = "console_locked"
+    stamp = _stamp_path().read_bytes() if _stamp_path().exists() else None
+    if setup == "old_safari_py":
+        monkeypatch.setattr(alsafari, "features", lambda _c: frozenset())
+        monkeypatch.setattr(al, "_mail_code_dry_run", lambda _s: None)
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            assert al.safari_target_action("notion", "", dry_run=True) == 0
+        text = out.getvalue()
+    else:
+        text, _seen = _dry(pipe, monkeypatch)
+    assert want in text
     assert not pipe["log"]
+    assert (_stamp_path().read_bytes() if _stamp_path().exists() else None) == stamp
 
 
 def test_no_secret_in_output(
@@ -867,3 +937,105 @@ def test_the_fallback_stamps_before_the_trigger_with_the_mail_env(
     click = next(e for e in pipe["log"] if e[0] == "click")
     assert click[1] == pytest.approx(als.MAIL_CODE_COOLDOWN_S, abs=5)
     assert pipe["env"] == {"SDSC_EMAIL_NO_AUTO_AUTH": "1"}
+
+
+# ---------------------------------------------------------------------------
+# B7/B9: a second route is one SAFARI_ROUTES entry; overview, -j, agents.md
+# ---------------------------------------------------------------------------
+
+
+def test_a_second_route_is_one_table_entry(
+    pipe: dict[str, Any], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    site = "galaxus"  # a recipe without a mail_code step
+    assert not any(s.kind == "mail_code" for s in alsafari.RECIPES[site].steps)
+    assert not al.login_columns(site).safari
+    host = alsafari.RECIPES[site].hosts[0]
+    monkeypatch.setitem(al.SAFARI_ROUTES, site, f"https://{host}/")
+    assert al.login_columns(site).safari
+    text, _seen = _dry(pipe, monkeypatch, site)
+    assert f"▶ {site}: Safari target https://{host} (the landing page)" in text
+    assert "no_safari_route" not in text and "MAILBOX" not in text
+    assert not pipe["log"]
+    assert f"`agent-login.py -L {site} -s`" in al.safari_route_sentence()
+
+
+def _width(text: str) -> int:
+    """Terminal columns of `text` (wide emoji 2, variation selectors 0)."""
+    return sum(
+        0
+        if unicodedata.combining(ch) or ch == "️"
+        else 2
+        if unicodedata.east_asian_width(ch) in "WF"
+        else 1
+        for ch in text
+    )
+
+
+def _rows() -> list[dict[str, Any]]:
+    return [
+        {"site": "notion", "name": "Notion", "status": "assisted"},
+        {"site": "anthropic", "name": "claude.ai", "status": "assisted"},
+        {"site": "shop", "name": "A shop with a long name", "status": "ready"},
+        {"site": "plain", "name": "Plain", "status": "refused"},
+    ]
+
+
+def test_overview_columns_align_with_a_legend(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.setattr(al, "USE", False)
+    monkeypatch.setattr(al, "last_checks", dict)
+    monkeypatch.setattr(al, "_row_flags", lambda _r: "")
+    states = {"notion": "ok", "anthropic": "failed", "shop": "ok", "plain": "failed"}
+    monkeypatch.setattr(al, "row_state", lambda r, _c: (states[r["site"]], "WHY"))
+    data = {"rows": _rows(), "broker_ok": True, "broker": "running"}
+    al.print_overview(data)
+    lines = capsys.readouterr().out.splitlines()
+    head = next(i for i, x in enumerate(lines) if "agent_fill_origins" in x)
+    header = lines[head]
+    assert "  Safari  Chromium  agent_fill_origins  status" in header
+    assert lines[head + 1].strip() == al.LOGIN_COLUMNS_LEGEND
+    body = lines[head + 2 : head + 2 + len(states)]
+    # every column up to the status text ends at the same terminal column
+    want = _width(header) - len("status")
+    assert [_width(x) - len("WHY") for x in body] == [want] * len(states)
+    cells = {x.split()[1]: x.split()[2:4] for x in body if x.split()[1] != "A"}
+    assert cells == {
+        "Notion": ["✅", "✅"],
+        "claude.ai": ["❌", "✅"],
+        "Plain": ["❌", "❌"],
+    }
+    shop = next(x for x in body if "A shop" in x)
+    assert shop.split("A shop with a long name")[1].split()[:2] == ["❌", "✅"]
+
+
+def test_json_rows_carry_login_columns(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    data = {"rows": _rows(), "broker_ok": True, "broker": "running"}
+    monkeypatch.setattr(al, "overview", lambda **_k: data)
+    monkeypatch.setattr(al, "write_agent_summary", lambda *_a: None)
+    monkeypatch.setattr(al.agent_login_cred, "load", lambda: {})
+    monkeypatch.setattr(al.agent_login_cred, "summary", lambda _c: {})
+    monkeypatch.setattr(sys, "argv", ["agent-login.py", "-j"])
+    assert al.main() == 0
+    rows = {r["site"]: r for r in json.loads(capsys.readouterr().out)["rows"]}
+    assert rows["notion"]["login_columns"] == {"safari": True, "chromium": True}
+    assert rows["anthropic"]["login_columns"] == {"safari": False, "chromium": True}
+    assert rows["shop"]["login_columns"] == {"safari": False, "chromium": True}
+    assert rows["plain"]["login_columns"] == {"safari": False, "chromium": False}
+
+
+def test_agents_md_names_the_safari_route_from_the_table(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    data = {"rows": [], "broker_ok": True, "broker": "running"}
+    text = al.agent_summary(data, {})
+    assert (
+        "Albert says 'log me into notion' → run `agent-login.py -L notion -s`" in text
+    )
+    # the site list is the table, not the text
+    monkeypatch.setattr(al, "SAFARI_ROUTES", {})
+    assert "-s`" not in al.agent_summary(data, {})
+    assert al._route_header([]).startswith("for the other sites")
