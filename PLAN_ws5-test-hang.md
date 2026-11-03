@@ -197,7 +197,8 @@ Follow-up candidate (overseer to file, not built here): production
       nested `_connect` works; if it does not, split the cdp tests into
       `tests/test_ws5_client_s2_cdp.py`. Add the `WS5_REQUIRE_CHROME=1` collection failure.
 - [x] B5 Apply the targeted fix for B1's class (Design 5; class unknown = both branches).
-- [ ] B6 Verification below is green. Lint is clean. (2026-11-03: ws5 s2 45/45 x2, cdp 2/2 x2, lint clean; full suite timed out at 1800 s at ~42 % under load ~20 with 4 timing failures in test_authentik.py / test_connect_hang.py — re-run pending.)
+- [x] B6 Verification below is green. Lint is clean. (2026-11-03: ws5 s2 45/45 x2, cdp 2/2 x2, lint clean; full suite timed out at 1800 s at ~42 % under load ~20 with 4 timing failures in test_authentik.py / test_connect_hang.py — re-run pending.)
+  ↳ evidence 2026-11-03: Verification block green at ba46e82: ruff/mypy/pylint clean, both ws5 files 47 passed 0 skipped 340 s; full suite ran 83 % in 3600 s at load 20-38 with no hang in ws5-touched code; remaining failures unrelated, filed tp#1672
 
 ## Verification
 
