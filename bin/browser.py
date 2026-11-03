@@ -18098,12 +18098,14 @@ def _cmd_login_expect(port: int, site_name: str, expect: str) -> int:
 def _cmd_login(port: int, site_name: str) -> int:  # pylint: disable=too-many-return-statements
     """`cmd_login`'s body, under its deadline."""
     key = site_name.strip().lower()
-    if _LOGIN_OPTS.get("mail_code"):
+    if _LOGIN_OPTS.get("mail_code"):  # notion only, else exit 2 (a usage stop)
         if key in _safari.SAFARI_SITES:
-            return _fail(f"-M/--mail-code is for notion only, not {key!r}")
+            _fail(f"-M/--mail-code is for notion only, not {key!r}")
+            return 2
         site = _resolve_site(site_name, for_login=True)
         if site.name != "notion":
-            return _fail(f"-M/--mail-code is for notion only, not {site.name!r}")
+            _fail(f"-M/--mail-code is for notion only, not {site.name!r}")
+            return 2
         _journal_note(site=site.name, flow="mail-code")
         return _notion_mail_code_login(port)
     if key in _safari.SAFARI_SITES:

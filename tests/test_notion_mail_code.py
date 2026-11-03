@@ -295,7 +295,7 @@ def _mail(msg_id: str, code: str, *, to: str = EMAIL) -> tuple[str, dict, str]:
     return msg_id, env, text
 
 
-class FakeMailbox:
+class FakeMailbox:  # pylint: disable=too-many-instance-attributes
     """himalaya as a ``subprocess.run``: INBOX + Archive answer, the rest is
     missing. ``after_trigger(n)`` gives the INBOX codes of the n-th list after
     the trigger click (1-based); ``dead`` fails every call."""
@@ -308,17 +308,22 @@ class FakeMailbox:
         self.polls = 0
         self.after_trigger: Any = None
         self.log: list[str] | None = None
+        # anything but himalaya (e.g. the quarantine audit's `ps`) runs as usual
+        self.other = subprocess.run
 
     def trigger(self, code: str) -> None:
         self.triggered = True
         if self.after_trigger is None:
             self.after_trigger = lambda _n: [code]
 
-    def __call__(self, argv: list[str], **kw: Any) -> subprocess.CompletedProcess:
+    def __call__(  # pylint: disable=too-many-return-statements
+        self, argv: list[str], **kw: Any
+    ) -> subprocess.CompletedProcess:
+        if argv[0] != HIMALAYA:
+            return self.other(argv, **kw)  # pylint: disable=subprocess-run-check
         self.calls.append({"argv": list(argv), **kw})
         if self.log is not None:
             self.log.append("mail:" + " ".join(argv[1:3]))
-        assert argv[0] == HIMALAYA
         if self.dead:
             return subprocess.CompletedProcess(argv, 1, "", "dead grant")
         verb = tuple(argv[1:3])
@@ -435,6 +440,7 @@ class Rig:  # pylint: disable=too-many-instance-attributes
         self.tmp = tmp_path
         self.log: list[str] = []
         self.mailbox = FakeMailbox()
+        self.mailbox.log = self.log
         self.page = FakePage(self.mailbox, self.log)
         self.clock = Clock()
         self.checks = [_check("invalid"), _check("valid")]
@@ -581,3 +587,305 @@ def test_the_baseline_and_archive_reads_are_capped(rig: Rig) -> None:
     capped.cap(None)
     capped([HIMALAYA, "envelope", "list", "--folder", "INBOX"], timeout=30)
     assert rig.mailbox.calls[-1]["timeout"] == 30
+
+
+# ---------------------------------------------------------------------------
+# B2: `login notion -M` against the fakes
+# ---------------------------------------------------------------------------
+
+
+def _no_code_anywhere(rig: Rig, capsys: pytest.CaptureFixture[str]) -> None:
+    out, err = capsys.readouterr()
+    code = rig.page.code
+    assert code not in out
+    assert code not in err
+    assert code not in rig.result.read_text(encoding="utf-8")
+    journal = Path(os.environ["CLAUDE_BROWSER_JOURNAL_FILE"])
+    if journal.exists():
+        assert code not in journal.read_text(encoding="utf-8")
+
+
+def test_the_happy_path_logs_in_once_and_says_no_code(
+    rig: Rig, capsys: pytest.CaptureFixture[str]
+) -> None:
+    rc, rec = rig.run()
+    assert rc == 0
+    assert (rec["route"], rec["phase"], rec["code"]) == ("mail-code", "ok", "ok")
+    assert rec["mail_archived"] == "ok"
+    assert rec["credential"] is True
+    assert "quarantined" not in rec
+    assert rig.page.clicks == 1
+    assert rig.page.submitted == [rig.page.code]
+    assert rig.mailbox.polls == 2  # two polls agreed on the code
+    assert rig.events == [("notion", "mail-code")]
+    assert rig.leases == ["login notion"]
+    assert rig.opened == 1
+    assert rig.log[-2:] == ["check", "close"]
+    assert browser._als.quarantined("notion") is None
+    moves = [c for c in rig.mailbox.calls if c["argv"][1:3] == ["message", "move"]]
+    assert len(moves) == 1
+    for call in rig.mailbox.calls:
+        assert call["env"]["SDSC_EMAIL_NO_AUTO_AUTH"] == "1"
+    _no_code_anywhere(rig, capsys)
+
+
+def test_the_cooldown_stamp_is_written_before_the_click(
+    rig: Rig, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    real = browser._nmc_stamp
+
+    def _stamp(now: float) -> bool:
+        rig.log.append("stamp")
+        return bool(real(now))
+
+    monkeypatch.setattr(browser, "_nmc_stamp", _stamp)
+    rc, _rec = rig.run()
+    assert rc == 0
+    assert rig.log.count("stamp") == 1
+    assert rig.log.index("stamp") < rig.log.index("click")
+    data = json.loads(rig.stamp.read_text(encoding="utf-8"))
+    assert isinstance(data["at"], float)
+    assert rig.stamp.stat().st_mode & 0o777 == 0o600
+
+
+def test_an_unwritable_stamp_sends_nothing(
+    rig: Rig, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(browser, "_nmc_stamp", lambda _now: False)
+    rc, rec = rig.run()
+    assert (rc, rec["code"]) == (2, "state_unwritable")
+    assert rig.page.clicks == 0
+    assert not rig.mailbox.triggered
+    assert "triggered" not in rec
+
+
+def test_a_second_run_inside_the_cooldown_is_refused(rig: Rig) -> None:
+    rig.stamp.parent.mkdir(parents=True, exist_ok=True)
+    rig.stamp.write_text(json.dumps({"at": browser.time.time() - 60}), "utf-8")
+    rc, rec = rig.run()
+    assert (rc, rec["code"]) == (2, "cooldown")
+    assert rig.opened == 0
+    assert not rig.mailbox.calls
+
+
+def test_an_old_stamp_does_not_block(rig: Rig) -> None:
+    rig.stamp.parent.mkdir(parents=True, exist_ok=True)
+    old = browser.time.time() - browser.NOTION_MAIL_CODE_COOLDOWN_S - 1
+    rig.stamp.write_text(json.dumps({"at": old}), "utf-8")
+    rc, _rec = rig.run()
+    assert rc == 0
+
+
+def test_prune_leaves_the_cooldown_file_alone(rig: Rig) -> None:
+    rc, _rec = rig.run()
+    assert rc == 0
+    before = rig.stamp.read_text(encoding="utf-8")
+    browser._als.prune(set())
+    assert rig.stamp.read_text(encoding="utf-8") == before
+
+
+def test_a_held_flock_is_busy(rig: Rig) -> None:
+    lock = s_state_dir() / str(browser.NOTION_MAIL_CODE_LOCK)
+    lock.parent.mkdir(parents=True, exist_ok=True)
+    fd = os.open(str(lock), os.O_RDWR | os.O_CREAT, 0o600)
+    try:
+        browser.fcntl.flock(fd, browser.fcntl.LOCK_EX | browser.fcntl.LOCK_NB)
+        rc, rec = rig.run()
+    finally:
+        os.close(fd)
+    assert rc == browser.BUSY_RC == 75
+    assert rec["code"] == "busy"
+    assert rig.opened == 0
+    assert not rig.mailbox.calls
+
+
+def test_the_trigger_and_the_submit_run_once_per_process(rig: Rig) -> None:
+    rc, _rec = rig.run()
+    assert rc == 0
+    rig.stamp.unlink()  # not the cooldown: the once-only guard must hold
+    rig.checks = [_check("invalid")]
+    rig.check_calls = 0
+    rig.page.stage = "blank"
+    rc, rec = rig.run()
+    assert (rc, rec["code"]) == (2, "internal")
+    assert rig.page.clicks == 1
+    assert len(rig.page.submitted) == 1
+
+
+def test_two_polls_must_agree_on_the_code(rig: Rig) -> None:
+    first, second = _code(), _code()
+    while second == first:
+        second = _code()
+    rig.mailbox.after_trigger = lambda n: [first] if n == 1 else [second]
+    rc, _rec = rig.run()
+    assert rc == 0
+    assert rig.page.submitted == [second]
+    assert rig.mailbox.polls == 3
+
+
+def test_two_codes_at_once_are_an_email_code_stop(rig: Rig) -> None:
+    first, second = _code(), _code()
+    while second == first:
+        second = _code()
+    rig.mailbox.after_trigger = lambda _n: [first, second]
+    rc, rec = rig.run()
+    assert (rc, rec["code"]) == (2, "email_code")
+    assert not rig.page.submitted
+    assert "quarantined" not in rec
+
+
+def test_no_code_within_the_wait_does_not_quarantine(rig: Rig) -> None:
+    rig.mailbox.after_trigger = lambda _n: []
+    rc, rec = rig.run()
+    assert (rc, rec["code"]) == (2, "email_code")
+    assert rig.page.clicks == 1
+    assert not rig.page.submitted
+    assert "quarantined" not in rec
+    assert browser._als.quarantined("notion") is None
+    assert rig.stamp.exists()  # the cooldown stays
+
+
+def test_a_failed_proof_after_the_submit_quarantines(rig: Rig) -> None:
+    rig.checks = [_check("invalid"), _check("invalid")]
+    rc, rec = rig.run()
+    assert (rc, rec["code"]) == (2, "login_failed")
+    assert rec["quarantined"] is True
+    assert rec["credential"] is True
+    assert browser._als.quarantined("notion") is not None
+
+
+def test_a_failed_submit_quarantines(rig: Rig, monkeypatch: pytest.MonkeyPatch) -> None:
+    real = rig.page.evaluate
+
+    def _evaluate(js: str, arg: Any = None) -> Any:
+        if js == s.CODE_FILL_FN:
+            rig.page.submitted.append(arg["code"])
+            return json.dumps({"ok": False, "why": "button"})
+        return real(js, arg)
+
+    monkeypatch.setattr(rig.page, "evaluate", _evaluate)
+    rc, rec = rig.run()
+    assert (rc, rec["phase"], rec["code"]) == (2, "submit", "email_code")
+    assert rec["quarantined"] is True
+    assert browser._als.quarantined("notion") is not None
+
+
+def test_a_deadline_after_the_submit_quarantines(tmp_path: Path) -> None:
+    out = tmp_path / "r.json"
+    browser._result_begin("login", "notion", str(out))
+    browser._result_set(phase_hint=browser.NOTION_MAIL_CODE_HINT, site="notion")
+    browser._result_timeout("notion:proof")
+    browser._result_write(browser.LOGIN_TIMEOUT_RC)
+    rec = json.loads(out.read_text(encoding="utf-8"))
+    assert (rec["phase"], rec["code"]) == ("submit", "timeout")
+    assert rec["quarantined"] is True
+    assert browser._als.quarantined("notion") is not None
+
+
+def test_a_deadline_before_the_submit_does_not_quarantine(tmp_path: Path) -> None:
+    out = tmp_path / "r.json"
+    browser._result_begin("login", "notion", str(out))
+    browser._result_set(route="mail-code", phase_hint="recipe")
+    browser._result_timeout("notion:code-wait")
+    browser._result_write(browser.LOGIN_TIMEOUT_RC)
+    rec = json.loads(out.read_text(encoding="utf-8"))
+    assert (rec["phase"], rec["code"]) == ("recipe", "timeout")
+    assert "quarantined" not in rec
+    assert browser._als.quarantined("notion") is None
+
+
+def test_already_logged_in_sends_nothing(rig: Rig) -> None:
+    rig.checks = [_check("valid")]
+    rc, rec = rig.run()
+    assert (rc, rec["route"]) == (0, "already")
+    assert rig.opened == 0
+    assert not rig.mailbox.calls
+    assert not rig.stamp.exists()
+
+
+@pytest.mark.parametrize(
+    ("check", "code"),
+    [
+        (_check("valid", "mismatch"), "wrong_account"),
+        (_check("valid", "unknown"), "indeterminate"),
+        (_check("valid", "unconfigured"), "indeterminate"),
+        (_check("indeterminate", "unknown"), "indeterminate"),
+    ],
+)
+def test_an_unclear_warm_probe_sends_nothing(
+    rig: Rig, check: dict[str, Any], code: str
+) -> None:
+    rig.checks = [check]
+    rc, rec = rig.run()
+    assert (rc, rec["code"]) == (2, code)
+    assert rig.opened == 0
+    assert not rig.mailbox.calls
+
+
+def test_quarantined_before_the_start_opens_nothing(rig: Rig) -> None:
+    browser._als.quarantine("notion", "submit", "login_failed")
+    rc, rec = rig.run()
+    assert (rc, rec["code"]) == (2, "quarantined")
+    assert rig.opened == 0
+
+
+def test_a_dead_mailbox_triggers_nothing(rig: Rig) -> None:
+    rig.mailbox.dead = True
+    rc, rec = rig.run()
+    assert (rc, rec["code"]) == (2, "mailbox_unreadable")
+    assert "goto" not in rig.log
+    assert rig.page.clicks == 0
+    assert all(c["env"]["SDSC_EMAIL_NO_AUTO_AUTH"] == "1" for c in rig.mailbox.calls)
+
+
+@pytest.mark.parametrize("flag", ["captcha", "sms", "push", "hardware_key"])
+def test_an_albert_stop_on_the_login_page_is_4(rig: Rig, flag: str) -> None:
+    rig.page.extra = {flag: True}
+    rc, rec = rig.run()
+    assert (rc, rec["code"]) == (browser.NEEDS_ALBERT_RC, f"needs_albert_{flag}")
+    assert rig.page.clicks == 0
+    assert rig.log.count("goto") == 1  # never a reload
+    reads_after = rig.log[rig.log.index("goto") :]
+    assert not [e for e in reads_after if e.startswith("mail:")]
+
+
+def test_a_silent_block_is_recipe_stuck(rig: Rig) -> None:
+    rig.page.after_goto = "blank"
+    rc, rec = rig.run()
+    assert (rc, rec["code"]) == (2, "recipe_stuck")
+    assert rig.page.reads == s.IDLE_POLLS
+    assert rig.log.count("goto") == 1
+    assert rig.page.clicks == 0
+
+
+def test_a_tab_off_the_notion_hosts_stops(rig: Rig) -> None:
+    rig.page.after_click = "code"
+    real = rig.page.goto
+
+    def _goto(url: str, **kw: Any) -> None:
+        real(url, **kw)
+        rig.page.url = "https://login.example.org/sso"
+
+    rig.page.goto = _goto  # type: ignore[method-assign]
+    rc, rec = rig.run()
+    assert (rc, rec["code"]) == (2, "tab_moved")
+    assert rig.page.clicks == 0
+
+
+def test_mail_code_on_another_site_is_exit_2(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    called: list[int] = []
+
+    def _mail_code(port: int) -> int:
+        called.append(port)
+        return 0
+
+    monkeypatch.setattr(browser, "_notion_mail_code_login", _mail_code)
+    monkeypatch.setitem(browser._LOGIN_OPTS, "mail_code", True)
+    assert browser._cmd_login(9, "tutti") == 2
+    assert browser._cmd_login(9, "anthropic") == 2
+    assert not called
+    assert "notion only" in capsys.readouterr().err
+    assert browser._cmd_login(9, "notion") == 0
+    assert called == [9]
