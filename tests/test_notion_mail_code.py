@@ -1007,6 +1007,39 @@ def test_a_clicked_submit_records_how(rig: Rig, how: str) -> None:
     }
 
 
+def test_an_indeterminate_proof_after_the_submit_is_checked_once_more(
+    rig: Rig,
+) -> None:
+    """B10 canary 3: the first post-submit check was indeterminate, the
+    session valid a minute later — one bounded re-check."""
+    rig.checks = [_check("invalid"), _check("indeterminate"), _check("valid")]
+    rc, rec = rig.run()
+    assert rc == 0
+    assert rec["proof_rechecked"] is True
+    assert rig.check_calls == 3
+    assert browser._als.quarantined("notion") is None
+
+
+def test_a_second_indeterminate_proof_quarantines(rig: Rig) -> None:
+    rig.checks = [_check("invalid"), _check("indeterminate")]
+    rc, rec = rig.run()
+    assert (rc, rec["code"]) == (2, "login_failed")
+    assert rig.check_calls == 3  # warm probe + two proofs, never a third
+    assert rec["quarantined"] is True
+
+
+def test_no_recheck_without_the_time_for_it(
+    rig: Rig, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    left = iter([None, browser.NOTION_MAIL_CODE_RECHECK_MIN_S - 1])
+    monkeypatch.setattr(browser, "_deadline_left", lambda: next(left))
+    rig.checks = [_check("invalid"), _check("indeterminate"), _check("valid")]
+    rc, rec = rig.run()
+    assert (rc, rec["code"]) == (2, "login_failed")
+    assert "proof_rechecked" not in rec
+    assert rig.check_calls == 2
+
+
 def test_the_mail_code_route_records_the_sentinel_proof(rig: Rig) -> None:
     """B10 step 9: the route's own result carries server+sentinel."""
     rig.checks = [

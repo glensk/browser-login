@@ -16178,6 +16178,12 @@ NOTION_MAIL_CODE_HINT = "mail-code-submitted"
 NOTION_MAIL_CODE_BASELINE_CAP_S = 45.0  # all baseline mailbox reads together
 NOTION_MAIL_CODE_ARCHIVE_CAP_S = 15.0
 NOTION_MAIL_CODE_SIDEBAR_S = 45.0  # the passive post-submit sidebar wait
+# B10 canary 3: a fresh session's first loads are slow — the post-submit
+# check came back indeterminate, a minute later valid. One more check, only
+# after a submit, only on indeterminate, only with this much deadline left
+# (outside the B3 caps: it never eats the proof reserve).
+NOTION_MAIL_CODE_RECHECK_MIN_S = 75.0
+NOTION_MAIL_CODE_RECHECK_PAUSE_S = 10.0
 NOTION_MAIL_CODE_LAST_POLL_S = 30.0  # one mailbox poll may end after the wait
 # Everything after the code wait: last poll 30 + submit 5 + archive 15 +
 # sidebar 45 + proof 40 = 135 (the budget test pins the sum).
@@ -16701,6 +16707,16 @@ def _nmc_proof(
     _deadline_step("notion:proof")
     _notion_wait_for_login(page, timeout_s=NOTION_MAIL_CODE_SIDEBAR_S, poll_s=1.0)
     res = _notion_check(port, expected)
+    left = _deadline_left()
+    if (
+        submitted
+        and res["verdict"] == "indeterminate"
+        and (left is None or left >= NOTION_MAIL_CODE_RECHECK_MIN_S)
+    ):
+        _deadline_step("notion:proof-recheck")
+        _result_set(proof_rechecked=True)
+        _nmc_sleep(NOTION_MAIL_CODE_RECHECK_PAUSE_S)
+        res = _notion_check(port, expected)
     _result_set(
         server=res["server"], proof=res["proof"], sentinel=bool(res.get("sentinel"))
     )
