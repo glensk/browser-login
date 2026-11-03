@@ -256,10 +256,11 @@ never calls the broker's `logout` op. Exit 2 when the jar is missing.
   `SDSC_EMAIL_STATE_DIR` with a dead store and `webbrowser.open` patched to fail →
   `EpflAuthError`, no browser call (imports `sdsc/email/epfl_oauth.py` by path, skipped
   when absent).
-- [ ] B1b (only if the B1 epfl test shows `SDSC_EMAIL_NO_AUTO_AUTH` is NOT honoured on
+- [x] B1b (only if the B1 epfl test shows `SDSC_EMAIL_NO_AUTO_AUTH` is NOT honoured on
   the himalaya `*.cmd` path): stop and hand back — the fix lives in the `sdsc/email`
   repo (`epfl_oauth.py` honours the variable in `token` and `refresh-token`), a separate
   ticket; B2 must not ship without it.
+  ↳ evidence 2026-11-03: not needed: B1 test (6eb9acd) shows SDSC_EMAIL_NO_AUTO_AUTH honoured on the himalaya cmd path
 - [x] B2 `bin/browser.py`: `login -M/--mail-code` flag (notion only, else exit 2) and
   `_notion_mail_code_login(port)` implementing Design steps 1–10 (owned background tab,
   registration → lease, detector stops, own cooldown file + flock with stamp BEFORE the
