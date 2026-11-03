@@ -81,7 +81,7 @@ def pl(monkeypatch: pytest.MonkeyPatch) -> dict[str, Any]:
             log["lock_held_in_mail"] = not free
         return log["mail"]
 
-    def drive(site: str, recipe: alsafari.Recipe) -> Any:
+    def drive(site: str, recipe: alsafari.Recipe, **_kw: Any) -> Any:
         log["order"].append("safari")
         return log["drive"]
 

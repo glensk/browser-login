@@ -1340,6 +1340,10 @@ class Machine:  # pylint: disable=too-many-instance-attributes
     # code (state_unwritable / cooldown / quarantined) ends the run with it
     # and NO click (no code mail); None goes on and clicks.
     before_trigger: Callable[[], str | None] | None = None
+    # tp#1643: a code (cooldown / quarantined) = run WITHOUT any code mail: no
+    # mailbox read, no e-mail fill, no click; the mail-code step ends the run
+    # with it (a live session still reaches the sentinel → ok).
+    no_trigger: str = ""
 
     # -- safari.py calls ---------------------------------------------------
 
@@ -1390,7 +1394,7 @@ class Machine:  # pylint: disable=too-many-instance-attributes
     def run(self) -> Outcome:
         """Open the login window, then read → stop / step / wait, bounded."""
         mail_steps = [s for s in self.recipe.steps if s.kind == "mail_code"]
-        if mail_steps and self.plan.mail is not None:
+        if mail_steps and self.plan.mail is not None and not self._lazy_baseline():
             # BEFORE anything can trigger a code mail
             self.baseline = mail_baseline(self.plan.mail, mail_steps[0])
         reply = self.call(
@@ -1414,6 +1418,12 @@ class Machine:  # pylint: disable=too-many-instance-attributes
             return self._loop()
         finally:
             self.call(["--close", "--handle", self.handle])
+
+    def _lazy_baseline(self) -> bool:
+        """tp#1643: with a trigger hook or in no-trigger mode the mailbox
+        baseline waits for the mail-code step (without both: read up front,
+        as before)."""
+        return self.before_trigger is not None or bool(self.no_trigger)
 
     def _loop(self) -> Outcome:  # pylint: disable=too-many-return-statements
         idle = 0
@@ -1512,13 +1522,22 @@ class Machine:  # pylint: disable=too-many-instance-attributes
         return reply.rc == 0 and res is not None and res.get("ok") is True
 
     # The mail-code step: one return per stage (e-mail, trigger, mail, code).
-    def _mail_code(  # pylint: disable=too-many-return-statements
+    def _mail_code(  # pylint: disable=too-many-return-statements,too-many-branches
         self, step: Step
     ) -> Outcome | None:
         """E-mail → trigger → wait for ONE new signed code (the same in two
         consecutive polls) → fill it → submit."""
+        if self.no_trigger:
+            return self._end(2, self.no_trigger)
         reader = self.plan.mail
-        if reader is None or self.baseline is None or not self.plan.expected_email:
+        if reader is None or not self.plan.expected_email:
+            return self._end(2, "email_code")
+        if self.baseline is None and self._lazy_baseline():
+            # with a hook: read only once the run reached the step (a live
+            # session never reads the mailbox), still BEFORE the trigger and
+            # before the hook writes anything
+            self.baseline = mail_baseline(reader, step)
+        if self.baseline is None:
             return self._end(2, "email_code")
         if step.email_field:
             params = {"field": step.email_field, "email": self.plan.expected_email}

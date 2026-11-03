@@ -223,12 +223,12 @@ def test_drive_safari_passes_the_hook_and_the_mail_env(
     env = dict(alsafari.NOTION_MAIL_ENV)
     out = al._drive_safari("notion", recipe, env=env, before_trigger=hook)
     assert out.ok
-    assert got["kw"] == {"before_trigger": hook}
+    assert got["kw"] == {"before_trigger": hook, "no_trigger": ""}
     assert got["plan"].mail.env == env
     assert got["plan"].mail.env.get("SDSC_EMAIL_NO_AUTO_AUTH") == "1"
     # defaults: today's behaviour (no hook, himalaya inherits the environment)
     out = al._drive_safari("notion", recipe)
-    assert got["kw"] == {"before_trigger": None}
+    assert got["kw"] == {"before_trigger": None, "no_trigger": ""}
     assert got["plan"].mail.env is None
 
 
@@ -411,3 +411,459 @@ def test_state_dir_is_private_to_the_test() -> None:
     # conftest points the state at a temp dir: no test here touches the real one
     assert als.state_dir() != Path.home() / ".local/state/agent-login"
     assert os.environ.get("AGENT_LOGIN_STATE_FILE")
+
+
+# ---------------------------------------------------------------------------
+# B6: the Machine's no-trigger mode and the lazy mailbox baseline
+# ---------------------------------------------------------------------------
+
+
+def _counting_box() -> tuple[w.FakeMailbox, list[list[str]]]:
+    box = w.FakeMailbox()
+    reads: list[list[str]] = []
+    real = box.run
+
+    def run(argv: list[str], **kw: Any) -> Any:
+        reads.append(list(argv))
+        return real(argv, **kw)
+
+    box.run = run  # type: ignore[method-assign]
+    return box, reads
+
+
+_LOGIN_PAGE = (
+    "https://www.example.org/login",
+    w._page(user=True, steps=[[True, False]]),
+)
+
+
+def test_no_trigger_mode_reads_no_mail_and_never_clicks() -> None:
+    box, reads = _counting_box()
+    fake = w.MailSafari(w.NOTION_LIKE, [_LOGIN_PAGE], w._code())
+    plan = w._plan(expected_email="me@example.org", mail=w._reader(box))
+    out = alsafari.Machine(
+        w.NOTION_LIKE, plan, fake, sleep=lambda _s: None, no_trigger="cooldown"
+    ).run()
+    assert (out.rc, out.code, out.credential) == (2, "cooldown", False)
+    assert not reads and not fake.order
+    assert not any(c[0] == "--click" for c in fake.calls)
+
+
+@pytest.mark.parametrize(
+    "mode", [{"no_trigger": "quarantined"}, {"before_trigger": lambda: None}]
+)
+def test_a_live_session_reaches_the_sentinel_without_a_mail_read(mode: dict) -> None:
+    box, reads = _counting_box()
+    script = [("https://www.example.org/", w._page(sentinel=True))]
+    fake = w.MailSafari(w.NOTION_LIKE, script, w._code())
+    plan = w._plan(expected_email="me@example.org", mail=w._reader(box))
+    machine = alsafari.Machine(w.NOTION_LIKE, plan, fake, sleep=lambda _s: None, **mode)
+    assert machine.run().ok and not reads
+
+
+def test_an_unreadable_mailbox_stops_before_the_hook_writes() -> None:
+    box = w.FakeMailbox()
+    box.unreadable = True
+    hooked: list[int] = []
+
+    def hook() -> None:
+        hooked.append(1)
+
+    fake = w.MailSafari(w.NOTION_LIKE, [_LOGIN_PAGE], w._code())
+    plan = w._plan(expected_email="me@example.org", mail=w._reader(box))
+    out = alsafari.Machine(
+        w.NOTION_LIKE, plan, fake, sleep=lambda _s: None, before_trigger=hook
+    ).run()
+    assert out.code == "email_code" and not hooked and not fake.order
+
+
+# ---------------------------------------------------------------------------
+# B4: login_columns
+# ---------------------------------------------------------------------------
+
+
+def test_login_columns(monkeypatch: pytest.MonkeyPatch) -> None:
+    assert al.login_columns("notion") == al.LoginColumns(True, True)
+    assert al.login_columns("anthropic") == al.LoginColumns(False, True)
+    monkeypatch.setattr(al, "agent_route", lambda _s, _r=None: True)
+    assert al.login_columns("galaxus") == al.LoginColumns(False, True)
+    monkeypatch.setattr(al, "agent_route", lambda _s, _r=None: False)
+    assert al.login_columns("galaxus") == al.LoginColumns(False, False)
+    row = {"site": "shop", "status": "ready"}
+    assert al.login_columns("shop", row) == al.LoginColumns(False, True)
+    assert not al.login_columns("shop", {**row, "fill_only": True}).chromium
+    assert not al.login_columns("shop", {**row, "status": "refused"}).chromium
+    # a second route (non-mail-code recipe) is one table entry
+    monkeypatch.setitem(al.SAFARI_ROUTES, "galaxus", "https://www.galaxus.ch/")
+    assert al.login_columns("galaxus").safari
+    host = alsafari.RECIPES["galaxus"].hosts[0]
+    assert al.safari_target_url("galaxus", f"https://{host}/x") is not None
+
+
+# ---------------------------------------------------------------------------
+# B5: -s parsing and the target URL
+# ---------------------------------------------------------------------------
+
+
+def _parse(monkeypatch: pytest.MonkeyPatch, *argv: str) -> Any:
+    monkeypatch.setattr(sys, "argv", ["agent-login.py", *argv])
+    return al.build_parser().parse_args()
+
+
+def test_in_safari_parses_short_long_and_bare(monkeypatch: pytest.MonkeyPatch) -> None:
+    assert _parse(monkeypatch, "-L", "notion", "-s").in_safari == ""
+    page = "https://app.notion.com/p"
+    assert _parse(monkeypatch, "-L", "notion", "--in-safari", page).in_safari == page
+    assert _parse(monkeypatch, "-L", "notion", "-s", "-n").dry_run is True
+    args = _parse(monkeypatch, "--safari-login", "notion")
+    assert args.in_safari is None and args.safari_login == "notion"
+
+
+def test_in_safari_without_l_exits_2(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(sys, "argv", ["agent-login.py", "-s"])
+    with pytest.raises(SystemExit) as exc:
+        al.main()
+    assert exc.value.code == 2
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "http://app.notion.com/",
+        "https://example.com/",
+        "https://user@app.notion.com/",
+        "https://notion.so.evil.com/",
+        "https://app.notion.com:8443/x",
+        "https://app.notion.com:/x",
+        "https://app.notion.com\\@evil.com/",
+        "https:///x",
+        "https://APP.notion.com/",
+        "https://app.notion.com/ x",
+    ],
+)
+def test_bad_url_exits_2_with_nothing_called(
+    url: str, pipe: dict[str, Any], capsys: pytest.CaptureFixture[str]
+) -> None:
+    assert al.safari_target_url("notion", url) is None
+    assert al.safari_target_action("notion", url) == 2
+    assert "bad_url" in capsys.readouterr().out
+    assert not pipe["log"]
+
+
+def test_good_urls() -> None:
+    assert al.safari_target_url("notion", "") == "https://app.notion.com/"
+    page = "https://app.notion.com/p/renku/S3-40d0df2efafc8078835ad80c27f2f4d2"
+    assert al.safari_target_url("notion", page) == page
+
+
+def test_a_site_without_a_route_exits_2(pipe: dict[str, Any]) -> None:
+    assert al.safari_target_action("galaxus", "") == 2
+    assert not pipe["log"]
+
+
+# ---------------------------------------------------------------------------
+# B6: the -s pipeline (fakes for safari.py, browser.py, the Machine)
+# ---------------------------------------------------------------------------
+
+
+class _PipeMachine:  # pylint: disable=too-few-public-methods
+    """The Safari Machine: scripted by `st["machine"]`, logs into `st["log"]`."""
+
+    st: dict[str, Any] = {}
+
+    def __init__(self, _r: Any, plan: Any, _c: Any, **kw: Any) -> None:
+        self.hook = kw.get("before_trigger")
+        self.no_trigger = kw.get("no_trigger", "")
+        self.st["env"] = plan.mail.env if plan.mail else None
+
+    def run(self) -> alsafari.Outcome:
+        st = self.st
+        st["log"].append(("machine", self.no_trigger))
+        if st["machine"] == "sentinel":
+            return alsafari.Outcome(0, "ok")
+        if st["machine"] == "captcha":
+            return alsafari.Outcome(4, "needs_albert_captcha")
+        if self.no_trigger:
+            return alsafari.Outcome(2, self.no_trigger, steps=["mail_code"])
+        stop = self.hook() if self.hook else None
+        if stop:
+            return alsafari.Outcome(2, stop, steps=["mail_code"])
+        left = als.mail_code_cooldown_left("notion", time.time())
+        st["log"].append(("click", left))
+        if st["machine"] == "no_sentinel":
+            return alsafari.Outcome(
+                2, "recipe_stuck", credential=True, steps=["mail_code"]
+            )
+        return alsafari.Outcome(
+            0, "ok", credential=True, steps=["mail_code"], mail_archived="ok"
+        )
+
+
+@pytest.fixture
+def pipe(monkeypatch: pytest.MonkeyPatch) -> dict[str, Any]:
+    st: dict[str, Any] = {
+        "log": [],
+        "jar": [_token()],
+        "proof": (0, "match"),
+        "free": (0, ""),
+        "import_rc": 0,
+        "open_rc": 0,
+        "machine": "login",  # login | sentinel | captcha | no_sentinel
+        "gate": None,
+        "records": [],
+    }
+    recipe = alsafari.RECIPES["notion"]
+
+    def call(args: list[str]) -> alsafari.Reply:
+        if args[0] == "--status":
+            return alsafari.Reply(0, {"javascript": True})
+        if args[0] == "--open":
+            st["log"].append(("open", args[1]))
+            return alsafari.Reply(st["open_rc"], {})
+        return alsafari.Reply(0, {})
+
+    def run_browser(*args: Any, **_k: Any) -> Any:
+        st["log"].append(("browser", args))
+        rc, said = st["proof"]
+        return al.BrowserRun(rc, False, "", 0.0, {"safari": said, "code": said})
+
+    def import_run(_site: str, agent: bool) -> Any:
+        st["log"].append(("import", agent))
+        return al.BrowserRun(st["import_rc"], False, "", 0.0, {"code": "x"})
+
+    def features(_c: Any) -> frozenset[str]:
+        return alsafari.BASE_FEATURES | recipe.features()
+
+    def free(_s: str) -> tuple[int, dict]:
+        return st["free"][0], {"code": st["free"][1]}
+
+    monkeypatch.setattr(_PipeMachine, "st", st)
+    monkeypatch.setattr(alsafari, "scheduled", lambda: False)
+    monkeypatch.setattr(alsafari, "interactive_gate", lambda *_a: st["gate"])
+    monkeypatch.setattr(alsafari, "safari_py_bin", lambda: "safari-fake")
+    monkeypatch.setattr(alsafari, "run_safari_py", lambda _b: call)
+    monkeypatch.setattr(alsafari, "features", features)
+    monkeypatch.setattr(
+        alsafari, "load_overrides", lambda: {"notion": {"expected_email": "a@b.c"}}
+    )
+    monkeypatch.setattr(alsafari, "Machine", _PipeMachine)
+    monkeypatch.setattr(al.shutil, "which", lambda _n: "himalaya-fake")
+    monkeypatch.setattr(al, "_safari_jar", lambda _s: (list(st["jar"]), None))
+    monkeypatch.setattr(al, "run_browser", run_browser)
+    monkeypatch.setattr(al, "site_session", lambda _s: contextlib.nullcontext())
+    monkeypatch.setattr(al, "_free_check", free)
+    monkeypatch.setattr(al, "_import_run", import_run)
+    monkeypatch.setattr(al, "_import_proof", lambda _s, r: dict(r or {}))
+    monkeypatch.setattr(al, "_wait_flush", lambda _s, _b: True)
+    monkeypatch.setattr(al, "record_check", lambda *a, **_k: st["records"].append(a))
+    monkeypatch.setattr(al, "resolve_site", lambda s: s)
+    return st
+
+
+def _kinds(st: dict[str, Any]) -> list[str]:
+    return [e[0] for e in st["log"]]
+
+
+def _stamp_path() -> Path:
+    return als.state_dir() / "notion-mail-code.json"
+
+
+def test_match_opens_without_machine_mail_or_stamp(pipe: dict[str, Any]) -> None:
+    assert al.safari_target_action("notion", "") == 0
+    assert _kinds(pipe) == ["browser", "open"]
+    assert pipe["log"][0][1][:3] == ("import-safari", "notion", "-P")
+    assert pipe["log"][-1] == ("open", "https://app.notion.com/")
+    assert not _stamp_path().exists()
+
+
+def test_match_with_a_page_and_chromium_logged_out_imports(
+    pipe: dict[str, Any],
+) -> None:
+    pipe["free"] = (2, "logged_out")
+    page = "https://app.notion.com/p/x-40d0df2efafc8078835ad80c27f2f4d2"
+    assert al.safari_target_action("notion", page) == 0
+    assert _kinds(pipe) == ["browser", "import", "open"]
+    assert pipe["log"][-1] == ("open", page)
+
+
+def test_logged_out_logs_in_stamp_before_click_then_imports(
+    pipe: dict[str, Any],
+) -> None:
+    pipe["proof"] = (2, "logged_out")
+    pipe["free"] = (2, "logged_out")
+    assert al.safari_target_action("notion", "") == 0
+    assert _kinds(pipe) == ["browser", "machine", "click", "import", "open"]
+    click = next(e for e in pipe["log"] if e[0] == "click")
+    assert click[1] == pytest.approx(als.MAIL_CODE_COOLDOWN_S, abs=5)  # stamped first
+    assert pipe["env"] == {"SDSC_EMAIL_NO_AUTO_AUTH": "1"}
+    assert ("import", True) in pipe["log"]
+
+
+def test_no_safari_session_logs_in_without_a_proof(pipe: dict[str, Any]) -> None:
+    pipe["jar"] = []
+    assert al.safari_target_action("notion", "") == 0
+    assert _kinds(pipe) == ["machine", "click", "open"]
+
+
+@pytest.mark.parametrize("block", ["cooldown", "quarantined", "unreadable"])
+def test_a_block_runs_without_a_code_mail(
+    pipe: dict[str, Any], block: str, capsys: pytest.CaptureFixture[str]
+) -> None:
+    pipe["proof"] = (2, "logged_out")
+    path = _stamp_path()
+    if block == "cooldown":
+        assert als.mail_code_stamp("notion", time.time())
+    elif block == "unreadable":
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("{bad", encoding="utf-8")
+    else:
+        als.quarantine("notion", "submit", "recipe_stuck")
+    before = path.read_bytes() if path.exists() else None
+    assert al.safari_target_action("notion", "") == 2
+    want = "quarantined" if block == "quarantined" else "cooldown"
+    assert _kinds(pipe) == ["browser", "machine"]
+    assert pipe["log"][1] == ("machine", want)
+    assert (path.read_bytes() if path.exists() else None) == before
+    assert want in capsys.readouterr().out
+    # never a new quarantine for a block
+    assert (als.quarantined("notion") is not None) == (block == "quarantined")
+
+
+def test_a_block_with_a_live_session_still_opens(pipe: dict[str, Any]) -> None:
+    pipe["proof"] = (2, "logged_out")
+    pipe["machine"] = "sentinel"
+    assert als.mail_code_stamp("notion", time.time())
+    assert al.safari_target_action("notion", "") == 0
+    assert _kinds(pipe) == ["browser", "machine", "open"]
+
+
+def test_the_mail_code_lock_busy_is_75(pipe: dict[str, Any]) -> None:
+    pipe["proof"] = (2, "logged_out")
+    with als.mail_code_lock("notion") as held:
+        assert held
+        assert al.safari_target_action("notion", "") == al.BUSY_RC
+    assert "machine" not in _kinds(pipe)
+
+
+def test_an_unwritable_stamp_never_clicks(
+    pipe: dict[str, Any], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    pipe["proof"] = (2, "logged_out")
+    monkeypatch.setattr(als, "mail_code_stamp", lambda *_a: False)
+    assert al.safari_target_action("notion", "") == 2
+    assert "click" not in _kinds(pipe) and "open" not in _kinds(pipe)
+
+
+def test_mismatch_is_wrong_account(
+    pipe: dict[str, Any], capsys: pytest.CaptureFixture[str]
+) -> None:
+    pipe["proof"] = (2, "mismatch")
+    assert al.safari_target_action("notion", "") == 2
+    assert "wrong_account" in capsys.readouterr().out
+    assert _kinds(pipe) == ["browser"]
+
+
+@pytest.mark.parametrize(("proof", "rc"), [((2, "indeterminate"), 2), ((75, ""), 75)])
+def test_a_proof_that_cannot_tell_stops(
+    pipe: dict[str, Any], proof: tuple, rc: int
+) -> None:
+    pipe["proof"] = proof
+    assert al.safari_target_action("notion", "") == rc
+    assert _kinds(pipe) == ["browser"]
+
+
+@pytest.mark.parametrize("gate", ["console_locked", "albert_idle", "not_on_console"])
+def test_a_closed_gate_is_3_with_nothing_called(
+    pipe: dict[str, Any], gate: str
+) -> None:
+    pipe["gate"] = gate
+    assert al.safari_target_action("notion", "") == 3
+    assert not pipe["log"]
+
+
+def test_scheduled_is_2(pipe: dict[str, Any], monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(alsafari, "scheduled", lambda: True)
+    assert al.safari_target_action("notion", "") == 2
+    assert not pipe["log"]
+
+
+def test_safari_py_missing_or_without_open_is_3(
+    pipe: dict[str, Any], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(alsafari, "safari_py_bin", lambda: None)
+    assert al.safari_target_action("notion", "") == 3
+    monkeypatch.setattr(alsafari, "safari_py_bin", lambda: "safari-fake")
+    lacking = alsafari.RECIPES["notion"].features() - {"open"}
+    monkeypatch.setattr(alsafari, "features", lambda _c: lacking)
+    assert al.safari_target_action("notion", "") == 3
+    assert not pipe["log"]
+
+
+def test_needs_albert_is_4_without_open(pipe: dict[str, Any]) -> None:
+    pipe["proof"] = (2, "logged_out")
+    pipe["machine"] = "captcha"
+    assert al.safari_target_action("notion", "") == 4
+    assert "open" not in _kinds(pipe)
+
+
+def test_a_credential_then_no_sentinel_quarantines_once(pipe: dict[str, Any]) -> None:
+    pipe["proof"] = (2, "logged_out")
+    pipe["machine"] = "no_sentinel"
+    assert al.safari_target_action("notion", "") == 2
+    assert als.quarantined("notion") is not None
+    assert "open" not in _kinds(pipe)
+    assert pipe["records"][-1][3]["route"] == "safari-target"
+
+
+def test_open_failure_is_safari_open_failed(
+    pipe: dict[str, Any], capsys: pytest.CaptureFixture[str]
+) -> None:
+    pipe["open_rc"] = 3
+    assert al.safari_target_action("notion", "") == 2
+    assert "safari_open_failed" in capsys.readouterr().out
+
+
+def test_an_import_failure_still_opens(pipe: dict[str, Any]) -> None:
+    pipe["free"] = (2, "logged_out")
+    pipe["import_rc"] = 2
+    assert al.safari_target_action("notion", "") == 0
+    assert _kinds(pipe) == ["browser", "import", "open"]
+
+
+def test_dry_run_calls_nothing(
+    pipe: dict[str, Any], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(al, "_mail_code_dry_run", lambda _s: None)
+    assert al.safari_target_action("notion", "", dry_run=True) == 0
+    assert not pipe["log"]
+
+
+def test_no_secret_in_output(
+    pipe: dict[str, Any], capsys: pytest.CaptureFixture[str]
+) -> None:
+    pipe["proof"] = (2, "logged_out")
+    cookie = pipe["jar"][0].value
+    assert al.safari_target_action("notion", "") == 0
+    out = capsys.readouterr()
+    assert cookie not in out.out + out.err + repr(pipe["records"])
+    for f in als.state_dir().rglob("*"):
+        if f.is_file():
+            assert cookie not in f.read_text(encoding="utf-8", errors="replace")
+
+
+# the -L notion fallback goes through the same drive
+
+
+def test_the_fallback_honours_the_cooldown(pipe: dict[str, Any]) -> None:
+    assert als.mail_code_stamp("notion", time.time())
+    assert al._safari_drive_stage("notion", alsafari.RECIPES["notion"], "fp") == 2
+    assert ("machine", "cooldown") in pipe["log"] and "click" not in _kinds(pipe)
+
+
+def test_the_fallback_stamps_before_the_trigger_with_the_mail_env(
+    pipe: dict[str, Any],
+) -> None:
+    assert al._safari_drive_stage("notion", alsafari.RECIPES["notion"], "fp") == 0
+    click = next(e for e in pipe["log"] if e[0] == "click")
+    assert click[1] == pytest.approx(als.MAIL_CODE_COOLDOWN_S, abs=5)
+    assert pipe["env"] == {"SDSC_EMAIL_NO_AUTO_AUTH": "1"}

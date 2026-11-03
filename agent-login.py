@@ -1002,6 +1002,50 @@ def _safari_session_live(row: dict) -> bool:
     return row.get("safari") is True and fresh
 
 
+# site -> landing URL a `-L SITE -s` run leaves Safari on (tp#1643). For a
+# recipe without a mail_code step, adding a site here (with its RECIPES entry)
+# is the whole of a new Safari route; a mail-code site also needs its mail env
+# (`MAIL_CODE_ENV`).
+SAFARI_ROUTES: dict[str, str] = {"notion": "https://app.notion.com/"}
+
+
+@dataclass(frozen=True)
+class LoginColumns:
+    """The overview's two capability cells of one site (tp#1643)."""
+
+    # `-L SITE -s`: an agent logs Albert's Safari in AND leaves the landing page open
+    safari: bool
+    # an agent can get the shared Chromium logged in itself
+    chromium: bool
+
+
+def login_columns(site: str, row: dict | None = None) -> LoginColumns:
+    """Safari = `site` has a Safari route (`SAFARI_ROUTES` and a recipe);
+    Chromium = `agent_route` (unchanged), the headless e-mail code, the
+    magic link, or a broker login usable by agents."""
+    safari = site in SAFARI_ROUTES and site in alsafari.RECIPES
+    chromium = (
+        agent_route(site, row)
+        or site in MAIL_CODE_SITES
+        or site in alsafari.MAGIC_LINK_SITES
+        or _broker_logs_in(row)
+    )
+    return LoginColumns(safari, chromium)
+
+
+def _broker_logs_in(row: dict | None) -> bool:
+    """A broker login row an agent can log in itself (`browser.py login
+    SITE`): set up (`ready` / `extra`), not fill-only, its account provable
+    (the row predicates the overview already uses)."""
+    if not row:
+        return False
+    return (
+        row.get("status") in ("ready", "extra")
+        and not is_fill_only(row)
+        and not account_unproven(row)
+    )
+
+
 def route_hint(site: str, row: dict | None = None) -> str:
     """The note's renewal hint for `site` (fixed words; '' when none)."""
     if agent_route(site, row):
@@ -3652,6 +3696,9 @@ IMPORT_STOP_RCS = frozenset({BUSY_RC, LOGIN_TIMEOUT_RC, LOGIN_TIMEOUT_DIRTY_RC})
 # shared Chromium (`browser.py login SITE -M`) — ungated, also on an idle or
 # locked Mac — between the Safari import and the attended Safari login.
 MAIL_CODE_SITES = frozenset({"notion"})
+# tp#1643: the extra environment of a mail-code site's himalaya in Safari
+# drives (notion: a dead EPFL grant stops instead of opening a browser).
+MAIL_CODE_ENV: dict[str, dict[str, str]] = {"notion": dict(alsafari.NOTION_MAIL_ENV)}
 # `-M` stops that sent nothing: only these may fall through to the Safari
 # login (and only with the interactive gate open). Every other stop ends -L.
 MAIL_CODE_FALLTHROUGH = frozenset(
@@ -3991,12 +4038,17 @@ def _safari_drive_stage(  # pylint: disable=too-many-return-statements
     site: str, recipe: alsafari.Recipe, before: str
 ) -> int:
     """Log Albert's Safari in, then import (`before`: Safari's session
-    fingerprint before the drive, for the flush wait)."""
-    out = _drive_safari(site, recipe)
+    fingerprint before the drive, for the flush wait). A mail-code site
+    drives through `_mail_code_safari_drive` (tp#1643: lock, cooldown /
+    quarantine, stamp before the trigger, its mail env)."""
+    if site in MAIL_CODE_SITES:
+        out = _mail_code_safari_drive(site, recipe)
+    else:
+        out = _drive_safari(site, recipe)
     if out.mail_archived == "failed":
         print(f"⚠️ {site}: the login-code mail could not be archived (left in INBOX)")
     if not out.ok:
-        return _safari_fail(site, out, f"Safari login stopped — {out.code}")
+        return _safari_drive_fail(site, out)
     if not recipe.import_after:
         record_check(
             site,
@@ -4038,6 +4090,315 @@ def _safari_drive_stage(  # pylint: disable=too-many-return-statements
     return _safari_fail(
         site, failed, _import_how(run, "Safari login done, the import failed")
     )
+
+
+# ---------------------------------------------------------------------------
+# tp#1643: Safari mail-code drives share the headless route's cooldown, and
+# `-L SITE -s [URL]` logs Albert's Safari in and opens a page there.
+# ---------------------------------------------------------------------------
+
+# Codes a Safari mail-code drive stops with at the trigger (no code mail).
+MAIL_CODE_BLOCKS = frozenset({"cooldown", "quarantined"})
+# safari.py `--open … --wait` for the target page (seconds).
+SAFARI_OPEN_WAIT_S = 20
+
+
+def _mail_code_block(site: str) -> str:
+    """Why no code mail may go out for `site` now ('' = none): quarantined,
+    else the shared cooldown — an unreadable stamp counts (fail closed)."""
+    if als.quarantined(site) is not None:
+        return "quarantined"
+    left = als.mail_code_cooldown_left(site, time.time())
+    if left is None or left > 0:
+        return "cooldown"
+    return ""
+
+
+def _mail_code_safari_drive(site: str, recipe: alsafari.Recipe) -> alsafari.Outcome:
+    """One Safari drive of a mail-code site (`-s` and the `-L` fallback):
+    under `mail_code_lock(site)` (busy → 75), blocked (cooldown /
+    quarantined) → the Machine runs WITHOUT any code mail (no mailbox read,
+    no click; a live session still reaches the sentinel), else the cooldown
+    stamp is written right before the trigger click; himalaya with the
+    site's mail env."""
+    with als.mail_code_lock(site) as held:
+        if held is None:
+            return alsafari.Outcome(2, "state_unwritable", phase="precheck")
+        if not held:
+            return alsafari.Outcome(BUSY_RC, "busy", phase="precheck")
+        block = _mail_code_block(site)
+        if block:
+            print(
+                f"ℹ️ {site}: {block} — Safari is tried without a code mail "
+                "(only a live Safari session can get through)"
+            )
+
+        def hook() -> str | None:
+            late = _mail_code_block(site)
+            if late:
+                return late
+            return (
+                None if als.mail_code_stamp(site, time.time()) else "state_unwritable"
+            )
+
+        return _drive_safari(
+            site,
+            recipe,
+            env=dict(MAIL_CODE_ENV.get(site, {})),
+            before_trigger=hook,
+            no_trigger=block,
+        )
+
+
+def _safari_drive_fail(
+    site: str, out: alsafari.Outcome, *, route: str = "safari-login"
+) -> int:
+    """`_safari_fail` of a Safari drive, plus the hint of a cooldown /
+    quarantine stop (those never quarantine: no credential step ran)."""
+    rc = _safari_fail(site, out, f"Safari login stopped — {out.code}", route=route)
+    if out.code == "cooldown":
+        left = als.mail_code_cooldown_left(site, time.time())
+        print(
+            "   a code mail went out < 15 min ago — "
+            + (
+                "the cooldown file is unreadable"
+                if left is None
+                else f"{int(left)} s left"
+            )
+        )
+    elif out.code == "quarantined":
+        print(f"   no code mail while quarantined: ./agent-login.py -Q {site}")
+    return rc
+
+
+def safari_target_url(site: str, given: str) -> str | None:
+    """The page `-L SITE -s [URL]` opens (`given`, else the landing page), or
+    None (`bad_url`): https only, no userinfo, no port, no backslash or
+    whitespace anywhere, a host of the site's recipe (exact)."""
+    raw = given or SAFARI_ROUTES.get(site, "")
+    recipe = alsafari.RECIPES.get(site)
+    if not raw or recipe is None or "\\" in raw or any(c <= " " for c in raw):
+        return None
+    try:
+        parts = urllib.parse.urlsplit(raw)
+        port = parts.port
+    except ValueError:
+        return None
+    host = parts.hostname or ""
+    # netloc == host: no userinfo, no (empty) port, lower case, non-empty
+    ok = parts.scheme == "https" and port is None and parts.netloc == host != ""
+    return raw if ok and host in recipe.hosts else None
+
+
+def _origin(url: str) -> str:
+    """`https://host` of a validated target URL (all that is ever printed)."""
+    return f"https://{urllib.parse.urlsplit(url).hostname}"
+
+
+def _safari_py_ready(recipe: alsafari.Recipe) -> tuple[alsafari.Runner | None, str]:
+    """(safari.py runner, '') when it offers the recipe's features plus
+    `open` and Safari runs JavaScript; else (None, its stop code)."""
+    binary = alsafari.safari_py_bin()
+    if binary is None:
+        return None, "safari_py_missing"
+    call = alsafari.run_safari_py(binary)
+    missing = (alsafari.BASE_FEATURES | recipe.features()) - alsafari.features(call)
+    if missing:
+        print(f"   safari.py lacks: {', '.join(sorted(missing))} (mydotfiles specs)")
+        return None, "safari_py_outdated"
+    status = call(["--status"])
+    if status.rc != 0 or status.data.get("javascript") is not True:
+        return None, "safari_unavailable"
+    return call, ""
+
+
+# One return per stage of the -s pipeline (tp#1643 Design).
+def safari_target_action(  # pylint: disable=too-many-return-statements
+    site: str, url: str, *, dry_run: bool = False
+) -> int:
+    """`-L SITE -s [URL]`: prove Safari's session (else log Safari in), import
+    into the shared Chromium when that is logged out, open the page in
+    Safari. Attended only; one run, no retries."""
+    site = resolve_site(site)
+    if alsafari.scheduled():
+        print(
+            f"❌ -L -s drives Albert's Safari: never from a LaunchAgent "
+            f"({alsafari.SCHEDULED_ENV}=1)"
+        )
+        return 2
+    if site not in SAFARI_ROUTES or site not in alsafari.RECIPES:
+        print(
+            f"❌ {site}: no_safari_route — -s works for: "
+            + ", ".join(sorted(s for s in SAFARI_ROUTES if s in alsafari.RECIPES))
+        )
+        return 2
+    recipe = alsafari.RECIPES[site]
+    target = safari_target_url(site, url)
+    if target is None:
+        print(
+            f"❌ {site}: bad_url — -s takes an https page on "
+            f"{', '.join(recipe.hosts)} (no user, port or backslash); nothing done"
+        )
+        return 2
+    what = "the given page" if url else "the landing page"
+    print(f"▶ {site}: Safari target {_origin(target)} ({what})")
+    if dry_run:
+        return safari_dry_run(site, recipe)
+    gate = alsafari.interactive_gate()
+    if gate is not None:
+        print(f"❌ {site}: {phases.CODE_TEXT.get(gate, gate)} ({gate})")
+        return 3
+    call, stop = _safari_py_ready(recipe)
+    if call is None:
+        print(f"❌ {site}: {phases.CODE_TEXT.get(stop, stop)} ({stop})")
+        return 3
+    with safari_login_lock() as got:
+        if not got:
+            print(f"⏸  {site}: another Safari login runs — try again later")
+            return BUSY_RC
+        return _safari_target_locked(site, recipe, call, target, what)
+
+
+def _safari_target_locked(
+    site: str,
+    recipe: alsafari.Recipe,
+    call: alsafari.Runner,
+    target: str,
+    what: str,
+) -> int:
+    """`safari_target_action` under the Safari-login lock (steps 6-9)."""
+    state, before = _safari_proof(site)
+    if isinstance(state, int):
+        return state
+    out: alsafari.Outcome | None = None
+    if state == "logged_out":
+        print(f"▶ {site}: Safari is not logged in — logging Safari in")
+        out = (
+            _mail_code_safari_drive(site, recipe)
+            if site in MAIL_CODE_SITES
+            else _drive_safari(site, recipe)
+        )
+        if out.mail_archived == "failed":
+            print(
+                f"⚠️ {site}: the login-code mail could not be archived (left in INBOX)"
+            )
+        if not out.ok:
+            return _safari_drive_fail(site, out, route="safari-target")
+        if out.steps and not _wait_flush(site, before):
+            print(f"⚠️ {site}: Safari did not write the new session yet")
+    else:
+        print(f"✅ {site}: Albert's Safari holds a working session — no login needed")
+    if recipe.import_after:
+        _safari_target_import(site, out)
+    reply = call(["--open", target, "--wait", str(SAFARI_OPEN_WAIT_S)])
+    if reply.rc != 0:
+        print(
+            f"❌ {site}: safari_open_failed — safari.py could not open "
+            f"{_origin(target)} (exit {reply.rc}); Safari's login is unchanged"
+        )
+        return 2
+    print(
+        f"✅ {site}: Albert's Safari is logged in — opened {_origin(target)} ({what})"
+    )
+    return 0
+
+
+def _safari_proof(site: str) -> tuple[str | int, str]:  # pylint: disable=too-many-return-statements  # pylint: disable=too-many-return-statements
+    """(Safari's state, its session fingerprint before any login): "match",
+    "logged_out" (no / unreadable session, or the proof said so), or the
+    exit code when `-s` stops (mismatch 2, busy 75, cannot tell 2)."""
+    cookies, why = _safari_jar(site)
+    before = safari_cookies.session_fingerprint(site, cookies)
+    held = why is None and safari_cookies.has_session(site, cookies)
+    cookies.clear()
+    if why is not None:
+        print(
+            f"ℹ️ {site}: Safari's cookie file unreadable ({why}) — counts as logged out"
+        )
+        return "logged_out", before
+    if not held:
+        print(f"ℹ️ {site}: Safari holds no session")
+        return "logged_out", before
+    with site_session(site):
+        run = run_browser(
+            "import-safari",
+            site,
+            "-P",
+            timeout_s=browser_timeout("import-safari"),
+            capture=True,
+            result=True,
+        )
+    res = run.result or {}
+    said = str(res.get("safari") or "")
+    if run.rc == 0 and said == "match":
+        return "match", before
+    if run.rc == BUSY_RC:
+        print(f"⏸  {site}: {BUSY_HOW}")
+        return BUSY_RC, before
+    if run.rc == 2 and said == "logged_out":
+        print(f"ℹ️ {site}: Safari's session does not work (proof: logged out)")
+        return "logged_out", before
+    if run.rc == 2 and said == "mismatch":
+        print(
+            f"❌ {site}: wrong_account — Albert's Safari is logged in as ANOTHER "
+            "account; nothing done (never a second account)"
+        )
+        return 2, before
+    code = str(res.get("code") or ("timeout" if run.rc is None else "indeterminate"))
+    print(
+        f"⏸  {site}: Safari's session could not be proven ({code}) — nothing done; "
+        "try again later"
+    )
+    return (BUSY_RC if run.rc in IMPORT_STOP_RCS else 2), before
+
+
+def _safari_target_import(site: str, out: alsafari.Outcome | None) -> None:
+    """Step 8, best effort: import Safari's session when the shared Chromium
+    is definitely logged out (`out`: our Safari login, None after a match)."""
+    rc, check = _free_check(site)
+    code = str(check.get("code") or "")
+    if rc == 0:
+        print(f"ℹ️ {site}: the shared Chromium is already logged in — nothing imported")
+        return
+    if not (rc == 2 and code in CONTINUE_CODES.get(site, DEFAULT_CONTINUE)):
+        print(
+            f"⚠️ {site}: the shared Chromium check said exit {rc} "
+            f"({code or 'no code'}) — not imported"
+        )
+        return
+    run = _import_run(site, agent=bool(out and out.steps))
+    mail = _mail_detail(out) if out is not None else {}
+    if run.rc == 0:
+        record_check(
+            site,
+            True,
+            "logged in (Safari session imported, -s)",
+            {
+                **mail,
+                **_import_proof(site, run.result),
+                "phase": "ok",
+                "code": "ok",
+                "route": "safari-login",
+            },
+        )
+        print(f"✅ {site}: the shared Chromium is logged in with Safari's session")
+        return
+    res = run.result or {}
+    failed = str(
+        res.get("code") or ("timeout" if run.rc in IMPORT_STOP_RCS else "logged_out")
+    )
+    record_check(
+        site,
+        None if run.rc in IMPORT_STOP_RCS or run.rc is None else False,
+        _import_how(run, f"Safari session not imported — {failed}"),
+        {
+            **mail,
+            "phase": str(res.get("phase") or "client-proof"),
+            "code": failed,
+            "route": "safari-target",
+        },
+    )
+    print(f"⚠️ {site}: the import into the shared Chromium failed ({failed}) — going on")
 
 
 def _mail_code_run(site: str) -> BrowserRun:
@@ -4255,11 +4616,13 @@ def _drive_safari(  # pylint: disable=too-many-return-statements
     *,
     env: dict[str, str] | None = None,
     before_trigger: Callable[[], str | None] | None = None,
+    no_trigger: str = "",
 ) -> alsafari.Outcome:
     """Resolve what the recipe needs, check safari.py, run the step machine.
     `env`: extra environment for the MailReader's himalaya (a site's mail
     env); `before_trigger`: the Machine's hook right before a code-mail
-    trigger click (tp#1643). Both default to today's behaviour."""
+    trigger click; `no_trigger`: a code that runs the Machine without any
+    code mail (tp#1643). All default to today's behaviour."""
     binary = alsafari.safari_py_bin()
     if binary is None:
         return alsafari.Outcome(3, "safari_py_missing")
@@ -4280,7 +4643,9 @@ def _drive_safari(  # pylint: disable=too-many-return-statements
     if plan is None:
         return alsafari.Outcome(2, "safari_no_recipe")
     print(f"▶ {site}: logging in in Albert's Safari (a new window; his clipboard)")
-    return alsafari.Machine(recipe, plan, call, before_trigger=before_trigger).run()
+    return alsafari.Machine(
+        recipe, plan, call, before_trigger=before_trigger, no_trigger=no_trigger
+    ).run()
 
 
 def _safari_plan(
@@ -4614,6 +4979,19 @@ def build_parser() -> argparse.ArgumentParser:
         "later",
     )
     ap.add_argument(
+        "-s",
+        "--in-safari",
+        nargs="?",
+        const="",
+        default=None,
+        metavar="URL",
+        help="with -L SITE: log Albert's SAFARI in to SITE (attended: the Mac "
+        "unlocked and in use) and leave it on the site's landing page, or on "
+        "URL (an https page of the site); Safari already logged in → no code "
+        "mail, it only opens the page; imports the session when the shared "
+        "Chromium is logged out. Sites: " + ", ".join(sorted(SAFARI_ROUTES)),
+    )
+    ap.add_argument(
         "-l",
         "--fillable",
         action="store_true",
@@ -4682,6 +5060,10 @@ def login_action(args: argparse.Namespace) -> int | None:  # pylint: disable=too
         return rearm_action(args.rearm)
     if args.remove:
         return remove_action(args.remove, force=args.force)
+    if args.safari_login and args.in_safari is not None:
+        return safari_target_action(
+            args.safari_login, args.in_safari, dry_run=args.dry_run
+        )
     if args.safari_login:
         return safari_login_action(args.safari_login, dry_run=args.dry_run)
     if args.refresh_pass:
@@ -4701,11 +5083,8 @@ def listing_action(args: argparse.Namespace) -> int | None:
     return None
 
 
-# One early exit per CLI mode.
-def main() -> int:  # pylint: disable=too-many-return-statements,too-many-branches
-    """CLI entry point."""
-    ap = build_parser()
-    args = ap.parse_args()
+def _check_pairs(ap: argparse.ArgumentParser, args: argparse.Namespace) -> None:
+    """Options that only work together with another one (exit 2 otherwise)."""
     if args.mail and not args.check_all:
         ap.error("-m/--mail only works together with -c/--check-all")
     if args.force and not (args.guided or args.remove):
@@ -4714,6 +5093,16 @@ def main() -> int:  # pylint: disable=too-many-return-statements,too-many-branch
         ap.error("-i/--item only works together with -V/--validate")
     if args.dry_run and not args.safari_login:
         ap.error("-n/--dry-run only works together with -L/--safari-login")
+    if args.in_safari is not None and not args.safari_login:
+        ap.error("-s/--in-safari only works together with -L/--safari-login SITE")
+
+
+# One early exit per CLI mode.
+def main() -> int:  # pylint: disable=too-many-return-statements,too-many-branches
+    """CLI entry point."""
+    ap = build_parser()
+    args = ap.parse_args()
+    _check_pairs(ap, args)
     others = (
         args.check_all,
         args.snapshot,

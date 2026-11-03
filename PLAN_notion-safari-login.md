@@ -314,13 +314,13 @@ names `-L notion -s` ("Albert says 'log me into notion' → run
   traceback; (b) is agent-login's `browser_timeout("import-safari")` long enough for
   the proof plus the `_interaction_lease` wait? — if not, give `-P` its own timeout
   key. Record both answers in the B3 commit message.
-- [ ] B4 `agent-login.py`: `SAFARI_ROUTES`, `LoginColumns`, `login_columns()`
+- [x] B4 `agent-login.py`: `SAFARI_ROUTES`, `LoginColumns`, `login_columns()`
   (reusing `agent_route()` unchanged), `_broker_logs_in()`.
-- [ ] B5 `agent-login.py`: `-s/--in-safari [URL]` argument (`nargs="?"`, `const=""`,
+- [x] B5 `agent-login.py`: `-s/--in-safari [URL]` argument (`nargs="?"`, `const=""`,
   only with `-L`, else exit 2; conflicts handled like `-L`'s other-flag check ~4733)
   and the step-2 target validation (`no_safari_route`, `bad_url` incl. port,
   backslash, empty host).
-- [ ] B6 `agent-login.py`: `safari_target_action` steps 3-9 (gate, safari.py check,
+- [x] B6 `agent-login.py`: `safari_target_action` steps 3-9 (gate, safari.py check,
   lock, `-P` proof, login, flush, best-effort import — after a `match` too —,
   `safari.py -o URL`), `_safari_fail(route="safari-target")`; the shared
   `_mail_code_safari_drive(site, recipe, before)` (step 7: `mail_code_lock(site)` →
