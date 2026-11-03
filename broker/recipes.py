@@ -35,6 +35,7 @@ import re
 import time
 import urllib.parse
 from collections.abc import Callable
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
 from broker.login_form import (
@@ -66,7 +67,13 @@ from broker.origins import (
     origin_hint,
     url_origin,
 )
-from broker.otp_detect import OTP_CANDIDATE_SELECTOR, OTP_DESCRIBE_JS, otp_field_like
+from broker.otp_detect import (
+    OTP_CANDIDATE_SELECTOR,
+    OTP_DESCRIBE_JS,
+    SPLIT_OTP_DESCRIBE_JS,
+    otp_field_like,
+    split_otp_group_like,
+)
 from broker.page_state import (
     PROCESSING_CHALLENGE_KINDS,
     await_sentinel,
@@ -1244,6 +1251,71 @@ def _otp_field(page: Any) -> Any:
     return None
 
 
+@dataclass(frozen=True)
+class OtpTarget:
+    """Where the TOTP goes: one field (``boxes == (field,)``) or a code split
+    into one-digit boxes (``boxes`` in DOM order, judged by
+    ``otp_detect.split_otp_group_like``). `hidden_code`: the page has a hidden
+    code input for the boxes (``SPLIT_OTP_DESCRIBE_JS``), never its value."""
+
+    boxes: tuple[Any, ...]
+    hidden_code: bool = False
+
+    @property
+    def split(self) -> bool:
+        """The code goes digit by digit into several boxes."""
+        return len(self.boxes) > 1
+
+
+def _split_otp_group(page: Any) -> OtpTarget | None:
+    """The first ``split_otp_group_like`` group of one-digit boxes, or None.
+
+    No group when the page cannot be read (no ``evaluate``, a script error,
+    a result that is no list) or changed between the description and the
+    handles (another number of inputs, an index out of range)."""
+    try:
+        groups = page.evaluate(SPLIT_OTP_DESCRIBE_JS, USERNAME_SELECTOR)
+    except Exception:  # pylint: disable=broad-exception-caught
+        return None
+    if not isinstance(groups, list):
+        return None
+    group = next(
+        (g for g in groups if isinstance(g, dict) and split_otp_group_like(g)), None
+    )
+    if group is None:
+        return None
+    try:
+        inputs = page.query_selector_all("input")
+        indexes = [int(i) for i in group.get("indexes") or []]
+    except Exception:  # pylint: disable=broad-exception-caught
+        return None
+    if (
+        len(inputs) != group.get("total")
+        or len(indexes) != len(group["members"])
+        or not all(0 <= i < len(inputs) for i in indexes)
+    ):
+        return None
+    return OtpTarget(
+        tuple(inputs[i] for i in indexes), hidden_code=bool(group.get("hidden_code"))
+    )
+
+
+def _otp_target(page: Any, *, generic: bool) -> OtpTarget | None:
+    """Where the TOTP goes now, or None.
+
+    A split group first (its first box may carry ``autocomplete=one-time-code``
+    and would pass as a single field); for the generic recipe only while no
+    password field is visible (``_otp_field``'s guard). Then the single field:
+    ``_otp_field`` (generic, looked up at call time) or ``OTP_SELECTOR``
+    (cscs)."""
+    if not generic or _visible(page, PASSWORD_SELECTOR) is None:
+        split = _split_otp_group(page)
+        if split is not None:
+            return split
+    field = _otp_field(page) if generic else _visible(page, OTP_SELECTOR)
+    return None if field is None else OtpTarget((field,))
+
+
 # Keycloak lists several OTP credentials as radios; labels are not secrets.
 _SELECT_OTP_JS = """(label) => {
   const rs = [...document.querySelectorAll('input[name=selectedCredentialId]')];
@@ -1312,6 +1384,7 @@ def _fill_otp(  # pylint: disable=too-many-arguments
     attempt: AttemptController | None = None,
     tripwire: SubmitTripwire | None = None,
     watch: ChallengeWatch | None = None,
+    generic: bool = True,
 ) -> bool:
     """Type the TOTP code and submit it like the password
     (``_submit_password``: Enter only on a login default button, else the
@@ -1324,7 +1397,12 @@ def _fill_otp(  # pylint: disable=too-many-arguments
     With a `watch`, the page is checked for a challenge right before the
     first click/keystroke (after the code wait): one showing → False,
     nothing selected or typed, the caller's loop comes back. True = the code
-    went in."""
+    went in.
+
+    `otp_field`: the caller's sighting (an ``OtpTarget`` or a bare field
+    handle); the target is re-queried after the code wait through
+    ``_otp_target`` with the caller's `generic`. A split group goes to the
+    split fill; a single field takes the path described above."""
     if not secret.totp_seed:
         if email_code_page(page):
             raise NeedsHuman(
@@ -1338,10 +1416,16 @@ def _fill_otp(  # pylint: disable=too-many-arguments
         raise LoginFailed("could not produce a TOTP code", submitted=True)
     if watch is not None and not watch.clear(page):
         return False
-    otp_field = _otp_field(page)  # re-query: the wait may have taken s
-    if otp_field is None:
+    target = _otp_target(page, generic=generic)  # re-query: the wait took s
+    if target is None:
         raise LoginFailed("the OTP field disappeared", submitted=True)
     _select_authenticator(page, otp_label)
+    if target.split:
+        raise LoginFailed(
+            "the one-time code is split into boxes — not supported yet",
+            submitted=True,
+        )
+    otp_field = target.boxes[0]
     try:
         _guard(page, otp_field, allowed, dev=dev)
     except OriginViolation as exc:
@@ -2301,6 +2385,19 @@ def _same_field(field: Any, other: Any) -> bool:
         return True
 
 
+def _settle_otp_target(page: Any, credential: Any) -> OtpTarget | None:
+    """The generic recipe's OTP target, None when there is none or any of its
+    boxes is the username-only login's `credential` field."""
+    target = _otp_target(page, generic=True)
+    if (
+        target is not None
+        and credential is not None
+        and any(_same_field(box, credential) for box in target.boxes)
+    ):
+        return None
+    return target
+
+
 # The settle loop after the submit: one branch per thing the page may show.
 def _settle(  # pylint: disable=too-many-arguments
     page: Any,
@@ -2333,17 +2430,11 @@ def _settle(  # pylint: disable=too-many-arguments
             return
         if not watch.clear(page):
             continue  # nothing typed or clicked while one shows
-        otp_field = None if otp_done else _otp_field(page)
-        if (
-            otp_field is not None
-            and credential is not None
-            and _same_field(otp_field, credential)
-        ):
-            otp_field = None
-        if otp_field is not None:
+        target = None if otp_done else _settle_otp_target(page, credential)
+        if target is not None:
             otp_done = _fill_otp(
                 page,
-                otp_field,
+                target,
                 secret,
                 allowed,
                 dev=dev,
@@ -2693,12 +2784,15 @@ CSCS_FINAL_CHECK_S = 8.0
 KEYCLOAK_ATTEMPTED_USER = "#kc-attempted-username"
 KEYCLOAK_RESTART = "#reset-login"
 # What a "form not found" names about the page: value-free (input types and
-# ids of a fixed shape, the path's safe characters), never page text.
+# ids of a fixed shape, the path's safe characters), never page text. "/1"
+# marks a one-character field (``maxLength == 1``, a split code's box), "!f"
+# one outside any form.
 _KC_PAGE_HINT_JS = """() => {
   const ok = s => /^[A-Za-z0-9_-]{1,32}$/.test(s || '') ? s : '?';
   const shown = [...document.querySelectorAll('input')]
     .filter(e => e.type !== 'hidden' && (e.offsetWidth || e.offsetHeight))
-    .slice(0, 6).map(e => ok(e.type) + (e.id ? '#' + ok(e.id) : ''));
+    .slice(0, 6).map(e => ok(e.type) + (e.id ? '#' + ok(e.id) : '')
+      + (e.maxLength === 1 ? '/1' : '') + (e.form ? '' : '!f'));
   return {path: location.pathname, fields: shown};
 }"""
 
@@ -2719,7 +2813,7 @@ def _kc_page_hint(page: Any) -> str:
     try:
         got = page.evaluate(_KC_PAGE_HINT_JS)
         path = re.sub(r"[^A-Za-z0-9/_.-]", "", str(got.get("path") or ""))[:64]
-        fields = [str(f)[:66] for f in got.get("fields") or []][:6]
+        fields = [str(f)[:70] for f in got.get("fields") or []][:6]
     except Exception:  # pylint: disable=broad-exception-caught
         return ""
     return f" (on {path or '/'}; fields: {', '.join(fields) or 'none'})"
@@ -3028,22 +3122,25 @@ def cscs_login(
         if not watch.clear(page):
             continue
         if not otp_done:
-            otp_field = _visible(page, OTP_SELECTOR)
-            if otp_field is not None:
+            target = _otp_target(page, generic=False)
+            if target is not None:
                 otp_done = _fill_otp(
                     page,
-                    otp_field,
+                    target,
                     secret,
                     allowed,
                     dev=dev,
                     otp_label=item.otp_label,
                     attempt=attempt,
                     watch=watch,  # checked again right before typing
+                    generic=False,
                 )
     if cscs_on_portal(page.url):
         return
     watch.final(page)
-    raise LoginFailed("login did not reach the CSCS portal", submitted=True)
+    raise LoginFailed(
+        "login did not reach the CSCS portal" + _kc_page_hint(page), submitted=True
+    )
 
 
 # Smartsheet's login wizard (verified 2026-10-06): e-mail + Continue, then

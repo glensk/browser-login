@@ -210,7 +210,7 @@ Build rounds (at most 3 boxes per round, one writer agent per round, rounds in o
   "backup code" context; 6 `maxlength=1` boxes without OTP or code words and not numeric
   (for example initials fields); a single `maxlength=6` field. `tests/test_infomaniak_otp.py`
   stays green unchanged.
-- [ ] B2 `broker/recipes.py` target and wiring: add `OtpTarget` (bare handle still accepted
+- [x] B2 `broker/recipes.py` target and wiring: add `OtpTarget` (bare handle still accepted
   by `_fill_otp`), `_otp_target(page, *, generic)` (split first; password-visible guard for
   `generic=True`; exception / missing `evaluate` / non-list → no group; fallback through the
   module-global `_otp_field` resp. `_visible(page, OTP_SELECTOR)`). Wire it into
