@@ -5626,16 +5626,193 @@ class BrowserAttachTimeout(Exception):
     """
 
 
-def _stop_playwright_bounded(pw: Any, wait_s: float = 5.0) -> None:
-    """``pw.stop()`` in a daemon thread, errors suppressed, joined for `wait_s`."""
+class _PlaywrightStopStall(BaseException):
+    """`_stop_playwright_bounded`'s bound ran out. A BaseException, so no
+    `except Exception` inside Playwright swallows it."""
 
-    def _stop() -> None:
+
+class _StopAlarm:  # pylint: disable=too-few-public-methods
+    """`stopping` is set only while a bounded stop may still stall: a SIGALRM
+    arriving outside that window (late, after the stop returned) is ignored."""
+
+    stopping = False
+
+
+def _on_stop_alarm(_signum: int, _frame: Any) -> None:
+    if _StopAlarm.stopping:
+        raise _PlaywrightStopStall
+
+
+def _pw_internals(pw: Any) -> tuple[Any, Any, int | None]:
+    """`(connection, driver process, driver pid)` of a sync Playwright, each
+    None when the internals are missing (a test fake with only `.stop()`)."""
+    conn = proc = pid = None
+    try:
+        conn = pw._impl_obj._connection
+        proc = conn._transport._proc
+        pid = int(proc.pid)
+    except (AttributeError, TypeError, ValueError):
+        pass
+    return conn, proc, pid
+
+
+def _driver_running(proc: Any) -> bool:
+    """Playwright has not seen its driver exit (the asyncio process object,
+    never a bare pid probe: a reaped driver's pid may be reused)."""
+    try:
+        return proc is not None and proc.returncode is None
+    except (AttributeError, TypeError, ValueError):
+        return False
+
+
+def _stop_on_main_thread(pw: Any, wait_s: float) -> bool:
+    """``pw.stop()`` under a `wait_s` SIGALRM bound; True when it stalled.
+    The previous handler and any outer itimer are restored (the outer one
+    with what is left of it). A handler installed outside Python (None) is
+    never replaced: the stop then runs unbounded."""
+    old_handler = signal.getsignal(signal.SIGALRM)
+    if old_handler is None:
         with contextlib.suppress(Exception):
             pw.stop()
+        return False
+    old_left, old_interval = signal.getitimer(signal.ITIMER_REAL)
+    start = time.monotonic()
+    stalled = False
+    signal.signal(signal.SIGALRM, _on_stop_alarm)
+    _StopAlarm.stopping = True
+    try:
+        signal.setitimer(signal.ITIMER_REAL, max(wait_s, 0.001))
+        pw.stop()
+    except _PlaywrightStopStall:
+        stalled = True
+    except Exception:  # pylint: disable=broad-exception-caught
+        pass
+    finally:
+        _StopAlarm.stopping = False
+        try:
+            signal.setitimer(signal.ITIMER_REAL, 0)
+            signal.signal(signal.SIGALRM, old_handler)
+            if old_left:
+                left = max(old_left - (time.monotonic() - start), 0.001)
+                signal.setitimer(signal.ITIMER_REAL, left, old_interval)
+        except _PlaywrightStopStall:  # an alarm racing the flag reset
+            stalled = True
+    return stalled
 
-    th = threading.Thread(target=_stop, name="playwright-stop", daemon=True)
-    th.start()
-    th.join(timeout=wait_s)
+
+def _reap_driver(pid: int, loop: Any, wait_s: float = 1.0) -> None:
+    """Let the killed driver be reaped before its loop closes. asyncio's own
+    waitpid thread (macOS) reaps it and warns when the loop is already closed
+    or the pid was reaped by someone else, so that thread is joined; without
+    one (a pidfd watcher, or none found) the pid is reaped here."""
+    try:
+        reaper = loop._watcher._threads.get(pid)
+    except (AttributeError, TypeError, ValueError):
+        reaper = None
+    if reaper is not None:
+        with contextlib.suppress(RuntimeError):
+            reaper.join(timeout=wait_s)
+        return
+    end = time.monotonic() + wait_s
+    while time.monotonic() < end:
+        try:
+            done, _status = os.waitpid(pid, os.WNOHANG)
+        except (ChildProcessError, OSError):
+            return
+        if done:
+            return
+        time.sleep(0.02)
+
+
+def _kill_driver_tree(pid: int, loop: Any) -> None:
+    """SIGKILL the driver `pid` and its descendants (never this process).
+    The `pgrep -P` tree is read before the first kill: an orphan's parent is
+    no longer `pid`. The driver is then reaped (`_reap_driver`)."""
+    victims = [pid]
+    for parent in victims:
+        try:
+            found = subprocess.run(
+                ["pgrep", "-P", str(parent)],
+                capture_output=True,
+                text=True,
+                check=False,
+                timeout=5,
+            ).stdout.split()
+        except (OSError, subprocess.SubprocessError):
+            continue
+        victims += [int(k) for k in found if k.isdigit() and int(k) not in victims]
+    for victim in victims:
+        if victim == os.getpid():
+            continue
+        with contextlib.suppress(ProcessLookupError, PermissionError):
+            os.kill(victim, signal.SIGKILL)
+    _reap_driver(pid, loop)
+
+
+def _unwind_playwright(conn: Any) -> None:
+    """After a stall: end the dispatcher greenlet still suspended in its loop,
+    cancel the loop's pending tasks and close it, and drop it as this
+    thread's running loop, so a later `sync_playwright()` here works again
+    and no "Task was destroyed" / "Event loop is closed" noise follows."""
+    import asyncio  # only after a stalled stop
+
+    try:
+        fiber = conn._dispatcher_fiber
+        loop = conn._loop
+    except (AttributeError, TypeError, ValueError):
+        return
+    if fiber is not None and not getattr(fiber, "dead", True):
+        with contextlib.suppress(Exception):
+            fiber.throw()
+    if loop is None:
+        return
+    with contextlib.suppress(Exception):
+        if not loop.is_running():
+            for task in asyncio.all_tasks(loop):
+                task.cancel()
+            loop.close()
+    with contextlib.suppress(Exception):
+        if asyncio._get_running_loop() is loop:
+            asyncio._set_running_loop(None)
+
+
+def _stop_playwright_bounded(pw: Any, wait_s: float = 5.0) -> None:
+    """Stop a sync Playwright on the calling thread, bounded; never raises.
+
+    Sync Playwright is bound to the thread that started it: a stop from any
+    other thread fails with ``greenlet.error`` and leaves the driver alive and
+    the thread's loop "running" (tp#1659). So on the main thread `pw.stop()`
+    runs under a `wait_s` SIGALRM bound (`_stop_on_main_thread`: a flag-gated
+    handler, so a late alarm after the stop returned is ignored, and an alarm
+    racing the disarm is caught there too; the previous handler and outer
+    itimer are restored). Off the main thread no signal is possible and the
+    stop runs unbounded. Only when the stop stalled or Playwright never saw
+    its driver exit is the driver's process tree SIGKILLed and the loop
+    unwound (`_unwind_playwright`); a normal stop takes about 0.1 s.
+
+    Callers (audited 2026-11-03): `_connect` after a timed-out attach and
+    `_doctor_probe_cleanup`. Every `_connect` call site runs on the main
+    thread, including under `LoginDeadline` (its watchdog thread only exits
+    the process), and no `threading.Thread` target reaches `_connect`.
+    """
+    conn, proc, pid = _pw_internals(pw)
+    stalled = False
+    if threading.current_thread() is threading.main_thread() and hasattr(
+        signal, "setitimer"
+    ):
+        stalled = _stop_on_main_thread(pw, wait_s)
+    else:
+        with contextlib.suppress(Exception):
+            pw.stop()
+    if not stalled and not _driver_running(proc):
+        return
+    try:
+        if pid is not None and _driver_running(proc):
+            _kill_driver_tree(pid, getattr(conn, "_loop", None))
+        if conn is not None:
+            _unwind_playwright(conn)
+    except Exception:  # pylint: disable=broad-exception-caught
+        pass
 
 
 def _attach_timeout_message(port: int) -> str:
