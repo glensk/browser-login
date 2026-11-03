@@ -71,6 +71,8 @@ from broker.otp_detect import (
     OTP_CANDIDATE_SELECTOR,
     OTP_DESCRIBE_JS,
     SPLIT_OTP_DESCRIBE_JS,
+    SPLIT_OTP_HIDDEN_JS,
+    SPLIT_OTP_ROOT_JS,
     otp_field_like,
     split_otp_group_like,
 )
@@ -1421,9 +1423,16 @@ def _fill_otp(  # pylint: disable=too-many-arguments
         raise LoginFailed("the OTP field disappeared", submitted=True)
     _select_authenticator(page, otp_label)
     if target.split:
-        raise LoginFailed(
-            "the one-time code is split into boxes — not supported yet",
-            submitted=True,
+        return _fill_split_otp(
+            page,
+            target,
+            secret,
+            allowed,
+            dev=dev,
+            generic=generic,
+            attempt=attempt,
+            tripwire=tripwire,
+            watch=watch,
         )
     otp_field = target.boxes[0]
     try:
@@ -1454,6 +1463,388 @@ def _fill_otp(  # pylint: disable=too-many-arguments
 
 # How long a page may take to submit a complete OTP code by itself.
 OTP_SELF_SUBMIT_MS = 400
+
+# A split code is typed box by box and checked after every key: it needs more
+# of its TOTP step than ``fresh_totp``'s margin leaves.
+SPLIT_OTP_MIN_REMAINING_S = 15
+# How long the boxes' check is polled (a theme may sync on a debounce), how
+# long a disabled "Verify" button is waited for, and the poll step.
+SPLIT_OTP_VERIFY_S = 1.0
+SPLIT_OTP_BUTTON_S = 2.0
+SPLIT_OTP_POLL_MS = 100
+# The clock the split fill reads its TOTP step from (tests drive it).
+_now: Callable[[], float] = time.time
+
+# Whether the boxes hold `code` (box i its digit, every box beyond `code`
+# empty) and the state of the hidden code input of the boxes' form (else of
+# the nearest form around them): booleans and enum states only, never a value.
+SPLIT_OTP_CHECK_JS = (
+    """([boxes, code]) => {
+  const rootOf = """
+    + SPLIT_OTP_ROOT_JS
+    + """;
+  const hiddenOf = """
+    + SPLIT_OTP_HIDDEN_JS
+    + """;
+  const vals = boxes.map(b => (b && b.isConnected) ? String(b.value) : null);
+  const first = boxes[0];
+  const h = first ? hiddenOf(first.form || null, rootOf(first)) : null;
+  let hidden = 'none';
+  if (h) hidden = h.value === '' ? 'empty' : (h.value === code ? 'match' : 'mismatch');
+  return {boxes_ok: vals.every((v, i) => v === (code[i] || '')),
+          blank: vals.every(v => v === ''), hidden: hidden};
+}"""
+)
+
+# Where the split code is submitted, resolved before anything is typed: the
+# boxes' common form (`anchor`: the first box); else the form of the hidden
+# code input (`anchor`: that input); else the single visible button within
+# the group's ancestor four levels up (`button`); else "none".
+SPLIT_OTP_SCOPE_JS = (
+    """(boxes) => {
+  const rootOf = """
+    + SPLIT_OTP_ROOT_JS
+    + """;
+  const hiddenOf = """
+    + SPLIT_OTP_HIDDEN_JS
+    + """;
+  const none = {kind: 'none', anchor: null, button: null};
+  const first = boxes[0];
+  if (!first) return none;
+  if (first.form) {
+    return boxes.every(b => b.form === first.form)
+      ? {kind: 'form', anchor: first, button: null} : none;
+  }
+  if (boxes.some(b => b.form)) return none;
+  const h = hiddenOf(null, rootOf(first));
+  if (h && h.form) return {kind: 'hidden-form', anchor: h, button: null};
+  const vis = el => !!(el.offsetWidth || el.offsetHeight || el.getClientRects().length);
+  const bs = [...rootOf(first).querySelectorAll(
+      'button, input[type=submit], [role=button]')].filter(vis);
+  return bs.length === 1 ? {kind: 'button', anchor: null, button: bs[0]} : none;
+}"""
+)
+
+# The fill fallback's events: what a theme listening for input/change sees.
+_SPLIT_OTP_EVENTS_JS = """e => {
+  e.dispatchEvent(new Event('input', {bubbles: true}));
+  e.dispatchEvent(new Event('change', {bubbles: true}));
+}"""
+
+_SPLIT_HIDDEN_STATES = ("match", "mismatch", "empty", "none")
+
+
+def _split_check(page: Any, boxes: tuple[Any, ...], code: str) -> dict[str, Any]:
+    """``SPLIT_OTP_CHECK_JS`` of `boxes` against `code` (passed in only as the
+    script's argument); {} when it cannot be read."""
+    try:
+        got = page.evaluate(SPLIT_OTP_CHECK_JS, [list(boxes), code])
+    except Exception:  # pylint: disable=broad-exception-caught
+        return {}
+    return got if isinstance(got, dict) else {}
+
+
+def _hidden_state(state: dict[str, Any]) -> str:
+    """The check's hidden-input state, one of ``_SPLIT_HIDDEN_STATES`` or
+    "unread" — safe for an error message."""
+    hidden = state.get("hidden")
+    return hidden if hidden in _SPLIT_HIDDEN_STATES else "unread"
+
+
+def _split_kept(page: Any, boxes: tuple[Any, ...], code: str) -> str:
+    """ "" when every box holds its digit and the hidden code input (if any)
+    matches, polled for ``SPLIT_OTP_VERIFY_S``; else the last hidden state."""
+    state: dict[str, Any] = {}
+    for i in range(int(SPLIT_OTP_VERIFY_S * 1000 / SPLIT_OTP_POLL_MS) + 1):
+        if i:
+            page.wait_for_timeout(SPLIT_OTP_POLL_MS)
+        state = _split_check(page, boxes, code)
+        if state.get("boxes_ok") is True and state.get("hidden") in ("match", "none"):
+            return ""
+    return _hidden_state(state)
+
+
+def _split_moved_on(page: Any, boxes: tuple[Any, ...], url_before: str) -> bool:
+    """The page went on by itself: the URL changed or a box is gone."""
+    return page.url != url_before or not all(_still_there(b) for b in boxes)
+
+
+def _split_not_kept(state: str) -> LoginFailed:
+    return LoginFailed(
+        f"the one-time-code boxes did not keep the code — nothing submitted "
+        f"(hidden: {state})",
+        submitted=True,
+    )
+
+
+def _split_submit_button(
+    page: Any,
+    boxes: tuple[Any, ...],
+    allowed: list[str],
+    *,
+    dev: bool,
+    tripwire: SubmitTripwire | None,
+) -> Any:
+    """The button that submits the split code (``SPLIT_OTP_SCOPE_JS``): in a
+    form scope the form's first visible submit button that is not secondary
+    (disabled or not: the theme may enable it once the boxes are full), else
+    the group's single visible button when it is not secondary. Guarded like
+    every submit; the tripwire takes the form's buttons and shields the boxes.
+    No such button → ``LoginFailed`` before anything is typed."""
+    nothing = LoginFailed(
+        "no submit target for the one-time-code boxes — nothing typed",
+        submitted=True,
+    )
+    try:
+        props = page.evaluate_handle(SPLIT_OTP_SCOPE_JS, list(boxes)).get_properties()
+        kind = props["kind"].json_value()
+        anchor = props["anchor"].as_element()
+        button = props["button"].as_element()
+    except Exception:  # pylint: disable=broad-exception-caught
+        raise nothing from None
+    descs: list[dict[str, Any]] | None = None
+    if kind in ("form", "hidden-form") and anchor is not None:
+        read = read_submit_buttons(anchor)
+        if read is None:
+            raise nothing
+        buttons, descs = read
+        pick = next(
+            (
+                i
+                for i, desc in enumerate(descs)
+                if desc.get("visible") and not secondary_button_like(desc)
+            ),
+            None,
+        )
+        if pick is None:
+            raise nothing
+        button = buttons[pick]
+    elif kind == "button" and button is not None:
+        descs = describe_buttons([button])
+        if not descs or secondary_button_like(descs[0]):
+            raise nothing
+    else:
+        raise nothing
+    try:
+        if anchor is not None:
+            _guard(page, anchor, allowed, dev=dev)
+        problem = _guarded_button(page, button, allowed, dev=dev)
+    except OriginViolation as exc:
+        exc.submitted = True
+        raise
+    if problem:
+        raise OriginViolation(problem, submitted=True)
+    if tripwire is not None:
+        tripwire.step(descs, *boxes, anchor)
+    return button
+
+
+def _press_digit(page: Any, box: Any, digit: str) -> None:
+    """Focus `box` (click it when focus is refused) and press `digit`."""
+    try:
+        box.focus()
+    except Exception:  # pylint: disable=broad-exception-caught
+        box.click()
+    page.keyboard.press(digit)
+
+
+def _type_split_keys(page: Any, boxes: tuple[Any, ...], code: str) -> bool:
+    """One real key per box, checked after every key but the last: True when
+    all keys went in; False when the first key reached no box (the boxes
+    ignore keys: the fill fallback may try). A digit anywhere else (an
+    auto-advance one box ahead) stops BEFORE the next key — the last key may
+    submit the form."""
+    last = len(boxes) - 1
+    for i, box in enumerate(boxes):
+        _press_digit(page, box, code[i])
+        if i == last:
+            break
+        state = _split_check(page, boxes, code[: i + 1])
+        if state.get("boxes_ok") is True:
+            continue
+        if i == 0 and state.get("blank") is True:
+            return False
+        raise LoginFailed(
+            "the one-time-code boxes did not take the digits in order — "
+            "nothing submitted",
+            submitted=True,
+        )
+    return True
+
+
+def _fill_split_fallback(page: Any, boxes: tuple[Any, ...], code: str) -> bool:
+    """Clear every box, then ``fill`` box by box plus input/change events,
+    checked after every box but the last. False: a handle failed (the page
+    changed) — never a second fill then."""
+    last = len(boxes) - 1
+    try:
+        for box in boxes:
+            box.fill("")
+        for i, box in enumerate(boxes):
+            box.fill(code[i])
+            box.evaluate(_SPLIT_OTP_EVENTS_JS)
+            if i == last:
+                break
+            state = _split_check(page, boxes, code[: i + 1])
+            if state.get("boxes_ok") is not True:
+                raise _split_not_kept(_hidden_state(state))
+    except RecipeError:
+        raise
+    except Exception:  # pylint: disable=broad-exception-caught
+        return False
+    return True
+
+
+def _split_code(
+    page: Any, otp: Any, watch: ChallengeWatch | None
+) -> tuple[str, bool] | None:
+    """(code, waited) for a code with ``SPLIT_OTP_MIN_REMAINING_S`` of its
+    step left (capped at half a step): otherwise wait for the next step
+    first. None: a challenge came up during that wait."""
+    margin = min(SPLIT_OTP_MIN_REMAINING_S, otp.interval / 2)
+    remaining = otp.interval - (_now() % otp.interval)
+    waited = remaining < margin
+    if waited:
+        page.wait_for_timeout((remaining + 0.05) * 1000)
+        if watch is not None and not watch.clear(page):
+            return None
+    return str(otp.at(_now())), waited
+
+
+def _fill_split_otp(  # pylint: disable=too-many-arguments
+    page: Any,
+    target: OtpTarget,
+    secret: Secret,
+    allowed: list[str],
+    *,
+    dev: bool,
+    generic: bool,
+    attempt: AttemptController | None,
+    tripwire: SubmitTripwire | None,
+    watch: ChallengeWatch | None,
+) -> bool:
+    """Type a TOTP split into one-digit boxes and submit it — or submit
+    nothing. The code goes in only with ``SPLIT_OTP_MIN_REMAINING_S`` of its
+    step left (after a wait the boxes are re-queried); every box is guarded;
+    the box count must match the code; the submit button is resolved before
+    typing. Real keys first, checked per key; after the last key a page that
+    submitted itself is left alone (marked, no check, no click). Else the
+    boxes must hold the code and the hidden code input (if any) match it; one
+    fill-plus-events fallback on an unchanged page; then the button must be
+    enabled and the code still current, and the identified button is
+    clicked — never Enter. The code is passed to the page only as a check
+    script's argument, never logged or named in an error. True = submitted
+    (or the page submitted itself); False = a challenge showed during the
+    step wait, nothing typed."""
+    otp = parse_totp(secret.totp_seed or "")
+    if otp is None:
+        raise LoginFailed("could not produce a TOTP code", submitted=True)
+    got = _split_code(page, otp, watch)
+    if got is None:
+        return False
+    code, waited = got
+    if waited:  # the page had the time to redraw: take its boxes now
+        fresh = _otp_target(page, generic=generic)
+        if fresh is None or not fresh.split:
+            raise LoginFailed("the one-time-code boxes disappeared", submitted=True)
+        target = fresh
+    boxes = target.boxes
+    try:
+        for box in boxes:
+            _guard(page, box, allowed, dev=dev)
+    except OriginViolation as exc:
+        exc.submitted = True
+        raise
+    if len(code) != len(boxes):
+        raise LoginFailed(
+            f"the one-time-code form has {len(boxes)} boxes, the TOTP has "
+            f"{len(code)} digits",
+            submitted=True,
+        )
+    button = _split_submit_button(page, boxes, allowed, dev=dev, tripwire=tripwire)
+    if _enter_split_code(page, boxes, code):
+        (attempt or NO_ATTEMPT).mark_submitted()  # the page submitted itself
+        return True
+    _submit_split_code(page, otp, code, button, allowed, dev=dev, attempt=attempt)
+    return True
+
+
+def _enter_split_code(page: Any, boxes: tuple[Any, ...], code: str) -> bool:
+    """Put `code` into `boxes`: True = the page submitted itself on the way
+    (no check, no fallback, no click after that); False = the boxes hold the
+    code and the hidden code input (if any) matches — ready to submit. Real
+    keys first; one fill-plus-events fallback, only while the page is
+    unchanged. Anything else raises ``LoginFailed`` with nothing submitted."""
+    before = page.url
+    try:
+        typed = _type_split_keys(page, boxes, code)
+    except RecipeError:
+        raise
+    except Exception:  # pylint: disable=broad-exception-caught
+        # a handle failed mid-typing: the page moved on, or nothing is sent
+        if _split_moved_on(page, boxes, before):
+            return True
+        raise LoginFailed(
+            "the one-time-code boxes could not be typed into — nothing submitted",
+            submitted=True,
+        ) from None
+    state = "unread"
+    if typed:
+        page.wait_for_timeout(OTP_SELF_SUBMIT_MS)
+        if _split_moved_on(page, boxes, before):
+            return True
+        state = _split_kept(page, boxes, code)
+        if not state:
+            return False
+    if not _fill_split_fallback(page, boxes, code):
+        if _split_moved_on(page, boxes, before):
+            return True
+        raise _split_not_kept(state)
+    page.wait_for_timeout(OTP_SELF_SUBMIT_MS)
+    if _split_moved_on(page, boxes, before):
+        return True
+    state = _split_kept(page, boxes, code)
+    if state:
+        raise _split_not_kept(state)
+    return False
+
+
+def _submit_split_code(  # pylint: disable=too-many-arguments
+    page: Any,
+    otp: Any,
+    code: str,
+    button: Any,
+    allowed: list[str],
+    *,
+    dev: bool,
+    attempt: AttemptController | None,
+) -> None:
+    """Click the identified button once it is enabled (``SPLIT_OTP_BUTTON_S``)
+    and the typed code is still the current TOTP; else nothing is submitted
+    (a new code is never typed into a page that may hold a copy)."""
+    waited_ms = 0
+    while not _enabled(button):
+        if waited_ms >= SPLIT_OTP_BUTTON_S * 1000:
+            raise LoginFailed(
+                "the one-time-code submit button stayed disabled — nothing submitted",
+                submitted=True,
+            )
+        page.wait_for_timeout(SPLIT_OTP_POLL_MS)
+        waited_ms += SPLIT_OTP_POLL_MS
+    if str(otp.at(_now())) != code:
+        raise LoginFailed(
+            "the TOTP step rolled over before submit — nothing submitted",
+            submitted=True,
+        )
+    problem = _guarded_button(page, button, allowed, dev=dev)
+    if problem:
+        raise OriginViolation(problem, submitted=True)
+    (attempt or NO_ATTEMPT).mark_submitted()
+    try:
+        _click_on_fill_origin(page, button, allowed, dev=dev)
+    except RecipeError as exc:
+        exc.submitted = True
+        raise
 
 
 def _submitted_itself(page: Any, field: Any, url_before: str) -> bool:

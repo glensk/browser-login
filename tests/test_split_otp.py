@@ -34,6 +34,7 @@ from broker import login_form, otp_detect, recipes, vault  # noqa: E402
 SEED = base64.b32encode(os.urandom(20)).decode()  # test-only, never a real seed
 ORIGIN = "https://auth.cscs.ch"
 URL = ORIGIN + "/auth/realms/cscs/login-actions/authenticate"
+STEP = 1_800_000_000.0  # a TOTP step start (30 s steps)
 
 # ---------------------------------------------------------------------------
 # A. split_otp_group_like on descriptor groups (what SPLIT_OTP_DESCRIBE_JS returns)
@@ -217,6 +218,7 @@ class _Element:
 
     def evaluate_handle(self, js: str) -> _Handle:
         assert js == login_form.SUBMIT_BUTTONS_JS
+        self.page.button_reads.append(self)
         return _Handle({"0": self.page.button} if self.in_form else {})
 
 
@@ -315,7 +317,7 @@ class _SplitOtpPage:  # pylint: disable=too-many-instance-attributes
         self_submit_after_last: bool = False,
         in_form: bool = True,
         button_enabled_after_ms: float | None = 0,
-        clock: float = 1_800_000_000.0,  # a step start (30 s steps)
+        clock: float = STEP,
         key_delay_ms: float = 0,
         password: bool = False,
     ) -> None:
@@ -341,6 +343,7 @@ class _SplitOtpPage:  # pylint: disable=too-many-instance-attributes
         self.enters: list[str] = []
         self.clicks: list[float] = []
         self.checks = 0
+        self.button_reads: list[Any] = []
         self.events = 0
         self.waits: list[float] = []
 
@@ -574,3 +577,189 @@ def test_cscs_names_the_page_when_the_portal_never_came(
     with pytest.raises(recipes.LoginFailed, match="CSCS portal") as err:
         recipes.cscs_login(page, item, _secret(), settle_s=0.3)  # type: ignore[arg-type]
     assert err.value.submitted and "(on /auth/realms/cscs" in err.value.detail
+
+
+# ---------------------------------------------------------------------------
+# C. the split fill (``_fill_otp`` on a split group)
+# ---------------------------------------------------------------------------
+
+
+def _code(at: float) -> str:
+    return str(recipes.parse_totp(SEED).at(at))
+
+
+def _split_run(
+    monkeypatch: pytest.MonkeyPatch, page: _SplitOtpPage
+) -> tuple[recipes.AttemptController, recipes.RecipeError | None]:
+    monkeypatch.setattr(recipes, "_now", page.now)
+    monkeypatch.setattr(recipes, "fresh_totp", lambda _seed: "0" * 6)
+    attempt = recipes.AttemptController()
+    codes = {_code(page.clock + d) for d in (0, 30)}
+    try:
+        recipes._fill_otp(
+            page,
+            recipes.OtpTarget(tuple(page.boxes)),
+            _secret(),
+            [ORIGIN],
+            dev=False,
+            attempt=attempt,
+            generic=False,
+        )
+    except recipes.RecipeError as exc:
+        assert not any(c in str(exc) or c in exc.detail for c in codes)
+        assert not any(c in recipes._kc_page_hint(page) for c in codes)
+        return attempt, exc
+    return attempt, None
+
+
+def test_split_boxes_get_one_key_each_then_one_submit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    page = _SplitOtpPage(button_enabled_after_ms=500)  # pale until all six
+    attempt, err = _split_run(monkeypatch, page)
+    assert err is None and attempt.submitted
+    assert page.keys == list(_code(STEP))
+    assert [b.focuses for b in page.boxes] == [1] * 6
+    assert all(not b.fills for b in page.boxes)
+    assert len(page.clicks) == 1 and not page.enters
+    assert page.filled_at is not None
+    assert page.clicks[0] >= page.filled_at + 0.5  # waited for the button
+
+
+def test_keys_ignored_falls_back_to_fill_with_events(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    page = _SplitOtpPage(takes_keys=False)
+    attempt, err = _split_run(monkeypatch, page)
+    assert err is None and attempt.submitted
+    code = _code(STEP)
+    assert page.keys == [code[0]]  # the first key reached no box: stop
+    assert [b.fills for b in page.boxes] == [["", d] for d in code]
+    assert page.events == 6 and len(page.clicks) == 1
+
+
+def test_neither_strategy_kept_the_code_submits_nothing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    page = _SplitOtpPage(takes_keys=False, takes_fill=False)
+    attempt, err = _split_run(monkeypatch, page)
+    assert isinstance(err, recipes.LoginFailed) and err.submitted
+    assert "nothing submitted" in err.detail
+    assert not page.clicks and not page.enters and not attempt.submitted
+
+
+def test_a_wrong_hidden_code_submits_nothing(monkeypatch: pytest.MonkeyPatch) -> None:
+    page = _SplitOtpPage(hidden_sync="wrong")
+    attempt, err = _split_run(monkeypatch, page)
+    assert isinstance(err, recipes.LoginFailed) and err.submitted
+    assert "(hidden: mismatch)" in err.detail
+    assert not page.clicks and not page.enters and not attempt.submitted
+
+
+def test_an_empty_hidden_code_is_reported_as_empty(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    page = _SplitOtpPage(hidden_sync="empty")
+    _attempt, err = _split_run(monkeypatch, page)
+    assert isinstance(err, recipes.LoginFailed) and "(hidden: empty)" in err.detail
+    assert not page.clicks
+
+
+def test_an_off_by_one_auto_advance_stops_before_the_last_key(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    page = _SplitOtpPage(auto_advance="off_by_one")
+    attempt, err = _split_run(monkeypatch, page)
+    assert isinstance(err, recipes.LoginFailed) and "in order" in err.detail
+    assert len(page.keys) == 1  # stopped right after the misplaced digit
+    assert all(not b.fills for b in page.boxes)
+    assert not page.clicks and not attempt.submitted
+
+
+def test_box_count_not_matching_the_code_types_nothing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    page = _SplitOtpPage(5)
+    _attempt, err = _split_run(monkeypatch, page)
+    assert isinstance(err, recipes.LoginFailed) and err.submitted
+    assert "5 boxes, the TOTP has 6 digits" in err.detail
+    assert not page.keys and all(not b.fills for b in page.boxes)
+
+
+def test_a_page_that_submits_itself_is_not_submitted_again(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    page = _SplitOtpPage(self_submit_after_last=True)
+    attempt, err = _split_run(monkeypatch, page)
+    assert err is None and attempt.submitted
+    assert len(page.keys) == 6
+    assert page.checks == 5  # per key but the last; none after it
+    assert all(not b.fills for b in page.boxes) and page.events == 0
+    assert not page.clicks and not page.enters
+
+
+def test_a_still_disabled_verify_button_submits_nothing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    page = _SplitOtpPage(button_enabled_after_ms=None)
+    attempt, err = _split_run(monkeypatch, page)
+    assert isinstance(err, recipes.LoginFailed) and "stayed disabled" in err.detail
+    assert not page.clicks and not attempt.submitted
+
+
+def test_boxes_outside_the_form_submit_through_the_hidden_inputs_form(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    page = _SplitOtpPage(in_form=False)
+    attempt, err = _split_run(monkeypatch, page)
+    assert err is None and attempt.submitted
+    assert page.button_reads == [page.hidden]  # the hidden input's form
+    assert len(page.clicks) == 1 and not page.enters
+
+
+def test_formless_boxes_without_a_hidden_input_click_their_one_button(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    page = _SplitOtpPage(in_form=False, hidden_sync="none")
+    attempt, err = _split_run(monkeypatch, page)
+    assert err is None and attempt.submitted
+    assert not page.button_reads and len(page.clicks) == 1
+
+
+def test_no_submit_target_types_nothing(monkeypatch: pytest.MonkeyPatch) -> None:
+    page = _SplitOtpPage(in_form=False, hidden_sync="none")
+    nowhere = {"kind": "none", "anchor": "null", "button": "null"}
+    page.scope = lambda: nowhere  # type: ignore[method-assign]
+    _attempt, err = _split_run(monkeypatch, page)
+    assert isinstance(err, recipes.LoginFailed) and "nothing typed" in err.detail
+    assert not page.keys
+
+
+def test_short_step_remaining_waits_for_the_next_step(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    page = _SplitOtpPage(clock=STEP + 20)  # 10 s left: under the 15 s margin
+    attempt, err = _split_run(monkeypatch, page)
+    assert err is None and attempt.submitted
+    assert page.waits[0] >= 10_000
+    assert page.keys == list(_code(STEP + 30))
+
+
+def test_a_step_rollover_before_submit_submits_nothing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    page = _SplitOtpPage(clock=STEP + 14, key_delay_ms=3000)  # 16 s left, 18 s typing
+    attempt, err = _split_run(monkeypatch, page)
+    assert isinstance(err, recipes.LoginFailed) and "rolled over" in err.detail
+    assert page.keys == list(_code(STEP))  # never retyped with the new code
+    assert not page.clicks and not attempt.submitted
+
+
+def test_a_box_off_the_fill_origin_is_an_origin_violation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    page = _SplitOtpPage()
+    page.boxes[3].frame_url = "https://evil.example/frame"
+    _attempt, err = _split_run(monkeypatch, page)
+    assert isinstance(err, recipes.OriginViolation) and err.submitted
+    assert not page.keys and not page.clicks

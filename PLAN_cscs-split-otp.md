@@ -227,7 +227,7 @@ Build rounds (at most 3 boxes per round, one writer agent per round, rounds in o
   `test_kc_page_hint_marks_one_char_and_formless_fields`. Re-run
   `tests/test_infomaniak_otp.py`, `tests/test_ws2_calibre.py`,
   `tests/test_invisible_captcha.py` and `tests/test_email_code_page.py` unchanged.
-- [ ] B3 `broker/recipes.py` split fill: add `SPLIT_OTP_CHECK_JS`,
+- [x] B3 `broker/recipes.py` split fill: add `SPLIT_OTP_CHECK_JS`,
   `SPLIT_OTP_MIN_REMAINING_S`, the injectable `_now`, and the split path in `_fill_otp`
   exactly as Fix design steps 1-12 (guard every box, 15 s TOTP margin, length check, submit
   scope, per-key key-event fill with per-key check, self-submit check first, verify with the
