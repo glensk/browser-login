@@ -15,6 +15,18 @@ from typing import Any
 
 REPO = Path(__file__).resolve().parent.parent
 
+# A PWA's service worker: it answers every navigation of its origin with the
+# app shell (which would run the app, send the token and write it back).
+APP_SW = """
+self.addEventListener('install', e => self.skipWaiting());
+self.addEventListener('activate', e => e.waitUntil(clients.claim()));
+self.addEventListener('fetch', e => {
+  if (e.request.mode === 'navigate')
+    e.respondWith(new Response('<p id=shell>app shell</p>',
+      {headers: {'content-type': 'text/html'}}));
+});
+"""
+
 
 def load_script(rel: str, name: str) -> Any:
     """The repo script `rel` as a module registered under `name`
@@ -30,16 +42,22 @@ def load_script(rel: str, name: str) -> Any:
 
 
 @functools.cache
-def chromium_available() -> bool:
-    """Playwright's Chromium binary is installed (asked once per run)."""
+def chromium_executable() -> str:
+    """Playwright's Chromium binary path ('' when unknown), asked once per
+    run (one driver start)."""
     try:
         from playwright.sync_api import sync_playwright
 
         with sync_playwright() as pw:
-            binary = Path(pw.chromium.executable_path)
+            return str(pw.chromium.executable_path)
     except Exception:  # pylint: disable=broad-exception-caught
-        return False
-    return binary.exists()
+        return ""
+
+
+def chromium_available() -> bool:
+    """Playwright's Chromium binary is installed."""
+    exe = chromium_executable()
+    return bool(exe) and Path(exe).exists()
 
 
 @contextlib.contextmanager

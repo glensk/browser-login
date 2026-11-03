@@ -192,12 +192,12 @@ Follow-up candidate (overseer to file, not built here): production
       `launch(timeout=30_000)`), with its own 60 s bound around setup and teardown and a
       relaunch when the browser is disconnected or dead. Port `chrome` and `storage_chrome`
       to a fresh context per test, closed in `finally`.
-- [ ] B4 Switch `_chromium_installed` to `chromium_page.chromium_available`. Make
+- [x] B4 Switch `_chromium_installed` to `chromium_page.chromium_available`. Make
       `cdp_chromium` reuse `_pw` for `executable_path` and `connect_over_cdp`. Check that a
       nested `_connect` works; if it does not, split the cdp tests into
       `tests/test_ws5_client_s2_cdp.py`. Add the `WS5_REQUIRE_CHROME=1` collection failure.
-- [ ] B5 Apply the targeted fix for B1's class (Design 5; class unknown = both branches).
-- [ ] B6 Verification below is green. Lint is clean.
+- [x] B5 Apply the targeted fix for B1's class (Design 5; class unknown = both branches).
+- [x] B6 Verification below is green. Lint is clean.
 
 ## Verification
 

@@ -15,32 +15,34 @@ from __future__ import annotations
 # pylint: disable=import-error,wrong-import-position,redefined-outer-name
 # pylint: disable=too-many-lines  # one file: the client proof end to end
 import argparse
-import asyncio
 import base64
 import contextlib
-import faulthandler
 import importlib.util
 import json
 import os
 import secrets
 import shutil
-import signal
-import socket
-import subprocess
 import sys
 import tempfile
 import threading
 import time
-import urllib.request
 from collections.abc import Iterator
 from pathlib import Path
-from types import FrameType
 from typing import Any
 
 import pytest
 
 REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO))
+
+from chromium_page import APP_SW  # noqa: E402
+from pw_bound import (  # noqa: E402
+    PwHolder,
+    bound_test,
+    chrome_mark,
+    module_holder,
+    set_phase,
+)
 
 from broker import daemon, identity, identity_ops, limiter, vault  # noqa: E402
 
@@ -216,276 +218,23 @@ def _gitlab_pair(
 
 
 # ---------------------------------------------------------------------------
-# A real headless Chromium: the fixture GitLab and the probe page
+# A real headless Chromium: the fixture GitLab and the probe page, under the
+# bounded Playwright lifecycle of tests/pw_bound.py (tp#1655)
 # ---------------------------------------------------------------------------
 
-
-def _chromium_installed() -> bool:
-    try:
-        from playwright.sync_api import (  # pylint: disable=import-outside-toplevel
-            sync_playwright,
-        )
-
-        with sync_playwright() as pw:
-            return Path(pw.chromium.executable_path).exists()
-    except Exception:  # pylint: disable=broad-exception-caught
-        return False
-
-
-CHROME = pytest.mark.skipif(
-    not _chromium_installed(), reason="Playwright Chromium missing"
-)
-
-
-# ---------------------------------------------------------------------------
-# A bounded Playwright lifecycle (tp#1655): no launching test can wedge the run
-# ---------------------------------------------------------------------------
-
-TEST_BOUND_S = 90  # one launching test: setup, body and teardown
-HOLDER_BOUND_S = 60  # the shared instance's own start and stop
-BACKSTOP_S = 600  # faulthandler: dump every stack and exit
-_REFIRE_S = 10  # a stalled bound fires again (breaks a dead instance's spin)
-
-
-class PlaywrightStall(BaseException):
-    """A bound ran out. A BaseException, so no `except Exception` (the code
-    under test, the storage tab) swallows it."""
-
-
-class _BoundState:  # pylint: disable=too-few-public-methods
-    """The innermost armed bound: its phase, whether it fired, and every
-    phase that stalled so far (a test's bound reads its own slice)."""
-
-    phase = ""
-    fired = False
-    stalls: list[str] = []
-
-
-def _in_playwright(frame: FrameType | None) -> bool:
-    while frame is not None:
-        if f"{os.sep}playwright{os.sep}" in frame.f_code.co_filename:
-            return True
-        frame = frame.f_back
-    return False
-
-
-def _on_alarm(_signum: int, frame: FrameType | None) -> None:
-    """SIGALRM in the main thread: it interrupts the dispatcher's `select()`
-    and `time.sleep`. The first fire marks the shared instance dead and
-    raises; a re-fire raises only inside Playwright code (a later sync call
-    on the dead instance spins in `_sync_base`)."""
-    if not _BoundState.fired:
-        _BoundState.fired = True
-        _BoundState.stalls.append(_BoundState.phase)
-        if _HOLDER is not None:
-            _HOLDER.dead = True
-        raise PlaywrightStall(f"Playwright lifecycle hung in {_BoundState.phase}")
-    if _in_playwright(frame):
-        raise PlaywrightStall(f"Playwright lifecycle hung in {_BoundState.phase}")
-
-
-@contextlib.contextmanager
-def _bounded(seconds: float, phase: str) -> Iterator[None]:
-    """Arm a `seconds` SIGALRM bound named `phase`; an outer bound is
-    restored afterwards with what is left of it."""
-    old_handler = signal.signal(signal.SIGALRM, _on_alarm)
-    old_left, _interval = signal.getitimer(signal.ITIMER_REAL)
-    old_phase, old_fired = _BoundState.phase, _BoundState.fired
-    start = time.monotonic()
-    _BoundState.phase, _BoundState.fired = phase, False
-    signal.setitimer(signal.ITIMER_REAL, seconds, _REFIRE_S)
-    try:
-        yield
-    finally:
-        signal.setitimer(signal.ITIMER_REAL, 0)
-        _BoundState.phase, _BoundState.fired = old_phase, old_fired
-        if old_left:
-            left = max(old_left - (time.monotonic() - start), 0.001)
-            signal.setitimer(signal.ITIMER_REAL, left, _REFIRE_S)
-        signal.signal(signal.SIGALRM, old_handler)
-
-
-def _set_phase(phase: str) -> None:
-    """Rename the innermost bound (a fixture moves from setup to call to
-    teardown)."""
-    _BoundState.phase = phase
-
-
-def _descendants(pid: int) -> list[int]:
-    """Every descendant of `pid` (a `pgrep -P` walk from `pid` only)."""
-    found = subprocess.run(
-        ["pgrep", "-P", str(pid)],
-        capture_output=True,
-        text=True,
-        check=False,
-        timeout=10,
-    ).stdout.split()
-    kids = [int(k) for k in found if k.isdigit()]
-    for kid in list(kids):
-        kids += _descendants(kid)
-    return kids
-
-
-def _kill_tree(pid: int) -> None:
-    """SIGKILL the driver `pid` and its descendants (its Chromium). The tree
-    is read before the first kill: an orphan's parent is no longer `pid`."""
-    for victim in [pid, *_descendants(pid)]:
-        with contextlib.suppress(ProcessLookupError, PermissionError):
-            os.kill(victim, signal.SIGKILL)
-
-
-def _driver_pid(manager: Any) -> int | None:
-    """The Node driver's pid, from Playwright's own transport."""
-    try:
-        return int(manager._connection._transport._proc.pid)
-    except (AttributeError, TypeError, ValueError):
-        return None
-
-
-def _dispatcher(manager: Any) -> Any:
-    """The instance's dispatcher greenlet (None before it exists)."""
-    return getattr(getattr(manager, "_connection", None), "_dispatcher_fiber", None)
-
-
-class _PwHolder:
-    """One driver and one headless Chromium for the module; every test gets
-    a fresh context of it. `dead` is set by a stall: from then on no sync
-    call reaches this instance (it would spin), only a kill of its driver."""
-
-    def __init__(self) -> None:
-        self.manager: Any = None
-        self.pw: Any = None
-        self.browser_: Any = None
-        self.pid: int | None = None
-        self.dead = False
-        self.starts = 0
-
-    def _start(self) -> None:
-        from playwright.sync_api import (  # pylint: disable=import-outside-toplevel
-            sync_playwright,
-        )
-
-        self.starts += 1
-        self.manager = sync_playwright()
-        self.pw = self.manager.start()
-        self.pid = _driver_pid(self.manager)
-        self.browser_ = self.pw.chromium.launch(headless=True, timeout=30_000)
-
-    def _usable(self) -> bool:
-        """Not marked dead, and its dispatcher greenlet still runs (a sync
-        call on a finished dispatcher spins forever)."""
-        dispatcher = _dispatcher(self.manager)
-        return not self.dead and dispatcher is not None and not dispatcher.dead
-
-    def ensure(self) -> Any:
-        """The live browser; a dead or disconnected one is killed and
-        relaunched. A relaunch that stalls too ends the run."""
-        if (
-            self.browser_ is not None
-            and self._usable()
-            and self.browser_.is_connected()
-        ):
-            return self.browser_
-        relaunch = self.starts > 0
-        if self.manager is not None:
-            self.kill()
-        phase = "relaunch" if relaunch else "launch"
-        try:
-            with _bounded(HOLDER_BOUND_S, phase):
-                self._start()
-        except BaseException:  # pylint: disable=broad-exception-caught
-            stalled = self.dead
-            self.kill()
-            if stalled and relaunch:
-                pytest.exit(f"Playwright cannot start: {phase}", returncode=1)
-            raise
-        return self.browser_
-
-    def kill(self) -> None:
-        """SIGKILL this instance's driver tree; no sync call on it."""
-        pid = self.pid or _driver_pid(self.manager)
-        if pid is not None:
-            _kill_tree(pid)
-        # A dispatcher greenlet still suspended inside its loop keeps that
-        # loop "running" for this thread, and every new sync_playwright()
-        # refuses. Unwind it (GreenletExit runs asyncio's own cleanup).
-        dispatcher = _dispatcher(self.manager)
-        if dispatcher is not None and not dispatcher.dead:
-            with contextlib.suppress(Exception):
-                dispatcher.throw()
-        loop = getattr(self.manager, "_loop", None)
-        if loop is not None and not loop.is_running():
-            with contextlib.suppress(Exception):
-                loop.close()
-        # Every sync call leaves its loop set as this thread's running loop
-        # (`_sync_base._sync`); a new sync_playwright() would adopt it.
-        if loop is not None and asyncio._get_running_loop() is loop:
-            asyncio._set_running_loop(None)
-        self.manager = self.pw = self.browser_ = None
-        self.pid = None
-        self.dead = False
-
-    def stop(self, phase: str = "module teardown") -> None:
-        """A clean close under its own bound, else a kill."""
-        if self.manager is None:
-            return
-        if not self._usable():
-            self.kill()
-            return
-        try:
-            with _bounded(HOLDER_BOUND_S, phase):
-                if self.browser_ is not None:
-                    self.browser_.close()
-                self.pw.stop()
-        except BaseException:  # pylint: disable=broad-exception-caught
-            stalled = self.dead
-            self.kill()
-            if not stalled:
-                raise
-            pytest.fail(f"Playwright lifecycle hung in {phase}")
-        self.manager = self.pw = self.browser_ = None
-        self.pid = None
-
-
-_HOLDER: _PwHolder | None = None
+CHROME = chrome_mark()
 
 
 @pytest.fixture(scope="module")
-def _pw() -> Iterator[_PwHolder]:
+def _pw() -> Iterator[PwHolder]:
     """The module's shared Playwright instance (started on first use)."""
-    global _HOLDER  # pylint: disable=global-statement
-    holder = _PwHolder()
-    _HOLDER = holder
-    try:
-        yield holder
-    finally:
-        try:
-            holder.stop()
-        finally:
-            _HOLDER = None
+    yield from module_holder()
 
 
 @pytest.fixture(autouse=True)
 def _playwright_bound(request: pytest.FixtureRequest) -> Iterator[None]:
-    """Every `launches_chrome` test runs under a 90 s main-thread bound. A
-    stall fails that test (`Playwright lifecycle hung in <phase>`); the
-    shared instance's driver is killed and the next test relaunches it.
-    faulthandler (dump + exit) is the last resort for a stall the signal
-    cannot reach."""
-    if request.node.get_closest_marker("launches_chrome") is None:
-        yield
-        return
-    # pytest's own faulthandler_timeout re-arms (and cancels) the one
-    # faulthandler timer per test: the backstop is armed here, per test.
-    faulthandler.dump_traceback_later(BACKSTOP_S, exit=True)
-    before = len(_BoundState.stalls)
-    with _bounded(TEST_BOUND_S, "setup"):
-        yield
-    stalled = _BoundState.stalls[before:]
-    if stalled:
-        if _HOLDER is not None and _HOLDER.dead:
-            _HOLDER.kill()
-        pytest.fail(f"Playwright lifecycle hung in {stalled[0]}")
+    """Every `launches_chrome` test runs under the 90 s main-thread bound."""
+    yield from bound_test(request)
 
 
 class _Api:
@@ -520,7 +269,7 @@ class _Api:
 
 @pytest.fixture
 def chrome(
-    monkeypatch: pytest.MonkeyPatch, _pw: _PwHolder
+    monkeypatch: pytest.MonkeyPatch, _pw: PwHolder
 ) -> Iterator[tuple[Any, _Api]]:
     """A fresh context of the module's headless Chromium whose page stands
     in for the probe tab (`_with_prepared_background_page`): it loads the
@@ -548,10 +297,10 @@ def chrome(
         monkeypatch.setattr(browser, "_with_prepared_background_page", probe_tab)
         monkeypatch.setattr(browser, "_broker_note_session_age", lambda *_a: None)
         monkeypatch.setattr(browser, "_broker_clear_cookies", clear)
-        _set_phase("call")
+        set_phase("call")
         yield page, api
     finally:
-        _set_phase("teardown")
+        set_phase("teardown")
         if not _pw.dead:
             ctx.close()
 
@@ -1342,17 +1091,8 @@ _APP_DOC = (
 )
 
 
-# A PWA's service worker: it answers every navigation of its origin with the
-# app shell (which would run the app, send the token and write it back).
-_APP_SW = """
-self.addEventListener('install', e => self.skipWaiting());
-self.addEventListener('activate', e => e.waitUntil(clients.claim()));
-self.addEventListener('fetch', e => {
-  if (e.request.mode === 'navigate')
-    e.respondWith(new Response('<p id=shell>app shell</p>',
-      {headers: {'content-type': 'text/html'}}));
-});
-"""
+# A PWA's service worker (shared with tests/test_ws5_client_s2_cdp.py).
+_APP_SW = APP_SW
 
 
 def _register_sw(ctx: Any, origin: str) -> None:
@@ -1447,7 +1187,7 @@ class _StorageApp:
 @pytest.fixture
 def storage_chrome(
     monkeypatch: pytest.MonkeyPatch,
-    _pw: _PwHolder,
+    _pw: PwHolder,
 ) -> Iterator[tuple[Any, _StorageApp]]:
     """A fresh context of the module's headless Chromium standing in for
     THIS browser: every background tab (`_with_prepared_background_page`)
@@ -1488,10 +1228,10 @@ def storage_chrome(
         monkeypatch.setattr(browser, "_with_prepared_background_page", tab)
         monkeypatch.setattr(browser, "_broker_note_session_age", lambda *_a: None)
         monkeypatch.setattr(browser, "_connect", lambda _port: (_Pw(), _Browser()))
-        _set_phase("call")
+        set_phase("call")
         yield ctx, app
     finally:
-        _set_phase("teardown")
+        set_phase("teardown")
         if not _pw.dead:
             ctx.close()
 
@@ -1668,163 +1408,3 @@ def test_the_bypass_keeps_a_service_worker_out_of_the_clear_tab(
     said = browser._broker_clear_foreign(9222, "navidrome-user", _nd_entry())
     assert "and 1 storage key(s)" in said
     assert _storage(ctx, ND) == {"keep": "k"}
-
-
-# ---------------------------------------------------------------------------
-# The clear in production shape: a disposable Chromium attached over CDP
-# (connect_over_cdp, its default context), real owned tabs, registry, lease
-# ---------------------------------------------------------------------------
-
-
-@pytest.fixture
-def cdp_chromium(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, _pw: _PwHolder
-) -> Iterator[tuple[int, Any]]:
-    """A throwaway headless Chromium with a DevTools port (never 9222-9225)
-    and every coordination file of browser.py in `tmp_path`; yields
-    (port, a seeding helper that runs `fn(page)` on a routed page of the
-    default context)."""
-    from playwright.sync_api import (  # pylint: disable=import-outside-toplevel
-        sync_playwright,
-    )
-
-    # A live module instance makes every nested sync_playwright() (here and
-    # in the real `_connect`) refuse: its loop counts as running. Stop it;
-    # the next `chrome` / `storage_chrome` test relaunches it.
-    _pw.stop("stop before cdp")
-
-    files = {
-        "CACHE_DIR": "",
-        "LIFECYCLE_FILE": ".browser-lifecycle.json",
-        "CLIENTS_DIR": "clients",
-        "REGISTRY_GATE": "clients/.registry.lock",
-        "INTERACTION_LOCK": "interaction.lock",
-        "MAINTENANCE_FILE": "maintenance.json",
-        "MAINTENANCE_LOCK": ".maintenance.lock",
-    }
-    for name, rel in files.items():
-        monkeypatch.setattr(browser, name, tmp_path / rel if rel else tmp_path)
-    monkeypatch.setenv("CLAUDE_BROWSER_CACHE_DIR", str(tmp_path))
-    monkeypatch.delenv("CLAUDE_BROWSER_LEASE_HELD", raising=False)
-    with socket.socket() as s:
-        s.bind(("127.0.0.1", 0))
-        port = int(s.getsockname()[1])
-    assert port not in browser.INSTANCE_PORTS.values()
-    with sync_playwright() as pw:
-        exe = pw.chromium.executable_path
-    proc = subprocess.Popen(  # pylint: disable=consider-using-with
-        [
-            exe,
-            "--headless=new",
-            f"--remote-debugging-port={port}",
-            f"--user-data-dir={tmp_path / 'profile'}",
-            "--no-first-run",
-            "--no-default-browser-check",
-            "about:blank",
-        ],
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-    )
-    try:
-        deadline = time.monotonic() + 20
-        while True:
-            try:
-                with urllib.request.urlopen(
-                    f"http://127.0.0.1:{port}/json/version", timeout=1
-                ):
-                    break
-            except OSError:
-                assert time.monotonic() < deadline, "disposable Chromium did not start"
-                time.sleep(0.1)
-
-        def seed_doc(route: Any) -> None:
-            if route.request.url.endswith("/sw.js"):
-                route.fulfill(status=200, content_type="text/javascript", body=_APP_SW)
-            else:
-                route.fulfill(status=200, content_type="text/html", body="<p>seed</p>")
-
-        def on_page(url: str, fn: Any) -> Any:
-            with sync_playwright() as pw2:
-                attached = pw2.chromium.connect_over_cdp(f"http://127.0.0.1:{port}")
-                try:
-                    ctx = attached.contexts[0]
-                    ctx.route("**/*", seed_doc)
-                    page = ctx.new_page()
-                    page.goto(url)
-                    try:
-                        return fn(page)
-                    finally:
-                        page.close()
-                finally:
-                    attached.close()  # disconnects; the browser keeps running
-
-        yield port, on_page
-    finally:
-        proc.terminate()
-        try:
-            proc.wait(timeout=10)
-        except subprocess.TimeoutExpired:
-            proc.kill()
-            proc.wait(timeout=10)
-
-
-@pytest.mark.launches_chrome
-@CHROME
-def test_the_clear_route_works_over_connect_over_cdp(
-    cdp_chromium: tuple[int, Any],
-) -> None:
-    """The real `_broker_clear_foreign_storage` against a Chromium attached
-    the way production attaches (connect_over_cdp, default context): it
-    removes only the planned keys of the planned origin, through an owned
-    tab that is gone afterwards."""
-    port, on_page = cdp_chromium
-    seed = (
-        "kv => { for (const [k, v] of Object.entries(kv)) localStorage.setItem(k, v); }"
-    )
-    read = "() => Object.assign({}, localStorage)"
-    token = secrets.token_hex(12)
-    on_page(
-        f"{ND}/x",
-        lambda p: p.evaluate(seed, {"token": token, "userId": "u", "keep": "k"}),
-    )
-    on_page(f"{ELSEWHERE}/x", lambda p: p.evaluate(seed, {"token": token}))
-    plan = {ND: ["token", "userId", "subsonic-token"]}
-    assert browser._broker_clear_foreign_storage(port, "navidrome-user", plan) == 2
-    assert on_page(f"{ND}/x", lambda p: p.evaluate(read)) == {"keep": "k"}
-    assert on_page(f"{ELSEWHERE}/x", lambda p: p.evaluate(read)) == {"token": token}
-    assert not [
-        t
-        for t in browser._page_targets(port)
-        if str(t.get("url", "")).startswith(browser.OWNED_MARKER_PREFIX)
-        or str(t.get("url", "")).startswith(ND)
-    ]
-
-
-@pytest.mark.launches_chrome
-@CHROME
-def test_over_cdp_a_service_worker_is_bypassed_or_nothing_is_cleared(
-    cdp_chromium: tuple[int, Any], monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """Production attach, a PWA worker installed on the origin: the real
-    bypass keeps it out of the clear tab (cleared); a bypass that does not
-    take effect lets the worker answer — the nonce is missing, nothing is
-    cleared, and the clear says so."""
-    port, on_page = cdp_chromium
-    seed = (
-        "kv => { for (const [k, v] of Object.entries(kv)) localStorage.setItem(k, v); }"
-    )
-    register = (
-        "async () => { await navigator.serviceWorker.register('/sw.js');"
-        " await navigator.serviceWorker.ready; }"
-    )
-    read = "() => Object.assign({}, localStorage)"
-    on_page(f"{ND}/x", lambda p: p.evaluate(register))
-    assert "app shell" in on_page(f"{ND}/x", lambda p: p.content())
-    plan = {ND: ["token"]}
-    on_page(f"{ND}/x", lambda p: p.evaluate(seed, {"token": "a"}))
-    assert browser._broker_clear_foreign_storage(port, "navidrome-user", plan) == 1
-    on_page(f"{ND}/x", lambda p: p.evaluate(seed, {"token": "b"}))
-    monkeypatch.setattr(browser, "_broker_bypass_cache", lambda _p: True)
-    with pytest.raises(browser.ForeignStorageError, match="not our document"):
-        browser._broker_clear_foreign_storage(port, "navidrome-user", plan)
-    assert on_page(f"{ND}/x", lambda p: p.evaluate(read)) == {"token": "b"}
