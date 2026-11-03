@@ -339,7 +339,7 @@ never calls the broker's `logout` op. Exit 2 when the jar is missing.
   `agent-login.py -L notion` (headless e-mail code, anytime)") and line 169 ("First
   login per site is manual (ask Albert once …)" → "… except Notion: agents renew it
   headlessly with `agent-login.py -L notion`").
-- [ ] B9 verify + install: `ruff format`, `ruff check`, `mypy`, `uv run pylint` on every
+- [x] B9 verify + install: `ruff format`, `ruff check`, `mypy`, `uv run pylint` on every
   touched file; targeted pytest (new file + the touched test files) in the foreground;
   `bin/browser.py -h` and `login -h` exit 0; `browser.py doctor` against a DISPOSABLE
   instance (`CLAUDE_BROWSER_CACHE_DIR=<tmp> browser.py --cdp-port <free> up`, then
