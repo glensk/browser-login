@@ -377,7 +377,7 @@ names `-L notion -s` ("Albert says 'log me into notion' → run
   `before_trigger` returning a code → no click, `_end` code = that code.
 - [x] B9 `agent-login.py`: overview `Safari` / `Chromium` columns + legend line + `-j`
   `login_columns` + agents.md route sentence from `SAFARI_ROUTES` (Design).
-- [ ] B10 docs: README notion row (~586: "`-L notion -s [URL]` logs Albert's Safari in
+- [x] B10 docs: README notion row (~586: "`-L notion -s [URL]` logs Albert's Safari in
   (attended) and opens the page"), §"Agents renew…" (~1075: a step "Safari target"
   after step 2 + Guards line "both Safari routes share the 15-min cooldown and the
   quarantine; inside them Safari is only tried without a code mail"), the `-L` row
@@ -391,7 +391,7 @@ names `-L notion -s` ("Albert says 'log me into notion' → run
   `/Users/albert/obsidian/42-Git/home/mydotfiles/dotfiles/claude/.claude/skills/browser-login/SKILL.md`
   line 139 and line 169 — add "Albert says 'log me into notion' / 'open this page in my
   Safari' → `agent-login.py -L notion -s [URL]` (attended: Mac unlocked and in use)".
-- [ ] B11 verify + install: `ruff format`, `ruff check`, `mypy`, `uv run pylint` on
+- [x] B11 verify + install: `ruff format`, `ruff check`, `mypy`, `uv run pylint` on
   every touched file (incl. `agent-login.py` and the new test file); targeted pytest
   (the Verification block) in the foreground; `agent-login.py -h` and `browser.py
   import-safari -h` exit 0. Install into the live checkout atomically, in this order:

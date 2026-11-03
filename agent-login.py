@@ -5,7 +5,10 @@ Without arguments: a health line for the broker, then every login we want agents
 use, once: ✅ when it works for agents (setup complete AND the latest real check, -c/-t,
 passed) or ❌ with the reason. Read-only: it asks the broker for its site list (never a
 secret), reads the names and expiry dates (never values) of Safari's cookies, and logs
-into nothing unless you pass -t, -g or -c.
+into nothing unless you pass -t, -g or -c. Two columns after the login name say
+what an agent can do there by itself (legend line under the header): Safari =
+-L SITE -s logs Albert's Safari in and opens the page · Chromium = an agent gets
+the shared Chromium logged in itself (-j: `login_columns` per row).
 
 The marketplace sites (anibis, tutti, Ricardo, Kleinanzeigen), Galaxus and
 Galaxus DE run on YOUR Safari session: `browser.py login SITE` copies that site's
@@ -18,7 +21,11 @@ feature its recipe needs; the credentials from the login broker, else your
 Vaultwarden tab) when it has lapsed there too — claude.ai through its automated
 magic link, Notion headlessly with the e-mail code in the shared Chromium when
 no Safari session imports (no window, also while you are away; only its Safari
-fallback is attended). Only a CAPTCHA, an SMS code, a push / security-key approval (exit 4,
+fallback is attended). When Albert says "log me into notion" or "open this
+page in my Safari", `-L notion -s [URL]` logs HIS Safari in (attended: the Mac
+unlocked and in use) and opens the workspace home or that page; Safari already
+logged in → no code mail, it only opens the page (the Safari code fill is not
+proven live yet). Only a CAPTCHA, an SMS code, a push / security-key approval (exit 4,
 named) and the Touch ID touch stay yours: a locked vault is the agent's — it runs
 `~/.local/libexec/vault-touchid unlock-safari -a main` (you touch Touch ID once) or onboards the
 item into the broker (`broker-add.py ITEM -Y`/`-Z`); `-g SITE` is still there
@@ -48,6 +55,8 @@ Examples:
   ./agent-login.py -D docker    # remove: run while listed, again after the vault item went
   ./agent-login.py -L notion    # an AGENT renews Notion: Safari import, else the headless
                                 # e-mail code (also unattended), else an attended Safari login
+  ./agent-login.py -L notion -s   # "log me into notion": Albert's Safari, left on the
+                                  # workspace home (-s URL: that page)
   ./agent-login.py -L galaxus-de -n  # what -L would do (no import, no Safari login)
   ./agent-login.py -R           # refresh-only pass (NPM tokens; LaunchAgent every 6 h)
   ./agent-login.py -l           # items agents can fill into Albert's Safari (safari.py -L)
@@ -5090,7 +5099,8 @@ def build_parser() -> argparse.ArgumentParser:
         "security key); a locked vault is the agent's: `vault-touchid "
         "unlock-safari -a main` (Albert touches once); exit 3 = the Mac is "
         "locked or idle (for notion only before its Safari fallback): retry "
-        "later",
+        "later. With -s: the target is Albert's SAFARI, not the shared "
+        "Chromium (see -s)",
     )
     ap.add_argument(
         "-s",
@@ -5101,9 +5111,16 @@ def build_parser() -> argparse.ArgumentParser:
         metavar="URL",
         help="with -L SITE: log Albert's SAFARI in to SITE (attended: the Mac "
         "unlocked and in use) and leave it on the site's landing page, or on "
-        "URL (an https page of the site); Safari already logged in → no code "
-        "mail, it only opens the page; imports the session when the shared "
-        "Chromium is logged out. Sites: " + ", ".join(sorted(SAFARI_ROUTES)),
+        "URL (an https page of the site, else exit 2 bad_url); Safari already "
+        "logged in (proven in a throwaway context, never a second account) → "
+        "no code mail, it only opens the page in a new tab; else the e-mail "
+        "code login in a new Safari window (one code mail per 15 min, shared "
+        "with -L SITE's headless route; the Safari code fill is not proven "
+        "live yet); imports the session when the shared Chromium is logged "
+        "out. Exit 0 = Safari logged in AND the page opened; 3 = the Mac is "
+        "locked or idle; 4 = needs Albert (CAPTCHA). For Albert's 'log me "
+        "into notion' / 'open this page in my Safari'. Sites: "
+        + ", ".join(sorted(SAFARI_ROUTES)),
     )
     ap.add_argument(
         "-l",
