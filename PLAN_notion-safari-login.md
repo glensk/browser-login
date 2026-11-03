@@ -405,7 +405,7 @@ names `-L notion -s` ("Albert says 'log me into notion' → run
   (`agent-login.py` → `bin/browser.py` → `agent_login_safari.py` →
   `agent_login_state.py`). Remove the `.bak` files only after B12 step 1 passed.
   Commit with the grant the brief carries.
-- [ ] B12 LIVE CANARY A (Albert present at the Mac; no logout of anything). Result
+- [x] B12 LIVE CANARY A (Albert present at the Mac; no logout of anything). Result
   files in a fresh `mktemp -d` (0700).
   1. `agent-login.py -L notion -s -n` → target origin, gate open, Safari holds a
      session, cooldown, next step. Note `safari fp` and the mtime of
@@ -423,6 +423,7 @@ names `-L notion -s` ("Albert says 'log me into notion' → run
      (`agent-login.py -L notion -n` shows no quarantine).
   6. Negative, read-only: `agent-login.py -L notion -s http://app.notion.com/` and
      `-s https://example.com/` → exit 2 `bad_url`, Safari untouched.
+  ↳ evidence 2026-11-03: live 2026-11-03 23:3x: -n gate open, import-safari -P match, -s and -s <S3 URL> exit 0, Albert confirmed Notion logged in to renku workspace; cooldown mtime unchanged 1793715634; no quarantine; http:// and example.com -> exit 2 bad_url
 - [ ] B13 LIVE CANARY B — the e-mail-code login in Safari (only when Safari is
   GENUINELY logged out of Notion — B12 step 2 said `logged_out`, or a later agent run
   meets it; never forced by a logout; Albert present; the cooldown free).
