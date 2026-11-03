@@ -5,6 +5,8 @@ one-time-code``, ``name*=otp``, ``#otp``). Everything else is judged here:
 the page describes each visible text-like input (``OTP_DESCRIBE_JS``) and the
 pure function ``otp_field_like`` decides — so the rules are testable without a
 browser. Nothing read here is a secret (attributes, labels, nearby text).
+A code split into one-digit boxes is described as a group
+(``SPLIT_OTP_DESCRIBE_JS``) and judged by ``split_otp_group_like``.
 """
 
 from __future__ import annotations
@@ -78,14 +80,33 @@ def _numeric_code_shape(desc: dict[str, Any]) -> tuple[bool, bool]:
         maxlength = int(desc.get("maxlength") or -1)
     except (TypeError, ValueError):
         maxlength = -1
+    numeric = _numeric_input(desc)
+    return numeric and (6 <= maxlength <= 8 or digit_placeholder), digit_placeholder
+
+
+def _numeric_input(desc: dict[str, Any]) -> bool:
+    """The input takes digits: ``type`` tel/number, a numeric ``inputmode``
+    or a digit ``pattern``."""
     pattern = str(desc.get("pattern") or "")
-    numeric = (
+    return (
         str(desc.get("type") or "") in ("tel", "number")
         or str(desc.get("inputmode") or "") in ("numeric", "decimal")
         or "0-9" in pattern
         or "\\d" in pattern
     )
-    return numeric and (6 <= maxlength <= 8 or digit_placeholder), digit_placeholder
+
+
+def _words(descs: list[dict[str, Any]], context: str) -> str:
+    """The attribute / label words of `descs` plus `context`, camelCase and
+    snake_case split (name/id like "otp_code" / "mfaToken": word boundaries
+    need separators)."""
+    words = " ".join(
+        str(desc.get(k) or "")
+        for desc in descs
+        for k in ("name", "id", "placeholder", "aria_label", "title", "labels")
+    )
+    words += " " + context
+    return re.sub(r"([a-z])([A-Z])", r"\1 \2", words).replace("_", " ")
 
 
 def otp_field_like(desc: dict[str, Any]) -> bool:
@@ -104,13 +125,7 @@ def otp_field_like(desc: dict[str, Any]) -> bool:
         return False
     if "one-time-code" in tokens:
         return True
-    words = " ".join(
-        str(desc.get(k) or "")
-        for k in ("name", "id", "placeholder", "aria_label", "title", "labels")
-    )
-    words += " " + str(desc.get("context") or "")
-    # name/id like "otp_code" / "mfaToken": word boundaries need separators
-    words = re.sub(r"([a-z])([A-Z])", r"\1 \2", words).replace("_", " ")
+    words = _words([desc], str(desc.get("context") or ""))
     if tokens & {"username", "email", "tel", "current-password"} or (
         OTP_NEGATIVE_RE.search(words)
     ):
@@ -119,3 +134,110 @@ def otp_field_like(desc: dict[str, Any]) -> bool:
     return bool(OTP_WORD_RE.search(words)) or (
         shape and (digit_placeholder or bool(CODE_WORD_RE.search(words)))
     )
+
+
+# Split one-time-code boxes (CSCS Keycloak theme, 2026-11-03: six one-digit
+# boxes under "One-Time Code", then "Verify Code"). A group: the visible,
+# editable, non-password ``maxLength == 1`` inputs that share their form or,
+# without one, their ancestor four levels up. Shared JS pieces (function
+# sources, spliced into the page scripts here and in ``recipes``):
+# ``SPLIT_OTP_ROOT_JS`` (box -> that ancestor) and ``SPLIT_OTP_HIDDEN_JS``
+# ((form, root) -> the hidden input whose name looks like a code: in the form,
+# without one in the nearest form around the root; else null).
+SPLIT_OTP_ROOT_JS = """e => {
+  let n = e;
+  for (let k = 0; k < 4 && n.parentElement && n.parentElement !== document.body; k++) {
+    n = n.parentElement;
+  }
+  return n;
+}"""
+SPLIT_OTP_HIDDEN_JS = """(form, root) => {
+  let f = form;
+  for (let n = root; !f && n; n = n.parentElement) f = n.querySelector('form');
+  if (!f) return null;
+  return [...f.elements].find(h => (h.type || '').toLowerCase() === 'hidden'
+      && /otp|totp|code/i.test(h.name || '')) || null;
+}"""
+
+# The candidate groups, value-free, as a list: each member described like
+# ``OTP_DESCRIBE_JS`` plus ``in_form``, in DOM order; ``indexes`` are the
+# members' positions in ``document.querySelectorAll('input')`` (``total``
+# inputs then), ``context`` is the first member's, ``hidden_code`` whether
+# ``SPLIT_OTP_HIDDEN_JS`` finds an input (never its value).
+SPLIT_OTP_DESCRIBE_JS = (
+    """(userSel) => {
+  const describe = """
+    + OTP_DESCRIBE_JS
+    + """;
+  const rootOf = """
+    + SPLIT_OTP_ROOT_JS
+    + """;
+  const hiddenOf = """
+    + SPLIT_OTP_HIDDEN_JS
+    + """;
+  const vis = e => !!(e.offsetWidth || e.offsetHeight || e.getClientRects().length);
+  const all = [...document.querySelectorAll('input')];
+  const groups = new Map();
+  all.forEach((e, i) => {
+    const t = (e.getAttribute('type') || 'text').toLowerCase();
+    if (t === 'hidden' || t === 'password' || e.maxLength !== 1) return;
+    if (!vis(e) || e.disabled || e.readOnly) return;
+    const key = e.form || rootOf(e);
+    if (!groups.has(key)) groups.set(key, {form: e.form || null, root: rootOf(e), boxes: [], indexes: []});
+    const g = groups.get(key);
+    g.boxes.push(e);
+    g.indexes.push(i);
+  });
+  return [...groups.values()].filter(g => g.boxes.length > 1).map(g => {
+    const members = g.boxes.map(e => Object.assign(describe(e, userSel), {in_form: !!e.form}));
+    return {members: members, indexes: g.indexes, total: all.length,
+            in_form: !!g.form, context: members[0].context,
+            hidden_code: !!hiddenOf(g.form, g.root)};
+  });
+}"""
+)
+
+SPLIT_OTP_MIN_BOXES = 4
+SPLIT_OTP_MAX_BOXES = 8
+
+
+def _one_digit_box(desc: Any) -> bool:
+    """A described input that can be one box of a split code: a ``text`` /
+    ``tel`` / ``number`` input with ``maxlength == 1``, not a username field."""
+    if not isinstance(desc, dict) or desc.get("username"):
+        return False
+    if str(desc.get("type") or "text") not in ("text", "tel", "number"):
+        return False
+    try:
+        return int(desc.get("maxlength") or -1) == 1
+    except (TypeError, ValueError):
+        return False
+
+
+def split_otp_group_like(group: dict[str, Any]) -> bool:
+    """True iff a ``SPLIT_OTP_DESCRIBE_JS`` group is one TOTP code split into
+    one-digit boxes.
+
+    4 to 8 members, each a ``text``/``tel``/``number`` input with
+    ``maxlength == 1`` and none a username field; no ``OTP_NEGATIVE_RE`` word
+    (sms, e-mail, backup, …) in the members' attributes / labels or the
+    group's context; then ``autocomplete=one-time-code`` on some member, an
+    ``OTP_WORD_RE`` word, or every member numeric (inputmode/type/pattern)
+    together with a ``CODE_WORD_RE`` word. A single code field (no siblings,
+    ``maxlength`` other than 1) never is one."""
+    members = group.get("members") if isinstance(group, dict) else None
+    if not isinstance(members, list) or not (
+        SPLIT_OTP_MIN_BOXES <= len(members) <= SPLIT_OTP_MAX_BOXES
+        and all(_one_digit_box(m) for m in members)
+    ):
+        return False
+    words = _words(members, str(group.get("context") or ""))
+    if OTP_NEGATIVE_RE.search(words):
+        return False
+    tagged = any(
+        "one-time-code" in str(m.get("autocomplete") or "").split() for m in members
+    )
+    numeric_code = all(_numeric_input(m) for m in members) and bool(
+        CODE_WORD_RE.search(words)
+    )
+    return tagged or bool(OTP_WORD_RE.search(words)) or numeric_code

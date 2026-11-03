@@ -200,7 +200,7 @@ Build rounds (at most 3 boxes per round, one writer agent per round, rounds in o
   done by the main session or a big agent (`sudo -n`, launchd restart, live login), not by a
   lean builder.
 
-- [ ] B1 `broker/otp_detect.py`: add `SPLIT_OTP_DESCRIBE_JS` (value-free groups of visible,
+- [x] B1 `broker/otp_detect.py`: add `SPLIT_OTP_DESCRIBE_JS` (value-free groups of visible,
   editable, `maxLength == 1` inputs per form or common ancestor, in DOM order, with `in_form`,
   context text and a hidden-code-input flag) and the pure `split_otp_group_like(group) ->
   bool` as designed. New `tests/test_split_otp.py`, hermetic with no Chromium. Accept cases:
