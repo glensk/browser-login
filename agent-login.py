@@ -3779,6 +3779,30 @@ def _free_check(site: str) -> tuple[int, dict]:
     return rc, check or {}
 
 
+# The fields of browser.py's `logged-in` record that carry its proof.
+PROOF_FIELDS = ("server", "proof", "sentinel", "identity", "cookie_days_left")
+
+
+def _import_proof(site: str, result: dict | None) -> dict:
+    """The import's result record plus the proof of the free check run right
+    after it (tp#1633): `import-safari` records no `proof`, so without this
+    the latest check of a built-in-proof site (notion) rests on nothing and
+    agents.md keeps "weak proof" although the sidebar is up. Other sites,
+    and a check that does not say logged in, keep the import's record."""
+    res = dict(result or {})
+    if site not in BUILTIN_PROOF_SITES:
+        return res
+    rc, check = _free_check(site)
+    if rc != 0:
+        print(
+            f"⚠️ {site}: the check after the import says exit {rc} "
+            f"({check.get('code') or 'no code'}) — the import's own proof stands"
+        )
+        return res
+    res.update({k: check[k] for k in PROOF_FIELDS if k in check})
+    return res
+
+
 def _import_how(run: BrowserRun, base: str) -> str:
     """`base`, plus a failed undo the import recorded (S6)."""
     if (run.result or {}).get("undo") == "failed":
@@ -3933,7 +3957,7 @@ def _safari_import_stage(site: str) -> int | None:
             True,
             "logged in (Safari session imported)",
             {
-                **(run.result or {}),
+                **_import_proof(site, run.result),
                 "phase": "ok",
                 "code": "ok",
                 "route": "safari-import",
@@ -3995,7 +4019,7 @@ def _safari_drive_stage(  # pylint: disable=too-many-return-statements
             "logged in (agent's Safari login)",
             {
                 **_mail_detail(out),
-                **(run.result or {}),
+                **_import_proof(site, run.result),
                 "phase": "ok",
                 "code": "ok",
                 "route": "safari-login",

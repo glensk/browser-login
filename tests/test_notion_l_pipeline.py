@@ -109,7 +109,7 @@ def test_a_safari_session_is_imported_first(pl: dict) -> None:
     pl["jar"] = ([_token()], None)
     pl["import"] = _run(0, {"phase": "ok", "code": "ok"})
     assert al.safari_login_action("notion") == 0
-    assert pl["order"] == ["probe", "import"]
+    assert pl["order"] == ["probe", "import", "probe"]  # the proof after it
 
 
 def test_no_safari_session_goes_headless_on_a_locked_mac(pl: dict) -> None:
@@ -155,6 +155,7 @@ def test_a_stop_before_sending_falls_through_to_safari(pl: dict, code: str) -> N
         "probe",
         "safari",
         "import-agent",
+        "probe",
     ]
 
 
@@ -237,7 +238,7 @@ def test_quarantined_still_imports_a_safari_session(
     pl["jar"] = ([_token()], None)
     pl["import"] = _run(0, {"phase": "ok", "code": "ok"})
     assert al.safari_login_action("notion") == 0
-    assert pl["order"] == ["probe", "import"]
+    assert pl["order"] == ["probe", "import", "probe"]
     assert als.quarantined("notion") is not None
     assert "Safari session" in capsys.readouterr().out
 
@@ -353,3 +354,80 @@ def test_the_agents_md_notion_line_has_no_weak_proof() -> None:
     assert "weak proof" not in line
     # without the sidebar sentinel the old warning stays
     assert "weak proof" in _notion_line("server")
+
+
+# ---------------------------------------------------------------------------
+# tp#1633 canary 3: the import route records the proven check's proof
+# ---------------------------------------------------------------------------
+
+PROVEN = {
+    "phase": "ok",
+    "code": "ok",
+    "server": "valid",
+    "proof": "server+sentinel",
+    "sentinel": True,
+    "identity": "match",
+    "cookie_days_left": 364,
+}
+
+
+def test_the_import_records_the_proof_of_the_check_after_it(
+    pl: dict, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    pl["jar"] = ([_token()], None)
+    pl["import"] = _run(0, {"phase": "ok", "code": "ok", "proof": ""})
+    probes = iter([(2, {"code": "logged_out"}), (0, dict(PROVEN))])
+
+    def probe(site: str, quiet: bool = True) -> Any:
+        pl["order"].append("probe")
+        return next(probes)
+
+    monkeypatch.setattr(al, "probe", probe)
+    assert al.safari_login_action("notion") == 0
+    assert pl["order"] == ["probe", "import", "probe"]
+    rec = al.last_checks()["notion"]
+    assert (rec["state"], rec["route"]) == ("ok", "safari-import")
+    assert (rec["proof"], rec["server"]) == ("server+sentinel", "valid")
+    assert "weak proof" not in _notion_line(rec["proof"])
+
+
+def test_the_agent_import_records_the_proof_too(
+    pl: dict, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    pl["mail"] = _run(2, {"phase": "precheck", "code": "recipe_stuck"})
+    pl["import"] = _run(0, {"phase": "ok", "code": "ok"})
+    probes = iter(
+        [(2, {"code": "logged_out"}), (2, {"code": "logged_out"}), (0, dict(PROVEN))]
+    )
+    monkeypatch.setattr(al, "probe", lambda site, quiet=True: next(probes))
+    assert al.safari_login_action("notion") == 0
+    rec = al.last_checks()["notion"]
+    assert (rec["route"], rec["proof"]) == ("safari-login", "server+sentinel")
+
+
+def test_a_failed_check_after_the_import_keeps_the_import(
+    pl: dict, capsys: pytest.CaptureFixture
+) -> None:
+    pl["jar"] = ([_token()], None)
+    pl["import"] = _run(0, {"phase": "ok", "code": "ok", "proof": ""})
+    assert al.safari_login_action("notion") == 0  # the probe stub: logged_out
+    rec = al.last_checks()["notion"]
+    assert (rec["state"], rec["code"], rec["proof"]) == ("ok", "ok", "")
+    assert "the import's own proof stands" in capsys.readouterr().out
+
+
+def test_other_sites_import_without_a_second_check(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def _never(site: str) -> Any:
+        raise AssertionError("no check after another site's import")
+
+    monkeypatch.setattr(al, "_free_check", _never)
+    assert al._import_proof("galaxus-de", {"code": "ok"}) == {"code": "ok"}
+
+
+def test_logged_in_records_the_proof_of_the_check(pl: dict) -> None:
+    pl["probe"] = (0, dict(PROVEN))
+    assert al.safari_login_action("notion") == 0
+    assert pl["order"] == ["probe"]
+    assert al.last_checks()["notion"]["proof"] == "server+sentinel"
