@@ -154,7 +154,7 @@ click, no fill, no navigation).
   `RECIPES["notion"].steps[0].host == "www.notion.so"`
   (`grep -rn 'www.notion.so' tests/` showed only cookie domains and one URL in
   `test_notion_mail_code.py:1554`, which is a probe URL, not the step).
-- [ ] B2 tests, new `tests/test_notion_safari_recipe.py` (no network, no real Safari;
+- [x] B2 tests, new `tests/test_notion_safari_recipe.py` (no network, no real Safari;
   headless Chromium only through `tests/chromium_page.py`, skipped when Playwright's
   Chromium is missing). A hand-written fixture of the new login page as a string
   constant — the probe's structure only (form, `input[type=email]
