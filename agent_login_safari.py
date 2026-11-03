@@ -139,6 +139,19 @@ CLIPBOARD_KINDS = frozenset({"user", "login", "otp"})
 POLL_S = 3.0
 MAX_POLLS = 40  # ~2 min of page reads, plus the steps' own waits
 IDLE_POLLS = 4  # this many reads with nothing to do = stuck
+# tp#1643: after the code submit, a page still showing the code field waits
+# this long for the sentinel (mirrors the headless sidebar wait)
+POST_SUBMIT_S = 30.0
+# Outcome.stuck: the fixed reasons a run ended `recipe_stuck`
+STUCK_REASONS = frozenset(
+    {
+        "no_step_for_host",
+        "step_conditions_unmet",
+        "page_unreadable",
+        "code_field",
+        "after_submit",
+    }
+)
 MAIL_WAIT_S = 180.0
 MAIL_POLL_S = 5.0
 # The himalaya environment of the headless Notion path: a dead EPFL grant
@@ -396,9 +409,12 @@ RECIPES: dict[str, Recipe] = {
         ("www.notion.so", "notion.so", "app.notion.com"),
         "app.notion.com",
         (
+            # L2 (2026-11-03): the login page is app.notion.com/login
+            # (www.notion.so/login redirects there); one visible
+            # input[type=email], one div[role=button] "Continue".
             Step(
                 "mail_code",
-                "www.notion.so",
+                "app.notion.com",
                 trigger="Continue",
                 submit="Continue with login code",
                 when='input[type="email"]',
@@ -416,7 +432,7 @@ RECIPES: dict[str, Recipe] = {
                 subjects=("login code", "Anmeldecode"),
             ),
         ),
-        start_url="https://www.notion.so/login",
+        start_url="https://app.notion.com/login",
         sentinel=".notion-sidebar, .notion-sidebar-switcher",
         broker=False,
         identity="notion",
@@ -440,7 +456,7 @@ ENV_RC = 3
 
 
 @dataclass
-class Outcome:
+class Outcome:  # pylint: disable=too-many-instance-attributes
     """How a Safari run ended: exit code, fixed phase/code, whether a
     credential step ran (→ quarantine on failure), the steps that ran."""
 
@@ -454,6 +470,10 @@ class Outcome:
     # the used login-code mail moved out of INBOX: ok / failed / skipped
     # ("" = no mail code was used); fixed vocabulary, never mail content
     mail_archived: str = ""
+    # tp#1643: why a `recipe_stuck` ended (STUCK_REASONS, "" = not stuck)
+    # and the tab host it ended on (a host from the recipe, never a URL)
+    stuck: str = ""
+    stuck_host: str = ""
 
     @property
     def ok(self) -> bool:
@@ -1344,6 +1364,10 @@ class Machine:  # pylint: disable=too-many-instance-attributes
     # mailbox read, no e-mail fill, no click; the mail-code step ends the run
     # with it (a live session still reaches the sentinel → ok).
     no_trigger: str = ""
+    # tp#1643: the mail code was typed and submitted (the fill answered ok);
+    # until `submit_deadline` (clock) a page still on the code waits
+    submitted: bool = False
+    submit_deadline: float = 0.0
 
     # -- safari.py calls ---------------------------------------------------
 
@@ -1354,6 +1378,11 @@ class Machine:  # pylint: disable=too-many-instance-attributes
     def _end(self, rc: int, code: str) -> Outcome:
         self.out.rc, self.out.code = rc, code
         return self.out
+
+    def _stuck(self, why: str, host: str) -> Outcome:
+        """End `recipe_stuck`, naming why (STUCK_REASONS) and the tab host."""
+        self.out.stuck, self.out.stuck_host = why, host
+        return self._end(2, "recipe_stuck")
 
     def _on(self, host: str) -> list[str]:
         """The window handle + the host safari.py must find the tab on."""
@@ -1425,17 +1454,23 @@ class Machine:  # pylint: disable=too-many-instance-attributes
         as before)."""
         return self.before_trigger is not None or bool(self.no_trigger)
 
-    def _loop(self) -> Outcome:  # pylint: disable=too-many-return-statements
+    # one return per stop; the branches are the page states in check order
+    def _loop(self) -> Outcome:  # pylint: disable=too-many-return-statements,too-many-branches
         idle = 0
         for _ in range(MAX_POLLS):
             host, stop = self.tab_host()
             if stop:
                 return self._end(stop_rc(stop), stop)
             page = self.read_page(host) if host else None
+            if self._post_submit_wait(host, page):
+                if self.clock() >= self.submit_deadline:
+                    return self._stuck("after_submit", host)
+                self.sleep(POLL_S)
+                continue
             if page is None:
                 idle += 1
                 if idle >= IDLE_POLLS + 2:
-                    return self._end(2, "recipe_stuck")
+                    return self._stuck("page_unreadable", host)
                 self.sleep(POLL_S)
                 continue
             if page["sentinel"] and host == self.recipe.sentinel_host:
@@ -1449,7 +1484,9 @@ class Machine:  # pylint: disable=too-many-instance-attributes
                     return self._end(2, "email_code")
                 idle += 1
                 if idle >= IDLE_POLLS:
-                    return self._end(2, "recipe_stuck")
+                    on_host = any(s.host == host for s in self.recipe.steps)
+                    why = "step_conditions_unmet" if on_host else "no_step_for_host"
+                    return self._stuck(why, host)
                 self.sleep(POLL_S)
                 continue
             idle = 0
@@ -1457,7 +1494,22 @@ class Machine:  # pylint: disable=too-many-instance-attributes
             if stopped is not None:
                 return stopped
             self.sleep(POLL_S)
+        if self.submitted:
+            return self._stuck("after_submit", "")
         return self._end(2, "recipe_stuck")
+
+    def _post_submit_wait(self, host: str, page: dict[str, Any] | None) -> bool:
+        """True while the submitted code may still be verifying: the page is
+        unreadable or still shows the code field, no sentinel, no Albert stop."""
+        if not self.submitted:
+            return False
+        if page is None:
+            return True
+        if page["sentinel"] and host == self.recipe.sentinel_host:
+            return False
+        if any(page[flag] for flag in ALBERT_STOPS):
+            return False
+        return bool(page["code"] or page["email_code"])
 
     def _next_step(self, host: str, page: dict[str, Any]) -> int | None:
         for i, step in enumerate(self.recipe.steps):
@@ -1558,6 +1610,12 @@ class Machine:  # pylint: disable=too-many-instance-attributes
         code = self._wait_code(reader, step)
         if code is None:
             return self._end(2, "email_code")
+        stopped = self._wait_code_field(step)
+        if stopped is not None:
+            if stopped.stuck == "code_field":
+                # nothing typed: the unused code mail goes out of INBOX too
+                self.out.mail_archived = reader.archive(code)
+            return stopped
         self.out.credential = True
         params = {
             "otp": _OTP_FIELD,
@@ -1576,8 +1634,36 @@ class Machine:  # pylint: disable=too-many-instance-attributes
             reader.sources = {}
             return self._end(2, "email_code")
         # typed and submitted: the mail did its job, out of INBOX with it
+        self.submitted = True
+        self.submit_deadline = self.clock() + POST_SUBMIT_S
         self.out.mail_archived = reader.archive(code)
         return None
+
+    def _wait_code_field(self, step: Step) -> Outcome | None:
+        """tp#1643: None once the code field shows on `step.host` (≤
+        IDLE_POLLS reads, the tab host read first); else the stop — a tab
+        stop, an Albert stop, or `recipe_stuck` / `code_field` (nothing typed,
+        no credential)."""
+        last_host = ""
+        for poll in range(IDLE_POLLS):
+            if poll:
+                self.sleep(POLL_S)
+            host, stop = self.tab_host()
+            if stop:
+                return self._end(stop_rc(stop), stop)
+            if host:
+                last_host = host
+            if host != step.host:
+                continue
+            page = self.read_page(step.host)
+            if page is None:
+                continue
+            for flag in ALBERT_STOPS:
+                if page[flag]:
+                    return self._end(NEEDS_ALBERT_RC, f"needs_albert_{flag}")
+            if page["code"]:
+                return None
+        return self._stuck("code_field", last_host or step.host)
 
     def _wait_code(self, reader: MailReader, step: Step) -> str | None:
         """The code once two consecutive polls agree on one new signed code."""

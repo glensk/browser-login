@@ -724,8 +724,13 @@ class MailSafari(FakeSafari):
         if args[0] == "--click":
             self.order.append(f"click:{args[1]}")
             self.calls.append(list(args))
+            self.pos += 1  # the trigger moves on to the code page
             return s.Reply(0, {"ok": True})
         return super().__call__(args)
+
+
+# tp#1643: the page the trigger leads to (the code field shows)
+CODE_PAGE = ("https://www.example.org/login", _page(code=True, email_code=True))
 
 
 def test_mail_code_order_email_trigger_wait_fill_submit() -> None:
@@ -733,6 +738,7 @@ def test_mail_code_order_email_trigger_wait_fill_submit() -> None:
     code = _code()
     script = [
         ("https://www.example.org/login", _page(user=True, steps=[[True, False]])),
+        CODE_PAGE,
         ("https://www.example.org/", _page(sentinel=True)),
     ]
     fake = MailSafari(NOTION_LIKE, script, code)
@@ -762,6 +768,7 @@ def _mail_run(
     code = _code()
     script = [
         ("https://www.example.org/login", _page(user=True, steps=[[True, False]])),
+        CODE_PAGE,
         ("https://www.example.org/", _page(sentinel=True)),
     ]
     fake = MailSafari(NOTION_LIKE, script, code)

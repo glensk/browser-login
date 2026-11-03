@@ -126,6 +126,7 @@ def _mail_machine(hook: Any) -> tuple[alsafari.Outcome, w.MailSafari, w.FakeMail
     code = w._code()
     script = [
         ("https://www.example.org/login", w._page(user=True, steps=[[True, False]])),
+        w.CODE_PAGE,
         ("https://www.example.org/", w._page(sentinel=True)),
     ]
     fake = w.MailSafari(w.NOTION_LIKE, script, code)
@@ -170,6 +171,7 @@ def test_the_hook_runs_after_the_email_and_before_the_click() -> None:
     code = w._code()
     script = [
         ("https://www.example.org/login", w._page(user=True, steps=[[True, False]])),
+        w.CODE_PAGE,
         ("https://www.example.org/", w._page(sentinel=True)),
     ]
     holder["fake"] = w.MailSafari(w.NOTION_LIKE, script, code)

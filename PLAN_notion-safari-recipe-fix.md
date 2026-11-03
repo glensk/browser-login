@@ -140,7 +140,7 @@ click, no fill, no navigation).
 
 ## Boxes
 
-- [ ] B1 `agent_login_safari.py` + `agent-login.py` (worktree): the Design's
+- [x] B1 `agent_login_safari.py` + `agent-login.py` (worktree): the Design's
   changes — notion step `host="app.notion.com"` + `start_url=
   "https://app.notion.com/login"` + its L2 comment; the code-field wait (tab_host
   first, archive on `code_field`) before `credential` / `CODE_FILL_JS` in

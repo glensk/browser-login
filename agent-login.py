@@ -3823,7 +3823,9 @@ def _safari_fail(
     step may have sent something; the exit code. Says "quarantined" only
     when the quarantine was written (N8). `quarantined` True: the run's own
     `-R` result says it quarantined already — never a second quarantine
-    (tp#1633), just the report."""
+    (tp#1633), just the report. A `recipe_stuck` names its reason (fixed
+    vocabulary) and the tab host it ended on (tp#1643)."""
+    detail = detail or out.stuck
     if out.credential and not quarantined:
         try:
             als.quarantine(site, out.phase, out.code)
@@ -3843,7 +3845,11 @@ def _safari_fail(
         },
     )
     who = "needs Albert" if out.rc == alsafari.NEEDS_ALBERT_RC else "not logged in"
-    print(f"❌ {site}: {who} — {phases.text(out.phase, out.code)}")
+    why = ""
+    if out.stuck:
+        where = f" on {out.stuck_host}" if out.stuck_host else ""
+        why = f" ({out.stuck}{where})"
+    print(f"❌ {site}: {who} — {phases.text(out.phase, out.code)}{why}")
     if quarantined:
         print(
             f"   quarantined (a credential step ran) — the main session releases "
