@@ -1,6 +1,7 @@
 # PLAN: Notion Safari login recipe — match the new login page (tp#1643)
 
-> **Resume here.** Status: planned, nothing built. Next box: B1.
+> **Resume here.** Status: planned, debated (Opus adversary, 2026-11-04) and
+> reconciled, nothing built. Next box: B1.
 > Overseer session: 5aa659e4-da4b-437b-8cb7-af851b04c9f2. Work in a worktree
 > (`git -C /Users/albert/obsidian/42-Git/home/browser-login worktree add
 > /Users/albert/obsidian/42-Git/home/browser-login/.worktrees.noindex/notion-safari-fix -b
@@ -24,7 +25,9 @@ by e-mail code (last-check 2026-11-03 23:49, "logged in headlessly (e-mail code)
 
 `./agent-login.py -L notion -s` logs a genuinely logged-out Safari in to Notion by
 e-mail code on the current login page (`app.notion.com/login`), then opens the
-workspace home — the parent's B13 passes live. No change to the headless route.
+workspace home — the parent's B13 passes live. No behaviour change to the headless
+route (it shares `recipe.start_url`, browser.py ~17065, and now opens the login page
+it already landed on directly).
 
 ## Findings (root cause)
 
@@ -91,22 +94,43 @@ click, no fill, no navigation).
 - `RECIPES["notion"]`: the `mail_code` step's `host` → `"app.notion.com"`; comment
   "L2 (2026-11-03): the login page is app.notion.com/login (www.notion.so/login
   redirects there); one visible input[type=email], one div[role=button] 'Continue'".
-  `start_url` stays `https://www.notion.so/login` (the redirect is proven in both
-  routes; the headless route reads the same field — unchanged behaviour). `hosts`
-  stay `("www.notion.so", "notion.so", "app.notion.com")`. Decided: ONE step on one
+  `start_url` → `https://app.notion.com/login` (= browser.py `NOTION_LOGIN_URL`
+  ~378): no redirect dependence, and no redirect reads on `www.notion.so` eating the
+  shared `idle` budget (`IDLE_POLLS` 4 × `POLL_S` 3 s, ~1447-1452) — a slow or
+  client-side redirect would otherwise end in a false `no_step_for_host`. The
+  headless route uses the same `start_url` (browser.py ~17065) and already treats
+  that URL as the login page (~16595). `hosts`
+  stay `("www.notion.so", "notion.so", "app.notion.com")`; `sentinel_host` stays
+  `app.notion.com`. Decided: ONE step on one
   host, no second `mail_code` step for `www.notion.so` (two credential steps could
   send two code mails); a future host move again ends in a clean `recipe_stuck` with
   the B1 reason, nothing sent.
 - `Machine._mail_code`, after `_wait_code` returned a code and BEFORE
-  `out.credential = True`: poll `read_page(step.host)` (≤ `IDLE_POLLS` reads,
-  `POLL_S` apart) until `page["code"]`; an Albert stop on the page → that stop; never
-  seen → `_end(2, "recipe_stuck")` with `out.stuck = "code_field"` and `credential`
-  still false (no quarantine; the code mail went out, the cooldown stamp already
-  blocks a repeat). Then `credential = True` and `CODE_FILL_JS` as today
-  (`CODE_FILL_JS` / `EMAIL_FILL_JS` bodies untouched — their sha256 pins in
-  `test_notion_mail_code.py` stay).
+  `out.credential = True`: poll (≤ `IDLE_POLLS` reads, `POLL_S` apart) `tab_host()`
+  FIRST, then `read_page(step.host)`, until `page["code"]`. A `tab_host` stop
+  (`safari_tab_moved`, …) → that stop; a tab host ≠ `step.host` → keep polling, and
+  at the end `stuck_host` = that real tab host; an Albert stop on the page → that
+  stop; never seen → `_end(2, "recipe_stuck")` with `out.stuck = "code_field"` and
+  `credential` still false (no quarantine; the code mail went out, the cooldown
+  stamp already blocks a repeat), and `out.mail_archived = reader.archive(code)` so
+  the unused code does not sit in INBOX (value-free status only). Then
+  `credential = True` and `CODE_FILL_JS` as today (`CODE_FILL_JS` / `EMAIL_FILL_JS`
+  bodies untouched — their sha256 pins in `test_notion_mail_code.py` stay).
+  (Interleaving the field check into `_wait_code`'s polls, as headless does, is
+  optional — not required; the extra ≤ 12 s is inside the code's validity.)
+- **Post-submit wait (new, critique objection 1):** today, after `_mail_code`
+  returns None, `_loop` sleeps one `POLL_S` and the next read of a page that still
+  shows the code field + "inbox" text (detector ~804 `email_code`) ends the run
+  `email_code` WITH `credential` → quarantine (~1446-1449), although Notion may
+  finish the login a second later. Fix: `Machine.submitted: bool` set when the
+  mail-code fill answered ok; while `submitted` and the sentinel is not yet seen, a
+  page with `code` / `email_code` (or `None`) counts as waiting, bounded by
+  `POST_SUBMIT_S = 30` s (clock-based, `POLL_S` apart); sentinel → ok; Albert stop
+  → that stop; timeout → `_end(2, "recipe_stuck")`, `stuck = "after_submit"`
+  (credential stays true: the code WAS typed → quarantine, as intended). This mirrors
+  the headless `_nmc_proof` sidebar wait (browser.py ~17252).
 - `Outcome.stuck: str = ""` — fixed vocabulary: `no_step_for_host`,
-  `step_conditions_unmet`, `page_unreadable`, `code_field`. `_loop` sets it at each
+  `step_conditions_unmet`, `page_unreadable`, `code_field`, `after_submit`. `_loop` sets it at each
   `recipe_stuck` end (no step whose `host` equals the tab host → `no_step_for_host`;
   a step on that host whose `when`/`unless` never fit → `step_conditions_unmet`;
   `read_page` None → `page_unreadable`). `Outcome.stuck_host` = the tab host (a host
@@ -116,11 +140,13 @@ click, no fill, no navigation).
 
 ## Boxes
 
-- [ ] B1 `agent_login_safari.py` + `agent-login.py` (worktree): the Design's three
-  changes — notion step `host="app.notion.com"` + its L2 comment; the code-field wait
-  before `credential` / `CODE_FILL_JS` in `Machine._mail_code`; `Outcome.stuck` /
-  `stuck_host` set in `_loop` and `_mail_code`, read by `_safari_fail` (record detail
-  - ❌ line). **Check first:** (a) every existing `Machine` test that ends in
+- [ ] B1 `agent_login_safari.py` + `agent-login.py` (worktree): the Design's
+  changes — notion step `host="app.notion.com"` + `start_url=
+  "https://app.notion.com/login"` + its L2 comment; the code-field wait (tab_host
+  first, archive on `code_field`) before `credential` / `CODE_FILL_JS` in
+  `Machine._mail_code`; the post-submit wait (`submitted`, `POST_SUBMIT_S`,
+  `after_submit`) in `_loop`; `Outcome.stuck` / `stuck_host` set in `_loop` and
+  `_mail_code`, read by `_safari_fail` (record detail + ❌ line). **Check first:** (a) every existing `Machine` test that ends in
   `recipe_stuck` or fills a code (`test_ws1b_safari.py` ~187, ~205, `MailSafari`
   ~699-790, `test_notion_safari_target.py`) — the new code-field read is one extra
   `--eval` of the detector: update the fakes' scripts so the code page reports
@@ -156,8 +182,15 @@ click, no fill, no navigation).
   (6) code mail found but the code field never shows → `recipe_stuck`,
   `stuck == "code_field"`, `credential` false, no `CODE_FILL_JS` eval, no
   quarantine through `_safari_fail` (fake `als.quarantine` not called), the ❌ line
-  names `code_field on app.notion.com`;
-  (7) the code value never appears in stdout/stderr/argv (capsys + recorded calls).
+  names `code_field on app.notion.com`, `reader.archive` called once;
+  (7) the code value never appears in stdout/stderr/argv (capsys + recorded calls);
+  (8) after the code fill the fake keeps the code page (code field + "Check your
+  inbox") for 3 reads, then the sentinel page → exit 0, NOT `email_code`, no
+  quarantine; and the same with the code page held past `POST_SUBMIT_S` (fake clock)
+  → `recipe_stuck`, `stuck == "after_submit"`, `credential` true;
+  (9) the login window disappears during the code-field wait (`--tabs` without it) →
+  `safari_tab_moved`, not `code_field`, `credential` false;
+  (10) `RECIPES["notion"].start_url == browser.NOTION_LOGIN_URL`.
 - [ ] B3 docs + verify + install. README: the notion row (~594) and §"Agents renew…"
   (~1117) gain one sentence — "Safari and the shared Chromium share one Notion session
   after an import: a Notion logout in Safari (`notion.so/logout` or the in-app Log out)
@@ -165,27 +198,59 @@ click, no fill, no navigation).
   since logged in on its own (headless e-mail code)"; the `recipe_stuck` stop now
   names its reason. Keep "the Safari code fill is not proven live yet" until B4
   passed (B4 removes it in README ~594 / ~1117 / ~1608 / ~1675 and agent-login.py
-  ~27 / ~1095 / ~5118, then regenerates agents.md with `agent-login.py -A`). Run the
-  Verification block in the worktree, fix to green. Install: check both live files are
-  unchanged since the worktree base (`git -C <live> diff --quiet <base> --
-  agent_login_safari.py agent-login.py`; stop if not), then per file in this order
-  `agent_login_safari.py` → `agent-login.py`: `cp <live> <live>.bak`, `cp <worktree
-  file> <live dir>/.<name>.new`, `mv <live dir>/.<name>.new <live>` (+x kept on
-  `agent-login.py`); live `./agent-login.py -h` exit 0 and `./agent-login.py -L notion
-  -s -n` (read-only) after the swap. Commit with the brief's grant.
+  ~27 / ~1095 / ~5118, then regenerates agents.md with `agent-login.py -A`; that
+  edit of a live file goes through the SAME worktree → verify → atomic install path
+  below, never in place). **Pre-install verification:** run the Verification block's
+  commands with the worktree root
+  (`/Users/albert/obsidian/42-Git/home/browser-login/.worktrees.noindex/notion-safari-fix`)
+  in place of the live root, fix to green (the block as written checks the LIVE
+  files and is the post-install `tp verify`).
+  **Install (one path, cp/mv into live, commit from live):** `<base>` = the live
+  `HEAD` recorded when the worktree is created (`git -C <live> rev-parse HEAD`, noted
+  in the build report). (1) Check the live files are unchanged since `<base>`
+  (`git -C <live> diff --quiet <base> -- agent_login_safari.py agent-login.py
+  README.md`, and `git -C <live> status --porcelain -- <same files>` empty); stop if
+  not. (2) Backups OUTSIDE the repo: `mkdir -p ~/.local/state/agent-login/bak-1643`
+  (0700), `cp -p <live file> ~/.local/state/agent-login/bak-1643/<name>` for both .py
+  files. (3) Per file in this order `agent_login_safari.py` → `agent-login.py`:
+  `cp -p <worktree file> <live dir>/.<name>.new` (`-p` keeps mode; then `chmod +x`
+  on `.agent-login.py.new` explicitly), `mv <live dir>/.<name>.new <live file>`
+  (same-directory rename = atomic; a consumer exec'ing mid-swap sees either the old
+  pair or new-module + old-script — the new module only ADDS fields with defaults,
+  so old agent-login.py keeps working with it, which is why the module goes first).
+  README.md and `tests/test_notion_safari_recipe.py` are copied the same way (not
+  live-executed, plain cp is fine). (4) Post-install: live `./agent-login.py -h` exit
+  0, live `pytest -q tests/test_notion_safari_recipe.py` green (the real smoke —
+  `./agent-login.py -L notion -s -n` is only an import smoke: `-n` never runs the
+  Machine, agent-login.py ~5135), then the live Verification block. (5) Commit from
+  the live checkout with the brief's grant: `ai.py push -m "…" agent_login_safari.py
+  agent-login.py README.md tests/test_notion_safari_recipe.py` (explicit paths only —
+  another session may be committing other files there), then remove the worktree
+  and delete the branch (`git -C <live> worktree remove …`, `git -C <live> branch -D
+  notion-safari-fix`).
 - [ ] B4 LIVE CANARY (= parent B13; Albert present at the Mac; he asked for a real
   logout test on 2026-11-03, which overrides the parent's "never forced by a logout"
   rule for this run only). Preconditions: the cooldown is free (`stat -f %m
   ~/.local/state/agent-login/notion-mail-code.json` ≥ 15 min ago — tonight's headless
   code mail was 23:49, so not before 00:05), nothing quarantined (`agent-login.py -L
   notion -n`). Result files in a fresh `mktemp -d` (0700).
-  1. Albert (or the agent on his explicit go) opens `https://www.notion.so/logout` in
-     Safari; Albert confirms Safari shows the login page. Expect the shared Chromium
-     to stay logged in (its token is its own since 23:49) — note `browser.py logged-in
-     notion` before and after.
+  1. **Albert logs out by hand** in Safari: Notion's sidebar account menu → "Log out"
+     (this browser only). NEVER "Log out of all devices" (Settings → Account), which
+     revokes every session incl. the Pixel and the shared Chromium. The agent does
+     not open `/logout` itself: a GET of `https://www.notion.so/logout` is unverified
+     (cross-host since the session now lives on `app.notion.com`; it may log out
+     every account in the account switcher, or not clear the app.notion.com session
+     at all). Before the logout, Albert says which Notion accounts Safari's account
+     switcher holds; if more than one, he picks the per-account logout if offered,
+     else accepts that all Safari Notion accounts log out (the other one(s) re-login
+     by hand afterwards). Albert confirms Safari shows the login page. Expect the
+     shared Chromium to stay logged in (its token is its own since 2026-11-03 23:49,
+     provided no `import-safari` ran since — check `last-check` before) — note
+     `browser.py logged-in notion` before and after. Step 2 is the gate that the
+     logout really took effect.
   2. `browser.py import-safari notion -P -R <dir>/prove.json` → exit 2 `logged_out`
      (or `no_safari_session`).
-  3. `./agent-login.py -L notion -s` → a new Safari window opens on
+  3. `./agent-login.py -L notion -s` → a new Safari window opens directly on
      `app.notion.com/login`, e-mail filled, "Continue" once, the code filled once, the
      window closes; then "shared Chromium already logged in, nothing imported" (or an
      import when it is logged out); the workspace home opens in a new tab; exit 0. The
@@ -207,21 +272,29 @@ cd /Users/albert/obsidian/42-Git/home/browser-login && uv run --project /Users/a
 cd /Users/albert/obsidian/42-Git/home/browser-login && uv run --project /Users/albert/obsidian/42-Git/home/browser-login pylint /Users/albert/obsidian/42-Git/home/browser-login/agent_login_safari.py /Users/albert/obsidian/42-Git/home/browser-login/agent-login.py /Users/albert/obsidian/42-Git/home/browser-login/tests/test_notion_safari_recipe.py
 cd /Users/albert/obsidian/42-Git/home/browser-login && uv run --project /Users/albert/obsidian/42-Git/home/browser-login pytest -q /Users/albert/obsidian/42-Git/home/browser-login/tests/test_notion_safari_recipe.py /Users/albert/obsidian/42-Git/home/browser-login/tests/test_ws1b_safari.py /Users/albert/obsidian/42-Git/home/browser-login/tests/test_notion_safari_target.py /Users/albert/obsidian/42-Git/home/browser-login/tests/test_notion_mail_code.py /Users/albert/obsidian/42-Git/home/browser-login/tests/test_notion_l_pipeline.py /Users/albert/obsidian/42-Git/home/browser-login/tests/test_ws1b_agent_login.py /Users/albert/obsidian/42-Git/home/browser-login/tests/test_agent_login.py
 cd /Users/albert/obsidian/42-Git/home/browser-login && ./agent-login.py -h
-cd /Users/albert/obsidian/42-Git/home/browser-login && grep -c "app.notion.com" /Users/albert/obsidian/42-Git/home/browser-login/agent_login_safari.py
 ```
 
-Each line is `cd <repo> && <argv>` (`tp verify` grammar); no live login. Read-only
+Each line is `cd <repo> && <argv>` (`tp verify` grammar); no live login. The block
+checks the LIVE files (post-install `tp verify`); B3 runs the same commands against
+the worktree root before the install. The old `grep -c "app.notion.com"` line was
+dropped (it already passed at HEAD: `hosts` / `sentinel_host` contain the string);
+B2 cases (4) and (10) pin the step host and start URL instead. Not strict-eligible
+(uv env, pytest, mypy, pylint, a live `-h`), as the parent plan's note says. Read-only
 smoke (not in the block, B3): `./agent-login.py -L notion -s -n`. Full suite: skipped
 unless a touched file's neighbours fail (say so in the report).
 
 ## Rollback
 
 - Before B3's install: discard the worktree branch; nothing live changed.
-- After the install: `mv agent-login.py.bak agent-login.py`, then
-  `mv agent_login_safari.py.bak agent_login_safari.py` (reverse order); live
-  `./agent-login.py -h` exit 0. The recipe fix alone is one line (`host`) to revert.
-  Remove the `.bak` files only after B4 step 3 passed (or after Albert decides to defer
-  B4 and the B3 smoke passed).
+- After the install, before the commit: per file, reverse order (`agent-login.py`
+  first, then `agent_login_safari.py`): `cp -p
+  ~/.local/state/agent-login/bak-1643/<name> <live dir>/.<name>.new`, `mv <live
+  dir>/.<name>.new <live file>`; README / test via `git -C <live> checkout --
+  README.md` and removing the new test; live `./agent-login.py -h` exit 0. After the
+  commit: `git revert` of that commit through `ai.py push`. The recipe fix alone is
+  two lines (`host`, `start_url`). Remove `~/.local/state/agent-login/bak-1643/` only
+  after B4 step 3 passed (or after Albert decides to defer B4 and the B3 smoke
+  passed).
 - No state migration: the cooldown / quarantine files are untouched by the code change.
 
 ## Risks
@@ -231,7 +304,11 @@ unless a touched file's neighbours fail (say so in the report).
   B1's `code_field` / host-pinned fill stops cleanly without a quarantine; B4 reports it.
 - **One code mail per B4 attempt:** the 15-min cooldown blocks a quick retry; a stuck
   run costs one mail and a 15-min wait.
-- **Logout side effects:** `notion.so/logout` revokes Safari's session only; the shared
+- **The post-submit page in Safari is unprobed:** the `after_submit` wait (30 s)
+  covers a slow verification; a code page that stays longer quarantines (code typed).
+- **Logout side effects:** Albert's in-app "Log out" revokes Safari's session only
+  (moderate confidence; it may cover every account in Safari's switcher, never other
+  devices — "Log out of all devices" is a separate Settings action); the shared
   Chromium currently holds its own token (headless login 23:49), so it should stay
   logged in. If it had been imported from Safari since, it is logged out too and B4
   step 4 re-imports.
@@ -240,3 +317,49 @@ unless a touched file's neighbours fail (say so in the report).
 ## Open points
 
 - None blocking. The code page's DOM in Safari is confirmed only by B4.
+
+## Debate outcome (Opus adversary)
+
+Critic: fresh Opus subagent, 2026-11-04, 1 round (Codex round 0 refused:
+`debate_seat_unknown`, no fresh five-hour reading on either seat). Verdict:
+sound-with-fixes. All objections accepted, so no round 2 was needed.
+
+1. [major] After the code submit, `_loop` ends `email_code` with `credential` → a
+   quarantine on the first read that still shows the code page (detector ~804,
+   `_loop` ~1446-1449). Accepted: Design "Post-submit wait" (`submitted`,
+   `POST_SUBMIT_S` 30 s, `after_submit`), B1 item, B2 case (8).
+2. [major] The Verification block checks the live files, so before the install it
+   tests the old code, and `grep -c app.notion.com` already passed at HEAD.
+   Accepted: B3 runs the commands against the worktree root before the install; the
+   grep line is dropped, and B2 cases (4) and (10) pin the step host and start URL.
+3. [major] The B3 install and commit path was undefined (`<base>`, which checkout
+   commits, the merge-back conflict). Accepted: one path. `<base>` is the live HEAD
+   recorded at worktree creation, plus a diff/status check; files are copied into
+   live by cp -p + mv; the commit runs from live with explicit paths; then the
+   worktree and branch are removed.
+4. [major] B4's GET of `www.notion.so/logout` has unverified scope (the account
+   switcher, cross-host). Accepted: Albert logs out by hand through the in-app
+   "Log out", never "Log out of all devices", and the agent never opens `/logout`.
+   The accounts in the switcher are noted first, and step 2 is the gate.
+5. [minor] The code-field wait skipped `tab_host()`, so a closed or moved window
+   was misreported. Accepted: `tab_host` is polled first, and B2 case (9) covers it.
+6. [minor] `start_url` should move to `app.notion.com/login`. Accepted: Design,
+   the Goal wording (headless shares `start_url`, no behaviour change), B2 case (10).
+7. [minor] An unused code mail stays in INBOX on a `code_field` stop. Accepted:
+   `reader.archive(code)` on that stop, asserted in B2 case (6).
+8. [minor] The `.bak` files sat inside the repo, which has no `*.bak` ignore.
+   Accepted: backups go to `~/.local/state/agent-login/bak-1643/`, and Rollback is
+   updated.
+9. [minor] The post-B4 wording edit changed live agent-login.py in place.
+   Accepted: it goes through the same worktree → verify → atomic install path.
+10. [minor] The `-n` smoke never runs the Machine. Accepted: it is labelled an
+    import smoke, and a live `pytest tests/test_notion_safari_recipe.py` runs right
+    after the swap.
+
+Overseer checks (brief): every safari.py origin check (`read_page`, e-mail fill,
+trigger click, code fill) uses `self._on(step.host)` or the tab host
+(agent_login_safari.py ~1360, ~1387, ~1545, ~1554, ~1571). One `host` change
+therefore moves them all, and B2 case (3) asserts every `--expect-host`. The
+sentinel host is already `app.notion.com`. The cooldown is stamped in
+`before_trigger`, right before the click, so a late code page costs one mail plus
+15 min and never a quarantine.
