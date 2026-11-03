@@ -535,7 +535,12 @@ def test_the_budget_fits_the_login_deadline(monkeypatch: pytest.MonkeyPatch) -> 
     assert budget["sidebar"] == browser.NOTION_MAIL_CODE_SIDEBAR_S == 45.0
     assert budget["last-poll"] == browser.NOTION_MAIL_CODE_LAST_POLL_S
     assert budget["code-wait"] == s.MAIL_WAIT_S == 180.0
-    assert browser.NOTION_MAIL_CODE_PROOF_RESERVE_S == 120.0
+    assert browser.NOTION_MAIL_CODE_PROOF_RESERVE_S == 135.0
+    # the reserve covers every step after the code wait
+    after_wait = ("last-poll", "fill-submit", "archive", "sidebar", "proof")
+    assert browser.NOTION_MAIL_CODE_PROOF_RESERVE_S >= sum(
+        budget[k] for k in after_wait
+    )
 
 
 def _wait_of(rig: Rig, monkeypatch: pytest.MonkeyPatch, left: float | None) -> Any:
@@ -553,12 +558,19 @@ def _wait_of(rig: Rig, monkeypatch: pytest.MonkeyPatch, left: float | None) -> A
 
 @pytest.mark.parametrize(
     ("left", "wait"),
-    [(None, 180.0), (400.0, 180.0), (300.0, 180.0), (250.0, 130.0), (131.0, 11.0)],
+    [
+        (None, 180.0),
+        (400.0, 180.0),
+        (315.0, 180.0),
+        (300.0, 165.0),
+        (250.0, 115.0),
+        (146.0, 11.0),
+    ],
 )
 def test_the_code_wait_leaves_the_proof_reserve(
     rig: Rig, monkeypatch: pytest.MonkeyPatch, left: float | None, wait: float
 ) -> None:
-    """code wait = min(MAIL_WAIT_S, deadline_left - 120)."""
+    """code wait = min(MAIL_WAIT_S, deadline_left - 135)."""
     rc, _rec, seen = _wait_of(rig, monkeypatch, left)
     assert rc == 0
     assert seen == [wait]
@@ -568,7 +580,7 @@ def test_the_code_wait_leaves_the_proof_reserve(
 def test_no_time_for_the_code_wait_sends_nothing(
     rig: Rig, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    rc, rec, seen = _wait_of(rig, monkeypatch, 125.0)
+    rc, rec, seen = _wait_of(rig, monkeypatch, 140.0)
     assert (rc, rec["code"]) == (2, "timeout")
     assert not seen
     assert rig.page.clicks == 0

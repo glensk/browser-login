@@ -16102,7 +16102,9 @@ NOTION_MAIL_CODE_BASELINE_CAP_S = 45.0  # all baseline mailbox reads together
 NOTION_MAIL_CODE_ARCHIVE_CAP_S = 15.0
 NOTION_MAIL_CODE_SIDEBAR_S = 45.0  # the passive post-submit sidebar wait
 NOTION_MAIL_CODE_LAST_POLL_S = 30.0  # one mailbox poll may end after the wait
-NOTION_MAIL_CODE_PROOF_RESERVE_S = 120.0
+# Everything after the code wait: last poll 30 + submit 5 + archive 15 +
+# sidebar 45 + proof 40 = 135 (the budget test pins the sum).
+NOTION_MAIL_CODE_PROOF_RESERVE_S = 135.0
 NOTION_MAIL_CODE_BUDGET = {
     "warm-probe": 40.0,  # sidebar poll 30 + server fetch 10
     "lock-registration-lease": 10.0,
