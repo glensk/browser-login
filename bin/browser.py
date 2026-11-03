@@ -150,6 +150,7 @@ import atexit
 import base64
 import contextlib
 import copy
+import ctypes
 import dataclasses
 import fcntl
 import fnmatch
@@ -1833,6 +1834,120 @@ def _app_bundle(binary: str) -> Path | None:
     return None
 
 
+# ---------------------------------------------------------------------------
+# Launch context — macOS Local Network privacy (tp#703, tp#1663)
+# ---------------------------------------------------------------------------
+# macOS judges a process's Local Network access by its RESPONSIBLE process: a
+# browser spawned from an iTerm2 shell is covered by iTerm2's grant and reaches
+# the LAN; one cold-started by a LaunchAgent job (agent-login -c/-R, 2026-11-02)
+# is its own responsible process, has no grant, and every LAN host except the
+# gateway fails with ERR_ADDRESS_UNREACHABLE. So a launchd context never
+# cold-starts the shared browser (`up` exits BUSY_RC and leaves the start to the
+# next interactive caller), and a terminal `up` relaunches a browser that a
+# launchd job started. The responsible PID comes from libSystem's
+# `responsibility_get_pid_responsible_for_pid` — never `launchctl procinfo`,
+# which needs root and prints the process environment (tokens) besides.
+
+SCHEDULED_ENV = "AGENT_LOGIN_SCHEDULED"
+
+
+def _responsible_pid(pid: int) -> int | None:
+    """macOS's responsible PID for `pid`; None off macOS or when unknown."""
+    if sys.platform != "darwin":
+        return None
+    try:
+        fn = ctypes.CDLL(None).responsibility_get_pid_responsible_for_pid
+        fn.restype = ctypes.c_int
+        fn.argtypes = [ctypes.c_int]
+        resp = int(fn(pid))
+    except (OSError, AttributeError, ValueError, TypeError):
+        return None
+    return resp if resp > 0 else None
+
+
+def _proc_exe(pid: int) -> str | None:
+    """The executable path of PID (``ps -o comm=``), or None if it's gone."""
+    return _ps_field(pid, "comm=")
+
+
+def _has_ctty() -> bool:
+    """True when this process has a controlling terminal (ssh, tmux, a tty)."""
+    try:
+        fd = os.open("/dev/tty", os.O_RDONLY | os.O_NOCTTY)
+    except OSError:
+        return False
+    os.close(fd)
+    return True
+
+
+def _launch_context() -> str | None:
+    """Why THIS process is a launchd context that must not start the browser.
+
+    None = interactive, a launch is fine. Signals, first match wins:
+    ``AGENT_LOGIN_SCHEDULED`` set (every browser-login LaunchAgent sets it) →
+    launchd; off macOS or responsible PID unknown → interactive (nothing to
+    judge by); responsible process inside an ``.app`` (iTerm2, Terminal, an
+    IDE) → interactive, its Local Network grant covers the browser; a
+    controlling tty (ssh, tmux) → interactive; else → launchd (a job's own
+    process is its responsible process, no app, no tty).
+    """
+    if os.environ.get(SCHEDULED_ENV):
+        return f"{SCHEDULED_ENV} is set: a scheduled LaunchAgent job"
+    resp = _responsible_pid(os.getpid())
+    if resp is None:
+        return None
+    exe = _proc_exe(resp)
+    if exe and _app_bundle(exe) is not None:
+        return None
+    if _has_ctty():
+        return None
+    name = os.path.basename(exe) if exe else "?"
+    return (
+        f"no terminal: the responsible process is {name} (pid {resp}), "
+        "not an app — a launchd job"
+    )
+
+
+def _browser_launchd_rooted(port: int) -> str | None:
+    """Why the RUNNING root browser lacks a terminal's Local Network grant.
+
+    None = fine or unknown (not exactly one root, responsible PID unknown, or
+    its responsible process gone). A browser that is its own responsible
+    process, or whose responsible process is no app, was started by a launchd
+    job (tp#1663).
+    """
+    pids = _find_root_pids(port)
+    if len(pids) != 1:
+        return None
+    resp = _responsible_pid(pids[0])
+    if resp is None:
+        return None
+    if resp == pids[0]:
+        return f"pid {resp} is its own responsible process (started by launchd)"
+    exe = _proc_exe(resp)
+    if exe is None or _app_bundle(exe) is not None:
+        return None
+    return (
+        f"its responsible process {os.path.basename(exe)} (pid {resp}) is no app "
+        "(started by launchd)"
+    )
+
+
+def _launchd_refusal(reason: str, what: str = "up") -> int:
+    """`up`/`switch`'s exit in a launchd context: one ⏸ line, BUSY_RC (skip,
+    re-check — never a failure)."""
+    doing = "starting" if what == "up" else "relaunching (switch)"
+    print(
+        f"⏸ not {doing} the shared browser from a launchd context ({reason}): "
+        "macOS Local Network privacy would deny it every LAN host (tp#1663). "
+        f"The next interactive caller does it: {_instance_prefix(INSTANCE)}"
+        f"browser.py {what}",
+        file=sys.stderr,
+    )
+    _journal("launchd_refused", cmd=what)
+    return BUSY_RC
+
+
 def _launch_browser(
     binary: str, flags: list[str], headless: bool = False
 ) -> int | None:
@@ -1844,8 +1959,13 @@ def _launch_browser(
     process", and macOS Local Network privacy then judges the browser by its
     own entry, which denied every LAN address (``ERR_ADDRESS_UNREACHABLE`` on
     192.168.178.x and *.dom42.space) even with the toggle ON. Spawned directly,
-    the browser inherits the launching terminal's Local Network grant — the
-    same binary then reaches the LAN. Measured the same day: the direct launch
+    the browser inherits the responsible process of the process that launched
+    it — and with it that one's Local Network grant. That covers the LAN only
+    when the launcher runs under a terminal app (iTerm2): a LaunchAgent job is
+    its own responsible process with no grant, so a browser it cold-starts
+    gets no LAN either (tp#1663) — which is why `up` refuses a launchd context
+    (`_launch_context`) and a terminal `up` relaunches such a browser
+    (`_browser_launchd_rooted`). Measured on 2026-09-29: the direct launch
     opens its window behind the frontmost app and does not take focus, exactly
     like ``open -g -n``. ``CLAUDE_BROWSER_OPEN_LAUNCH=1`` restores the old
     ``open -g -n`` launch (no PID; the caller resolves it after CDP is up via
@@ -4399,28 +4519,21 @@ def cmd_up(port: int, headless: bool = True) -> int:  # pylint: disable=unused-a
     slip into the middle of a `switch`/`down` window and race the relaunch that
     switch is about to do itself. The already-up branch needs no gate — it
     touches no process.
+
+    Local Network privacy (tp#1663): a launchd context (`_launch_context`)
+    never cold-starts the browser — BUSY_RC, the next interactive caller starts
+    it. An interactive `up` that finds a running browser started by launchd
+    (`_browser_launchd_rooted`) relaunches it from here
+    (`_relaunch_from_terminal`), so it inherits the terminal's grant.
     """
     want = _desired_mode()
     _desired_mode_write()
     running = _browser_mode(port)
     if running is not None:
-        if running != want:
-            live = _headed_lease_live()
-            if live is not None:
-                print(
-                    f"✓ Shared browser up, HEADED inside a guided login (site "
-                    f"{live.get('site')}, pid {live.get('pid')}); it returns to "
-                    f"headless when that login ends (CDP http://127.0.0.1:{port})."
-                )
-                return 0
-            return _revert_headed(port, "`up`")
-        healed = _heal_running_record(port, running)
-        print(
-            f"✓ Shared browser already up, {running.upper()} "
-            f"(CDP http://127.0.0.1:{port})."
-            + (" (lifecycle record refreshed)" if healed else "")
-        )
-        return 0
+        return _up_running(port, running, want)
+    reason = _launch_context()
+    if reason is not None:
+        return _launchd_refusal(reason)
     gate = _gate_acquire(fcntl.LOCK_SH, REGISTRY_UP_WAIT_S)
     if gate is None:
         return _fail(
@@ -4434,13 +4547,78 @@ def cmd_up(port: int, headless: bool = True) -> int:  # pylint: disable=unused-a
         _gate_release(gate)
 
 
-def _switch_recheck(port: int, target: str, revert: bool) -> int | None:
+def _up_running(port: int, running: str, want: str) -> int:
+    """`cmd_up` when a browser is already up: revert, relaunch or reuse it."""
+    if running != want:
+        live = _headed_lease_live()
+        if live is not None:
+            print(
+                f"✓ Shared browser up, HEADED inside a guided login (site "
+                f"{live.get('site')}, pid {live.get('pid')}); it returns to "
+                f"headless when that login ends (CDP http://127.0.0.1:{port})."
+            )
+            return 0
+        return _revert_headed(port, "`up`")
+    healed = _heal_running_record(port, running)
+    rooted = _browser_launchd_rooted(port)
+    if rooted is not None and _launch_context() is None:
+        return _relaunch_from_terminal(port, rooted)
+    print(
+        f"✓ Shared browser already up, {running.upper()} "
+        f"(CDP http://127.0.0.1:{port})."
+        + (" (lifecycle record refreshed)" if healed else "")
+    )
+    if rooted is not None:
+        print(
+            f"⚠ it has no Local Network access ({rooted}); a terminal "
+            "`browser.py up` relaunches it (tp#1663).",
+            file=sys.stderr,
+        )
+    return 0
+
+
+def _relaunch_from_terminal(port: int, why: str) -> int:
+    """Stop the launchd-started browser and relaunch it from this terminal.
+
+    The same short maintenance transaction as the headless revert
+    (`_revert_tx` with ``relaunch``): registered long-lived clients are paused
+    so the exclusive gate is free, then stop + relaunch on the SAME profile
+    (every login persists). A relaunch that fails while the browser is still
+    up keeps `up`'s contract (exit 0, it IS up) with one ❌ line; a browser
+    left down returns the failure.
+    """
+    print(
+        f"⚠ the shared browser has no Local Network access ({why}) — relaunching "
+        "it from this terminal (same profile, logins persist) …",
+        file=sys.stderr,
+    )
+    _journal("relaunch_launchd", phase="start", reason=why)
+    rc = _revert_tx(port, gate_wait_s=PREFLIGHT_GATE_WAIT_S, relaunch=True)
+    _journal("relaunch_launchd", phase="end", result=rc)
+    if rc == 0:
+        return 0
+    if _browser_mode(port) is not None:
+        print(
+            f"❌ relaunch not done (exit {rc}); the browser stays up WITHOUT LAN "
+            "access — retry `browser.py up` from a terminal, or "
+            "`browser.py down -f` then `browser.py up`.",
+            file=sys.stderr,
+        )
+        return 0
+    return rc
+
+
+def _switch_recheck(
+    port: int, target: str, revert: bool, relaunch: bool = False
+) -> int | None:
     """The re-check `cmd_switch` runs once it HOLDS the gate; an exit code when
     the switch must not happen any more, else None.
 
     While we waited, a guided login may have taken the lease (a preflight
     revert then stands down: ``revert_skipped``), another switch may have
-    reached `target` already, or the browser may have gone down.
+    reached `target` already, or the browser may have gone down. A
+    ``relaunch`` proceeds in `target` mode only while the browser is still
+    launchd-rooted.
     """
     if revert and _headed_lease_live() is not None:
         _journal("revert_skipped", reason="lease")
@@ -4449,6 +4627,11 @@ def _switch_recheck(port: int, target: str, revert: bool) -> int | None:
     live = _browser_mode(port)
     if live is None:
         return _fail("Nothing to switch — the shared browser went down meanwhile.")
+    if live == target and relaunch:
+        if _browser_launchd_rooted(port) is not None:
+            return None
+        print("✓ Shared browser relaunched from a terminal meanwhile.")
+        return 0
     if live == target:
         print(f"✓ Shared browser already {target.upper()} (switched meanwhile).")
         return 0
@@ -4480,6 +4663,7 @@ def cmd_switch(  # pylint: disable=too-many-arguments
     *,
     revert: bool = False,
     force_maintenance: bool = False,
+    relaunch: bool = False,
 ) -> int:
     """Switch the running browser between headed and headless, transactionally.
 
@@ -4508,6 +4692,10 @@ def cmd_switch(  # pylint: disable=too-many-arguments
     exists to prevent. ``--force`` is the deliberate override; the relaunch
     itself must NOT re-acquire the gate (deadlock rule), so `_launch_and_record`
     is called directly here while we still hold it.
+
+    ``relaunch`` (only via `_relaunch_from_terminal`'s transaction) stops and
+    relaunches a browser already in `target` mode that a launchd job started,
+    so the new one inherits this terminal's Local Network grant (tp#1663).
     """
     # Each of the exits is a distinct, named refusal (down / already in that
     # mode / unknown CDP client / stale lock / no lease …) that callers read off
@@ -4521,6 +4709,11 @@ def cmd_switch(  # pylint: disable=too-many-arguments
     if blocked is not None:
         print(blocked, file=sys.stderr)
         return BUSY_RC
+    reason = _launch_context()
+    if reason is not None:
+        # A switch relaunches: from a launchd context the new browser would
+        # have no LAN (tp#1663). Leave it to the next interactive caller.
+        return _launchd_refusal(reason, "switch")
     if target == "headless":
         _desired_mode_write()
     live = _browser_mode(port)
@@ -4529,7 +4722,7 @@ def cmd_switch(  # pylint: disable=too-many-arguments
             "Nothing to switch — the shared browser is down. Run: "
             f"{_instance_prefix(INSTANCE)}browser.py up"
         )
-    if live == target:
+    if live == target and not relaunch:
         healed = _heal_running_record(port, live)
         print(
             f"✓ Shared browser already in {target.upper()} mode "
@@ -4554,7 +4747,7 @@ def cmd_switch(  # pylint: disable=too-many-arguments
     if gate is None:
         return _fail(_gate_busy(f"switch to {target.upper()}", wait_s=wait_s))
     try:
-        settled = _switch_recheck(port, target, revert)
+        settled = _switch_recheck(port, target, revert, relaunch)
         if settled is not None:
             return settled
         verdict = _unknown_clients_verdict(port)
@@ -4563,7 +4756,11 @@ def cmd_switch(  # pylint: disable=too-many-arguments
         if verdict is not None:
             print(f"⚠ --force: switching anyway — {verdict}", file=sys.stderr)
         switching = _lifecycle_transition("switching", target, _lifecycle_read(), port)
-        print(f"Switching {live.upper()} → {target.upper()} (stopping the browser)…")
+        print(
+            f"Relaunching {target.upper()} from this terminal (stopping the browser)…"
+            if relaunch
+            else f"Switching {live.upper()} → {target.upper()} (stopping the browser)…"
+        )
         if not _shutdown_browser(port, switching):
             survivors = ", ".join(str(p) for p in _find_root_pids(port)) or "unknown"
             return _fail(
@@ -4576,7 +4773,11 @@ def cmd_switch(  # pylint: disable=too-many-arguments
             return rc
     finally:
         _gate_release(gate)
-    print(f"✓ Switched to {target.upper()}.")
+    print(
+        f"✓ Relaunched {target.upper()} from this terminal."
+        if relaunch
+        else f"✓ Switched to {target.upper()}."
+    )
     return 0
 
 
@@ -6617,6 +6818,109 @@ def _doctor_responsiveness(log: list[str], port: int) -> bool:
     return True
 
 
+# The LAN probe (tp#1663): one LAN URL loaded in doctor's disposable probe tab.
+# A browser without a Local Network grant fails every LAN host but the gateway
+# with ERR_ADDRESS_UNREACHABLE. Override with the env var; `off` disables it.
+LAN_PROBE_ENV = "CLAUDE_BROWSER_LAN_PROBE_URL"
+LAN_PROBE_DEFAULT_URL = "https://decide-lan.dom42.space/healthz"
+LAN_PROBE_TIMEOUT_S = 10.0
+LAN_PROBE_CONNECT_S = 3.0
+
+
+def _lan_probe_url() -> str | None:
+    """The LAN URL doctor loads, or None when disabled (``off``/empty)."""
+    raw = os.environ.get(LAN_PROBE_ENV)
+    if raw is None:
+        return LAN_PROBE_DEFAULT_URL
+    raw = raw.strip()
+    return None if raw.lower() in ("", "off", "0", "none") else raw
+
+
+def _lan_host_reachable(url: str) -> bool:
+    """True when THIS process opens a TCP connection to the URL's host:port.
+
+    Tells "the browser is denied the LAN" (❌) from "this Mac is not on that
+    LAN at all" (⚠, skipped).
+    """
+    try:
+        parts = urllib.parse.urlsplit(url)
+        host = parts.hostname
+        port = parts.port or {"https": 443, "http": 80}.get(parts.scheme, 0)
+    except ValueError:
+        return False
+    if not host or not port:
+        return False
+    try:
+        with socket.create_connection((host, port), timeout=LAN_PROBE_CONNECT_S):
+            return True
+    except OSError:
+        return False
+
+
+def _doctor_lan(log: list[str], page: Any) -> None:
+    """Load the LAN probe URL in the probe tab; ✅ reached, ❌ denied."""
+    from playwright.sync_api import Error as PlaywrightError
+
+    url = _lan_probe_url()
+    if url is None:
+        _doctor_add(log, "ok", "LAN probe", f"disabled ({LAN_PROBE_ENV}=off)")
+        return
+    origin = _url_origin(url) or "?"
+    if not _lan_host_reachable(url):
+        _doctor_add(
+            log,
+            "warn",
+            "LAN probe",
+            f"{origin} is unreachable from this process too — not on that LAN? "
+            "(skipped)",
+        )
+        return
+    try:
+        resp = page.goto(
+            url, timeout=LAN_PROBE_TIMEOUT_S * 1000, wait_until="domcontentloaded"
+        )
+    except PlaywrightError as exc:
+        line = _exc_line(exc)
+        hint = (
+            " — macOS Local Network privacy: the browser runs without a "
+            "terminal's grant; relaunch it from a terminal: browser.py up "
+            "(tp#1663)"
+            if "ERR_ADDRESS_UNREACHABLE" in line
+            else ""
+        )
+        _doctor_add(log, "fail", "LAN probe", f"{origin}: {line}{hint}")
+        return
+    status = getattr(resp, "status", None) if resp is not None else None
+    if isinstance(status, int) and status < 400:
+        _doctor_add(log, "ok", "LAN probe", f"{origin} loaded (HTTP {status})")
+    else:
+        _doctor_add(
+            log,
+            "warn",
+            "LAN probe",
+            f"{origin} reached, but answered HTTP {status if status else '?'}",
+        )
+
+
+def _doctor_launch_context(log: list[str], port: int) -> None:
+    """✅ the browser inherits a terminal's Local Network grant, ❌ launchd-rooted."""
+    rooted = _browser_launchd_rooted(port)
+    if rooted is None:
+        _doctor_add(
+            log,
+            "ok",
+            "launch context",
+            "not started by launchd (Local Network grant of its launcher)",
+        )
+        return
+    _doctor_add(
+        log,
+        "fail",
+        "launch context",
+        f"{rooted} — no LAN access; a terminal `browser.py up` relaunches it (tp#1663)",
+    )
+
+
 def _doctor_probe(log: list[str], port: int) -> None:
     """Drive a disposable probe page and report every drivability check.
 
@@ -6649,6 +6953,8 @@ def _doctor_probe(log: list[str], port: int) -> None:
             )
             return
         _doctor_drivability(log, page, port)
+        # Last: it navigates the probe tab away from its probe page.
+        _doctor_lan(log, page)
     except BrowserAttachTimeout as exc:
         _doctor_add(log, "fail", "attach", str(exc).replace("\n", " "))
     finally:
@@ -6712,6 +7018,7 @@ def cmd_doctor(port: int) -> int:
         _doctor_add(log, "fail", "doctor", "browser is down — nothing to probe")
         return 1
     _doctor_mode(log, port)
+    _doctor_launch_context(log, port)
     _doctor_coordination(log, port)
     _doctor_owned_ledgers(log)
     _doctor_access_team(log, port)
@@ -15662,7 +15969,7 @@ def _builtin_logout_names(site: str) -> tuple[str, ...]:
     ``session_cookies``. Device / browser-id cookies are not in it."""
     if site == "notion":
         return NOTION_AUTH_COOKIES
-    return _safari.SAFARI_BUILTIN[site].session_cookies
+    return tuple(_safari.SAFARI_BUILTIN[site].session_cookies)
 
 
 def _builtin_session_cookies(
@@ -16388,18 +16695,20 @@ def _nmc_quarantine(code: str) -> None:
 def _nmc_lock() -> contextlib.AbstractContextManager[bool | None]:
     """notion's code-mail flock (non-blocking): True held, False busy, None
     when the state dir cannot be written (shared: `_als.mail_code_lock`)."""
-    return _als.mail_code_lock("notion")
+    lock: contextlib.AbstractContextManager[bool | None] = _als.mail_code_lock("notion")
+    return lock
 
 
 def _nmc_cooldown_left(now: float) -> float | None:
     """Seconds of notion's code-mail cooldown left (0: none); None when the
     cooldown file exists but cannot be read (fail closed)."""
-    return _als.mail_code_cooldown_left("notion", now)
+    left = _als.mail_code_cooldown_left("notion", now)
+    return None if left is None else float(left)
 
 
 def _nmc_stamp(now: float) -> bool:
     """Write notion's cooldown stamp ``{"at": now}`` (atomic, 0600); False on failure."""
-    return _als.mail_code_stamp("notion", now)
+    return bool(_als.mail_code_stamp("notion", now))
 
 
 def _nmc_page(page: Any, recipe: Any, als_s: Any) -> tuple[bool, dict | None]:
@@ -17473,7 +17782,11 @@ def _maintenance(
 
 
 def _revert_tx(
-    port: int, *, force: bool = False, gate_wait_s: float | None = None
+    port: int,
+    *,
+    force: bool = False,
+    gate_wait_s: float | None = None,
+    relaunch: bool = False,
 ) -> int:
     """Switch a headed browser WITHOUT a live lease back to headless, as a short
     maintenance transaction (record purpose ``revert``).
@@ -17494,10 +17807,16 @@ def _revert_tx(
     Returns the switch's exit code; 0 when nothing headed was left; BUSY_RC
     when another live maintenance record exists (nothing touched, nothing
     printed — the caller words it); 1 when the transaction refused.
+
+    ``relaunch`` (tp#1663): the same transaction stops and relaunches a
+    HEADLESS browser that a launchd job started (`_browser_launchd_rooted`),
+    so the new one inherits this terminal's Local Network grant; 0 when it is
+    no longer launchd-rooted.
     """
     tx: Maintenance | None = None
     rc = 1
-    _journal("revert_tx", phase="start", forced=force)
+    extra: dict[str, object] = {"relaunch": True} if relaunch else {}
+    _journal("revert_tx", phase="start", forced=force, **extra)
     try:
         with _maint_record(
             REVERT_SITE,
@@ -17506,12 +17825,21 @@ def _revert_tx(
             until_s=REVERT_UNTIL_S,
             port=port,
         ) as nonce:
-            tx = Maintenance(nonce, REVERT_SITE, "B", port, label="the headless revert")
-            if _browser_mode(port) != "headed":
+            tx = Maintenance(
+                nonce,
+                REVERT_SITE,
+                "B",
+                port,
+                label="the terminal relaunch" if relaunch else "the headless revert",
+            )
+            if relaunch and _browser_launchd_rooted(port) is None:
+                print("✓ Shared browser relaunched from a terminal meanwhile.")
+                rc = 0
+            elif not relaunch and _browser_mode(port) != "headed":
                 print("✓ Shared browser already HEADLESS (reverted meanwhile).")
                 rc = 0
             else:
-                rc = _revert_tx_switch(tx, force, gate_wait_s)
+                rc = _revert_tx_switch(tx, force, gate_wait_s, relaunch)
     except HeadedLeaseBusy:
         rc = BUSY_RC
     except (MaintenanceRefused, HeadedLeaseError) as exc:
@@ -17526,12 +17854,16 @@ def _revert_tx(
             result=rc,
             paused=len(tx.paused) if tx is not None else 0,
             problems=len(problems),
+            **extra,
         )
     return rc
 
 
-def _revert_tx_switch(tx: Maintenance, force: bool, gate_wait_s: float | None) -> int:
-    """`_revert_tx`'s body, holding the record: pause, then switch headless."""
+def _revert_tx_switch(
+    tx: Maintenance, force: bool, gate_wait_s: float | None, relaunch: bool = False
+) -> int:
+    """`_revert_tx`'s body, holding the record: pause, then switch headless
+    (``relaunch``: stop + relaunch headless)."""
     if _pause_targets(tx.nonce):
         # Refuse an unregistered peer BEFORE freezing anybody: without this a
         # stray client would make every preflight pause and resume the MCP.
@@ -17544,7 +17876,8 @@ def _revert_tx_switch(tx: Maintenance, force: bool, gate_wait_s: float | None) -
             watchdog_start_time=_proc_lstart(wd_pid) if wd_pid else None,
         )
         _pause_clients(tx)
-    return cmd_switch(tx.port, "headless", force, gate_wait_s, revert=True)
+    extra = {"relaunch": True} if relaunch else {}
+    return cmd_switch(tx.port, "headless", force, gate_wait_s, revert=True, **extra)
 
 
 # --- watchdog -----------------------------------------------------------------

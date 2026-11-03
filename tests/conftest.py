@@ -153,6 +153,9 @@ def _private_mode_state(tmp_path, monkeypatch):
     either, hence the lease env var is cleared.
     """
     monkeypatch.delenv("CLAUDE_BROWSER_MAINTENANCE", raising=False)
+    # tp#1663: a LaunchAgent's marker makes `up`/`switch` refuse (exit 75);
+    # a test run from a scheduled job must not inherit it.
+    monkeypatch.delenv("AGENT_LOGIN_SCHEDULED", raising=False)
     # A developer's host-map override must not change what a launch test sees.
     monkeypatch.delenv("CLAUDE_BROWSER_PAC_HOSTS", raising=False)
     state = tmp_path / "mode-state"

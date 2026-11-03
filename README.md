@@ -248,7 +248,14 @@ desktop**: no focus steal, no window, no z-order change, no native prompt
   directly (not `open -a`): LaunchServices would make the app its own
   responsible process, and macOS Local Network privacy then blocked every LAN
   address (`ERR_ADDRESS_UNREACHABLE` on 192.168.178.x and `*.dom42.space`, tp#703);
-  spawned directly it inherits the launching terminal's grant. A headed window
+  spawned directly it inherits the launching terminal's grant. That holds only
+  under a terminal app: a LaunchAgent job is its own responsible process with
+  no grant, so a launchd context (`AGENT_LOGIN_SCHEDULED` set, or a responsible
+  process that is no app and no controlling tty) never cold-starts the browser
+  — `up`/`switch` exit 75 and leave it to the next interactive caller — and a
+  terminal `up` relaunches a running browser that launchd started (tp#1663).
+  `doctor` reports the launch context and loads a LAN URL
+  (`CLAUDE_BROWSER_LAN_PROBE_URL`, default the decide-lan healthz). A headed window
   opens behind the frontmost app; macOS pauses rendering of an occluded window
   (rAF stops, every Playwright click times out on "stable"), which is why the
   `--disable-backgrounding-*` flags stay, and why `Page.bringToFront` (which on
