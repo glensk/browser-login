@@ -143,8 +143,10 @@ correctly and are only unbounded. No follow-up item unless one is seen hanging.
 - [x] B1 Worktree (`.claude/worktrees.noindex/stop-pw-bounded`, `uv sync`) + base hash; audit that every `_connect` call site (`grep -n "_connect(" bin/browser.py`, about 15) and `_doctor_probe_cleanup` run on the main thread, including under `LoginDeadline`, and that no `threading.Thread` target reaches `_connect`; record the result in the docstring
 - [x] B2 New test file `tests/test_stop_playwright_bounded.py` (see Verification); confirm tests 1 and 2 FAIL on the unchanged `bin/browser.py`
 - [x] B3 Rewrite `_stop_playwright_bounded` per the fix design (named internals, tolerant reads, main-thread SIGALRM bound with flag + late-alarm-safe disarm + save/restore, stall-only kill via `returncode`, unwind with task cancel + running-loop reset, docstring)
-- [ ] B4 Lint per AGENTS.md (`ruff format`, `ruff check`, `mypy bin/browser.py`, `uv run pylint bin/browser.py`); targeted tests green: the new file plus `tests/test_connect_hang.py` (its doctor test at `:404` with `_FakePw` is the regression for tolerant reads)
-- [ ] B5 Land via `ai.py push` (base re-hash first), `-h` smoke, disposable-instance `doctor`; rollback = `git revert`
+- [x] B4 Lint per AGENTS.md (`ruff format`, `ruff check`, `mypy bin/browser.py`, `uv run pylint bin/browser.py`); targeted tests green: the new file plus `tests/test_connect_hang.py` (its doctor test at `:404` with `_FakePw` is the regression for tolerant reads)
+  ↳ evidence 2026-11-03: at 35a7a79 no code change needed: ruff format/check clean, mypy clean, pylint exit 0; pytest test_stop_playwright_bounded.py 4 passed, test_connect_hang.py all passed (92 s); browser.py -h exit 0; disposable doctor (own cache dir, port 9311) all checks passed 19 ok 1 warn (no access-sweep record on…
+- [x] B5 Land via `ai.py push` (base re-hash first), `-h` smoke, disposable-instance `doctor`; rollback = `git revert`
+  ↳ evidence 2026-11-03: at 35a7a79 no code change needed: ruff format/check clean, mypy clean, pylint exit 0; pytest test_stop_playwright_bounded.py 4 passed, test_connect_hang.py all passed (92 s); browser.py -h exit 0; disposable doctor (own cache dir, port 9311) all checks passed 19 ok 1 warn (no access-sweep record on…
 
 ## Verification
 
