@@ -228,6 +228,56 @@ def test_a_credential_stop_quarantines_once(
     assert calls == ["notion"]  # the -R result did not say quarantined
 
 
+def test_quarantined_still_imports_a_safari_session(
+    pl: dict, capsys: pytest.CaptureFixture
+) -> None:
+    """D-c: the import sends nothing to Notion — it may restore the session
+    while notion is quarantined; the quarantine stays."""
+    als.quarantine("notion", "submit", "email_code")
+    pl["jar"] = ([_token()], None)
+    pl["import"] = _run(0, {"phase": "ok", "code": "ok"})
+    assert al.safari_login_action("notion") == 0
+    assert pl["order"] == ["probe", "import"]
+    assert als.quarantined("notion") is not None
+    assert "Safari session" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize(
+    "jar",
+    [
+        ([], None),  # Safari holds no session
+        ([], "Operation not permitted"),  # Safari's jar unreadable
+        ("token", None),  # the import did not work
+    ],
+)
+def test_quarantined_never_sends_a_code_nor_drives_safari(
+    pl: dict, capsys: pytest.CaptureFixture, jar: tuple
+) -> None:
+    als.quarantine("notion", "submit", "email_code")
+    pl["jar"] = ([_token()], None) if jar[0] == "token" else jar
+    assert al.safari_login_action("notion") == 2
+    assert "mail-code" not in pl["order"]
+    assert "safari" not in pl["order"] and "gate" not in pl["order"]
+    assert pl["order"][0] == "probe"
+    assert als.quarantined("notion") is not None
+    out = capsys.readouterr().out
+    assert "-Q notion" in out
+    assert "no e-mail code and no Safari login while quarantined" in out
+
+
+def test_quarantined_and_logged_in_does_nothing(pl: dict) -> None:
+    als.quarantine("notion", "submit", "email_code")
+    pl["probe"] = (0, {"phase": "ok", "code": "ok"})
+    assert al.safari_login_action("notion") == 0
+    assert pl["order"] == ["probe"]
+
+
+def test_quarantine_still_refuses_other_recipes(pl: dict) -> None:
+    als.quarantine("galaxus-de", "submit", "login_failed")
+    assert al.safari_login_action("galaxus-de") == 2
+    assert pl["order"] == ["gate"]
+
+
 def test_scheduled_still_refuses(pl: dict, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv(alsafari.SCHEDULED_ENV, "1")
     assert al.safari_login_action("notion") == 2

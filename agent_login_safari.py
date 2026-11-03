@@ -1198,23 +1198,59 @@ EMAIL_FILL_FN = r"""// agent-login:email-fn
 }
 """
 
+# Label variants the headless code submit accepts after the step's exact
+# `submit` label (tp#1633 D-b: Notion's code button is a ``div[role=button]``
+# whose text is not pinned down live).
+CODE_SUBMIT_VARIANTS = ("Continue", "Verify", "Sign in")
+
+# The headless code fill (tp#1633 D-b) differs from CODE_FILL_JS: it fills
+# FIRST, waits one tick (the page re-renders, a disabled button enables, an
+# auto-submit may start), then clicks the ONE button labelled `submit`, else
+# the one labelled with the first matching `alts` entry, else the one live
+# button (or the one submit button) of the field's form / nearest container;
+# an ambiguous label never falls back. No button: ``clicked: false``,
+# ``why: "button"`` — the caller waits for an auto-submit, the sidebar proof
+# decides. ``labels`` lists the visible button texts (masked when they hold
+# an "@", 4+ digits or the code) — never an input value.
 CODE_FILL_FN = r"""// agent-login:code-fn
-(P) => {
+async (P) => {
   const vis = (e) => !!e && e.getClientRects().length > 0;
-  const field = [...document.querySelectorAll(P.otp)].find(vis);
-  if (!field) return JSON.stringify({ ok: false, why: "field" });
   const norm = (s) => String(s || "").replace(/\s+/g, " ").trim();
-  const scope = field.form || document;
-  const hits = P.submit ? [...scope.querySelectorAll('button,input[type="submit"]')]
-    .filter((b) => vis(b) && (norm(b.innerText) === P.submit || norm(b.value) === P.submit)) : [];
-  if (P.submit && hits.length !== 1) return JSON.stringify({ ok: false, why: "button" });
+  const field = [...document.querySelectorAll(P.otp)].find(vis);
+  if (!field) return JSON.stringify({ ok: false, why: "field", how: "none", labels: [] });
+  const BTN = 'button,[role="button"],input[type="submit"]';
+  const text = (b) => norm(b.tagName === "INPUT" ? b.value : b.innerText);
+  const safe = (t) => (/@|\d{4,}/.test(t) || (P.code && t.includes(P.code)) ? "<masked>" : t.slice(0, 40));
   const set = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value").set;
   set.call(field, P.code);
   for (const t of ["input", "change", "keyup"]) field.dispatchEvent(new Event(t, { bubbles: true }));
-  if (field.value !== P.code) return JSON.stringify({ ok: false, why: "stick" });
-  if (!P.submit) return JSON.stringify({ ok: true, clicked: false });
-  hits[0].click();
-  return JSON.stringify({ ok: true, clicked: true });
+  if (field.value !== P.code) return JSON.stringify({ ok: false, why: "stick", how: "none", labels: [] });
+  await new Promise((r) => setTimeout(r, 400));
+  let scope = field.isConnected ? field.form : null;
+  for (let n = field.parentElement, i = 0; field.isConnected && !scope && n && i < 8; n = n.parentElement, i += 1) {
+    if ([...n.querySelectorAll(BTN)].some(vis)) scope = n;
+  }
+  const pool = [...(scope || document).querySelectorAll(BTN)].filter(vis);
+  const labels = pool.map((b) => safe(text(b))).slice(0, 8);
+  const live = (b) => !b.disabled && b.getAttribute("aria-disabled") !== "true";
+  let hit = null;
+  let how = "none";
+  let ambiguous = false;
+  const wanted = [P.submit, ...(P.alts || [])].filter(Boolean);
+  for (let i = 0; i < wanted.length && !hit && !ambiguous; i += 1) {
+    const hits = pool.filter((b) => text(b) === wanted[i]);
+    if (hits.length === 1) [hit, how] = [hits[0], i === 0 ? "exact" : "variant"];
+    else if (hits.length > 1) ambiguous = true;
+  }
+  if (!hit && !ambiguous && scope && wanted.length) {
+    const en = pool.filter(live);
+    const subs = en.filter((b) => b.type === "submit");
+    const one = en.length === 1 ? en[0] : subs.length === 1 ? subs[0] : null;
+    if (one) [hit, how] = [one, "lone"];
+  }
+  if (!hit) return JSON.stringify({ ok: true, clicked: false, why: wanted.length ? "button" : "", how, labels });
+  hit.click();
+  return JSON.stringify({ ok: true, clicked: true, why: "", how, labels });
 }
 """
 

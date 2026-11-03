@@ -16356,6 +16356,48 @@ def _nmc_eval_ok(page: Any, js: str, params: dict[str, Any]) -> bool:
     return isinstance(data, dict) and data.get("ok") is True
 
 
+_NMC_FILL_WHY = ("", "field", "stick", "button", "eval")
+_NMC_FILL_HOW = ("exact", "variant", "lone", "none")
+_NMC_LABEL_MAX = 8
+
+
+def _nmc_eval_json(page: Any, js: str, params: dict[str, Any]) -> dict | None:
+    """`js(params)`'s JSON answer; None when the evaluate raised or the answer
+    is not a JSON object (the tab may have navigated mid-call)."""
+    try:
+        raw = page.evaluate(js, params)
+    except Exception:  # pylint: disable=broad-exception-caught
+        return None
+    try:
+        data = json.loads(raw) if isinstance(raw, str) else None
+    except ValueError:
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def _nmc_fill_info(fill: dict | None, code: str) -> dict[str, Any]:
+    """The value-free record of the code fill (tp#1633 D-a): ``why`` /
+    ``how`` from fixed sets, ``clicked``, and the visible button labels —
+    text only, masked again here (an "@", 4+ digits or the code)."""
+    if fill is None:
+        return {"why": "eval", "how": "none", "clicked": False, "labels": []}
+    why = fill.get("why") or ""
+    how = fill.get("how") or "none"
+    labels = []
+    raw = fill.get("labels")
+    for label in raw[:_NMC_LABEL_MAX] if isinstance(raw, list) else []:
+        text = str(label)[:40]
+        if "@" in text or re.search(r"\d{4,}", text) or (code and code in text):
+            text = "<masked>"
+        labels.append(_journal_redact(text, 40))
+    return {
+        "why": why if why in _NMC_FILL_WHY else "eval",
+        "how": how if how in _NMC_FILL_HOW else "none",
+        "clicked": fill.get("clicked") is True,
+        "labels": labels,
+    }
+
+
 def _notion_mail_code_login(port: int) -> int:  # pylint: disable=too-many-return-statements
     """`login notion -M`: Design steps 1–3 (warm probe, preconditions under
     the per-site flock), then the owned tab under registration + lease."""
@@ -16607,15 +16649,39 @@ def _nmc_submit(  # pylint: disable=too-many-arguments,too-many-positional-argum
     # From here a deadline expiry quarantines notion (`_result_timeout`).
     _result_set(phase_hint=NOTION_MAIL_CODE_HINT, site="notion", credential=True)
     _deadline_step("notion:submit")
-    params = {"otp": als_s._OTP_FIELD, "code": code, "submit": step.submit}  # pylint: disable=protected-access
+    params = {
+        "otp": als_s._OTP_FIELD,  # pylint: disable=protected-access
+        "code": code,
+        "submit": step.submit,
+        "alts": list(als_s.CODE_SUBMIT_VARIANTS),
+    }
     try:
-        ok = _nmc_eval_ok(page, als_s.CODE_FILL_FN, params)
+        fill = _nmc_eval_json(page, als_s.CODE_FILL_FN, params)
+        info = _nmc_fill_info(fill, code)
     finally:
         params.clear()
-    if not ok:
+    # tp#1633 D-a: why the fill went the way it did, value-free.
+    _result_set(code_fill=info)
+    _journal_note(
+        code_fill_why=info["why"] or "ok",
+        code_fill_how=info["how"],
+        code_fill_labels=" | ".join(info["labels"]) or "(none)",
+    )
+    if fill is not None and fill.get("ok") is not True:
+        # the field was missing or kept no value: nothing was submitted
         reader.sources = {}
         _nmc_quarantine("email_code")
-        return _nmc_stop(2, "submit", "email_code", "the code did not submit")
+        return _nmc_stop(
+            2, "submit", "email_code", f"the code did not fill ({info['why']})"
+        )
+    if not info["clicked"]:
+        # no single submit button (or the tab moved mid-fill): Notion may
+        # submit on the 6th character — the sidebar proof decides.
+        print(
+            f"ℹ notion: no code button clicked ({info['why']}; labels: "
+            f"{', '.join(info['labels']) or 'none'}) — waiting for the page",
+            file=sys.stderr,
+        )
     _deadline_step("notion:archive")
     capped.cap(NOTION_MAIL_CODE_ARCHIVE_CAP_S)
     try:
@@ -16635,7 +16701,9 @@ def _nmc_proof(
     _deadline_step("notion:proof")
     _notion_wait_for_login(page, timeout_s=NOTION_MAIL_CODE_SIDEBAR_S, poll_s=1.0)
     res = _notion_check(port, expected)
-    _result_set(server=res["server"], proof=res["proof"])
+    _result_set(
+        server=res["server"], proof=res["proof"], sentinel=bool(res.get("sentinel"))
+    )
     if res["verdict"] == "valid" and res["identity"] == "match":
         _result_set(route="mail-code", phase="ok", code="ok")
         _record_login_event("notion", "mail-code")

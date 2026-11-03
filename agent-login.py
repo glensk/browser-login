@@ -3786,6 +3786,14 @@ def _import_how(run: BrowserRun, base: str) -> str:
     return base
 
 
+def _quarantined_text(site: str, q: dict) -> str:
+    """The refusal line of a quarantined `-L SITE`."""
+    return (
+        f"❌ {site}: quarantined after {q.get('phase')} {q.get('at_text', '')} — "
+        f"the main session releases it: ./agent-login.py -Q {site}"
+    )
+
+
 # One return per stage of the pipeline (D1).
 def safari_login_action(  # pylint: disable=too-many-return-statements
     site: str, *, dry_run: bool = False
@@ -3816,14 +3824,13 @@ def safari_login_action(  # pylint: disable=too-many-return-statements
             print(f"❌ {site}: {phases.CODE_TEXT.get(gate, gate)} ({gate})")
             return 3
     q = als.quarantined(site)
-    if q is not None:
-        print(
-            f"❌ {site}: quarantined after {q.get('phase')} {q.get('at_text', '')} — "
-            f"the main session releases it: ./agent-login.py -Q {site}"
-        )
-        return 2
     if site in MAIL_CODE_SITES:
-        return _mail_code_pipeline(site, recipe)
+        # tp#1633 D-c: a quarantine still allows the Safari import (it sends
+        # nothing to the site); the e-mail code and the Safari login stay off.
+        return _mail_code_pipeline(site, recipe, quarantine=q)
+    if q is not None:
+        print(_quarantined_text(site, q))
+        return 2
     with safari_login_lock() as got:
         if not got:
             print(f"⏸  {site}: another Safari login runs — try again later")
@@ -4065,14 +4072,16 @@ def _mail_code_stop(site: str, run: BrowserRun, detail: str) -> int:
 
 # One return per stage of the notion pipeline (tp#1633 Design).
 def _mail_code_pipeline(  # pylint: disable=too-many-return-statements
-    site: str, recipe: alsafari.Recipe
+    site: str, recipe: alsafari.Recipe, quarantine: dict | None = None
 ) -> int:
     """`-L notion`: free check → Safari import → headless e-mail code
     (`browser.py login notion -M`, ungated) → attended Safari login. The
     Safari-login lock covers the free check and the import only; it is
     released before `-M` (which serialises on its own per-site flock) and
     reacquired only for the Safari fallback, after a fresh free check. An
-    unreadable Safari jar counts as "no Safari session"."""
+    unreadable Safari jar counts as "no Safari session". A `quarantine`
+    (tp#1633 D-c) ends the run after the import stage: the import sends
+    nothing to the site, the e-mail code and the Safari login would."""
     detail = ""
     with safari_login_lock() as got:
         if not got:
@@ -4091,6 +4100,10 @@ def _mail_code_pipeline(  # pylint: disable=too-many-return-statements
                 return stop
             print(f"↻ {site}: the imported session does not work")
         cookies.clear()
+    if quarantine is not None:
+        print(_quarantined_text(site, quarantine))
+        print(f"   {site}: no e-mail code and no Safari login while quarantined")
+        return 2
     print(f"▶ {site}: headless e-mail-code login in the shared Chromium")
     run = _mail_code_run(site)
     res = run.result or {}

@@ -18,6 +18,7 @@ import importlib.util
 import json
 import os
 import re
+import secrets
 import subprocess
 import sys
 from collections.abc import Iterator
@@ -97,18 +98,26 @@ def test_the_safari_fill_scripts_are_unchanged() -> None:
     )
 
 
-@pytest.mark.parametrize(
-    ("iife", "fn"),
-    [(s.EMAIL_FILL_JS, s.EMAIL_FILL_FN), (s.CODE_FILL_JS, s.CODE_FILL_FN)],
-)
-def test_the_function_forms_have_the_same_bodies(iife: str, fn: str) -> None:
-    old, new = iife.splitlines(), fn.splitlines()
+def test_the_email_function_form_has_the_same_body() -> None:
+    old, new = s.EMAIL_FILL_JS.splitlines(), s.EMAIL_FILL_FN.splitlines()
     assert old[1:3] == ["(() => {", "  const P = __PARAMS__;"]
     assert old[-1] == "})()"
     assert new[1] == "(P) => {"
     assert new[-1] == "}"
     assert old[3:-1] == new[2:-1]
-    assert "__PARAMS__" not in fn
+    assert "__PARAMS__" not in s.EMAIL_FILL_FN
+
+
+def test_the_code_function_form_takes_its_params_as_the_argument() -> None:
+    """D-b: the headless code fill is its own (async) function form; the
+    Safari CODE_FILL_JS keeps the old body (hash test above)."""
+    lines = s.CODE_FILL_FN.splitlines()
+    assert lines[0] == "// agent-login:code-fn"
+    assert lines[1] == "async (P) => {"
+    assert lines[-1] == "}"
+    assert "__PARAMS__" not in s.CODE_FILL_FN
+    assert '[role="button"]' in s.CODE_FILL_FN
+    assert s.CODE_SUBMIT_VARIANTS[0] == "Continue"
 
 
 def _chromium_installed() -> bool:
@@ -159,12 +168,119 @@ def test_the_function_forms_fill_through_the_evaluate_argument() -> None:
                         "otp": s._OTP_FIELD,
                         "code": code,
                         "submit": "Continue with login code",
+                        "alts": list(s.CODE_SUBMIT_VARIANTS),
                     },
                 )
             )
-            assert got == {"ok": True, "clicked": True}
+            assert got == {
+                "ok": True,
+                "clicked": True,
+                "why": "",
+                "how": "exact",
+                "labels": ["Continue with login code"],
+            }
             assert page.evaluate("window.sent") == 1
             assert page.evaluate("document.querySelector('[name=code]').value") == code
+        finally:
+            chrome.close()
+
+
+_SENT = "<script>window.sent = 0; window.go = () => { window.sent += 1; };</script>"
+_DIV = '<div role="button" onclick="go()">{}</div>'
+# (page body, expected why, how, clicked, labels, window.sent after the fill)
+_CODE_PAGES = {
+    "exact-div": (
+        "<form>"
+        + '<input name="code">'
+        + _DIV.format("Continue with login code")
+        + _DIV.format("Resend")
+        + "</form>",
+        ("", "exact", True, ["Continue with login code", "Resend"], 1),
+    ),
+    "variant-div-no-form": (
+        '<div><input name="code">'
+        + _DIV.format("Continue")
+        + '</div><div role="button">Continue with Google</div>',
+        ("", "variant", True, ["Continue"], 1),
+    ),
+    "lone-submit": (
+        '<form onsubmit="event.preventDefault(); go()"><input name="code">'
+        '<button type="submit">Go</button></form>',
+        ("", "lone", True, ["Go"], 1),
+    ),
+    "enabled-after-fill": (
+        '<form><input name="code" oninput="b.disabled = this.value.length < 6">'
+        '<button id="b" type="button" disabled onclick="go()">Next</button>'
+        '<div role="button" aria-disabled="true">me@example.org 4711</div></form>',
+        ("", "lone", True, ["Next", "<masked>"], 1),
+    ),
+    "auto-submit": (
+        '<form><input name="code" oninput="if (this.value.length === 6) go()"></form>',
+        ("button", "none", False, [], 1),
+    ),
+    "no-button": (
+        '<form><input name="code">'
+        + _DIV.format("Resend")
+        + _DIV.format("Back")
+        + "</form>",
+        ("button", "none", False, ["Resend", "Back"], 0),
+    ),
+    "ambiguous": (
+        '<form><input name="code">'
+        + _DIV.format("Continue")
+        + _DIV.format("Continue")
+        + "</form>",
+        ("button", "none", False, ["Continue", "Continue"], 0),
+    ),
+}
+
+
+@pytest.mark.launches_chrome
+@CHROME
+def test_the_code_fill_variants() -> None:
+    """D-b on real DOM: exact label, a label variant on a div[role=button],
+    a lone submit button, a button enabled by the fill, an auto-submit and
+    no / two buttons (never a guess; `why: button` and the labels)."""
+    from playwright.sync_api import (  # pylint: disable=import-outside-toplevel
+        sync_playwright,
+    )
+
+    code = secrets.token_urlsafe(6)[:6]
+    with sync_playwright() as pw:
+        chrome = pw.chromium.launch(headless=True)
+        try:
+            page = chrome.new_page()
+            for name, (body, want) in _CODE_PAGES.items():
+                page.set_content(_SENT + body)
+                got = json.loads(
+                    page.evaluate(
+                        s.CODE_FILL_FN,
+                        {
+                            "otp": s._OTP_FIELD,
+                            "code": code,
+                            "submit": "Continue with login code",
+                            "alts": list(s.CODE_SUBMIT_VARIANTS),
+                        },
+                    )
+                )
+                why, how, clicked, labels, sent = want
+                assert got == {
+                    "ok": True,
+                    "clicked": clicked,
+                    "why": why,
+                    "how": how,
+                    "labels": labels,
+                }, name
+                assert page.evaluate("window.sent") == sent, name
+                assert code not in json.dumps(got)
+            page.set_content(_SENT + "<form><input name='other'></form>")
+            got = json.loads(
+                page.evaluate(
+                    s.CODE_FILL_FN,
+                    {"otp": s._OTP_FIELD, "code": code, "submit": "Continue"},
+                )
+            )
+            assert (got["ok"], got["why"]) == (False, "field")
         finally:
             chrome.close()
 
@@ -404,6 +520,13 @@ class FakePage:  # pylint: disable=too-many-instance-attributes
         self.after_goto = "email"
         self.after_click = "code"
         self.after_submit = "done"
+        self.fill_answer: dict[str, Any] = {
+            "ok": True,
+            "clicked": True,
+            "why": "",
+            "how": "exact",
+            "labels": ["Continue with login code"],
+        }
         self.extra: dict[str, bool] = {}
         self.mailbox = mailbox
         self.log = log
@@ -449,10 +572,11 @@ class FakePage:  # pylint: disable=too-many-instance-attributes
             return json.dumps({"ok": True})
         if js == s.CODE_FILL_FN:
             assert arg["submit"] == "Continue with login code"
+            assert arg["alts"] == list(s.CODE_SUBMIT_VARIANTS)
             self.submitted.append(arg["code"])
             self.log.append("submit")
             self.stage = self.after_submit
-            return json.dumps({"ok": True, "clicked": True})
+            return json.dumps(self.fill_answer)
         raise AssertionError("unexpected evaluate")
 
 
@@ -845,20 +969,136 @@ def test_a_failed_proof_after_the_submit_quarantines(rig: Rig) -> None:
     assert browser._als.quarantined("notion") is not None
 
 
-def test_a_failed_submit_quarantines(rig: Rig, monkeypatch: pytest.MonkeyPatch) -> None:
+@pytest.mark.parametrize("why", ["field", "stick"])
+def test_a_failed_fill_quarantines_and_records_why(rig: Rig, why: str) -> None:
+    rig.page.fill_answer = {"ok": False, "why": why, "how": "none", "labels": []}
+    rig.page.after_submit = "code"
+    rc, rec = rig.run()
+    assert (rc, rec["phase"], rec["code"]) == (2, "submit", "email_code")
+    assert rec["code_fill"] == {
+        "why": why,
+        "how": "none",
+        "clicked": False,
+        "labels": [],
+    }
+    assert rec["quarantined"] is True
+    assert browser._als.quarantined("notion") is not None
+    moves = [c for c in rig.mailbox.calls if c["argv"][1:3] == ["message", "move"]]
+    assert not moves  # nothing submitted: no archive, no proof
+    assert rig.check_calls == 1
+
+
+@pytest.mark.parametrize("how", ["exact", "variant", "lone"])
+def test_a_clicked_submit_records_how(rig: Rig, how: str) -> None:
+    rig.page.fill_answer = {
+        "ok": True,
+        "clicked": True,
+        "why": "",
+        "how": how,
+        "labels": ["Continue", "Resend"],
+    }
+    rc, rec = rig.run()
+    assert rc == 0
+    assert rec["code_fill"] == {
+        "why": "",
+        "how": how,
+        "clicked": True,
+        "labels": ["Continue", "Resend"],
+    }
+
+
+def test_the_mail_code_route_records_the_sentinel_proof(rig: Rig) -> None:
+    """B10 step 9: the route's own result carries server+sentinel."""
+    rig.checks = [
+        _check("invalid"),
+        {**_check("valid"), "proof": "server+sentinel", "sentinel": True},
+    ]
+    rc, rec = rig.run()
+    assert rc == 0
+    assert (rec["proof"], rec["sentinel"], rec["server"]) == (
+        "server+sentinel",
+        True,
+        "valid",
+    )
+
+
+def test_an_auto_submit_without_a_button_logs_in(
+    rig: Rig, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """D-b: no single button, the field took the code, Notion submits on the
+    6th character — the sidebar proof decides, no quarantine."""
+    rig.page.fill_answer = {
+        "ok": True,
+        "clicked": False,
+        "why": "button",
+        "how": "none",
+        "labels": ["Resend", "Back"],
+    }
+    rc, rec = rig.run()
+    assert rc == 0
+    assert (rec["route"], rec["code"]) == ("mail-code", "ok")
+    assert rec["code_fill"]["why"] == "button"
+    assert rec["code_fill"]["clicked"] is False
+    assert browser._als.quarantined("notion") is None
+    assert "waiting for the page" in capsys.readouterr().err
+
+
+def test_no_button_and_no_login_records_button_and_labels(rig: Rig) -> None:
+    rig.page.fill_answer = {
+        "ok": True,
+        "clicked": False,
+        "why": "button",
+        "how": "none",
+        "labels": ["Resend code", "me@example.org", "Code 123456", rig.page.code],
+    }
+    rig.page.after_submit = "code"
+    rig.checks = [_check("invalid"), _check("invalid")]
+    rc, rec = rig.run()
+    assert (rc, rec["code"]) == (2, "login_failed")
+    assert rec["code_fill"] == {
+        "why": "button",
+        "how": "none",
+        "clicked": False,
+        "labels": ["Resend code", "<masked>", "<masked>", "<masked>"],
+    }
+    assert rec["quarantined"] is True
+    assert rig.page.code not in rig.result.read_text(encoding="utf-8")
+
+
+def test_an_evaluate_that_raises_still_proves(
+    rig: Rig, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The tab navigated mid-fill (an auto-submit): the proof decides."""
     real = rig.page.evaluate
 
     def _evaluate(js: str, arg: Any = None) -> Any:
         if js == s.CODE_FILL_FN:
-            rig.page.submitted.append(arg["code"])
-            return json.dumps({"ok": False, "why": "button"})
+            rig.page.stage = "done"
+            raise RuntimeError("Execution context was destroyed")
         return real(js, arg)
 
     monkeypatch.setattr(rig.page, "evaluate", _evaluate)
     rc, rec = rig.run()
-    assert (rc, rec["phase"], rec["code"]) == (2, "submit", "email_code")
-    assert rec["quarantined"] is True
-    assert browser._als.quarantined("notion") is not None
+    assert rc == 0
+    assert rec["code_fill"]["why"] == "eval"
+
+
+def test_the_fill_reason_goes_to_the_journal_note(rig: Rig) -> None:
+    browser._JOURNAL_NOTES.clear()
+    rig.page.fill_answer = {
+        "ok": True,
+        "clicked": False,
+        "why": "button",
+        "how": "none",
+        "labels": ["Resend", "Back"],
+    }
+    rig.run()
+    notes = dict(browser._JOURNAL_NOTES)
+    browser._JOURNAL_NOTES.clear()
+    assert notes["code_fill_why"] == "button"
+    assert notes["code_fill_how"] == "none"
+    assert notes["code_fill_labels"] == "Resend | Back"
+    assert rig.page.code not in json.dumps(notes)
 
 
 def test_a_deadline_after_the_submit_quarantines(tmp_path: Path) -> None:
