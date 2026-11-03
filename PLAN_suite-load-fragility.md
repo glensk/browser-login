@@ -327,7 +327,10 @@ cd /Users/albert/obsidian/42-Git/home/browser-login && timeout 900 uv run --proj
 cd /Users/albert/obsidian/42-Git/home/browser-login && timeout 900 uv run --project /Users/albert/obsidian/42-Git/home/browser-login pytest -q -rs -p no:cacheprovider /Users/albert/obsidian/42-Git/home/browser-login/tests/test_ws2_npm.py -k stale_cached_build
 ```
 
-The targeted runs must pass at the current load (~20) on two normal runs. That is the
+Why this block is not strict-eligible: every claim of this plan is about test behaviour
+(races, budgets, timing), so it can only be shown by running pytest, mypy and pylint in the
+project venv. A no-tools reviewer cannot discharge it. The permissioned reviewer session
+runs it. The targeted runs must pass at the current load (~20) on two normal runs. That is the
 "under load" claim, and it uses no load generator. The tests that tell old code from new
 are named in the `-k` filters: the new hermetic C1 tests (they fail with exit 5, "no tests
 collected", before B1, and on the old `_cscs_form_or_portal` the navigation case raises
