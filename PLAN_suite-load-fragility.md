@@ -267,7 +267,7 @@ Build rounds (at most 3 boxes per round, one writer agent per round, rounds in o
   `test_a_stable_password_only_page_is_reauth`; and
   `test_a_password_only_page_first_seen_on_the_last_tick_is_reauth`. Also run the cscs
   reauth tests (:656, :669) and the 3 ticket tests by name.
-- [ ] B2 `tests/test_ws2_cscs.py`: add `Portal.leave_without_token` and make `_APP_JS`'s
+- [x] B2 `tests/test_ws2_cscs.py`: add `Portal.leave_without_token` and make `_APP_JS`'s
   `away()` conditional on it. The wrong-key test sets it to False and asserts that the page
   is still on `PORTAL + "/profile/"` at the end. That assertion is what tells the new test
   apart from the old one, which passes on a lucky run.

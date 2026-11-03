@@ -103,7 +103,7 @@ _BOOT_JS = """(() => {
 _APP_JS = """(async () => {
   const away = () => setTimeout(() => location.replace('__KC__'), 300);
   const tok = localStorage.getItem('waldur/auth/token');
-  if (!tok) { away(); return; }
+  if (!tok) { if (__LEAVE__) away(); return; }
   const r = await fetch('/api/users/me/', {headers: {Authorization: '__SCHEME__ ' + tok}});
   if (r.status === 401) { localStorage.removeItem('waldur/auth/token'); away(); return; }
   if (r.status !== 200) {  // an API outage: an error page, no redirect
@@ -151,6 +151,9 @@ class Portal:
     config_status: int = 200
     oidc: bool = False  # OIDC_ACCESS_TOKEN_ENABLED: the API wants Bearer
     silent_sso: bool = False  # Keycloak's own session: no form
+    # The app's redirect to Keycloak when no token is stored; False keeps a
+    # test that seeds none on the portal (the timer would race its checks).
+    leave_without_token: bool = True
     logins: int = 0
     remember_me: list[bool] = field(default_factory=list)
     me_calls: int = 0
@@ -195,7 +198,12 @@ class Portal:
         else:
             boot = _BOOT_JS.replace("__KC__", KC_AUTH)
             scheme = "Bearer" if self.oidc else "Token"  # the app's own rule
-            app = _APP_JS.replace("__KC__", KC_AUTH).replace("__SCHEME__", scheme)
+            leave = "true" if self.leave_without_token else "false"
+            app = (
+                _APP_JS.replace("__KC__", KC_AUTH)
+                .replace("__SCHEME__", scheme)
+                .replace("__LEAVE__", leave)
+            )
             _html(
                 route,
                 f"<html><head><script>{boot}</script></head><body>"
@@ -407,7 +415,9 @@ def test_a_valid_token_under_another_key_proves_nothing(portal: Portal) -> None:
     """Without `waldur/auth/token`, 40-hex values elsewhere are only
     candidates; one the server accepts is `wrong_key` — undecided, never a
     reusable session (the app reads only its key), so no proof-valid /
-    export-impossible loop (debate C2)."""
+    export-impossible loop (debate C2). The app stays on the portal (no
+    redirect timer), so all three checks provably ran there."""
+    portal.leave_without_token = False
     good = portal.issue()
     with _page(portal) as page:
         _seed(page, None)
@@ -420,6 +430,7 @@ def test_a_valid_token_under_another_key_proves_nothing(portal: Portal) -> None:
         assert recipes.cscs_token_proof(page, wait_s=8) == recipes.INDETERMINATE
         with pytest.raises(recipes.BundleExportError, match="not under"):
             recipes.cscs_export_storage(page)
+        assert page.url == PORTAL + "/profile/"
 
 
 @pytest.mark.launches_chrome
