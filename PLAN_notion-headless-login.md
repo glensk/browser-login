@@ -276,7 +276,7 @@ never calls the broker's `logout` op. Exit 2 when the jar is missing.
   it (`agent_login_jobs.py`).
 - [x] B4 `bin/browser.py`: real sentinel — `sentinel` field + `server+sentinel` proof in
   `_notion_check_page` / `cmd_notion_logged_in` result record.
-- [ ] B5 `bin/browser.py`: `logout SITE` for `SAFARI_BUILTIN` sites → delete only the
+- [x] B5 `bin/browser.py`: `logout SITE` for `SAFARI_BUILTIN` sites → delete only the
   site's session cookies (notion: `NOTION_AUTH_COOKIES`) under registration + lease,
   before the fill-only/broker path; help text says "shared browser only, session
   cookies only, Safari untouched".

@@ -105,6 +105,8 @@ the socket). Exit codes: 0 ok, 2 not logged in, 3 broker unavailable, 4 needs a
 human.
   broker-sites      List the broker's sites (id, fill origins, status).
   logout SITE       Drop the broker profile for SITE + delete its cookies here.
+                    Built-in notion/slack/openai: shared browser only, session
+                    cookies only, Safari untouched.
   import-safari SITE [-n]
                     Copy SITE's session cookies from Safari (sites in
                     SAFARI_SITES the broker lists = Albert's consent); bot-check
@@ -150,6 +152,7 @@ import contextlib
 import copy
 import dataclasses
 import fcntl
+import fnmatch
 import functools
 import glob
 import hashlib
@@ -1143,9 +1146,20 @@ def parse_args() -> argparse.Namespace:
     plo = sub.add_parser(
         "logout",
         help="Remove the broker's own profile for SITE and delete SITE's "
-        "allowlisted cookies from the shared browser.",
+        "allowlisted cookies from the shared browser. A built-in site "
+        f"({', '.join(_safari.SAFARI_BUILTIN)}): shared browser only, session "
+        "cookies only, Safari untouched.",
+        description="Broker site: remove the broker's own profile for SITE and "
+        "delete SITE's allowlisted cookies from the shared browser. Built-in "
+        f"site ({', '.join(_safari.SAFARI_BUILTIN)}; notion: token_v2, "
+        "notion_user_id): shared browser only, session cookies only, Safari "
+        "untouched; the broker is never asked; device cookies stay.",
     )
-    plo.add_argument("site", help="Broker site to log out.")
+    plo.add_argument(
+        "site",
+        help="Broker site, or a built-in site "
+        f"({', '.join(_safari.SAFARI_BUILTIN)}), to log out.",
+    )
     pis = sub.add_parser(
         "import-safari",
         help="Copy SITE's session cookies from Safari into the shared browser "
@@ -14778,8 +14792,13 @@ def cmd_broker_logout(port: int, site_name: str) -> int:  # pylint: disable=too-
     """Drop the broker's own profile for SITE and delete SITE's in-scope cookies
     and its declared localStorage keys (`_logout_storage_plan`, read back;
     exit 2 when that cannot be confirmed) from the shared browser (the session
-    ends here; server-side sessions live on until the site expires them)."""
+    ends here; server-side sessions live on until the site expires them).
+    A ``SAFARI_BUILTIN`` site (notion, slack, openai) goes to
+    `cmd_builtin_logout` BEFORE the broker lookup: the broker's fill-only
+    item of the same name would refuse, and its op is never called."""
     site = site_name.strip().lower()
+    if site in _safari.SAFARI_BUILTIN:
+        return cmd_builtin_logout(port, site)
     try:
         entry = _broker_site(site)
         if _is_fill_only(entry):  # no session, no profile: never logged in
@@ -15615,6 +15634,64 @@ def _builtin_clear(port: int, site: str) -> bool:
     except Exception:  # pylint: disable=broad-exception-caught
         ok = False
     return _builtin_clear_storage(port, site) and ok
+
+
+def _builtin_logout_names(site: str) -> tuple[str, ...]:
+    """The cookie names (fnmatch patterns) that ARE `site`'s login: notion
+    `NOTION_AUTH_COOKIES` (token_v2, notion_user_id), else the import rule's
+    ``session_cookies``. Device / browser-id cookies are not in it."""
+    if site == "notion":
+        return NOTION_AUTH_COOKIES
+    return _safari.SAFARI_BUILTIN[site].session_cookies
+
+
+def _builtin_session_cookies(
+    cookies: Sequence[Mapping[str, Any]], site: str
+) -> list[Mapping[str, Any]]:
+    """`site`'s session cookies in `cookies`: in its domains AND named by
+    `_builtin_logout_names` (an empty name list matches nothing)."""
+    pats = _builtin_logout_names(site)
+    return [
+        ck
+        for ck in cookies
+        if _safari.in_site(str(ck.get("domain")), site)
+        and any(fnmatch.fnmatchcase(str(ck.get("name")), p) for p in pats)
+    ]
+
+
+def cmd_builtin_logout(port: int, site: str) -> int:
+    """`logout SITE` for a ``SAFARI_BUILTIN`` site (tp#1633 B5): delete ONLY
+    its session cookies from the shared browser's jar, under registration
+    (`_connect`) + the interaction lease, read back. Device cookies stay (the
+    next login is not a "new device"); Safari is never read or written and
+    the broker is never asked. Exit 2 when the jar is missing or a session
+    cookie survived; names only, never a value."""
+    why = f"logout {site}"
+    pw, browser = _connect(port)
+    try:
+        with _interaction_lease(why):
+            ctx = _shared_jar(browser, why)
+            doomed = _builtin_session_cookies(ctx.cookies(), site)
+            for ck in doomed:
+                ctx.clear_cookies(name=ck["name"], domain=ck["domain"], path=ck["path"])
+            left = _builtin_session_cookies(ctx.cookies(), site)
+    except SharedJarMissing as exc:
+        return _broker_fail(2, f"{site}: no session cookie was deleted ({exc})")
+    finally:
+        browser.close()
+        pw.stop()
+    names = ", ".join(sorted({str(ck.get("name")) for ck in doomed})) or "none"
+    if left:
+        return _broker_fail(
+            2,
+            f"{site}: {len(left)} session cookie(s) survived the delete "
+            f"({', '.join(sorted({str(ck.get('name')) for ck in left}))}).",
+        )
+    print(
+        f"✓ deleted {len(doomed)} {site} session cookie(s) from the shared "
+        f"browser ({names}); other cookies kept, Safari untouched."
+    )
+    return 0
 
 
 # One return per gate of the transaction (cookies, expected account, own
