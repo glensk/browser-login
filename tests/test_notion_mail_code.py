@@ -11,6 +11,7 @@ from __future__ import annotations
 
 # pylint: disable=missing-function-docstring,import-error,wrong-import-position
 # pylint: disable=protected-access,unused-argument,redefined-outer-name
+# pylint: disable=too-many-lines
 import contextlib
 import hashlib
 import importlib.util
@@ -281,15 +282,23 @@ def _code() -> str:
     return f"{int.from_bytes(os.urandom(3), 'big') % 900000 + 100000}"
 
 
-def _mail(msg_id: str, code: str, *, to: str = EMAIL) -> tuple[str, dict, str]:
+def _mail(
+    msg_id: str,
+    code: str,
+    *,
+    to: str = EMAIL,
+    sender: str = "notify@mail.notion.so",
+    dkim: str = "pass",
+) -> tuple[str, dict, str]:
     env = {
         "id": msg_id,
         "subject": "Your Notion login code",
-        "from": {"addr": "notify@mail.notion.so"},
+        "from": {"addr": sender},
         "to": [{"addr": to}],
     }
+    domain = sender.rsplit("@", 1)[1]
     text = (
-        "Authentication-Results: mx.example.org; dkim=pass header.d=mail.notion.so\n"
+        f"Authentication-Results: mx.example.org; dkim={dkim} header.d={domain}\n"
         f"\nYour login code is {code}\n"
     )
     return msg_id, env, text
@@ -298,11 +307,15 @@ def _mail(msg_id: str, code: str, *, to: str = EMAIL) -> tuple[str, dict, str]:
 class FakeMailbox:  # pylint: disable=too-many-instance-attributes
     """himalaya as a ``subprocess.run``: INBOX + Archive answer, the rest is
     missing. ``after_trigger(n)`` gives the INBOX codes of the n-th list after
-    the trigger click (1-based); ``dead`` fails every call."""
+    the trigger click (1-based); ``standing`` mails are in INBOX all along
+    (the baseline sees them), ``late`` ones only after the trigger; ``dead``
+    fails every call."""
 
     def __init__(self) -> None:
         self.calls: list[dict[str, Any]] = []
         self.inbox: list[tuple[str, dict, str]] = []
+        self.standing: list[tuple[str, dict, str]] = []
+        self.late: list[tuple[str, dict, str]] = []
         self.dead = False
         self.triggered = False
         self.polls = 0
@@ -337,11 +350,13 @@ class FakeMailbox:  # pylint: disable=too-many-instance-attributes
                 self.polls += 1
                 codes = self.after_trigger(self.polls)
                 self.inbox = [_mail(f"n{i}-{c}", c) for i, c in enumerate(codes)]
+                self.inbox += self.late
+            listed = self.standing + self.inbox
             return subprocess.CompletedProcess(
-                argv, 0, json.dumps([e for _i, e, _t in self.inbox]), ""
+                argv, 0, json.dumps([e for _i, e, _t in listed]), ""
             )
         if verb == ("message", "read"):
-            got = {i: t for i, _e, t in self.inbox}
+            got = {i: t for i, _e, t in self.standing + self.inbox}
             return subprocess.CompletedProcess(argv, 0, got.get(argv[3], ""), "")
         if verb == ("message", "move"):
             return subprocess.CompletedProcess(argv, 0, "", "")
@@ -746,6 +761,39 @@ def test_two_codes_at_once_are_an_email_code_stop(rig: Rig) -> None:
     assert "quarantined" not in rec
 
 
+def test_an_old_baseline_code_is_ignored(rig: Rig) -> None:
+    old = _code()
+    while old == rig.page.code:
+        old = _code()
+    rig.mailbox.standing = [_mail("old-1", old)]
+    rc, _rec = rig.run()
+    assert rc == 0
+    assert rig.page.submitted == [rig.page.code]
+
+
+def test_foreign_unsigned_and_misaddressed_mails_are_ignored(rig: Rig) -> None:
+    others: set[str] = set()
+    while len(others) < 3 or rig.page.code in others:
+        others = {_code() for _ in range(3)}
+    wrong_to, unsigned, foreign = sorted(others)
+    rig.mailbox.late = [
+        _mail("x-to", wrong_to, to="someone@example.org"),
+        _mail("x-dkim", unsigned, dkim="fail"),
+        _mail("x-from", foreign, sender="notify@mail.example.org"),
+    ]
+    rc, _rec = rig.run()
+    assert rc == 0
+    assert rig.page.submitted == [rig.page.code]
+
+
+def test_only_ignored_mails_are_no_code(rig: Rig) -> None:
+    rig.mailbox.after_trigger = lambda _n: []
+    rig.mailbox.late = [_mail("x-dkim", _code(), dkim="fail")]
+    rc, rec = rig.run()
+    assert (rc, rec["code"]) == (2, "email_code")
+    assert not rig.page.submitted
+
+
 def test_no_code_within_the_wait_does_not_quarantine(rig: Rig) -> None:
     rig.mailbox.after_trigger = lambda _n: []
     rc, rec = rig.run()
@@ -901,6 +949,32 @@ def test_mail_code_on_another_site_is_exit_2(
     assert "notion only" in capsys.readouterr().err
     assert browser._cmd_login(9, "notion") == 0
     assert called == [9]
+
+
+def test_login_notion_without_m_stays_guided(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A stray `login notion` never sends a code mail: not guided → 4."""
+
+    def _never(*_a: Any, **_k: Any) -> Any:
+        raise AssertionError("the mail-code path or a tab was touched")
+
+    monkeypatch.setattr(browser, "_notion_mail_code_login", _never)
+    monkeypatch.setattr(browser, "_owned_background_page", _never)
+    monkeypatch.setattr(browser, "_notion_probe", lambda _port: False)
+    monkeypatch.setattr(browser, "_guided_login_allowed", lambda *_a, **_k: False)
+    monkeypatch.setitem(browser._LOGIN_OPTS, "mail_code", False)
+    assert browser._cmd_login(9, "notion") == browser.NEEDS_ALBERT_RC == 4
+
+
+def test_notion_resolves_to_the_static_site_despite_a_fill_only_item(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    item = {"site": "notion", "fill_only": True, "fill_origins": ["x"]}
+    monkeypatch.setattr(browser, "_broker_site", lambda _key: dict(item))
+    assert browser._is_fill_only(item)
+    for name in ("notion", "Notion", "app.notion.com"):
+        site = browser._resolve_site(name, for_login=True)
+        assert site.name == "notion"
+        assert site.login is browser.cmd_notion_login
 
 
 # ---------------------------------------------------------------------------

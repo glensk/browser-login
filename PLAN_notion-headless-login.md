@@ -285,7 +285,7 @@ never calls the broker's `logout` op. Exit 2 when the jar is missing.
   → headless route, fall-through rules, `_safari_fail(route=…)` without double
   quarantine, record_check route `mail-code`, dry-run lines incl. `safari fp`); rows get
   `sentinel: "built-in"` for notion with a `server+sentinel` check.
-- [ ] B7 tests (unit, no network, no real Chrome — `CLAUDE_BROWSER_TEST_NO_LAUNCH=1`):
+- [x] B7 tests (unit, no network, no real Chrome — `CLAUDE_BROWSER_TEST_NO_LAUNCH=1`):
   new `tests/test_notion_mail_code.py` with a fake page (pattern of
   `tests/fake_cdp.py` / `chromium_page.py`) and a fake himalaya runner
   (pattern of `test_ws1b_safari.py` mail tests):

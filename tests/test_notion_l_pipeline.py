@@ -277,3 +277,29 @@ def test_the_check_record_keeps_the_proof() -> None:
     assert al.last_checks()["notion"]["proof"] == "server+sentinel"
     al.record_check("notion", True, "ok", {"proof": "<b>"})
     assert al.last_checks()["notion"]["proof"] == ""
+
+
+def _notion_line(proof: str) -> str:
+    """agents.md's Notion line after a passing check with `proof`."""
+    al.record_check("notion", True, "ok", {"proof": proof})
+    target = next(t for t in al.TARGETS if t.site == "notion")
+    row = {
+        **al.asdict(target),
+        "status": "assisted",
+        "detail": "",
+        "sentinel": False,
+        "instance": "",
+    }
+    al._builtin_sentinels([row])
+    text = al.agent_summary({"rows": [row], "broker_ok": True}, al.last_checks())
+    lines = [str(ln) for ln in str(text).splitlines() if "Notion (" in ln]
+    assert len(lines) == 1
+    return lines[0]
+
+
+def test_the_agents_md_notion_line_has_no_weak_proof() -> None:
+    line = _notion_line("server+sentinel")
+    assert line.startswith("- ✅ Notion (")
+    assert "weak proof" not in line
+    # without the sidebar sentinel the old warning stays
+    assert "weak proof" in _notion_line("server")
