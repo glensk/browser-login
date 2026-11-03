@@ -403,8 +403,16 @@ RECIPES: dict[str, Recipe] = {
                 submit="Continue with login code",
                 when='input[type="email"]',
                 email_field='input[type="email"]',
-                senders=("notify@mail.notion.so",),
-                code_re=r"\b\d{6}\b",
+                # The login code mail comes from updates.notion.so/.com (DKIM
+                # d= that same host); mail.notion.so kept for older mail.
+                senders=(
+                    "notify@updates.notion.com",
+                    "notify@updates.notion.so",
+                    "notify@mail.notion.so",
+                ),
+                # The code stands alone on its own line: six digits (older
+                # mail) or six mixed-case letters (since 2026-07).
+                code_re=r"(?m)^[ \t]*([A-Za-z0-9]{6})[ \t]*$",
                 subjects=("login code", "Anmeldecode"),
             ),
         ),

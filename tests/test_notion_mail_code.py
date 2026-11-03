@@ -17,6 +17,7 @@ import hashlib
 import importlib.util
 import json
 import os
+import re
 import subprocess
 import sys
 from collections.abc import Iterator
@@ -287,21 +288,51 @@ def _mail(
     code: str,
     *,
     to: str = EMAIL,
-    sender: str = "notify@mail.notion.so",
+    sender: str = "notify@updates.notion.com",
     dkim: str = "pass",
 ) -> tuple[str, dict, str]:
     env = {
         "id": msg_id,
-        "subject": "Your Notion login code",
+        "subject": "Your temporary Notion login code",
         "from": {"addr": sender},
         "to": [{"addr": to}],
     }
     domain = sender.rsplit("@", 1)[1]
+    # Notion's plain-text part: the code alone on the first line, then a note.
     text = (
         f"Authentication-Results: mx.example.org; dkim={dkim} header.d={domain}\n"
-        f"\nYour login code is {code}\n"
+        f"\n{code}\n\nNever share this code with anyone.\n"
     )
     return msg_id, env, text
+
+
+def _letters_code() -> str:
+    """A code like Notion's since 2026-07: six mixed-case letters."""
+    abc = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ"
+    return "".join(abc[b % len(abc)] for b in os.urandom(6))
+
+
+@pytest.mark.parametrize(
+    "sender",
+    ["notify@updates.notion.com", "notify@updates.notion.so", "notify@mail.notion.so"],
+)
+def test_the_notion_code_senders_with_their_dkim_domain_are_read(sender: str) -> None:
+    step = NOTION.steps[0]
+    msg_id, env, text = _mail("1", _code(), sender=sender)
+    assert s.is_login_mail(env, step, EMAIL)
+    headers, _body = s.split_message(text)
+    assert s.dkim_pass(headers, sender)
+    assert not s.is_login_mail(
+        {**env, "from": {"addr": "notify@updates.notion.evil"}}, step, EMAIL
+    )
+    assert msg_id == "1"
+
+
+@pytest.mark.parametrize("code", [_code(), _letters_code()])
+def test_the_notion_code_re_takes_the_code_line_only(code: str) -> None:
+    _msg_id, _env, text = _mail("1", code)
+    _headers, body = s.split_message(text)
+    assert re.findall(NOTION.steps[0].code_re, body) == [code]
 
 
 class FakeMailbox:  # pylint: disable=too-many-instance-attributes
