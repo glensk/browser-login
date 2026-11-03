@@ -35,6 +35,9 @@ import pytest
 REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO))
 
+from broker import daemon, identity, identity_ops, limiter, vault  # noqa: E402
+
+# isort: split
 from chromium_page import APP_SW  # noqa: E402
 from pw_bound import (  # noqa: E402
     PwHolder,
@@ -43,8 +46,6 @@ from pw_bound import (  # noqa: E402
     module_holder,
     set_phase,
 )
-
-from broker import daemon, identity, identity_ops, limiter, vault  # noqa: E402
 
 
 def _load(rel: str, name: str) -> Any:
