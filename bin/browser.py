@@ -846,6 +846,16 @@ def _add_login_parsers(sub: Any) -> None:
         "what it injected per host and what the browser did not keep. Printed "
         "and written to the -R result file (bundle_diag, inject_diag)",
     )
+    pl.add_argument(
+        "-M",
+        "--mail-code",
+        action="store_true",
+        help="notion only (else exit 2): the unattended e-mail-code login in a "
+        "background tab of the headless shared browser — e-mail, 'Continue', the "
+        "code from the mailbox (himalaya), 'Continue with login code'. Only from "
+        "a definite logged-out; one code mail per 15 min; stops with exit 4 on a "
+        "CAPTCHA; a failure after the code submit quarantines notion. Never with -s",
+    )
     pli = sub.add_parser(
         "logged-in", help="Exit 0 if SITE is logged in, 2 if not (no login)."
     )
@@ -10282,6 +10292,7 @@ _LOGIN_OPTS: dict[str, Any] = {
     "candidate": None,
     "refresh_only": False,
     "diag": False,  # `login -G`: value-free cookie diagnostics
+    "mail_code": False,  # `login notion -M`: the headless e-mail-code login
 }
 # The breadcrumb a deadline fired in -> the phase it stopped at.
 _STEP_PHASE = {
@@ -10352,7 +10363,17 @@ def _result_write(rc: int) -> None:
 
 def _result_timeout(step: str) -> None:
     """A LoginDeadline fired: record where (from the last broker breadcrumb),
-    and quarantine a login that was inside the broker request."""
+    and quarantine a login that was inside the broker request — or past the
+    code submit of `login notion -M` (phase hint, tp#1633)."""
+    if (
+        _RESULT.get("phase_hint") == NOTION_MAIL_CODE_HINT
+        and _RESULT.get("site") == "notion"
+        and _RESULT.get("cmd") == "login"
+    ):
+        _result_fail("submit", "timeout", f"no progress in step {step}")
+        _RESULT["submitted"] = True
+        _nmc_quarantine("timeout")
+        return
     phase = str(_RESULT.get("phase_hint") or _STEP_PHASE.get(step, "unknown"))
     _result_fail(phase, "timeout", f"no progress in step {step}")
     if phase == "unknown":
@@ -16052,6 +16073,502 @@ def cmd_notion_logged_in(port: int) -> int:
 
 
 # ---------------------------------------------------------------------------
+# Notion: the headless e-mail-code login (`login notion -M`, tp#1633)
+# ---------------------------------------------------------------------------
+# Albert (2026-11-03, D1): agents renew Notion in the HEADLESS shared Chromium
+# anytime — also unattended, notion only — in an owned background tab (never
+# brought to front): e-mail → "Continue" → the 6-digit code from the mailbox
+# (himalaya, SDSC_EMAIL_NO_AUTO_AUTH=1) → "Continue with login code". Only a
+# definite logged-out goes on; the trigger and the submit each run at most once
+# per process; the cooldown stamp is written BEFORE the trigger click (a failed
+# write sends nothing); a failure after the submit quarantines notion. The code
+# never leaves this process: not in output, the result file or the journal.
+NOTION_MAIL_CODE_COOLDOWN_S = 900.0  # D3: one code mail per 15 min at most
+NOTION_MAIL_CODE_FILE = "notion-mail-code.json"  # own file: prune() never rewrites it
+NOTION_MAIL_CODE_LOCK = "notion-mail-code.lock"
+NOTION_MAIL_CODE_HOSTS = ("www.notion.so", "app.notion.com")
+NOTION_MAIL_CODE_GOTO_S = 15.0
+# The submit set this hint; a LoginDeadline expiry after it quarantines notion.
+NOTION_MAIL_CODE_HINT = "mail-code-submitted"
+# B3: the time budget (seconds) of one `login notion -M`, step by step; its
+# sum stays under LOGIN_TIMEOUT_DEFAULT_S (tests pin it). The code wait is
+# also cut to leave NOTION_MAIL_CODE_PROOF_RESERVE_S for everything after it.
+NOTION_MAIL_CODE_BASELINE_CAP_S = 45.0  # all baseline mailbox reads together
+NOTION_MAIL_CODE_ARCHIVE_CAP_S = 15.0
+NOTION_MAIL_CODE_SIDEBAR_S = 45.0  # the passive post-submit sidebar wait
+NOTION_MAIL_CODE_LAST_POLL_S = 30.0  # one mailbox poll may end after the wait
+NOTION_MAIL_CODE_PROOF_RESERVE_S = 120.0
+NOTION_MAIL_CODE_BUDGET = {
+    "warm-probe": 40.0,  # sidebar poll 30 + server fetch 10
+    "lock-registration-lease": 10.0,
+    "baseline": NOTION_MAIL_CODE_BASELINE_CAP_S,
+    "goto-detector": 30.0,  # goto 15 + IDLE_POLLS x POLL_S reads
+    "fill-trigger": 5.0,
+    "code-wait": 180.0,  # agent_login_safari.MAIL_WAIT_S (the upper bound)
+    "last-poll": NOTION_MAIL_CODE_LAST_POLL_S,
+    "fill-submit": 5.0,
+    "archive": NOTION_MAIL_CODE_ARCHIVE_CAP_S,
+    "sidebar": NOTION_MAIL_CODE_SIDEBAR_S,
+    "proof": 40.0,  # _notion_check: sidebar poll 30 + server fetch 10
+}
+# Exactly ONE visible button with the exact label; clicked only with P.click.
+NOTION_BUTTON_FN = r"""(P) => {
+  const vis = (e) => !!e && e.getClientRects().length > 0;
+  const norm = (s) => String(s || "").replace(/\s+/g, " ").trim();
+  const hits = [...document.querySelectorAll('button,[role="button"],input[type="submit"]')]
+    .filter((b) => vis(b) && (norm(b.innerText) === P.label || norm(b.value) === P.label));
+  if (hits.length !== 1) return JSON.stringify({ ok: false, n: hits.length });
+  if (P.click) hits[0].click();
+  return JSON.stringify({ ok: true });
+}"""
+# Once-only per process (Design: "no loop back from a later step").
+_NMC_ONCE = {"trigger": False, "submit": False}
+
+
+def _nmc_sleep(seconds: float) -> None:
+    """The poll pause of the mail-code flow (tests replace it)."""
+    time.sleep(seconds)
+
+
+def _nmc_clock() -> float:
+    """The monotonic clock of the mail-code flow (tests replace it)."""
+    return time.monotonic()
+
+
+def _deadline_left() -> float | None:
+    """Seconds left on the active LoginDeadline's overall clock (None: none)."""
+    dl = _active_deadline()
+    if dl is None or not dl.armed:
+        return None
+    with dl.lock:
+        ends = [end for end, scope, _s in dl.deadlines if scope == "overall"]
+    return min(ends) - time.monotonic() if ends else None
+
+
+class _CappedRun:  # pylint: disable=too-few-public-methods
+    """`subprocess.run` for the MailReader with one shared time cap: every
+    call's timeout shrinks to what is left, a call past the cap fails at once
+    (MailReader reads that as unreadable)."""
+
+    def __init__(self, run: Callable[..., subprocess.CompletedProcess]) -> None:
+        self.run = run
+        self.until: float | None = None
+
+    def cap(self, seconds: float | None) -> None:
+        """Cap the calls from now on to `seconds` together (None: uncapped)."""
+        self.until = None if seconds is None else _nmc_clock() + seconds
+
+    def __call__(self, argv: list[str], **kw: Any) -> subprocess.CompletedProcess:
+        if self.until is not None:
+            left = self.until - _nmc_clock()
+            if left <= 0:
+                raise subprocess.TimeoutExpired(argv, 0)
+            kw["timeout"] = min(float(kw.get("timeout") or left), left)
+        return self.run(argv, **kw)
+
+
+def _nmc_stop(rc: int, phase: str, code: str, msg: str) -> int:
+    """Record a fixed stop of the mail-code login and say it (no free text)."""
+    _result_fail(phase, code)
+    print(f"❌ notion (e-mail code): {msg} [{code}]", file=sys.stderr)
+    return rc
+
+
+def _nmc_quarantine(code: str) -> None:
+    """After the submit: quarantine notion (the record says whether it held)."""
+    _RESULT["credential"] = True
+    try:
+        _als.quarantine("notion", "submit", code)
+    except Exception:  # pylint: disable=broad-exception-caught
+        _RESULT["quarantined"] = False
+        return
+    _RESULT["quarantined"] = True
+
+
+@contextlib.contextmanager
+def _nmc_lock() -> Iterator[bool | None]:
+    """The per-site flock (non-blocking): True held, False busy, None when
+    the state dir cannot be written."""
+    path = _als.state_dir() / NOTION_MAIL_CODE_LOCK
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        fd = os.open(str(path), os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+    except OSError:
+        yield None
+        return
+    try:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            yield False
+            return
+        yield True
+    finally:
+        os.close(fd)
+
+
+def _nmc_cooldown_left(now: float) -> float | None:
+    """Seconds of the code-mail cooldown left (0: none); None when the
+    cooldown file exists but cannot be read (fail closed)."""
+    path = _als.state_dir() / NOTION_MAIL_CODE_FILE
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return 0.0
+    except (OSError, ValueError):
+        return None
+    at = data.get("at") if isinstance(data, dict) else None
+    if not isinstance(at, (int, float)) or isinstance(at, bool):
+        return None
+    if at > now:  # a stamp from the future: the clock moved — wait it out
+        return NOTION_MAIL_CODE_COOLDOWN_S
+    return max(0.0, NOTION_MAIL_CODE_COOLDOWN_S - (now - at))
+
+
+def _nmc_stamp(now: float) -> bool:
+    """Write the cooldown stamp ``{"at": now}`` (atomic, 0600); False on failure."""
+    path = _als.state_dir() / NOTION_MAIL_CODE_FILE
+    tmp = ""
+    try:
+        fd, tmp = tempfile.mkstemp(prefix=f".{path.name}.", dir=str(path.parent))
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            json.dump({"at": now}, fh)
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(tmp, path)
+    except Exception:  # pylint: disable=broad-exception-caught
+        if tmp:
+            with contextlib.suppress(OSError):
+                Path(tmp).unlink(missing_ok=True)
+        return False
+    return True
+
+
+def _nmc_page(page: Any, recipe: Any, als_s: Any) -> tuple[bool, dict | None]:
+    """(host ok, detector flags or None) of the login tab — booleans only."""
+    try:
+        host = urllib.parse.urlsplit(page.url).hostname or ""
+    except Exception:  # pylint: disable=broad-exception-caught
+        return True, None
+    if host not in NOTION_MAIL_CODE_HOSTS:
+        return False, None
+    try:
+        raw = page.evaluate("() => " + als_s.detector_js(recipe, recipe.sentinel))
+    except Exception:  # pylint: disable=broad-exception-caught
+        return True, None
+    return True, als_s.parse_page(raw, len(recipe.steps))
+
+
+def _nmc_eval_ok(page: Any, js: str, params: dict[str, Any]) -> bool:
+    """`js(params)` in the tab answered ``{"ok": true}``."""
+    try:
+        raw = page.evaluate(js, params)
+    except Exception:  # pylint: disable=broad-exception-caught
+        return False
+    try:
+        data = json.loads(raw) if isinstance(raw, str) else None
+    except ValueError:
+        return False
+    return isinstance(data, dict) and data.get("ok") is True
+
+
+def _notion_mail_code_login(port: int) -> int:  # pylint: disable=too-many-return-statements
+    """`login notion -M`: Design steps 1–3 (warm probe, preconditions under
+    the per-site flock), then the owned tab under registration + lease."""
+    import agent_login_safari as als_s  # pylint: disable=import-outside-toplevel
+
+    _result_set(route="mail-code", phase_hint="recipe")
+    expected = _notion_expected_email()
+    _deadline_step("notion:warm-probe")
+    res = _notion_check(port, expected)
+    _result_set(server=res["server"], proof=res["proof"])
+    if res["verdict"] == "valid":
+        if res["identity"] == "match":
+            _result_set(route="already")
+            print("✓ Already logged into Notion (app.notion.com).")
+            return 0
+        if res["identity"] == "mismatch":
+            return _nmc_stop(
+                2, "client-proof", "wrong_account", "logged in as ANOTHER account"
+            )
+        return _nmc_stop(
+            2, "client-proof", "indeterminate", "logged in, account unproven"
+        )
+    if res["verdict"] != "invalid":
+        return _nmc_stop(
+            2, "client-proof", "indeterminate", "could not tell if logged in"
+        )
+    if _als.quarantined("notion") is not None:
+        return _nmc_stop(
+            2,
+            "precheck",
+            "quarantined",
+            "quarantined — release with agent-login.py -Q notion",
+        )
+    with _nmc_lock() as held:
+        if held is None:
+            return _nmc_stop(2, "precheck", "state_unwritable", "no state dir")
+        if not held:
+            return _nmc_stop(
+                BUSY_RC, "precheck", "busy", "another e-mail-code login runs"
+            )
+        left = _nmc_cooldown_left(time.time())
+        if left is None:
+            return _nmc_stop(
+                2, "precheck", "state_unwritable", "the cooldown file is unreadable"
+            )
+        if left > 0:
+            return _nmc_stop(
+                2,
+                "precheck",
+                "cooldown",
+                f"a code mail went out < 15 min ago (retry in {int(left) + 1}s)",
+            )
+        if not expected:
+            return _nmc_stop(
+                2,
+                "precheck",
+                "identity_unconfigured",
+                f"no notion.expected_email in {OVERRIDES_HINT}",
+            )
+        himalaya = shutil.which("himalaya")
+        if not himalaya:
+            return _nmc_stop(2, "precheck", "himalaya_missing", "himalaya not on PATH")
+        entry, _why = _safari_overrides("notion")
+        capped = _CappedRun(subprocess.run)
+        reader = als_s.MailReader(
+            himalaya,
+            account=str(entry.get("mailbox") or "") or None,
+            run=capped,
+            env=dict(als_s.NOTION_MAIL_ENV),
+        )
+        try:
+            with _owned_background_page(port) as page:
+                with _interaction_lease("login notion"):
+                    return _nmc_owned(port, page, reader, capped, expected, als_s)
+        except OwnedTabError as exc:
+            return _nmc_stop(2, "precheck", "indeterminate", f"no tab ({exc})")
+
+
+def _nmc_owned(  # pylint: disable=too-many-arguments,too-many-positional-arguments,too-many-return-statements
+    port: int,
+    page: Any,
+    reader: Any,
+    capped: _CappedRun,
+    expected: str,
+    als_s: Any,
+) -> int:
+    """Design steps 4–7 in the owned tab under the lease."""
+    recipe = als_s.RECIPES["notion"]
+    step = recipe.steps[0]
+    _deadline_step("notion:baseline")
+    capped.cap(NOTION_MAIL_CODE_BASELINE_CAP_S)
+    baseline = als_s.mail_baseline(reader, step)
+    capped.cap(None)
+    if baseline is None:
+        return _nmc_stop(
+            2,
+            "precheck",
+            "mailbox_unreadable",
+            "the mailbox cannot be read (EPFL grant: epfl_oauth.py auth) — "
+            "nothing sent",
+        )
+    _deadline_step("notion:login-page")
+    try:
+        page.goto(
+            recipe.start_url,
+            wait_until="domcontentloaded",
+            timeout=NOTION_MAIL_CODE_GOTO_S * 1000,
+        )
+    except Exception:  # pylint: disable=broad-exception-caught
+        return _nmc_stop(2, "recipe", "recipe_stuck", "the login page did not load")
+    flags, rc = _nmc_wait_page(page, recipe, als_s, need="user")
+    if flags is None:
+        return rc
+    if flags["sentinel"]:  # logged in after all: nothing to send
+        return _nmc_proof(port, page, reader, expected, None)
+    if not _nmc_eval_ok(
+        page, als_s.EMAIL_FILL_FN, {"field": step.email_field, "email": expected}
+    ):
+        return _nmc_stop(2, "recipe", "recipe_stuck", "the e-mail field did not fill")
+    if not _nmc_eval_ok(
+        page, NOTION_BUTTON_FN, {"label": step.trigger, "click": False}
+    ):
+        return _nmc_stop(
+            2, "recipe", "recipe_stuck", f"no single {step.trigger!r} button"
+        )
+    left = _deadline_left()
+    wait_s = als_s.MAIL_WAIT_S
+    if left is not None:
+        wait_s = min(wait_s, left - NOTION_MAIL_CODE_PROOF_RESERVE_S)
+    if wait_s < 2 * als_s.MAIL_POLL_S:
+        return _nmc_stop(2, "recipe", "timeout", "no time left for the code wait")
+    if not _nmc_stamp(time.time()):
+        return _nmc_stop(
+            2, "precheck", "state_unwritable", "the cooldown stamp cannot be written"
+        )
+    if _NMC_ONCE["trigger"]:
+        return _nmc_stop(2, "recipe", "internal", "the trigger ran already")
+    _NMC_ONCE["trigger"] = True
+    _deadline_step("notion:trigger")
+    _result_set(triggered=True)
+    if not _nmc_eval_ok(page, NOTION_BUTTON_FN, {"label": step.trigger, "click": True}):
+        return _nmc_stop(
+            2, "recipe", "recipe_stuck", f"the {step.trigger!r} click failed"
+        )
+    return _nmc_code(port, page, reader, capped, baseline, expected, wait_s, als_s)
+
+
+def _nmc_wait_page(
+    page: Any, recipe: Any, als_s: Any, need: str
+) -> tuple[dict | None, int]:
+    """Read the tab until it shows `need` (or the sentinel): (flags, 0), or
+    (None, rc) after a fixed stop — tab moved, Albert's stop, or
+    ``IDLE_POLLS`` reads without a known element (never a reload)."""
+    idle = 0
+    while True:
+        host_ok, flags = _nmc_page(page, recipe, als_s)
+        stop = _nmc_page_stop(host_ok, flags, als_s)
+        if stop:
+            return None, stop
+        if flags is not None and (flags[need] or flags["sentinel"]):
+            return flags, 0
+        idle += 1
+        if idle >= als_s.IDLE_POLLS:
+            return None, _nmc_stop(
+                2, "recipe", "recipe_stuck", "the login page shows no known step"
+            )
+        _nmc_sleep(als_s.POLL_S)
+
+
+def _nmc_page_stop(host_ok: bool, flags: dict | None, als_s: Any) -> int:
+    """The rc of a page that must stop the flow (0: none)."""
+    if not host_ok:
+        return _nmc_stop(2, "recipe", "tab_moved", "the tab left the Notion hosts")
+    for flag in als_s.ALBERT_STOPS if flags is not None else ():
+        if flags is not None and flags[flag]:
+            return _nmc_stop(
+                NEEDS_ALBERT_RC,
+                "recipe",
+                f"needs_albert_{flag}",
+                f"Notion shows a {flag.replace('_', ' ')} — needs Albert, no retry",
+            )
+    return 0
+
+
+def _nmc_code(  # pylint: disable=too-many-arguments,too-many-positional-arguments,too-many-return-statements
+    port: int,
+    page: Any,
+    reader: Any,
+    capped: _CappedRun,
+    baseline: Any,
+    expected: str,
+    wait_s: float,
+    als_s: Any,
+) -> int:
+    """Design steps 7–8: wait for ONE new signed code (two polls agree) and
+    the code field, then fill + submit it ONCE."""
+    step = als_s.RECIPES["notion"].steps[0]
+    recipe = als_s.RECIPES["notion"]
+    _deadline_step("notion:code-wait")
+    capped.cap(wait_s + NOTION_MAIL_CODE_LAST_POLL_S)
+    end = _nmc_clock() + wait_s
+    last: str | None = None
+    idle = 0
+    while True:
+        host_ok, flags = _nmc_page(page, recipe, als_s)
+        stop = _nmc_page_stop(host_ok, flags, als_s)
+        if stop:
+            return stop
+        known = flags is not None and (
+            flags["user"] or flags["code"] or flags["sentinel"]
+        )
+        idle = 0 if known else idle + 1
+        if idle >= als_s.IDLE_POLLS:
+            return _nmc_stop(
+                2, "recipe", "recipe_stuck", "the code page shows no known step"
+            )
+        got, why = als_s.find_code(reader, baseline, step, expected)
+        if why not in ("", "no_mail"):
+            # after the trigger: never a fall-through code (a mail went out)
+            return _nmc_stop(2, "recipe", "email_code", "no single new code mail")
+        if got is not None and got == last and flags is not None and flags["code"]:
+            break
+        last = got
+        if _nmc_clock() >= end:
+            if last is not None:
+                return _nmc_stop(
+                    2, "recipe", "recipe_stuck", "the code field never showed"
+                )
+            return _nmc_stop(2, "recipe", "email_code", "no code mail within the wait")
+        _nmc_sleep(als_s.MAIL_POLL_S)
+    capped.cap(None)
+    return _nmc_submit(port, page, reader, capped, got, expected, als_s)
+
+
+def _nmc_submit(  # pylint: disable=too-many-arguments,too-many-positional-arguments
+    port: int,
+    page: Any,
+    reader: Any,
+    capped: _CappedRun,
+    code: str,
+    expected: str,
+    als_s: Any,
+) -> int:
+    """Design steps 8–9: the phase hint, fill + submit ONCE, archive."""
+    step = als_s.RECIPES["notion"].steps[0]
+    if _NMC_ONCE["submit"]:
+        return _nmc_stop(2, "submit", "internal", "the submit ran already")
+    _NMC_ONCE["submit"] = True
+    # From here a deadline expiry quarantines notion (`_result_timeout`).
+    _result_set(phase_hint=NOTION_MAIL_CODE_HINT, site="notion", credential=True)
+    _deadline_step("notion:submit")
+    params = {"otp": als_s._OTP_FIELD, "code": code, "submit": step.submit}  # pylint: disable=protected-access
+    try:
+        ok = _nmc_eval_ok(page, als_s.CODE_FILL_FN, params)
+    finally:
+        params.clear()
+    if not ok:
+        reader.sources = {}
+        _nmc_quarantine("email_code")
+        return _nmc_stop(2, "submit", "email_code", "the code did not submit")
+    _deadline_step("notion:archive")
+    capped.cap(NOTION_MAIL_CODE_ARCHIVE_CAP_S)
+    try:
+        archived = reader.archive(code)
+    finally:
+        capped.cap(None)
+    _result_set(mail_archived=archived)
+    return _nmc_proof(port, page, reader, expected, True)
+
+
+def _nmc_proof(
+    port: int, page: Any, reader: Any, expected: str, submitted: bool | None
+) -> int:
+    """Design step 10: the passive sidebar wait, then the server proof with
+    the account; anything but valid + match after a submit quarantines."""
+    del reader
+    _deadline_step("notion:proof")
+    _notion_wait_for_login(page, timeout_s=NOTION_MAIL_CODE_SIDEBAR_S, poll_s=1.0)
+    res = _notion_check(port, expected)
+    _result_set(server=res["server"], proof=res["proof"])
+    if res["verdict"] == "valid" and res["identity"] == "match":
+        _result_set(route="mail-code", phase="ok", code="ok")
+        _record_login_event("notion", "mail-code")
+        print("✅ notion: logged in headlessly (e-mail code) — route: mail-code")
+        return 0
+    code = "wrong_account" if res["identity"] == "mismatch" else "login_failed"
+    if submitted:
+        _nmc_quarantine(code)
+    return _nmc_stop(
+        2,
+        "submit" if submitted else "client-proof",
+        code,
+        "the login did not prove (workspace + account)",
+    )
+
+
+# ---------------------------------------------------------------------------
 # Guided login (`assisted-login`, plans-done/PLAN_focus-free-browser_DONE.md Phase 3)
 # ---------------------------------------------------------------------------
 # ONE human entry: `browser.py assisted-login SITE` (agent-login.py -g SITE calls
@@ -17500,6 +18017,7 @@ def cmd_login(  # pylint: disable=too-many-arguments
     candidate: str | None = None,
     refresh_only: bool = False,
     diag: bool = False,
+    mail_code: bool = False,
 ) -> int:
     """Ensure SITE is logged in (automated or assisted, per the site).
 
@@ -17512,18 +18030,27 @@ def cmd_login(  # pylint: disable=too-many-arguments
     (`-x`): a one-shot candidate sentinel for a broker item without one;
     `refresh_only` (`-F`): renew a logged-in site's token, never log in;
     `diag` (`-G`): value-free cookie diagnostics of a broker login.
+    `mail_code` (`-M`): notion's headless e-mail-code login (tp#1633).
     """
     key = site_name.strip().lower()
     _result_begin("login", key, result_file)
     _LOGIN_OPTS.update(
-        scheduled=scheduled, candidate=candidate, refresh_only=refresh_only, diag=diag
+        scheduled=scheduled,
+        candidate=candidate,
+        refresh_only=refresh_only,
+        diag=diag,
+        mail_code=mail_code,
     )
     rc = 1
     sweep: AccessSweep | None = None
     try:
         with _login_deadline(port, "login", key, LOGIN_TIMEOUT_S, end_event="login"):
             try:
-                if expect is not None:
+                if mail_code and (
+                    expect is not None or scheduled or candidate or refresh_only
+                ):
+                    rc = _fail("-M/--mail-code goes alone (no -e/-s/-x/-F)")
+                elif expect is not None:
                     rc = _cmd_login_expect(port, site_name, expect)
                 elif candidate and (scheduled or key in _safari.SAFARI_SITES):
                     rc = _fail(
@@ -17568,9 +18095,17 @@ def _cmd_login_expect(port: int, site_name: str, expect: str) -> int:
     return cmd_anthropic_login(port, expect=expect)
 
 
-def _cmd_login(port: int, site_name: str) -> int:
+def _cmd_login(port: int, site_name: str) -> int:  # pylint: disable=too-many-return-statements
     """`cmd_login`'s body, under its deadline."""
     key = site_name.strip().lower()
+    if _LOGIN_OPTS.get("mail_code"):
+        if key in _safari.SAFARI_SITES:
+            return _fail(f"-M/--mail-code is for notion only, not {key!r}")
+        site = _resolve_site(site_name, for_login=True)
+        if site.name != "notion":
+            return _fail(f"-M/--mail-code is for notion only, not {site.name!r}")
+        _journal_note(site=site.name, flow="mail-code")
+        return _notion_mail_code_login(port)
     if key in _safari.SAFARI_SITES:
         _journal_note(flow="safari")
         return _safari_login(port, key)
@@ -18808,7 +19343,7 @@ def _journaled_dispatch(args: argparse.Namespace, port: int) -> int:
         )
 
 
-def _dispatch(args: argparse.Namespace, port: int) -> int:
+def _dispatch(args: argparse.Namespace, port: int) -> int:  # pylint: disable=too-many-statements
     """Run the chosen subcommand."""
     # A flat `if args.cmd == …: return cmd_…(…)` chain: one branch and one return
     # per subcommand, each forwarding a different argument set. A dispatch table
@@ -18903,6 +19438,8 @@ def _dispatch(args: argparse.Namespace, port: int) -> int:
             extra["refresh_only"] = True
         if getattr(args, "diag", False):
             extra["diag"] = True
+        if getattr(args, "mail_code", False):
+            extra["mail_code"] = True
         if expect is not None:
             return cmd_login(port, args.site, expect=expect, **extra)
         return cmd_login(port, args.site, **extra)

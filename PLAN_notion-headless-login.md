@@ -260,7 +260,7 @@ never calls the broker's `logout` op. Exit 2 when the jar is missing.
   the himalaya `*.cmd` path): stop and hand back — the fix lives in the `sdsc/email`
   repo (`epfl_oauth.py` honours the variable in `token` and `refresh-token`), a separate
   ticket; B2 must not ship without it.
-- [ ] B2 `bin/browser.py`: `login -M/--mail-code` flag (notion only, else exit 2) and
+- [x] B2 `bin/browser.py`: `login -M/--mail-code` flag (notion only, else exit 2) and
   `_notion_mail_code_login(port)` implementing Design steps 1–10 (owned background tab,
   registration → lease, detector stops, own cooldown file + flock with stamp BEFORE the
   click, once-only trigger + submit, quarantine after `credential`, archive, proof,

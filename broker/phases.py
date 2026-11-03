@@ -125,6 +125,13 @@ CODE_TEXT = {
         "and types it in Safari, then re-runs -L"
     ),
     "recipe_stuck": "the Safari login recipe found no next step on the page",
+    # tp#1633: notion's headless e-mail-code login (`browser.py login notion -M`)
+    "mailbox_unreadable": "the mailbox cannot be read — no code mail was triggered",
+    "himalaya_missing": "himalaya is not installed — no code mail was triggered",
+    "state_unwritable": (
+        "agent-login's state dir (cooldown) cannot be written — nothing sent"
+    ),
+    "tab_moved": "the login tab left the site's hosts — stopped",
     "safari_unavailable": (
         "Safari is not running, or JavaScript from Apple Events is off"
     ),
