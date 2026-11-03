@@ -269,7 +269,7 @@ never calls the broker's `logout` op. Exit 2 when the jar is missing.
   result carries `phase_hint == "mail-code-submitted"` and `site == "notion"`, it calls
   `_als.quarantine("notion", "submit", "timeout")` and sets `quarantined: true`
   (objection 1).
-- [ ] B3 `bin/browser.py`: the time budget of the Design section — baseline read cap
+- [x] B3 `bin/browser.py`: the time budget of the Design section — baseline read cap
   45 s, archive cap 15 s, post-submit sidebar wait 45 s, code wait
   `min(MAIL_WAIT_S, deadline_left − 120)`; assert in a unit test that the sum of caps ≤
   `login_timeout_s()` (480 s) and that agent-login's `browser_timeout("login")` covers
