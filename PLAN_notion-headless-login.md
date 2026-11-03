@@ -346,7 +346,7 @@ never calls the broker's `logout` op. Exit 2 when the jar is missing.
   `down`). Install into the live checkout atomically (cp to temp name + mv, after
   checking the live files are unchanged since the worktree base); commit with the
   grant the brief carries.
-- [ ] B10 LIVE CANARY (build agent runs it, after B9, on the live 9222 browser — the
+- [x] B10 LIVE CANARY (build agent runs it, after B9, on the live 9222 browser — the
   one deliberate exception to "never login casually", approved by tp#1633). Result
   files go to a fresh `mktemp -d` dir (0700).
   1. `browser.py logged-in notion -R <dir>/before.json` → 0 (if not 0, stop and report).
@@ -379,6 +379,7 @@ never calls the broker's `logout` op. Exit 2 when the jar is missing.
   `recipe_stuck` in step 5 → no retry; report the code; restore via step 6 (Safari
   import) so notion is not left logged out. `email_code` → no retry inside the 15-min
   cooldown; restore via step 6, report. A quarantine → report, never `-Q` it yourself.
+  ↳ evidence 2026-11-03: canary 4 /tmp/tp1633-canary4.lweWcq: steps 1-6, 8 (15 contenteditable), 9 passed; step 4 server invalid proof server; step 5 mail-code exit 0; step 7 windows/journal clean, safari fp moved with Safari's own token_v2 refresh 15:20:20 (accepted by overseer)
 
 ## Verification
 
