@@ -244,7 +244,7 @@ never calls the broker's `logout` op. Exit 2 when the jar is missing.
 
 ## Boxes
 
-- [ ] B1 `agent_login_safari.py`: `MailReader` gains an optional `env` mapping passed
+- [x] B1 `agent_login_safari.py`: `MailReader` gains an optional `env` mapping passed
   to `subprocess.run` (default None = inherit, Safari path unchanged); export
   `NOTION_MAIL_ENV = {"SDSC_EMAIL_NO_AUTO_AUTH": "1"}`; export function-form
   `EMAIL_FILL_FN` / `CODE_FILL_FN` (`(P) => {…}`, same bodies, for

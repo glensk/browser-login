@@ -38,6 +38,18 @@ Safety rules (each one tested):
 * safari.py is the fixed mydotfiles path (``DEFAULT_SAFARI_PY``); neither
   ``$SAFARI_PY_BIN`` nor ``PATH`` can redirect a credential step outside a
   pytest run (``PYTEST_CURRENT_TEST``).
+
+Headless Notion (tp#1633, Albert 2026-11-03): Notion's mail-code step may also
+run in the shared Chromium (``browser.py login notion -M``) — no Safari
+window, no focus loss, and NOT behind `interactive_gate`, so it also runs
+while Albert is away. Notion only; every other recipe stays attended-only.
+The same rules hold there: the trigger and the code submit run at most once
+per run, a failure after the submit quarantines notion, only a NEW,
+DKIM-signed code mail addressed to the expected e-mail counts, and himalaya
+runs with `NOTION_MAIL_ENV` (a dead EPFL grant stops instead of opening a
+browser). browser.py drives a Playwright page with the function forms
+`EMAIL_FILL_FN` / `CODE_FILL_FN` (the values travel as the evaluate
+argument, never in the script text).
 """
 
 from __future__ import annotations
@@ -129,6 +141,9 @@ MAX_POLLS = 40  # ~2 min of page reads, plus the steps' own waits
 IDLE_POLLS = 4  # this many reads with nothing to do = stuck
 MAIL_WAIT_S = 180.0
 MAIL_POLL_S = 5.0
+# The himalaya environment of the headless Notion path: a dead EPFL grant
+# raises in epfl_oauth.py instead of opening a browser sign-in (focus loss).
+NOTION_MAIL_ENV = {"SDSC_EMAIL_NO_AUTO_AUTH": "1"}
 # safari.py's worst case per call (its defaults): the vault lock (60 s), the
 # vault search (10 s) and two copies (menu 3 s + clipboard 5 s each), the
 # TOTP window (6 s), the page wait (`--wait`, 20 s), the submit enable (3 s)
@@ -960,14 +975,20 @@ class MailReader:
     # code -> (folder, id) of the mails it was read from, by the latest
     # scan (memory only; cleared once the code was used)
     sources: dict[str, list[tuple[str, str]]] = field(default_factory=dict)
+    # extra environment for himalaya (e.g. `NOTION_MAIL_ENV`), on top of this
+    # process's; None = inherit unchanged (the Safari path)
+    env: dict[str, str] | None = None
 
     def _cmd(self, *args: str) -> str | None:
         argv = [self.himalaya, *args]
         if self.account:
             argv += ["-a", self.account]
+        kw: dict[str, Any] = {}
+        if self.env is not None:
+            kw["env"] = {**os.environ, **self.env}
         try:
             res = self.run(
-                argv, capture_output=True, text=True, timeout=30, check=False
+                argv, capture_output=True, text=True, timeout=30, check=False, **kw
             )
         except (OSError, subprocess.SubprocessError):
             return None
@@ -1151,6 +1172,42 @@ CODE_FILL_JS = r"""// agent-login:code
   hits[0].click();
   return JSON.stringify({ ok: true, clicked: true });
 })()
+"""
+
+# Function forms of the two fills for a Playwright page
+# (``page.evaluate(EMAIL_FILL_FN, params)``): same bodies, the params travel
+# as the evaluate argument — the e-mail / code never enter the script text.
+# The Safari constants above stay byte-identical (safari.py evaluates text).
+EMAIL_FILL_FN = r"""// agent-login:email-fn
+(P) => {
+  const vis = (e) => !!e && e.getClientRects().length > 0;
+  const field = [...document.querySelectorAll(P.field)].find(vis);
+  if (!field) return JSON.stringify({ ok: false, why: "field" });
+  const set = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value").set;
+  set.call(field, P.email);
+  for (const t of ["input", "change", "keyup"]) field.dispatchEvent(new Event(t, { bubbles: true }));
+  return JSON.stringify({ ok: field.value === P.email });
+}
+"""
+
+CODE_FILL_FN = r"""// agent-login:code-fn
+(P) => {
+  const vis = (e) => !!e && e.getClientRects().length > 0;
+  const field = [...document.querySelectorAll(P.otp)].find(vis);
+  if (!field) return JSON.stringify({ ok: false, why: "field" });
+  const norm = (s) => String(s || "").replace(/\s+/g, " ").trim();
+  const scope = field.form || document;
+  const hits = P.submit ? [...scope.querySelectorAll('button,input[type="submit"]')]
+    .filter((b) => vis(b) && (norm(b.innerText) === P.submit || norm(b.value) === P.submit)) : [];
+  if (P.submit && hits.length !== 1) return JSON.stringify({ ok: false, why: "button" });
+  const set = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value").set;
+  set.call(field, P.code);
+  for (const t of ["input", "change", "keyup"]) field.dispatchEvent(new Event(t, { bubbles: true }));
+  if (field.value !== P.code) return JSON.stringify({ ok: false, why: "stick" });
+  if (!P.submit) return JSON.stringify({ ok: true, clicked: false });
+  hits[0].click();
+  return JSON.stringify({ ok: true, clicked: true });
+}
 """
 
 
