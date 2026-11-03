@@ -10762,7 +10762,7 @@ def _cookie_scopes_of(entry: Mapping[str, Any]) -> tuple[Any, ...]:
     (``identity.entry_cookie_scopes``: its versioned ``cookie_scopes``, else
     its ``cookie_hosts`` at path "/" — host-wide, the fail-closed reading of
     a pre-S4c broker or a malformed entry)."""
-    return _identity.entry_cookie_scopes(entry)
+    return tuple(_identity.entry_cookie_scopes(entry))
 
 
 def _url_origin(url: str) -> str:
@@ -12306,8 +12306,8 @@ def _broker_probe(page, entry: dict, sentinel: str | None = None) -> str:
         url = str(getattr(page, "url", "") or "")
         trail = _BG_TRAIL.get(id(page))
         if trail is None:
-            return _access_gated(url)
-        return _access_gated_via(trail.urls, url, own)
+            return bool(_access_gated(url))
+        return bool(_access_gated_via(trail.urls, url, own))
 
     if not gated():
         answer = _broker_probe_page(page, entry, sentinel)
