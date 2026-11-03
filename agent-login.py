@@ -84,6 +84,8 @@ from __future__ import annotations
 import argparse
 import contextlib
 import fcntl
+import hashlib
+import hmac
 import json
 import os
 import shutil
@@ -710,6 +712,30 @@ def _known_extras(planned: set[str]) -> list[str]:
     return sorted(s for s in known - planned if SITE_ID_RE.match(s))
 
 
+# tp#1633: sites whose proof is browser.py's own built-in check (server
+# probe + sidebar sentinel), not a broker item's `logged_in_selector`.
+BUILTIN_PROOF_SITES = frozenset({"notion"})
+
+
+def _builtin_sentinels(rows: list[dict]) -> None:
+    """Mark a built-in-proof row ``sentinel: "built-in"`` when its latest
+    check (checks.json) rests on ``server+sentinel``; `needs_sentinel`
+    stays row-only (an ``is False`` test), so the "weak proof" goes away."""
+    if not any(r.get("site") in BUILTIN_PROOF_SITES for r in rows):
+        return
+    try:
+        checks = last_checks()
+    except (als.StateError, OSError):
+        return
+    for row in rows:
+        site = row.get("site")
+        if (
+            site in BUILTIN_PROOF_SITES
+            and (checks.get(site) or {}).get("proof") == "server+sentinel"
+        ):
+            row["sentinel"] = "built-in"
+
+
 def overview(*, fresh: bool = False) -> dict:
     """Everything the report shows, as data."""
     health, sites = broker_state(fresh=fresh)
@@ -764,6 +790,7 @@ def overview(*, fresh: bool = False) -> dict:
                 **safari.get(t.site, {}),
             }
         )
+    _builtin_sentinels(rows)
     planned = {t.site for t in TARGETS}
     for site, entry in sorted(listed.items()):
         if site in planned or is_fill_only(entry):
@@ -1262,6 +1289,7 @@ def record_check(
             server=str(r.get("server") or ""),
             cookie_days_left=r.get("cookie_days_left"),
             run_id=RUN_ID,
+            proof=str(r.get("proof") or ""),
         )
 
 
@@ -3614,6 +3642,27 @@ DEFAULT_CONTINUE = frozenset({"logged_out"})
 # An import that ran out of time or met a guided login: the shared browser's
 # state is unknown — never followed by a Safari login (N5).
 IMPORT_STOP_RCS = frozenset({BUSY_RC, LOGIN_TIMEOUT_RC, LOGIN_TIMEOUT_DIRTY_RC})
+# tp#1633 (D1): sites `-L` renews with the headless e-mail-code login in the
+# shared Chromium (`browser.py login SITE -M`) — ungated, also on an idle or
+# locked Mac — between the Safari import and the attended Safari login.
+MAIL_CODE_SITES = frozenset({"notion"})
+# `-M` stops that sent nothing: only these may fall through to the Safari
+# login (and only with the interactive gate open). Every other stop ends -L.
+MAIL_CODE_FALLTHROUGH = frozenset(
+    {
+        "mailbox_unreadable",
+        "identity_unconfigured",
+        "himalaya_missing",
+        "state_unwritable",
+        "recipe_stuck",
+    }
+)
+# Mirrors bin/browser.py (NOTION_MAIL_CODE_FILE / _COOLDOWN_S): read-only here.
+MAIL_CODE_STAMP = "notion-mail-code.json"
+MAIL_CODE_COOLDOWN_S = 900.0
+# `safari fp` (`-L notion -n`): a value-free HMAC of Safari's session
+# fingerprint, keyed per host so two runs on this Mac compare.
+SAFARI_FP_SALT = "agent-login safari fp v1"
 
 
 @contextlib.contextmanager
@@ -3649,12 +3698,21 @@ def _mail_detail(out: alsafari.Outcome) -> dict:
     )
 
 
-def _safari_fail(site: str, out: alsafari.Outcome, how: str) -> int:
+def _safari_fail(
+    site: str,
+    out: alsafari.Outcome,
+    how: str,
+    *,
+    route: str = "safari-login",
+    quarantined: bool = False,
+    detail: str = "",
+) -> int:
     """Record a failed `-L` (phase/code fixed), quarantine when a credential
     step may have sent something; the exit code. Says "quarantined" only
-    when the quarantine was written (N8)."""
-    quarantined = False
-    if out.credential:
+    when the quarantine was written (N8). `quarantined` True: the run's own
+    `-R` result says it quarantined already — never a second quarantine
+    (tp#1633), just the report."""
+    if out.credential and not quarantined:
         try:
             als.quarantine(site, out.phase, out.code)
             quarantined = True
@@ -3667,8 +3725,9 @@ def _safari_fail(site: str, out: alsafari.Outcome, how: str) -> int:
         {
             "phase": out.phase,
             "code": out.code,
-            "route": "safari-login",
+            "route": route,
             **_mail_detail(out),
+            **({"detail": detail} if detail else {}),
         },
     )
     who = "needs Albert" if out.rc == alsafari.NEEDS_ALBERT_RC else "not logged in"
@@ -3743,10 +3802,13 @@ def safari_login_action(  # pylint: disable=too-many-return-statements
         return 2
     if dry_run:
         return safari_dry_run(site, recipe)
-    gate = alsafari.interactive_gate()
-    if gate is not None:
-        print(f"❌ {site}: {phases.CODE_TEXT.get(gate, gate)} ({gate})")
-        return 3
+    # tp#1633: notion's headless route runs on an idle / locked Mac too; its
+    # gate waits right before the Safari drive (`_mail_code_pipeline`).
+    if site not in MAIL_CODE_SITES:
+        gate = alsafari.interactive_gate()
+        if gate is not None:
+            print(f"❌ {site}: {phases.CODE_TEXT.get(gate, gate)} ({gate})")
+            return 3
     q = als.quarantined(site)
     if q is not None:
         print(
@@ -3754,6 +3816,8 @@ def safari_login_action(  # pylint: disable=too-many-return-statements
             f"the main session releases it: ./agent-login.py -Q {site}"
         )
         return 2
+    if site in MAIL_CODE_SITES:
+        return _mail_code_pipeline(site, recipe)
     with safari_login_lock() as got:
         if not got:
             print(f"⏸  {site}: another Safari login runs — try again later")
@@ -3779,14 +3843,22 @@ def safari_dry_run(site: str, recipe: alsafari.Recipe) -> int:
         f"ℹ️ {site}: interactive gate "
         + ("open" if gate is None else f"closed — {phases.CODE_TEXT.get(gate, gate)}")
     )
+    if site in MAIL_CODE_SITES:
+        _mail_code_dry_run(site)
     cookies, why = _safari_jar(site)
     if why is not None:
         print(f"ℹ️ {site}: Safari's cookie file unreadable ({why})")
         return 0
+    if site in MAIL_CODE_SITES:
+        print(f"ℹ️ {site}: safari fp: {_safari_fp(site, cookies)}")
     held = safari_cookies.has_session(site, cookies)
+    nxt = "log Safari in"
+    if held and recipe.import_after:
+        nxt = "import it first"
+    elif site in MAIL_CODE_SITES:
+        nxt = "try the headless e-mail code"
     print(
-        f"ℹ️ {site}: Safari {'holds' if held else 'holds NO'} session — -L would "
-        + ("import it first" if held and recipe.import_after else "log Safari in")
+        f"ℹ️ {site}: Safari {'holds' if held else 'holds NO'} session — -L would " + nxt
     )
     return 0
 
@@ -3829,44 +3901,63 @@ def _safari_login_locked(  # pylint: disable=too-many-return-statements
         return _safari_fail(site, out, f"Safari's cookie file unreadable ({why})")
     before = safari_cookies.session_fingerprint(site, cookies)
     if safari_cookies.has_session(site, cookies) and recipe.import_after:
-        print(f"▶ {site}: Safari holds a session — importing it")
-        run = _import_run(site, agent=False)
-        if run.rc == 0:
-            record_check(
-                site,
-                True,
-                "logged in (Safari session imported)",
-                {
-                    **(run.result or {}),
-                    "phase": "ok",
-                    "code": "ok",
-                    "route": "safari-import",
-                },
-            )
-            print(f"✅ {site}: logged in with Albert's Safari session")
-            return 0
-        res = run.result or {}
-        code = str(res.get("code") or "")
-        if (
-            run.rc in IMPORT_STOP_RCS
-            or run.rc is None
-            or code
-            in (
-                "identity_unconfigured",
-                "wrong_account",
-                "indeterminate",
-            )
-        ):
-            # a Safari login cannot fix it, or the browser's state is unknown
-            out = alsafari.Outcome(
-                BUSY_RC if run.rc == BUSY_RC else 2,
-                code or "timeout",
-                phase=str(res.get("phase") or "client-proof"),
-            )
-            return _safari_fail(
-                site, out, _import_how(run, f"Safari session not imported — {out.code}")
-            )
+        stop = _safari_import_stage(site)
+        if stop is not None:
+            return stop
         print(f"↻ {site}: the imported session does not work — logging Safari in")
+    return _safari_drive_stage(site, recipe, before)
+
+
+def _safari_import_stage(site: str) -> int | None:
+    """Import the session Safari holds: the exit code when the pipeline
+    ends here (logged in, or a stop a Safari login cannot fix), None when
+    the imported session did not work and the pipeline goes on."""
+    print(f"▶ {site}: Safari holds a session — importing it")
+    run = _import_run(site, agent=False)
+    if run.rc == 0:
+        record_check(
+            site,
+            True,
+            "logged in (Safari session imported)",
+            {
+                **(run.result or {}),
+                "phase": "ok",
+                "code": "ok",
+                "route": "safari-import",
+            },
+        )
+        print(f"✅ {site}: logged in with Albert's Safari session")
+        return 0
+    res = run.result or {}
+    code = str(res.get("code") or "")
+    if (
+        run.rc in IMPORT_STOP_RCS
+        or run.rc is None
+        or code
+        in (
+            "identity_unconfigured",
+            "wrong_account",
+            "indeterminate",
+        )
+    ):
+        # a Safari login cannot fix it, or the browser's state is unknown
+        out = alsafari.Outcome(
+            BUSY_RC if run.rc == BUSY_RC else 2,
+            code or "timeout",
+            phase=str(res.get("phase") or "client-proof"),
+        )
+        return _safari_fail(
+            site, out, _import_how(run, f"Safari session not imported — {out.code}")
+        )
+    return None
+
+
+# One return per stage, in pipeline order.
+def _safari_drive_stage(  # pylint: disable=too-many-return-statements
+    site: str, recipe: alsafari.Recipe, before: str
+) -> int:
+    """Log Albert's Safari in, then import (`before`: Safari's session
+    fingerprint before the drive, for the flush wait)."""
     out = _drive_safari(site, recipe)
     if out.mail_archived == "failed":
         print(f"⚠️ {site}: the login-code mail could not be archived (left in INBOX)")
@@ -3912,6 +4003,208 @@ def _safari_login_locked(  # pylint: disable=too-many-return-statements
     )
     return _safari_fail(
         site, failed, _import_how(run, "Safari login done, the import failed")
+    )
+
+
+def _mail_code_run(site: str) -> BrowserRun:
+    """`browser.py login SITE -M -R` (the headless e-mail-code login),
+    bounded like every unattended login."""
+    with site_session(site):
+        return run_browser(
+            "login",
+            browser_site(site),
+            "-M",
+            timeout_s=browser_timeout("login"),
+            capture=True,
+            result=True,
+        )
+
+
+def _mail_code_falls_through(run: BrowserRun) -> bool:
+    """True when the `-M` run stopped BEFORE sending anything (a fixed code of
+    `MAIL_CODE_FALLTHROUGH`, no trigger, no credential, no quarantine): only
+    then may the attended Safari login follow."""
+    res = run.result or {}
+    return (
+        run.rc == 2
+        and str(res.get("code") or "") in MAIL_CODE_FALLTHROUGH
+        and not res.get("triggered")
+        and not res.get("credential")
+        and not res.get("quarantined")
+    )
+
+
+def _mail_code_stop(site: str, run: BrowserRun, detail: str) -> int:
+    """Report a `-M` stop that ends `-L` (no Safari fallback)."""
+    res = run.result or {}
+    rc = run.rc
+    timed_out = rc is None or rc in (LOGIN_TIMEOUT_RC, LOGIN_TIMEOUT_DIRTY_RC)
+    out = alsafari.Outcome(
+        rc if rc in (BUSY_RC, alsafari.NEEDS_ALBERT_RC) else 2,
+        str(res.get("code") or ("timeout" if timed_out else "unknown")),
+        credential=bool(res.get("credential"))
+        or res.get("phase_hint") == "mail-code-submitted",
+        phase=str(res.get("phase") or "unknown"),
+        mail_archived=str(res.get("mail_archived") or ""),
+    )
+    return _safari_fail(
+        site,
+        out,
+        f"headless e-mail-code login stopped — {out.code}",
+        route="mail-code",
+        quarantined=res.get("quarantined") is True,
+        detail=detail,
+    )
+
+
+# One return per stage of the notion pipeline (tp#1633 Design).
+def _mail_code_pipeline(  # pylint: disable=too-many-return-statements
+    site: str, recipe: alsafari.Recipe
+) -> int:
+    """`-L notion`: free check → Safari import → headless e-mail code
+    (`browser.py login notion -M`, ungated) → attended Safari login. The
+    Safari-login lock covers the free check and the import only; it is
+    released before `-M` (which serialises on its own per-site flock) and
+    reacquired only for the Safari fallback, after a fresh free check. An
+    unreadable Safari jar counts as "no Safari session"."""
+    detail = ""
+    with safari_login_lock() as got:
+        if not got:
+            print(f"⏸  {site}: another Safari login runs — try again later")
+            return BUSY_RC
+        stop = _free_check_gate(site)
+        if stop is not None:
+            return stop
+        cookies, why = _safari_jar(site)
+        if why is not None:
+            detail = f"safari_jar: {why}"
+            print(f"ℹ️ {site}: Safari's cookie file unreadable ({why}) — headless route")
+        elif safari_cookies.has_session(site, cookies):
+            stop = _safari_import_stage(site)
+            if stop is not None:
+                return stop
+            print(f"↻ {site}: the imported session does not work")
+        cookies.clear()
+    print(f"▶ {site}: headless e-mail-code login in the shared Chromium")
+    run = _mail_code_run(site)
+    res = run.result or {}
+    if run.rc == 0:
+        record_check(
+            site,
+            True,
+            "logged in headlessly (e-mail code)",
+            {
+                **res,
+                "phase": "ok",
+                "code": "ok",
+                "route": "mail-code",
+                **({"detail": detail} if detail else {}),
+            },
+        )
+        print(f"✅ {site}: logged in headlessly (e-mail code)")
+        return 0
+    if not _mail_code_falls_through(run):
+        return _mail_code_stop(site, run, detail)
+    code = str(res.get("code"))
+    print(f"↻ {site}: the headless route stopped before sending anything ({code})")
+    gate = alsafari.interactive_gate()
+    if gate is not None:
+        print(f"❌ {site}: {phases.CODE_TEXT.get(gate, gate)} ({gate})")
+        record_check(
+            site,
+            None,
+            f"headless e-mail code stopped ({code}); Safari login refused ({gate})",
+            {
+                "phase": "precheck",
+                "code": gate,
+                "route": "mail-code",
+                **({"detail": detail} if detail else {}),
+            },
+        )
+        return 3
+    with safari_login_lock() as got:
+        if not got:
+            print(f"⏸  {site}: another Safari login runs — try again later")
+            return BUSY_RC
+        stop = _free_check_gate(site)
+        if stop is not None:
+            return stop
+        cookies, _why = _safari_jar(site)
+        before = safari_cookies.session_fingerprint(site, cookies)
+        cookies.clear()
+        return _safari_drive_stage(site, recipe, before)
+
+
+def _safari_fp(site: str, cookies: list) -> str:
+    """A value-free 8-hex HMAC of Safari's session fingerprint for `site`
+    ('none' without a session); keyed per host so two runs compare."""
+    if not safari_cookies.has_session(site, cookies):
+        return "none"
+    key = f"{SAFARI_FP_SALT}:{socket.gethostname()}".encode()
+    fp = safari_cookies.session_fingerprint(site, cookies).encode()
+    return hmac.new(key, fp, hashlib.sha256).hexdigest()[:8]
+
+
+def _mail_code_cooldown_left(now: float | None = None) -> float | None:
+    """Seconds left of the code-mail cooldown (0 = free); None = unreadable."""
+    path = als.state_dir() / MAIL_CODE_STAMP
+    try:
+        at = float(json.loads(path.read_text(encoding="utf-8")).get("at"))
+    except FileNotFoundError:
+        return 0.0
+    except (OSError, ValueError, TypeError, AttributeError):
+        return None
+    left = MAIL_CODE_COOLDOWN_S - ((time.time() if now is None else now) - at)
+    return max(0.0, left)
+
+
+def _mail_code_dry_run(site: str) -> None:
+    """`-L notion -n`: is the headless route ready? READ-ONLY — the expected
+    e-mail, himalaya, a mailbox baseline (no trigger), the cooldown."""
+    try:
+        over = alsafari.load_overrides().get(site, {})
+    except alsafari.OverrideError:
+        over = {}
+    email = bool(str(over.get("expected_email") or ""))
+    himalaya = shutil.which("himalaya")
+    readable = False
+    step = next(
+        (s for s in alsafari.RECIPES[site].steps if s.kind == "mail_code"), None
+    )
+    if email and himalaya and step is not None:
+        reader = alsafari.MailReader(
+            himalaya,
+            str(over.get("mailbox") or "") or None,
+            env=dict(alsafari.NOTION_MAIL_ENV),
+        )
+        readable = alsafari.mail_baseline(reader, step) is not None
+    ready = email and himalaya is not None and readable
+    print(
+        f"ℹ️ {site}: headless e-mail-code route "
+        + (
+            "ready"
+            if ready
+            else "NOT ready ("
+            + ", ".join(
+                w
+                for w, bad in (
+                    ("no expected e-mail", not email),
+                    ("himalaya missing", himalaya is None),
+                    ("mailbox unreadable", email and himalaya and not readable),
+                )
+                if bad
+            )
+            + ")"
+        )
+    )
+    left = _mail_code_cooldown_left()
+    print(
+        f"ℹ️ {site}: code-mail cooldown "
+        + (
+            "unreadable"
+            if left is None
+            else ("free" if left <= 0 else f"{int(left)} s left")
+        )
     )
 
 

@@ -280,7 +280,7 @@ never calls the broker's `logout` op. Exit 2 when the jar is missing.
   site's session cookies (notion: `NOTION_AUTH_COOKIES`) under registration + lease,
   before the fill-only/broker path; help text says "shared browser only, session
   cookies only, Safari untouched".
-- [ ] B6 `agent-login.py`: `-L notion` pipeline (gate moved before the Safari drive,
+- [x] B6 `agent-login.py`: `-L notion` pipeline (gate moved before the Safari drive,
   lock released before `-M` and reacquired only for the Safari fallback, jar-unreadable
   → headless route, fall-through rules, `_safari_fail(route=…)` without double
   quarantine, record_check route `mail-code`, dry-run lines incl. `safari fp`); rows get

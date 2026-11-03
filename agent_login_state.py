@@ -71,6 +71,8 @@ IDENTITY_WHY_RE = re.compile(r"^[a-z][a-z -]{0,31}$")
 PRE_SUBMIT_PHASES = frozenset({"precheck", "limiter", "vault", "profile-proof"})
 # WS1b: a server probe's verdicts (Notion) as recorded in checks.json.
 SERVER_VERDICTS = frozenset({"valid", "invalid", "indeterminate"})
+# tp#1633: what a built-in check's verdict rests on (browser.py's `proof`).
+PROOFS = frozenset({"server", "server+sentinel", "dom", "dom-unverified"})
 # Two failed checks count as two in a row only this far apart (and from two
 # different runs): a re-probe minutes later is not an independent result.
 STREAK_SPACING_S = 3600.0
@@ -209,6 +211,7 @@ def record_check(  # pylint: disable=too-many-arguments
     cookie_days_left: object = None,
     run_id: str = "",
     now: float | None = None,
+    proof: str = "",
 ) -> dict[str, Any]:
     """Record a site's LATEST check (checks.json v2 + the legacy projection).
 
@@ -265,6 +268,7 @@ def record_check(  # pylint: disable=too-many-arguments
         # the proof ran against ('' = unknown): a promotion holds for it only.
         "config": config if CONFIG_RE.match(config or "") else "",
         "server": server if server in SERVER_VERDICTS else "",
+        "proof": proof if proof in PROOFS else "",
         "cookie_days_left": (
             cookie_days_left
             if isinstance(cookie_days_left, int)
