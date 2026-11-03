@@ -326,7 +326,7 @@ never calls the broker's `logout` op. Exit 2 when the jar is missing.
   prints the `safari fp` HMAC and never a cookie value. `logout notion` test: clears
   only `token_v2`/`notion_user_id`, keeps other notion cookies, never reads/writes
   Safari (safari_cookies patched to raise).
-- [ ] B8 docs: README notion row (~586: no longer "Assisted" only — headless e-mail
+- [x] B8 docs: README notion row (~586: no longer "Assisted" only — headless e-mail
   code via `-L notion`, unattended allowed; sentinel + server proof), the -L section
   (~1078–1170, 1562, 1586, 1593: order import → headless code → attended Safari);
   `docs/AGENTS_REFERENCE.md` §"Agents renew Albert's own sessions through his Safari"

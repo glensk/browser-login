@@ -378,6 +378,36 @@ framework. It is a **provider**: other repos depend on it, not the reverse. See
   - **When `-L` goes on:** only from a DEFINITE logged-out of the free check
     (code `logged_out`; Notion also `wrong_account`). Never from `internal`,
     `unknown`, `indeterminate` or a gated code.
+  - **The Notion exception (tp#1633, `PLAN_notion-headless-login.md`; Albert's
+    decision, notion ONLY):** `-L notion` may renew the session HEADLESSLY,
+    also while Albert is away and the Mac is idle or locked — no Safari
+    window, no focus loss. Order: free check → Safari import (when Safari
+    holds a session; an unreadable jar counts as none, `safari_jar: <why>` in
+    the detail) → `browser.py login notion -M` (the e-mail code in an owned
+    background tab of the shared Chromium, NOT behind the interactive gate) →
+    only then the attended Safari login, behind the gate (exit 3 only there).
+    - `-M` sends at most one code mail per 15 min (own cooldown file
+      `notion-mail-code.json` + flock `notion-mail-code.lock` in the state dir,
+      stamp written BEFORE the click), reads the code with himalaya under
+      `SDSC_EMAIL_NO_AUTO_AUTH=1` (a dead EPFL grant is `mailbox_unreadable`,
+      never a browser pop-up), triggers and submits once per process and
+      quarantines notion on any failure after the submit (also a deadline,
+      via `phase_hint: mail-code-submitted`).
+    - `safari_login_lock` is held only for the free check and the Safari
+      import; it is released before `-M` and reacquired only for the Safari
+      fallback. A stop after something was sent (`credential`, `needs_albert_*`,
+      `cooldown`, `email_code`, `wrong_account`, `indeterminate`, busy,
+      timeouts) never falls through to Safari; only a stop before the trigger
+      (`mailbox_unreadable`, `identity_unconfigured`, `himalaya_missing`,
+      `state_unwritable`, `recipe_stuck` without a trigger) may.
+    - `LaunchAgent`s still never run it (`AGENT_LOGIN_SCHEDULED`), and a plain
+      `browser.py login notion` (no `-M`) stays guided-only (exit 4).
+    - Proof: `logged-in notion` writes `sentinel` and `proof:
+      server+sentinel` (server `loadUserContent` + the sidebar); a notion row
+      with such a check gets `sentinel: "built-in"`, so agents.md drops the
+      "weak proof" note.
+    - `browser.py logout notion` deletes only `token_v2` / `notion_user_id`
+      in the shared jar (device cookies stay, Safari untouched).
   - **Safari is driven only through `safari.py`, by LONG option names**
     (`--new-window`, `--handle`, `--expect-host`, `--user-only`, `--close`,
     `--capabilities`; never the short letters). Every fill, click and eval names

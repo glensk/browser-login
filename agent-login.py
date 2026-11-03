@@ -16,7 +16,9 @@ one of Notion, Slack, OpenAI or claude.ai lapses, an AGENT renews it: `-L SITE`
 imports your Safari session — logging Safari in first (safari.py with every
 feature its recipe needs; the credentials from the login broker, else your
 Vaultwarden tab) when it has lapsed there too — claude.ai through its automated
-magic link. Only a CAPTCHA, an SMS code, a push / security-key approval (exit 4,
+magic link, Notion headlessly with the e-mail code in the shared Chromium when
+no Safari session imports (no window, also while you are away; only its Safari
+fallback is attended). Only a CAPTCHA, an SMS code, a push / security-key approval (exit 4,
 named) and the Touch ID touch stay yours: a locked vault is the agent's — it runs
 `~/.local/libexec/vault-touchid unlock-safari -a main` (you touch Touch ID once) or onboards the
 item into the broker (`broker-add.py ITEM -Y`/`-Z`); `-g SITE` is still there
@@ -44,14 +46,16 @@ Examples:
   ./agent-login.py -V           # onboarding review of every broker item (read-only)
   ./agent-login.py -V -i new.json  # review a PLANNED item before the vault write
   ./agent-login.py -D docker    # remove: run while listed, again after the vault item went
-  ./agent-login.py -L notion    # an AGENT imports Albert's Safari session (+ a Safari login)
+  ./agent-login.py -L notion    # an AGENT renews Notion: Safari import, else the headless
+                                # e-mail code (also unattended), else an attended Safari login
   ./agent-login.py -L galaxus-de -n  # what -L would do (no import, no Safari login)
   ./agent-login.py -R           # refresh-only pass (NPM tokens; LaunchAgent every 6 h)
   ./agent-login.py -l           # items agents can fill into Albert's Safari (safari.py -L)
   ./agent-login.py -H runai-test3  # its identity proofs that did not say match (all: -H)
 
 Sites on Albert's session (Safari sites, galaxus-de, Notion, Slack, OpenAI,
-claude.ai) are renewed by AGENTS with -L — never a to-do for Albert, except
+claude.ai) are renewed by AGENTS with -L (Notion headlessly, also while Albert
+is away) — never a to-do for Albert, except
 a CAPTCHA, an SMS code or a push / security-key approval (exit 4, named) and
 the Touch ID touch of `~/.local/libexec/vault-touchid unlock-safari -a main` / `broker-add.py`,
 which the agent runs itself when the vault is locked. myfritz is on demand: never checked daily.
@@ -963,7 +967,9 @@ def _route_header(rows: list[dict]) -> str:
         return rest
     return (
         f"for {', '.join(routed)} run `agent-login.py -L <site>` yourself (it "
-        "renews the session through Albert's Safari or the magic link; one run, "
+        "renews the session through Albert's Safari or the magic link; Notion: "
+        "headless e-mail code, also while Albert is away; exit 3 only for the "
+        "Safari fallback; one run, "
         "no retries) — never ask Albert to log in: only a CAPTCHA, an SMS code, "
         "a push / security-key approval and the Touch ID touch are his, and -L "
         "names them; a locked vault is NOT his: -L takes the login from the "
@@ -4563,11 +4569,15 @@ def build_parser() -> argparse.ArgumentParser:
         "features), else log Safari in (safari.py, a "
         "new window; the login broker's credentials, else his Vaultwarden "
         "tab and clipboard) and import it; "
-        "claude.ai: the automated magic link. One run, no retries; never "
+        "claude.ai: the automated magic link; notion: after the import the "
+        "headless e-mail code (`browser.py login notion -M`, also while "
+        "Albert is away), the Safari login only as its fallback. One run, no "
+        "retries; never "
         "from a LaunchAgent. Exit 4 = needs Albert (CAPTCHA, SMS, push / "
         "security key); a locked vault is the agent's: `vault-touchid "
         "unlock-safari -a main` (Albert touches once); exit 3 = the Mac is "
-        "locked or idle: retry later",
+        "locked or idle (for notion only before its Safari fallback): retry "
+        "later",
     )
     ap.add_argument(
         "-l",
