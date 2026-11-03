@@ -889,3 +889,93 @@ def test_mail_code_on_another_site_is_exit_2(
     assert "notion only" in capsys.readouterr().err
     assert browser._cmd_login(9, "notion") == 0
     assert called == [9]
+
+
+# ---------------------------------------------------------------------------
+# B4: the real sentinel proof of `logged-in notion`
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("server", "sidebar", "on_login", "want"),
+    [
+        ("valid", True, False, ("valid", "server+sentinel")),
+        ("valid", False, False, ("valid", "server")),
+        ("invalid", False, True, ("invalid", "server")),
+        ("indeterminate", True, False, ("valid", "dom")),
+        ("indeterminate", False, False, ("indeterminate", "")),
+    ],
+)
+def test_server_plus_sentinel_needs_both(
+    server: str, sidebar: bool, on_login: bool, want: tuple[str, str]
+) -> None:
+    assert browser.notion_verdict(server, sidebar, on_login) == want
+
+
+class _CheckPage:
+    def __init__(self, server: str, url: str = "https://app.notion.com/") -> None:
+        self.url = url
+        self.answer = {"server": server, "identity": "match"}
+        self.context = self
+
+    def cookies(self, _origins: list[str]) -> list[dict[str, Any]]:
+        return []
+
+    def evaluate(self, js: str, arg: Any = None) -> dict[str, str]:
+        assert js == browser.NOTION_SERVER_JS
+        return dict(self.answer)
+
+
+@pytest.mark.parametrize(
+    ("server", "sidebar", "proof"),
+    [
+        ("valid", True, "server+sentinel"),
+        ("valid", False, "server"),
+        ("invalid", False, "server"),
+    ],
+)
+def test_the_check_page_reports_the_sentinel(
+    monkeypatch: pytest.MonkeyPatch, server: str, sidebar: bool, proof: str
+) -> None:
+    monkeypatch.setattr(browser, "_notion_wait_for_login", lambda *_a, **_k: sidebar)
+    url = "https://app.notion.com/login" if server == "invalid" else ""
+    page = _CheckPage(server, url or "https://app.notion.com/")
+    got = browser._notion_check_page(page, EMAIL)
+    assert got["sentinel"] is sidebar
+    assert got["proof"] == proof
+    assert got["verdict"] == ("valid" if server == "valid" else "invalid")
+
+
+@pytest.mark.parametrize(
+    ("check", "rc"),
+    [
+        ({**_check("valid"), "proof": "server+sentinel", "sentinel": True}, 0),
+        ({**_check("valid"), "sentinel": False}, 0),
+        ({**_check("invalid"), "sentinel": False}, 2),
+    ],
+)
+def test_logged_in_writes_the_sentinel_and_proof(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, check: dict[str, Any], rc: int
+) -> None:
+    monkeypatch.setattr(browser, "_notion_check", lambda _port, _exp="": check)
+    monkeypatch.setattr(browser, "_notion_expected_email", lambda: EMAIL)
+    out = tmp_path / "r.json"
+    browser._result_begin("logged-in", "notion", str(out))
+    got = browser.cmd_notion_logged_in(9)
+    browser._result_write(got)
+    rec = json.loads(out.read_text(encoding="utf-8"))
+    assert got == rc
+    assert rec["sentinel"] is check["sentinel"]
+    assert rec["proof"] == check["proof"]
+    assert rec["server"] == check["server"]
+
+
+def test_an_unopenable_tab_has_no_sentinel(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(browser, "_notion_probe_verified", lambda: False)
+    monkeypatch.setattr(browser, "_with_background_page", lambda *_a, **_k: None)
+    got = browser._notion_check(9, EMAIL)
+    assert (got["verdict"], got["proof"], got["sentinel"]) == (
+        "indeterminate",
+        "",
+        False,
+    )

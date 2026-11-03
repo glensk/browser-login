@@ -274,7 +274,7 @@ never calls the broker's `logout` op. Exit 2 when the jar is missing.
   `min(MAIL_WAIT_S, deadline_left − 120)`; assert in a unit test that the sum of caps ≤
   `login_timeout_s()` (480 s) and that agent-login's `browser_timeout("login")` covers
   it (`agent_login_jobs.py`).
-- [ ] B4 `bin/browser.py`: real sentinel — `sentinel` field + `server+sentinel` proof in
+- [x] B4 `bin/browser.py`: real sentinel — `sentinel` field + `server+sentinel` proof in
   `_notion_check_page` / `cmd_notion_logged_in` result record.
 - [ ] B5 `bin/browser.py`: `logout SITE` for `SAFARI_BUILTIN` sites → delete only the
   site's session cookies (notion: `NOTION_AUTH_COOKIES`) under registration + lease,

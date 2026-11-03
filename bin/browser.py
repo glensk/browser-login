@@ -15867,9 +15867,11 @@ def notion_verdict(
 ) -> tuple[str, str]:
     """(verdict, proof) from the server's answer and the page (pure, D8).
     Before L0 (`verified` False) a visible sidebar keeps a server "invalid"
-    from turning a working session ❌ (proof ``dom-unverified``)."""
+    from turning a working session ❌ (proof ``dom-unverified``). A server
+    "valid" with the sidebar up is the strongest proof, ``server+sentinel``
+    (tp#1633 B4; the verdict is the same as with ``server``)."""
     if server == "valid":
-        return "valid", "server"
+        return "valid", "server+sentinel" if sidebar else "server"
     if server == "invalid":
         if sidebar:
             return ("indeterminate", "") if verified else ("valid", "dom-unverified")
@@ -15948,6 +15950,7 @@ def _notion_check_page(page: Any, expected: str, verified: bool = False) -> dict
         "server": server,
         "identity": ident if expected else "unconfigured",
         "cookie_days_left": days,
+        "sentinel": bool(sidebar),  # the workspace sidebar showed (tp#1633 B4)
     }
 
 
@@ -15959,10 +15962,10 @@ def _notion_probe_verified() -> bool:
 
 def _notion_check(port: int, expected: str = "") -> dict:
     """The tri-state Notion check in a fresh background tab: ``verdict``
-    (valid / invalid / indeterminate), ``proof`` (server / dom /
-    dom-unverified), ``server``, ``identity`` (match / mismatch / unknown /
-    unconfigured), and ``cookie_days_left``. A tab that cannot be opened is
-    indeterminate."""
+    (valid / invalid / indeterminate), ``proof`` (server+sentinel / server /
+    dom / dom-unverified), ``server``, ``identity`` (match / mismatch /
+    unknown / unconfigured), ``cookie_days_left`` and ``sentinel`` (the
+    sidebar showed). A tab that cannot be opened is indeterminate."""
     verified = _notion_probe_verified()
     got = _with_background_page(
         port,
@@ -15977,6 +15980,7 @@ def _notion_check(port: int, expected: str = "") -> dict:
         "server": "indeterminate",
         "identity": "unknown",
         "cookie_days_left": None,
+        "sentinel": False,
     }
 
 
@@ -16047,6 +16051,7 @@ def cmd_notion_logged_in(port: int) -> int:
     _result_set(
         server=res["server"],
         proof=res["proof"],
+        sentinel=bool(res.get("sentinel")),
         cookie_days_left=res["cookie_days_left"],
         identity=res["identity"] if res["identity"] != "unknown" else "",
     )
