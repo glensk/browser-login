@@ -424,7 +424,7 @@ names `-L notion -s` ("Albert says 'log me into notion' → run
   6. Negative, read-only: `agent-login.py -L notion -s http://app.notion.com/` and
      `-s https://example.com/` → exit 2 `bad_url`, Safari untouched.
   ↳ evidence 2026-11-03: live 2026-11-03 23:3x: -n gate open, import-safari -P match, -s and -s <S3 URL> exit 0, Albert confirmed Notion logged in to renku workspace; cooldown mtime unchanged 1793715634; no quarantine; http:// and example.com -> exit 2 bad_url
-- [ ] B13 LIVE CANARY B — the e-mail-code login in Safari (only when Safari is
+- [x] B13 LIVE CANARY B — the e-mail-code login in Safari (only when Safari is
   GENUINELY logged out of Notion — B12 step 2 said `logged_out`, or a later agent run
   meets it; never forced by a logout; Albert present; the cooldown free).
   `agent-login.py -L notion -s` → Safari login window opens, e-mail filled, "Continue",
@@ -436,6 +436,7 @@ names `-L notion -s` ("Albert says 'log me into notion' → run
   cooldown, report (first live run of `CODE_FILL_JS` — a finding, not a bug hunt in
   place); a quarantine → report, never `-Q` it yourself. Until B13 ran, README /
   agents.md say "the Safari code fill is not proven live yet" (removed after B13).
+  ↳ evidence 2026-11-04: live Safari code login 2026-11-04 14:38-14:40: gate import-safari exit 2 logged_out, agent-login.py -L notion -s exit 0 landing app.notion.com, import-safari -P match; wording dropped in 7f82d11 (sub-plan B4)
 
 ## Verification
 
