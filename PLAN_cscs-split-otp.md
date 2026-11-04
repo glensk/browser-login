@@ -273,7 +273,7 @@ Build rounds (at most 3 boxes per round, one writer agent per round, rounds in o
   `test_a_single_one_time_code_still_logs_in`. The item secret gets a test-only TOTP seed
   generated in the test (never a real one). The existing tests keep `otp_form="none"` and do
   not change.
-- [ ] B5 Production landing and live canary (R3, coordinated with tp#1672 B6; main session or
+- [x] B5 Production landing and live canary (R3, coordinated with tp#1672 B6; main session or
   `[full-context: albert]` agent). Precondition: B1-B4 are merged to `origin/main`
   (`install.sh` installs `git archive HEAD` and refuses a HEAD that is not in `origin/main`),
   and tp#1672 B6 has not landed on its own in the meantime. Steps:
