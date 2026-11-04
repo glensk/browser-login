@@ -285,7 +285,7 @@ Build rounds (at most 3 boxes per round, one writer agent per round, rounds in o
   Rollback: re-point `current` to the recorded release with `sudo -n ln -sfn <old>
   /usr/local/libexec/login-broker/current.tmp` plus `mv -h` over `current`, then
   `sudo -n launchctl kickstart -k system/com.albert.login-broker`.
-- [ ] B3 `tests/test_login_timeout.py`: move the short budget into the stalled call for
+- [x] B3 `tests/test_login_timeout.py`: move the short budget into the stalled call for
   the three tests `test_stuck_evaluate_fires_closes_the_owned_tab_and_exits_124`,
   `test_stalled_raw_create_fires_on_bg_create_and_leaks_no_target` and
   `test_failed_close_still_listed_is_125_unconfirmed`

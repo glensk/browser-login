@@ -27,6 +27,7 @@ from __future__ import annotations
 # pylint: disable=too-many-positional-arguments
 # The cache fixture and record writer mirror test_guided_login's on purpose.
 # pylint: disable=duplicate-code
+import contextlib
 import fcntl
 import importlib.util
 import json
@@ -124,11 +125,31 @@ def exits(monkeypatch) -> Exits:
     return ex
 
 
+STALL_BUDGET_S = 0.3  # the short step budget a stalled call opens itself
+
+
+def _stall_budget() -> Any:
+    """The short `background_page` budget, opened by the stalled call itself.
+
+    `BG_PAGE_STEP_S` stays at a value the setup (registry, ledger, raw create,
+    attach) cannot exhaust under load; only the stuck call runs on the clock,
+    through the same public `LoginDeadline.push` `_background_page_run` uses
+    (`test_bg_step_budget_covers_create_and_close` pins that it covers the
+    whole tab, create to close)."""
+    dl = browser._active_deadline()
+    assert dl is not None, "the stalled call must run under the login deadline"
+    return dl.push(STALL_BUDGET_S, "background_page")
+
+
 class FakePage:
-    """The adopted page: `evaluate` blocks until released (or answers at once)."""
+    """The adopted page: `evaluate` blocks until released (or answers at once).
+
+    A blocking `evaluate` opens the short step budget around its wait and
+    records when the stall began (`stalled_at`)."""
 
     def __init__(self, release: threading.Event | None = None) -> None:
         self.release = release
+        self.stalled_at: float | None = None
 
     def wait_for_load_state(self, *_a, **_k) -> None:
         return None
@@ -138,7 +159,9 @@ class FakePage:
 
     def evaluate(self, *_a, **_k) -> bool:
         if self.release is not None:
-            self.release.wait(20)
+            with _stall_budget():
+                self.stalled_at = time.monotonic()
+                self.release.wait(20)
         return True
 
     def close(self) -> None:
@@ -206,13 +229,13 @@ def _bg_run(port: int, fn=lambda page: page.evaluate("1")):
 def test_stuck_evaluate_fires_closes_the_owned_tab_and_exits_124(
     fake, cache, exits, attach, close_spy, monkeypatch
 ):
-    monkeypatch.setattr(browser, "BG_PAGE_STEP_S", 0.3)
-    attach(FakePage(release=exits.released))
-    t0 = time.monotonic()
+    monkeypatch.setattr(browser, "BG_PAGE_STEP_S", 30.0)
+    page = FakePage(release=exits.released)
+    attach(page)
     with browser._login_deadline(fake.port, "login", "fakesite", 30, end_event="login"):
         _bg_run(fake.port)
     assert exits.codes == [124]
-    assert exits.at[0] - t0 < 2.0
+    assert page.stalled_at is not None and exits.at[0] - page.stalled_at < 2.0
     tid = fake.created[0]
     assert tid in close_spy and tid in fake.closed and tid not in fake.targets
     dog = [r for r in _events(cache, "watchdog") if "scope" in r]
@@ -227,14 +250,15 @@ def test_stuck_evaluate_fires_closes_the_owned_tab_and_exits_124(
 def test_stalled_raw_create_fires_on_bg_create_and_leaks_no_target(
     fake, cache, exits, attach, monkeypatch
 ):
-    monkeypatch.setattr(browser, "BG_PAGE_STEP_S", 0.3)
+    monkeypatch.setattr(browser, "BG_PAGE_STEP_S", 30.0)
     fake.create_stall = True
     real = browser._cdp_create_background_target
-    monkeypatch.setattr(
-        browser,
-        "_cdp_create_background_target",
-        lambda ws, url, budget_s=5.0: real(ws, url, 1.5),
-    )
+
+    def stalled_create(ws, url, budget_s=5.0):
+        with _stall_budget():
+            return real(ws, url, 1.5)
+
+    monkeypatch.setattr(browser, "_cdp_create_background_target", stalled_create)
     with browser._login_deadline(fake.port, "login", "fakesite", 30):
         assert _bg_run(fake.port) is None
     assert exits.codes == [124]
@@ -246,7 +270,7 @@ def test_stalled_raw_create_fires_on_bg_create_and_leaks_no_target(
 def test_failed_close_still_listed_is_125_unconfirmed(
     fake, cache, exits, attach, monkeypatch, capsys
 ):
-    monkeypatch.setattr(browser, "BG_PAGE_STEP_S", 0.3)
+    monkeypatch.setattr(browser, "BG_PAGE_STEP_S", 30.0)
     monkeypatch.setattr(browser, "_cdp_close_target", lambda *a, **k: False)
     attach(FakePage(release=exits.released))
     with browser._login_deadline(fake.port, "login", "fakesite", 30):
@@ -257,6 +281,44 @@ def test_failed_close_still_listed_is_125_unconfirmed(
     dog = [r for r in _events(cache, "watchdog") if "scope" in r]
     assert dog[0]["confirmed"] is False
     assert "may still be open" in capsys.readouterr().err
+
+
+def test_bg_step_budget_covers_create_and_close(
+    fake, cache, exits, attach, monkeypatch
+):
+    """The structural half of the tests above: `_background_page_run` holds
+    ONE `BG_PAGE_STEP_S` budget from before the tab is created until after it
+    is closed (the stalled-call tests open their own short one)."""
+    events: list[tuple[str, ...]] = []
+    real_push = browser._deadline_push
+    real_step = browser._deadline_step
+
+    @contextlib.contextmanager
+    def push_spy(seconds: float, scope: str) -> Iterator[None]:
+        with real_push(seconds, scope):
+            events.append(("enter", str(seconds), scope))
+            try:
+                yield
+            finally:
+                events.append(("exit", str(seconds), scope))
+
+    def step_spy(label: str) -> None:
+        events.append(("step", label))
+        real_step(label)
+
+    monkeypatch.setattr(browser, "_deadline_push", push_spy)
+    monkeypatch.setattr(browser, "_deadline_step", step_spy)
+    with browser._login_deadline(fake.port, "login", "fakesite", 30):
+        assert _bg_run(fake.port) is True
+    assert not exits.codes
+    budget = str(browser.BG_PAGE_STEP_S)
+    enter = events.index(("enter", budget, "background_page"))
+    leave = events.index(("exit", budget, "background_page"))
+    creates = [i for i, ev in enumerate(events) if ev == ("step", "bg:create")]
+    closes = [i for i, ev in enumerate(events) if ev == ("step", "bg:close")]
+    assert creates and closes, events
+    assert enter < min(creates) <= max(creates) < min(closes), events
+    assert max(closes) < leave, events
 
 
 def test_normal_path_closes_by_raw_cdp_and_owns_nothing_after(
