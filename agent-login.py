@@ -1056,6 +1056,12 @@ SAFARI_ROUTES: dict[str, SafariRoute] = {
     ),
     "galaxus": SafariRoute("https://www.galaxus.ch/de/orders", "in_safari"),
     "galaxus-de": SafariRoute("https://www.galaxus.de/de/orders", "in_safari"),
+    # tp#1644 B6: the built-in sites, proven by `import-safari SITE -P` (a
+    # throwaway context with Safari's cookies; slack: the `d` cookie, the
+    # client mints its own token store); a logged-out Safari → the Google
+    # steps (slack: else the e-mail code, `MAIL_CODE_ENV["slack"]`)
+    "slack": SafariRoute("https://swiss-data-science.slack.com/", "builtin"),
+    "openai": SafariRoute("https://chatgpt.com/", "builtin"),
 }
 # tp#1644: sites that can NOT have a Safari route (⛔), with a fixed reason
 # code. Admin accounts (listing `privilege` admin) are derived, not listed:
@@ -3884,7 +3890,12 @@ IMPORT_STOP_RCS = frozenset({BUSY_RC, LOGIN_TIMEOUT_RC, LOGIN_TIMEOUT_DIRTY_RC})
 MAIL_CODE_SITES = frozenset({"notion"})
 # tp#1643: the extra environment of a mail-code site's himalaya in Safari
 # drives (notion: a dead EPFL grant stops instead of opening a browser).
-MAIL_CODE_ENV: dict[str, dict[str, str]] = {"notion": dict(alsafari.NOTION_MAIL_ENV)}
+# tp#1644 B6: slack's e-mail-code fallback reads the same way (a dead EPFL
+# grant stops; never a browser sign-in), its cooldown `slack-mail-code.json`.
+MAIL_CODE_ENV: dict[str, dict[str, str]] = {
+    "notion": dict(alsafari.NOTION_MAIL_ENV),
+    "slack": dict(alsafari.NOTION_MAIL_ENV),
+}
 # `-M` stops that sent nothing: only these may fall through to the Safari
 # login (and only with the interactive gate open). Every other stop ends -L.
 MAIL_CODE_FALLTHROUGH = frozenset(

@@ -13,6 +13,8 @@ from __future__ import annotations
 
 # pylint: disable=missing-function-docstring,import-error,wrong-import-position
 # pylint: disable=protected-access,redefined-outer-name,unused-argument
+# One file for the whole route table (B2, B6, B8): pylint: disable=too-many-lines
+import contextlib
 import json
 import os
 import secrets
@@ -20,6 +22,7 @@ import shutil
 import stat
 import subprocess
 import sys
+import time
 import urllib.parse
 from pathlib import Path
 from typing import Any
@@ -119,6 +122,9 @@ EXPECTED: dict[str, str] = {
             "kleinanzeigen",
             "ricardo",
             "tutti",
+            # tp#1644 B6: the built-in sites
+            "openai",
+            "slack",
         ),
         ROUTE,
     ),
@@ -165,11 +171,9 @@ EXPECTED: dict[str, str] = {
             "navidrome-albert",
             "npm-nixos",
             "npm-raspi",
-            "openai",
             "portainer-ds218",
             "qbittorrent",
             "runai-test3",
-            "slack",
             "smartsheet",
             "stirling",
             "switch",
@@ -268,7 +272,8 @@ def _rows() -> list[dict[str, Any]]:
             "status": "extra",
             "privilege": "admin",
         },
-        {"site": "openai", "name": "openai", "status": "safari"},
+        # a login without a route yet (openai is routed since tp#1644 B6)
+        {"site": "github", "name": "github", "status": "extra"},
     ]
 
 
@@ -290,13 +295,13 @@ def test_the_overview_shows_the_blocked_cell_and_its_legend(
         name: next(x for x in lines[head + 2 :] if f" {name} " in x)
         .split(name, 1)[1]
         .split()[0]
-        for name in ("Notion", "google-kindle", "abs-root", "openai")
+        for name in ("Notion", "google-kindle", "abs-root", "github")
     }
     assert cells == {
         "Notion": "✅",
         "google-kindle": "⛔",
         "abs-root": "⛔",
-        "openai": "❌",
+        "github": "❌",
     }
 
 
@@ -306,7 +311,7 @@ def test_json_rows_carry_safari_why() -> None:
     kindle = rows["google-kindle"]
     assert (kindle["safari"], kindle["safari_why"]) == (False, "albert_only")
     assert rows["abs-root"]["safari_why"] == "admin_account"
-    assert rows["openai"]["safari_why"] == ""
+    assert rows["github"]["safari_why"] == ""
 
 
 def test_agents_md_lists_the_blocked_sites_in_one_line() -> None:
@@ -314,7 +319,7 @@ def test_agents_md_lists_the_blocked_sites_in_one_line() -> None:
     assert line.startswith("Safari logins that stay Albert's (⛔, never try them): ")
     for site, code in {**al.SAFARI_INFEASIBLE, "abs-root": "admin_account"}.items():
         assert f"{site} ({code})" in line
-    assert "openai" not in line and "notion" not in line
+    assert "github" not in line and "notion" not in line
     text = al.agent_summary({"rows": _rows(), "broker_ok": True, "broker": "x"}, {})
     assert line in text and text.count("never try them") == 1
 
@@ -773,6 +778,240 @@ def test_the_other_sc_sites_import_when_chromium_is_logged_out(
 ) -> None:
     assert _go_sc(sc, site, [_landed(site)]) == 0
     assert sc["imports"] == [site]
+
+
+# ---------------------------------------------------------------------------
+# tp#1644 B6: the built-in routes (slack, openai; the real recipes)
+# ---------------------------------------------------------------------------
+
+# site → (landing, the login page the Google click is on, the sentinel page)
+BI: dict[str, tuple[str, str, str]] = {
+    "slack": (
+        "https://swiss-data-science.slack.com/",
+        "https://swiss-data-science.slack.com/",
+        "https://app.slack.com/client/T1/C1",
+    ),
+    "openai": (
+        "https://chatgpt.com/",
+        "https://auth.openai.com/log-in",
+        "https://chatgpt.com/",
+    ),
+}
+GOOGLE = "accounts.google.com"
+ACCOUNT = "albert@example.org"  # the override file's Google account (fake)
+
+
+def test_the_builtin_routes_use_the_throwaway_proof() -> None:
+    for site, (landing, _login, _done) in BI.items():
+        assert al.SAFARI_ROUTES[site] == al.SafariRoute(landing, "builtin")
+        assert al.safari_target_url(site, "") == landing
+        assert al.login_columns(site).safari
+        recipe = alsafari.RECIPES[site]
+        assert recipe.identity == site and not recipe.broker and recipe.import_after
+    assert al.has_mail_code(alsafari.RECIPES["slack"])
+    assert not al.has_mail_code(alsafari.RECIPES["openai"])
+    assert al.MAIL_CODE_ENV["slack"] == {"SDSC_EMAIL_NO_AUTO_AUTH": "1"}
+    assert al.als.mail_code_file("slack") == "slack-mail-code.json"
+    # the headless -M set stays notion's
+    assert "slack" not in al.MAIL_CODE_SITES
+
+
+@pytest.fixture
+def bi(run: dict[str, Any], monkeypatch: pytest.MonkeyPatch) -> dict[str, Any]:
+    """`run` for a built-in route: Safari's jar (`held`), the `-P` proof's
+    verdict (`proof`), the override file (`over`); no flush wait, no
+    himalaya."""
+    run.update(held=True, proof=(0, "match"), over={"account": ACCOUNT}, proofs=[])
+
+    def run_browser(*args: Any, **_k: Any) -> Any:
+        run["proofs"].append(args)
+        rc, said = run["proof"]
+        return al.BrowserRun(rc, False, "", 0.0, {"safari": said, "code": said})
+
+    monkeypatch.setattr(al, "_safari_jar", lambda _s: ([], None))
+    monkeypatch.setattr(
+        al.safari_cookies, "has_session", lambda _s, _c: bool(run["held"])
+    )
+    monkeypatch.setattr(al, "run_browser", run_browser)
+    monkeypatch.setattr(al, "site_session", lambda _s: contextlib.nullcontext())
+    monkeypatch.setattr(al, "_wait_flush", lambda _s, _b: True)
+    monkeypatch.setattr(
+        alsafari, "load_overrides", lambda: {s: dict(run["over"]) for s in BI}
+    )
+    monkeypatch.setattr(al.shutil, "which", lambda _n: None)
+    return run
+
+
+def _go_bi(st: dict[str, Any], site: str, script: list, **kw: Any) -> int:
+    st["safari"] = Safari(alsafari.RECIPES[site], script)
+    rc: int = al.safari_target_action(site, "", **kw)
+    return rc
+
+
+def _google_login(site: str) -> list:
+    """The login page's Google button, the chooser, the consent, the
+    logged-in page (`steps`: one [when, unless] per recipe step)."""
+    _landing, login, done = BI[site]
+    n = len(alsafari.RECIPES[site].steps)
+
+    def on(i: int) -> list[list[bool]]:
+        return [[j == i, False] for j in range(n)]
+
+    return [
+        (login, w._page(steps=on(0))),
+        (f"https://{GOOGLE}/o/oauth2/chooser", w._page(steps=on(1))),
+        (f"https://{GOOGLE}/signin/oauth/consent", w._page(steps=on(2))),
+        (done, w._page(sentinel=True)),
+    ]
+
+
+@pytest.mark.parametrize("site", sorted(BI))
+def test_bi_a_proven_session_only_opens_the_landing_page(
+    site: str, bi: dict[str, Any]
+) -> None:
+    assert _go_bi(bi, site, [_google_login(site)[-1]]) == 0
+    assert bi["proofs"][0][:3] == ("import-safari", site, "-P")
+    fake = bi["safari"]
+    # no Machine window, no step: safari.py's status, then the landing page
+    assert [c[0] for c in fake.calls] == ["--status", "--open"]
+    assert fake.landing_opens() == [["--open", BI[site][0], "--wait", "20"]]
+    assert not (al.als.state_dir() / al.als.mail_code_file(site)).exists()
+
+
+@pytest.mark.parametrize("held", [True, False])
+@pytest.mark.parametrize("site", sorted(BI))
+def test_bi_logged_out_runs_the_google_steps_then_opens(
+    site: str, held: bool, bi: dict[str, Any]
+) -> None:
+    bi["held"] = held
+    bi["proof"] = (2, "logged_out")
+    assert _go_bi(bi, site, _google_login(site)) == 0
+    assert len(bi["proofs"]) == (1 if held else 0)  # no session: no proof run
+    fake = bi["safari"]
+    clicks = fake.ops("--click")
+    assert [c[1] for c in clicks] == [
+        alsafari.RECIPES[site].steps[0].trigger,
+        ACCOUNT,
+        "Continue",
+    ]
+    assert [_value(c, "--expect-host") for c in clicks] == [
+        urllib.parse.urlsplit(BI[site][1]).hostname,
+        GOOGLE,
+        GOOGLE,
+    ]
+    assert not fake.ops("--login", "--otp")  # no password, no TOTP
+    assert fake.landing_opens() == [["--open", BI[site][0], "--wait", "20"]]
+    assert bi["imports"] == [site]  # the shared Chromium was logged out
+    # Google's way in: no code mail, no cooldown stamp
+    assert not (al.als.state_dir() / al.als.mail_code_file(site)).exists()
+
+
+@pytest.mark.parametrize("held", [True, False])
+@pytest.mark.parametrize("site", sorted(BI))
+def test_bi_prove_only_and_logged_out_is_exit_2_without_steps(
+    site: str, held: bool, bi: dict[str, Any], capsys: pytest.CaptureFixture[str]
+) -> None:
+    bi["held"] = held
+    bi["proof"] = (2, "logged_out")
+    assert _go_bi(bi, site, _google_login(site), prove_only=True) == 2
+    assert "safari_logged_out" in capsys.readouterr().out
+    fake = bi["safari"]
+    assert [c[0] for c in fake.calls] == ["--status"]  # no window, no step
+    assert not bi["imports"] and not bi["mail"]
+    assert not (al.als.state_dir() / al.als.mail_code_file(site)).exists()
+
+
+@pytest.mark.parametrize("site", sorted(BI))
+def test_bi_the_google_chooser_picks_only_the_expected_account(
+    site: str, bi: dict[str, Any], capsys: pytest.CaptureFixture[str]
+) -> None:
+    bi["proof"] = (2, "logged_out")
+    assert _go_bi(bi, site, _google_login(site)) == 0
+    on_google = [
+        c
+        for c in bi["safari"].ops("--click")
+        if _value(c, "--expect-host") == GOOGLE and c[1] != "Continue"
+    ]
+    # exactly one pick on Google: the configured account, its row only
+    (pick,) = on_google
+    assert pick[:4] == ["--click", ACCOUNT, "--row", ACCOUNT]
+    # no account configured: the chooser is never clicked
+    capsys.readouterr()
+    bi["over"] = {}
+    assert _go_bi(bi, site, _google_login(site)) == 2
+    assert bi["records"][-1][3]["code"] == "identity_unconfigured"
+    assert [c[1] for c in bi["safari"].ops("--click")] == [
+        alsafari.RECIPES[site].steps[0].trigger
+    ]
+    assert not bi["safari"].landing_opens()
+
+
+@pytest.mark.parametrize(
+    ("flag", "code"),
+    [("push", "needs_albert_push"), ("hardware_key", "needs_albert_hardware_key")],
+)
+@pytest.mark.parametrize("site", sorted(BI))
+def test_bi_a_google_push_or_passkey_page_is_alberts(
+    site: str, flag: str, code: str, bi: dict[str, Any]
+) -> None:
+    bi["proof"] = (2, "logged_out")
+    login = _google_login(site)
+    script = [login[0], (f"https://{GOOGLE}/signin/challenge", w._page(**{flag: True}))]
+    assert _go_bi(bi, site, script) == 4
+    assert bi["records"][-1][3]["code"] == code
+    fake = bi["safari"]
+    assert len(fake.ops("--click")) == 1  # the Google button only
+    assert not fake.landing_opens() and not bi["imports"]
+
+
+class _MailDrive:  # pylint: disable=too-few-public-methods
+    """`_drive_safari` of slack's mail-code fallback: records the cooldown
+    seen at the trigger (after the hook), the env and the no-trigger mode."""
+
+    def __init__(self) -> None:
+        self.log: list[tuple[str, Any]] = []
+
+    def __call__(self, site: str, _recipe: Any, **kw: Any) -> alsafari.Outcome:
+        self.log.append(("env", kw.get("env")))
+        if kw.get("no_trigger"):
+            self.log.append(("no_trigger", kw["no_trigger"]))
+            return alsafari.Outcome(2, kw["no_trigger"])
+        stop = kw["before_trigger"]()
+        if stop:
+            return alsafari.Outcome(2, stop)
+        self.log.append(("click", al.als.mail_code_cooldown_left(site, time.time())))
+        return alsafari.Outcome(0, "ok", credential=True, steps=["mail_code"])
+
+
+def test_slack_mail_code_fallback_stamps_before_the_trigger(
+    bi: dict[str, Any], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    drive = _MailDrive()
+    monkeypatch.setattr(al, "_drive_safari", drive)
+    bi["proof"] = (2, "logged_out")
+    assert _go_bi(bi, "slack", []) == 0
+    assert [k for k, _v in drive.log] == ["env", "click"]
+    assert drive.log[0][1] == {"SDSC_EMAIL_NO_AUTO_AUTH": "1"}
+    # stamped first: the trigger already sees a full cooldown
+    assert drive.log[1][1] == pytest.approx(al.als.MAIL_CODE_COOLDOWN_S, abs=5)
+    assert (al.als.state_dir() / "slack-mail-code.json").is_file()
+    assert not (al.als.state_dir() / "notion-mail-code.json").exists()
+
+
+def test_slack_inside_the_cooldown_runs_without_a_code_mail(
+    bi: dict[str, Any], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    drive = _MailDrive()
+    monkeypatch.setattr(al, "_drive_safari", drive)
+    bi["proof"] = (2, "logged_out")
+    assert al.als.mail_code_stamp("slack", time.time())
+    path = al.als.state_dir() / "slack-mail-code.json"
+    before = path.read_bytes()
+    assert _go_bi(bi, "slack", []) == 2
+    assert ("no_trigger", "cooldown") in drive.log
+    assert not any(k == "click" for k, _v in drive.log)
+    assert path.read_bytes() == before  # never re-stamped
+    assert al.als.quarantined("slack") is None
 
 
 # ---------------------------------------------------------------------------

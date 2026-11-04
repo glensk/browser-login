@@ -311,7 +311,7 @@ Execution order from here: B8-B9 first, then B6-B7 (overseer decision).
   where `-O` said `safari_logged_out`; one attempt; a captcha → Albert solves it, no
   retry; a quarantine → report, never `-Q` it yourself.
   ↳ evidence 2026-11-04: live canary 2026-11-04 22:05-22:28: B8 (60bbfc3) installed into live 22:05 (live == base dd457c9 checked, backups bak-1644/b8, module->script cp -p + mv, status clean, -A/-h exit 0, 4 test files green); probes read-only: sentinels match on anibis/tutti/kleinanzeigen/galaxus, galaxus-de one-page for…
-- [ ] B6 batch BI (after B9): `SAFARI_ROUTES` entries for slack (`builtin`, landing
+- [x] B6 batch BI (after B9): `SAFARI_ROUTES` entries for slack (`builtin`, landing
   `https://swiss-data-science.slack.com/`; mail-code fallback with
   `MAIL_CODE_ENV["slack"]` and the shared per-site cooldown `slack-mail-code.json`)
   and openai (`builtin`, landing `https://chatgpt.com/`). Tests in
