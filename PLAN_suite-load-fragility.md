@@ -293,9 +293,10 @@ Build rounds (at most 3 boxes per round, one writer agent per round, rounds in o
   `BG_PAGE_STEP_S = 30`. Add `test_bg_step_budget_covers_create_and_close`: the spy wraps
   the context manager that `_deadline_push` returns and asserts
   `push enter < bg:create < bg:close < push exit`.
-- [ ] B4 `tests/test_login_timeout.py`: time `test_disarm_racing…` per iteration (one run).
+- [x] B4 `tests/test_login_timeout.py`: time `test_disarm_racing…` per iteration (one run).
   If `_fire` side effects dominate, stub them in that test. Keep 200 iterations and both
   assertions. If the time is sleep granularity instead, report back and change nothing.
+  ↳ evidence 2026-11-04: one timed run: 62.2 s total, sleep overshoot 60.9 s (~152 ms/sleep), _fire 1.06 s; sleep granularity dominates, so per box spec no change
 - [x] B8 `tests/test_connect_hang.py` (C6, test-only): in
   `test_real_connect_times_out_and_names_the_hung_tab_origin_only` and
   `test_eval_watchdog_exits_at_its_deadline_while_the_attach_is_stuck`, time a start-up
