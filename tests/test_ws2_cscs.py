@@ -25,6 +25,7 @@ from __future__ import annotations
 # pylint: disable=import-error,wrong-import-position,too-few-public-methods
 # pylint: disable=too-many-lines,redefined-outer-name,too-many-instance-attributes
 # pylint: disable=duplicate-code
+import base64
 import contextlib
 import importlib.util
 import json
@@ -137,6 +138,47 @@ _KC_PW_FORM = """<html><body><div id=kc-username>
 <input id=kc-login name=login type=submit value="Sign In">
 </form></body></html>"""
 KC_RESTART = AUTH + "/auth/realms/cscs/login-actions/restart"
+# Keycloak's one-time-code step after the password (`Portal.otp_form`):
+# "single" is the classic page, one `#otp` field.
+_KC_OTP_FORM = """<html><body><h1>Two-Factor Authentication</h1>
+<form id=kc-otp-login-form method=post action="__POST__">
+<label for=otp>One-time code</label>
+<input id=otp name=otp type=text autocomplete=one-time-code>
+<input id=kc-login name=login type=submit value="Sign In">
+</form>__MSG__</body></html>"""
+# The CSCS theme (screenshot 2026-11-03): six one-digit boxes without OTP
+# attributes under "One-Time Code", a hidden `otp` its script keeps in sync
+# and "Verify Code", enabled once all six boxes hold a digit. "split": the
+# boxes inside the form; "split-formless": outside it (the hidden input and
+# the button inside). __AUTO__ true: the form submits itself on the sixth.
+_KC_SPLIT_BOXES = (
+    "<div class=otp-card><label>One-Time Code</label><div class=otp-boxes>"
+    + "<input class=otp-box type=text maxlength=1 inputmode=numeric>" * 6
+    + "</div></div>"
+)
+_KC_SPLIT_JS = """(() => {
+  const boxes = [...document.querySelectorAll('input.otp-box')];
+  const hidden = document.getElementById('kc-code');
+  const btn = document.getElementById('kc-verify');
+  const form = document.getElementById('kc-otp-login-form');
+  const sync = () => {
+    hidden.value = boxes.map(b => b.value).join('');
+    const full = boxes.every(b => /^[0-9]$/.test(b.value));
+    btn.disabled = !full;
+    return full;
+  };
+  boxes.forEach((b, i) => b.addEventListener('input', () => {
+    b.value = b.value.replace(/[^0-9]/g, '');
+    if (b.value && i < boxes.length - 1) boxes[i + 1].focus();
+    if (sync() && __AUTO__ && i === boxes.length - 1) form.submit();
+  }));
+})();"""
+_KC_SPLIT_FORM = """<html><body><h1>Two-Factor Authentication</h1>
+<p>Enter the code from your authenticator app</p>__OUTSIDE__
+<form id=kc-otp-login-form method=post action="__POST__">__INSIDE__
+<input id=kc-code name=otp type=hidden value="">
+<button id=kc-verify type=submit disabled>Verify Code</button>
+</form>__MSG__<script>__JS__</script></body></html>"""
 
 
 @dataclass
@@ -164,6 +206,15 @@ class Portal:
     pending_user: str = ""  # the username a password-only page asks for
     restarts: int = 0
     passwords_posted: list[str] = field(default_factory=list)
+    # The one-time-code step once the sign-in is right, one of "none" (no
+    # second factor), "single", "split", "split-autosubmit", "split-formless".
+    otp_form: str = "none"
+    # A test-only TOTP seed (base32), generated per test — never a real one.
+    totp_seed: str = field(
+        default_factory=lambda: base64.b32encode(secrets.token_bytes(20)).decode()
+    )
+    otp_pending: bool = False  # the password went, the code is asked for
+    otp_posts: int = 0
 
     def issue(self) -> str:
         token = secrets.token_hex(20)
@@ -220,6 +271,9 @@ class Portal:
             _html(route, _KC_FORM.replace("__POST__", KC_POST).replace("__MSG__", ""))
             return
         if req.method == "POST" and url.path.endswith("/authenticate"):
+            if self.otp_pending:
+                self._otp_post(route, req, done)
+                return
             form = urllib.parse.parse_qs(req.post_data or "")
             if "password" not in form:  # username-first: the password page next
                 self.pending_user = (form.get("username") or [""])[0]
@@ -235,6 +289,10 @@ class Portal:
             if form.get("username") == [self.username] and form.get("password") == [
                 self.password
             ]:
+                if self.otp_form != "none":  # the second factor next
+                    self.otp_pending = True
+                    _html(route, self._otp_page(""))
+                    return
                 self.logins += 1
                 _html(route, f"<script>location.replace('{done}')</script>")
                 return
@@ -254,6 +312,35 @@ class Portal:
             _html(route, self._pw_form(self.pending_user))
             return
         _html(route, _KC_FORM.replace("__POST__", KC_POST).replace("__MSG__", ""))
+
+    def _otp_post(self, route: Any, req: Any, done: str) -> None:
+        """The code POST: the TOTP of the current step or the one before
+        (Keycloak's default look-around) logs in; anything else re-serves the
+        page with an error."""
+        self.otp_posts += 1
+        form = urllib.parse.parse_qs(req.post_data or "", keep_blank_values=True)
+        code = (form.get("otp") or [""])[0]
+        otp = recipes.parse_totp(self.totp_seed)
+        now = time.time()
+        if code and code in (otp.at(now), otp.at(now - otp.interval)):
+            self.otp_pending = False
+            self.logins += 1
+            _html(route, f"<script>location.replace('{done}')</script>")
+            return
+        _html(route, self._otp_page("Invalid authenticator code."))
+
+    def _otp_page(self, msg: str) -> str:
+        if self.otp_form == "single":
+            return _KC_OTP_FORM.replace("__POST__", KC_POST).replace("__MSG__", msg)
+        formless = self.otp_form == "split-formless"
+        auto = "true" if self.otp_form == "split-autosubmit" else "false"
+        return (
+            _KC_SPLIT_FORM.replace("__POST__", KC_POST)
+            .replace("__OUTSIDE__", _KC_SPLIT_BOXES if formless else "")
+            .replace("__INSIDE__", "" if formless else _KC_SPLIT_BOXES)
+            .replace("__MSG__", msg)
+            .replace("__JS__", _KC_SPLIT_JS.replace("__AUTO__", auto))
+        )
 
     @staticmethod
     def _pw_form(user: str) -> str:
@@ -508,10 +595,13 @@ def _rig(tmp_path: Path, app: Portal, **extra: str) -> _Rig:
         "agent_login_url": PORTAL + "/profile/",
         **extra,
     }
+    login = {"username": app.username, "password": app.password}
+    if app.otp_form != "none":  # the portal's test-only seed
+        login["totp"] = app.totp_seed
     item = {
         "id": "id-cscs",
         "name": "CSCS fixture",
-        "login": {"username": app.username, "password": app.password},
+        "login": login,
         "fields": [{"name": k, "value": v} for k, v in fields.items()],
     }
     fixture = tmp_path / "items.json"
@@ -721,6 +811,49 @@ def test_a_check_url_off_the_portal_stops_before_the_secret(
     assert resp.get("submitted") is not True
     assert portal.logins == 0 and portal.passwords_posted == []
     assert rig.vault.secret_calls == calls and rig.limiter_bytes() == before
+
+
+def _otp_login(tmp_path: Path, app: Portal, otp_form: str) -> None:
+    """A fresh broker login through the `otp_form` one-time-code step: one
+    code POST, accepted, the validated token exported."""
+    app.otp_form = otp_form
+    rig = _rig(tmp_path, app)
+    resp = rig.login()
+    assert resp.get("ok"), resp
+    assert resp["bundle"]["via"] == "login" and rig.last_outcome() == "ok"
+    assert app.live(resp["bundle"]["storage"][PORTAL][TOKEN_KEY])
+    assert app.logins == 1 and app.otp_posts == 1 and not app.otp_pending
+
+
+@pytest.mark.launches_chrome
+@CHROME
+def test_a_split_one_time_code_logs_in(tmp_path: Path, portal: Portal) -> None:
+    """tp#1675: six one-digit boxes in the form, "Verify Code" enabled once
+    they are full — typed key by key, then the button clicked once."""
+    _otp_login(tmp_path, portal, "split")
+
+
+@pytest.mark.launches_chrome
+@CHROME
+def test_a_self_submitting_split_code_posts_once(
+    tmp_path: Path, portal: Portal
+) -> None:
+    """The theme submits on the sixth digit: the recipe never submits again."""
+    _otp_login(tmp_path, portal, "split-autosubmit")
+
+
+@pytest.mark.launches_chrome
+@CHROME
+def test_a_formless_split_code_logs_in(tmp_path: Path, portal: Portal) -> None:
+    """The boxes outside the form: submitted through the hidden `otp`'s form."""
+    _otp_login(tmp_path, portal, "split-formless")
+
+
+@pytest.mark.launches_chrome
+@CHROME
+def test_a_single_one_time_code_still_logs_in(tmp_path: Path, portal: Portal) -> None:
+    """The classic Keycloak `#otp` field keeps the single-field path."""
+    _otp_login(tmp_path, portal, "single")
 
 
 def _streak(rig: _Rig) -> tuple[int, Any]:

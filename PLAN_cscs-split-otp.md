@@ -255,7 +255,7 @@ Build rounds (at most 3 boxes per round, one writer agent per round, rounds in o
   `test_a_step_rollover_before_submit_submits_nothing`;
   `test_a_box_off_the_fill_origin_is_an_origin_violation`. Also check that no recorded log,
   exception text or page hint contains the code.
-- [ ] B4 `tests/test_ws2_cscs.py` (real Chromium, `launches_chrome`, hermetic: local fixture
+- [x] B4 `tests/test_ws2_cscs.py` (real Chromium, `launches_chrome`, hermetic: local fixture
   server, no network): add `Portal.otp_form: str = "none"`, a switch with the values
   `"none" | "single" | "split" | "split-autosubmit" | "split-formless"`. After the password
   POST to `KC_POST`, `"single"` serves a classic Keycloak OTP page (`<input id=otp name=otp
