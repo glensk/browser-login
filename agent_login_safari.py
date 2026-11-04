@@ -390,6 +390,9 @@ RECIPES: dict[str, Recipe] = {
     ),
     # Google first; a sign-in page without the Google button falls through to
     # the e-mail code (the optional click is refused: nothing was sent).
+    # L2 (2026-11-04, tp#1644 B7): the sign-in page shows the buttons
+    # "Google" (data-qa base_google_login_button), "Microsoft", "Apple" and
+    # the e-mail form's submit "Sign in with email" (labels are exact).
     "slack": Recipe(
         "slack",
         (
@@ -400,13 +403,11 @@ RECIPES: dict[str, Recipe] = {
         ),
         "app.slack.com",
         (
-            *_google(
-                "swiss-data-science.slack.com", "Sign In With Google", optional=True
-            ),
+            *_google("swiss-data-science.slack.com", "Google", optional=True),
             Step(
                 "mail_code",
                 "swiss-data-science.slack.com",
-                trigger="Sign In With Email",
+                trigger="Sign in with email",
                 when='input[type="email"]',
                 email_field='input[type="email"]',
                 senders=("no-reply@slack.com", "feedback@slack.com"),
@@ -415,7 +416,9 @@ RECIPES: dict[str, Recipe] = {
             ),
         ),
         start_url="https://swiss-data-science.slack.com/",
-        sentinel='[data-qa="channel_sidebar"]',
+        # L2 (B7): the logged-in client's sidebar is data-qa "channel-sidebar"
+        # (hyphen); "channel_sidebar" never matched, so a login ended stuck
+        sentinel='[data-qa="channel-sidebar"]',
         broker=False,
         identity="slack",
     ),

@@ -801,6 +801,20 @@ GOOGLE = "accounts.google.com"
 ACCOUNT = "albert@example.org"  # the override file's Google account (fake)
 
 
+def test_slack_labels_match_the_live_sign_in_page() -> None:
+    """B7 L2 read (2026-11-04): Slack's sign-in page labels its buttons
+    "Google" and "Sign in with email"; safari.py matches labels exactly, so
+    the old "Sign In With Google" / "Sign In With Email" ended
+    `recipe_stuck` before anything was sent."""
+    steps = alsafari.RECIPES["slack"].steps
+    assert (steps[0].kind, steps[0].trigger) == ("click", "Google")
+    assert steps[0].optional
+    mail = next(s for s in steps if s.kind == "mail_code")
+    assert mail.trigger == "Sign in with email"
+    # the logged-in client (app.slack.com) carries data-qa "channel-sidebar"
+    assert alsafari.RECIPES["slack"].sentinel == '[data-qa="channel-sidebar"]'
+
+
 def test_the_builtin_routes_use_the_throwaway_proof() -> None:
     for site, (landing, _login, _done) in BI.items():
         assert al.SAFARI_ROUTES[site] == al.SafariRoute(landing, "builtin")
