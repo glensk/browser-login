@@ -399,9 +399,29 @@ def test_a_stale_cached_build_does_not_blank_the_login(
     app.reload_after_login = False  # like NPM 2.16: no reload revalidates it
     rig = _rig(tmp_path, origin)
     # One visit with build "a": the profile caches index.html + main-a.js.
-    with monkeypatch.context() as m:
-        m.setattr(rig.vault, "secret", _no_secret)
-        assert not rig.login().get("ok")  # logged out: needs the secret
+    # A direct visit through the broker's own launch, not a broker login: it
+    # is all that step needs, without a proof window and a limiter round.
+    from playwright.sync_api import (  # pylint: disable=import-outside-toplevel
+        sync_playwright,
+    )
+
+    runner = rig.brk.runner
+    assert isinstance(runner, daemon.PlaywrightRunner)
+    with sync_playwright() as pw:
+        ctx = runner._launch(pw, runner.profile_dir("npmfix"))
+        try:
+            page = ctx.new_page()
+            page.goto(origin + "/", wait_until="load")
+            # main-a.js ran (it renders the form) before the cache is closed:
+            # Chromium writes its disk cache asynchronously.
+            page.wait_for_selector("input[type=password]")
+            assert page.evaluate(
+                "() => performance.getEntriesByType('resource')"
+                ".some(e => e.name.endsWith('/assets/main-a.js'))"
+            )
+        finally:
+            ctx.close()
+    assert app.logins == 0
     app.build = "b"
     with monkeypatch.context() as m:  # the bug, reproduced: no cache clear
         m.setattr(daemon, "clear_http_cache", lambda _ctx: None)

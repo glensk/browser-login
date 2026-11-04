@@ -303,7 +303,7 @@ Build rounds (at most 3 boxes per round, one writer agent per round, rounds in o
   baseline first (same interpreter and env, `browser.py eval -t 0 1`, which exits before
   any CDP work). Assert `took - startup < 2 + PROBE_BUDGET_S + 4` and
   `took - startup < 2 + 4`. Every other assertion stays. No `bin/browser.py` change.
-- [ ] B5 `tests/test_ws2_npm.py`: replace the stale-build test's first login with a direct
+- [x] B5 `tests/test_ws2_npm.py`: replace the stale-build test's first login with a direct
   profile visit through `runner._launch`. Before `ctx.close()`, wait for `load` and check
   in-page that `main-a.js` loaded. Keep the asserts on logins 2 and 3. If the "broken"
   login then stops failing (the cache was not populated), revert B5 and record the test as
