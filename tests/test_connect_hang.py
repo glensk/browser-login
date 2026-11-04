@@ -107,24 +107,33 @@ def _run_cli(fake: FakeCdp, tmp_path: Path, *argv: str, env: dict, deadline: flo
     return proc, time.monotonic() - t0
 
 
+def _startup_s(fake: FakeCdp, tmp_path: Path, env: dict) -> float:
+    """The CLI's start-up cost right now: same interpreter, same env, an
+    invocation (`eval -t 0`) that is rejected before any CDP work. Subtracting
+    it leaves the time a bound below is really about (attach, probe, watchdog)
+    instead of interpreter start and the `browser.py` import under load."""
+    proc, took = _run_cli(fake, tmp_path, "eval", "-t", "0", "1", env=env, deadline=60)
+    assert proc.returncode == 2 and "must be > 0" in proc.stderr, proc.stderr
+    # Rejected while parsing: no registration a later check could mistake.
+    assert not list((tmp_path / "clients").glob("*.json"))
+    startup: float = took
+    return startup
+
+
 # --- the real _connect -------------------------------------------------------
 
 
 def test_real_connect_times_out_and_names_the_hung_tab_origin_only(fake, tmp_path):
     fake.add("AAAA0001", "https://example.com/", "Example", mode="ok")
     fake.add("EEE09E93FFFF", HUNG_URL, HUNG_TITLE, mode="silent")
+    env = {"CLAUDE_BROWSER_CONNECT_TIMEOUT_S": "2"}
+    startup = _startup_s(fake, tmp_path, env)
     proc, took = _run_cli(  # `open -r`: the one `open` mode that still attaches
-        fake,
-        tmp_path,
-        "open",
-        "-r",
-        "https://example.com",
-        env={"CLAUDE_BROWSER_CONNECT_TIMEOUT_S": "2"},
-        deadline=60,
+        fake, tmp_path, "open", "-r", "https://example.com", env=env, deadline=60
     )
-    # 2 s attach + the 6 s probe budget + interpreter/driver start-up slack.
+    # 2 s attach + the 6 s probe budget + driver slack, start-up subtracted.
     assert proc.returncode == 1, proc.stderr
-    assert took < 2 + browser.PROBE_BUDGET_S + 12, took
+    assert took - startup < 2 + browser.PROBE_BUDGET_S + 4, (took, startup)
     err = proc.stderr
     assert "within 2s" in err
     assert "https://albertha.cloudflareaccess.com" in err
@@ -138,19 +147,14 @@ def test_eval_watchdog_exits_at_its_deadline_while_the_attach_is_stuck(
     fake, tmp_path, cache
 ):
     fake.add("EEE09E93FFFF", HUNG_URL, HUNG_TITLE, mode="silent")
+    env = {"CLAUDE_BROWSER_CONNECT_TIMEOUT_S": "60"}
+    startup = _startup_s(fake, tmp_path, env)
     proc, took = _run_cli(
-        fake,
-        tmp_path,
-        "eval",
-        "-t",
-        "2",
-        "1+1",
-        env={"CLAUDE_BROWSER_CONNECT_TIMEOUT_S": "60"},
-        deadline=40,
+        fake, tmp_path, "eval", "-t", "2", "1+1", env=env, deadline=40
     )
     assert proc.returncode == 1
     assert "no result after 2s" in proc.stderr
-    assert took < 2 + 10, took
+    assert took - startup < 2 + 4, (took, startup)
     # os._exit skips atexit, but the registration's flock died with the process:
     # the listing reaps the file instead of reporting a live client.
     assert list((cache / "clients").glob("*.json")), "eval never registered"

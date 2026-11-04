@@ -296,7 +296,7 @@ Build rounds (at most 3 boxes per round, one writer agent per round, rounds in o
 - [ ] B4 `tests/test_login_timeout.py`: time `test_disarm_racing…` per iteration (one run).
   If `_fire` side effects dominate, stub them in that test. Keep 200 iterations and both
   assertions. If the time is sleep granularity instead, report back and change nothing.
-- [ ] B8 `tests/test_connect_hang.py` (C6, test-only): in
+- [x] B8 `tests/test_connect_hang.py` (C6, test-only): in
   `test_real_connect_times_out_and_names_the_hung_tab_origin_only` and
   `test_eval_watchdog_exits_at_its_deadline_while_the_attach_is_stuck`, time a start-up
   baseline first (same interpreter and env, `browser.py eval -t 0 1`, which exits before
