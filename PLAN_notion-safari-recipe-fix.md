@@ -191,7 +191,7 @@ click, no fill, no navigation).
   (9) the login window disappears during the code-field wait (`--tabs` without it) →
   `safari_tab_moved`, not `code_field`, `credential` false;
   (10) `RECIPES["notion"].start_url == browser.NOTION_LOGIN_URL`.
-- [ ] B3 docs + verify + install. README: the notion row (~594) and §"Agents renew…"
+- [x] B3 docs + verify + install. README: the notion row (~594) and §"Agents renew…"
   (~1117) gain one sentence — "Safari and the shared Chromium share one Notion session
   after an import: a Notion logout in Safari (`notion.so/logout` or the in-app Log out)
   revokes it server-side and logs the shared Chromium out too, unless Chromium has
