@@ -308,7 +308,7 @@ Build rounds (at most 3 boxes per round, one writer agent per round, rounds in o
   in-page that `main-a.js` loaded. Keep the asserts on logins 2 and 3. If the "broken"
   login then stops failing (the cache was not populated), revert B5 and record the test as
   an inherently slow full-tier member.
-- [ ] B7 `pyproject.toml` `--durations=25`, plus a `README.md` two-tier test section with
+- [x] B7 `pyproject.toml` `--durations=25`, plus a `README.md` two-tier test section with
   the low-load wall time from one full run done by the overseer at load < 8 (the overseer
   makes that run, not an agent under load).
 - [x] B9 `tests/test_ws2_cscs.py` `test_the_deadline_itself_decides_not_only_the_watchdog`

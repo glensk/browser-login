@@ -1351,6 +1351,36 @@ homeproxy down, the `; DIRECT` fallback gives today's behaviour (Access).
   `NOT in the running browser`). The broker picks its constant up with the next
   `install.sh` (each login run launches a fresh Chromium).
 
+## Tests: fast tier and full tier (tp#1672)
+
+The suite has two tiers. Neither one gates a commit. Every run ends with its 25 slowest
+tests (`--durations=25` in `pyproject.toml`).
+
+- **Fast tier**: everything except the tests that start a real headless Chromium
+  (about 3700 of about 3970 tests). Use it while you work. Its wall time has not been
+  measured.
+
+  ```bash
+  uv run pytest -q -m "not launches_chrome"
+  ```
+
+- **Full tier**: every test, including the 257 `launches_chrome` tests (fixture sites in
+  a disposable Chromium). Run it at low load and at low priority, so a busy machine does
+  not cause timing flakes:
+
+  ```bash
+  nice -n 15 taskpolicy -b uv run pytest -q
+  ```
+
+  Measured on 2026-11-04 (load 6.4 at the start, 10.7 at the end): 3929 passed,
+  36 skipped and 1 failed (the self-submit username-only flake, tp#1672 B10), in 2436 s (about 41 min). Plan for about 40 min at a load below 8, and
+  more on a busier machine. Most of the slowest tests start Chromium (`test_ws2_cscs.py`,
+  `test_ws2_npm.py`, `test_username_only.py`, `test_ws5_client_s2*.py`). The slowest
+  one does not start Chromium: `test_login_timeout.py`'s disarm-race test (60 s).
+
+To re-check one test, select it with `-k`. Do not rerun the whole file or the whole
+suite.
+
 ## Troubleshooting
 
 **`open` / `eval` / `doctor` / `login` fail with "could not attach … within

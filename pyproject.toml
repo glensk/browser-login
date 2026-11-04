@@ -35,6 +35,8 @@ default-groups = ["dev", "focus"]
 [tool.pytest.ini_options]
 # Any test that runs this long dumps every thread's stack (tp#1655).
 faulthandler_timeout = 120
+# Every run ends with its 25 slowest tests, so slow ones stay visible (tp#1672).
+addopts = "--durations=25"
 
 [dependency-groups]
 # pylint and pytest must run inside this venv: browser.py's deferred imports
