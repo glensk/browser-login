@@ -432,7 +432,10 @@ def test_agents_md_says_check_only_for_galaxus(monkeypatch) -> None:
     for stale in ({**row, "safari": False}, {**row, "safari_expires": "2000-01-01"}):
         text = al.agent_summary({"rows": [stale], "broker_ok": True}, ok)
         assert "- ❌ Galaxus: Safari session missing, expired or unreadable" in text
-        assert "-L galaxus" not in text
+        # the row offers no renewal (the `-L SITE -s` sentence of the Safari
+        # routes, tp#1644 B8, is Albert's attended "log me into", not a hint)
+        line = next(x for x in text.splitlines() if x.startswith("- ❌ Galaxus:"))
+        assert "-L galaxus" not in line
     # no new safari.py features, but Safari holds a live session: -L imports
     # it (SF2) — the plain `-t` wording is gone for a routed site
     text = al.agent_summary({"rows": [row], "broker_ok": True}, ok)

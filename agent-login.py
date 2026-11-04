@@ -1043,6 +1043,19 @@ class SafariRoute:
 SAFARI_PROOFS = frozenset({"builtin", "in_safari"})
 SAFARI_ROUTES: dict[str, SafariRoute] = {
     "notion": SafariRoute("https://app.notion.com/", "builtin"),
+    # tp#1644 B8: the Safari-cookie sites, proven in Safari (no throwaway
+    # proof: Akamai / Cloudflare / Auth0 read a headless proof wrongly); the
+    # landing = the recipe's start_url (the listing's check_url)
+    "anibis": SafariRoute("https://www.anibis.ch/fr/myads/active", "in_safari"),
+    "tutti": SafariRoute("https://www.tutti.ch/de/myads/active", "in_safari"),
+    "kleinanzeigen": SafariRoute(
+        "https://www.kleinanzeigen.de/m-meine-anzeigen.html", "in_safari"
+    ),
+    "ricardo": SafariRoute(
+        "https://www.ricardo.ch/de/my-ricardo/saved/articles/", "in_safari"
+    ),
+    "galaxus": SafariRoute("https://www.galaxus.ch/de/orders", "in_safari"),
+    "galaxus-de": SafariRoute("https://www.galaxus.de/de/orders", "in_safari"),
 }
 # tp#1644: sites that can NOT have a Safari route (⛔), with a fixed reason
 # code. Admin accounts (listing `privilege` admin) are derived, not listed:

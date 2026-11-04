@@ -490,6 +490,7 @@ def test_an_unreadable_mailbox_stops_before_the_hook_writes() -> None:
 def test_login_columns(monkeypatch: pytest.MonkeyPatch) -> None:
     assert al.login_columns("notion") == al.LoginColumns(True, True)
     assert al.login_columns("anthropic") == al.LoginColumns(False, True)
+    monkeypatch.delitem(al.SAFARI_ROUTES, "galaxus")  # a recipe, no route
     monkeypatch.setattr(al, "agent_route", lambda _s, _r=None: True)
     assert al.login_columns("galaxus") == al.LoginColumns(False, True)
     monkeypatch.setattr(al, "agent_route", lambda _s, _r=None: False)
@@ -565,7 +566,10 @@ def test_good_urls() -> None:
     assert al.safari_target_url("notion", page) == page
 
 
-def test_a_site_without_a_route_exits_2(pipe: dict[str, Any]) -> None:
+def test_a_site_without_a_route_exits_2(
+    pipe: dict[str, Any], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.delitem(al.SAFARI_ROUTES, "galaxus")  # a recipe, no route
     assert al.safari_target_action("galaxus", "") == 2
     assert not pipe["log"]
 
@@ -958,6 +962,7 @@ def test_a_second_route_is_one_table_entry(
 ) -> None:
     site = "galaxus"  # a recipe without a mail_code step
     assert not any(s.kind == "mail_code" for s in alsafari.RECIPES[site].steps)
+    monkeypatch.delitem(al.SAFARI_ROUTES, site)  # routed since tp#1644 B8
     assert not al.login_columns(site).safari
     host = alsafari.RECIPES[site].hosts[0]
     monkeypatch.setitem(

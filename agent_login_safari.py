@@ -289,6 +289,10 @@ def _google(host: str, trigger: str, *, optional: bool = False) -> tuple[Step, .
 # Labels are UNVERIFIED unless a comment says L2 read them in Albert's
 # Safari; a wrong one only stops the run (`recipe_stuck`) — safari.py clicks
 # exactly one visible match or nothing.
+# tp#1644 B8: the six Safari-cookie recipes start on their `-s` landing page
+# (the listing's `check_url`) with the listing's `logged_in_selector` as
+# sentinel — the one the broker proves with — so a live session ends ok
+# with zero steps.
 RECIPES: dict[str, Recipe] = {
     # L2 (2026-10-13): id.galaxus.eu shows ONE form with a visible
     # emailOrUsername field (autocomplete "username webauthn"), a visible
@@ -304,6 +308,8 @@ RECIPES: dict[str, Recipe] = {
             pass_submit="Anmelden",
             one_page_submit="Weiter",
         ),
+        start_url="https://www.galaxus.de/de/orders",
+        sentinel='[data-testid="customer-account-button"]',
     ),
     # Same Digitec Galaxus ID software as id.galaxus.eu; UNVERIFIED (L2:
     # Albert is logged in, the IdP redirected to the shop).
@@ -317,6 +323,8 @@ RECIPES: dict[str, Recipe] = {
             pass_submit="Anmelden",
             one_page_submit="Weiter",
         ),
+        start_url="https://www.galaxus.ch/de/orders",
+        sentinel='[data-testid="customer-account-button"]',
     ),
     # UNVERIFIED (L2: logged in, auth.anibis.ch redirected to the shop). Same
     # Auth0 Universal Login as tutti: expect a captcha there too.
@@ -327,6 +335,8 @@ RECIPES: dict[str, Recipe] = {
         _one_or_two_step(
             "auth.anibis.ch", user_submit="Continuer", pass_submit="Se connecter"
         ),
+        start_url="https://www.anibis.ch/fr/myads/active",
+        sentinel='input[data-testid="myads-searchbox"]',
     ),
     # L2 (2026-10-13): Auth0 identifier page, submit "Einloggen" (plus an
     # aria-hidden decoy with the same label) and an Auth0 captcha that blocks
@@ -339,6 +349,8 @@ RECIPES: dict[str, Recipe] = {
         _one_or_two_step(
             "auth.tutti.ch", user_submit="Einloggen", pass_submit="Anmelden"
         ),
+        start_url="https://www.tutti.ch/de/myads/active",
+        sentinel='input[data-testid="myads-searchbox"]',
     ),
     # UNVERIFIED (L2: logged in, the IdP redirected to the shop).
     "kleinanzeigen": Recipe(
@@ -348,6 +360,9 @@ RECIPES: dict[str, Recipe] = {
         _one_or_two_step(
             "login.kleinanzeigen.de", user_submit="Weiter", pass_submit="Einloggen"
         ),
+        start_url="https://www.kleinanzeigen.de/m-meine-anzeigen.html",
+        # read only (a visible logout link = logged in); never clicked
+        sentinel="a#user-logout",
     ),
     # Cloudflare blocks the automated browser on Ricardo: agents work in
     # Safari itself, so the recipe only logs Safari in (no import).
@@ -359,6 +374,8 @@ RECIPES: dict[str, Recipe] = {
         _one_or_two_step(
             "login.ricardo.ch", user_submit="Weiter", pass_submit="Anmelden"
         ),
+        start_url="https://www.ricardo.ch/de/my-ricardo/saved/articles/",
+        sentinel='button[title="Nachrichten"]',
         import_after=False,
     ),
     "openai": Recipe(

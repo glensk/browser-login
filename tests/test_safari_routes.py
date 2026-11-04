@@ -20,6 +20,7 @@ import shutil
 import stat
 import subprocess
 import sys
+import urllib.parse
 from pathlib import Path
 from typing import Any
 
@@ -34,7 +35,7 @@ import test_ws1b_safari as w  # noqa: E402
 from ws3_fixtures import load_script  # noqa: E402
 
 import agent_login_safari as alsafari  # noqa: E402
-from broker import identity  # noqa: E402
+from broker import identity, vault  # noqa: E402
 
 al = load_script("agent_login_tp1644_test", "agent-login.py")
 
@@ -108,7 +109,19 @@ NOT_BUILT = "not built yet"
 _ADMIN = "⛔ admin_account"
 # site → its ONE class: the route, a ⛔ reason code, or not built yet
 EXPECTED: dict[str, str] = {
-    "notion": ROUTE,
+    **dict.fromkeys(
+        (
+            "notion",
+            # tp#1644 B8: the Safari-cookie sites
+            "anibis",
+            "galaxus",
+            "galaxus-de",
+            "kleinanzeigen",
+            "ricardo",
+            "tutti",
+        ),
+        ROUTE,
+    ),
     "google-kindle": "⛔ albert_only",
     "authentik-test3": "⛔ account_unproven",
     "mullvad": "⛔ not_opted_in",
@@ -130,7 +143,6 @@ EXPECTED: dict[str, str] = {
     **dict.fromkeys(
         (
             "abs-albert",
-            "anibis",
             "anthropic",
             "anthropic-private",
             "aurral",
@@ -140,8 +152,6 @@ EXPECTED: dict[str, str] = {
             "cscs",
             "dsm-readonly",
             "eduid",
-            "galaxus",
-            "galaxus-de",
             "github",
             "gitlab-com",
             "gitlab-ethz",
@@ -151,7 +161,6 @@ EXPECTED: dict[str, str] = {
             "infomaniak",
             "jellyfin",
             "kavita-admin",
-            "kleinanzeigen",
             "komga",
             "navidrome-albert",
             "npm-nixos",
@@ -159,14 +168,12 @@ EXPECTED: dict[str, str] = {
             "openai",
             "portainer-ds218",
             "qbittorrent",
-            "ricardo",
             "runai-test3",
             "slack",
             "smartsheet",
             "stirling",
             "switch",
             "syncthing-nixos",
-            "tutti",
             "welib",
             "zoho-desk",
         ),
@@ -261,7 +268,7 @@ def _rows() -> list[dict[str, Any]]:
             "status": "extra",
             "privilege": "admin",
         },
-        {"site": "anibis", "name": "anibis", "status": "safari"},
+        {"site": "openai", "name": "openai", "status": "safari"},
     ]
 
 
@@ -283,13 +290,13 @@ def test_the_overview_shows_the_blocked_cell_and_its_legend(
         name: next(x for x in lines[head + 2 :] if f" {name} " in x)
         .split(name, 1)[1]
         .split()[0]
-        for name in ("Notion", "google-kindle", "abs-root", "anibis")
+        for name in ("Notion", "google-kindle", "abs-root", "openai")
     }
     assert cells == {
         "Notion": "✅",
         "google-kindle": "⛔",
         "abs-root": "⛔",
-        "anibis": "❌",
+        "openai": "❌",
     }
 
 
@@ -299,7 +306,7 @@ def test_json_rows_carry_safari_why() -> None:
     kindle = rows["google-kindle"]
     assert (kindle["safari"], kindle["safari_why"]) == (False, "albert_only")
     assert rows["abs-root"]["safari_why"] == "admin_account"
-    assert rows["anibis"]["safari_why"] == ""
+    assert rows["openai"]["safari_why"] == ""
 
 
 def test_agents_md_lists_the_blocked_sites_in_one_line() -> None:
@@ -307,7 +314,7 @@ def test_agents_md_lists_the_blocked_sites_in_one_line() -> None:
     assert line.startswith("Safari logins that stay Albert's (⛔, never try them): ")
     for site, code in {**al.SAFARI_INFEASIBLE, "abs-root": "admin_account"}.items():
         assert f"{site} ({code})" in line
-    assert "anibis" not in line and "notion" not in line
+    assert "openai" not in line and "notion" not in line
     text = al.agent_summary({"rows": _rows(), "broker_ok": True, "broker": "x"}, {})
     assert line in text and text.count("never try them") == 1
 
@@ -545,6 +552,227 @@ def test_the_import_runs_only_with_import_after(
     run["safari"] = Safari(recipe, w.TWO_STEP)
     assert al.safari_target_action(SITE, "") == 0
     assert run["imports"] == ([SITE] if import_after else [])
+
+
+# ---------------------------------------------------------------------------
+# tp#1644 B8: the Safari-cookie routes (the real recipes)
+# ---------------------------------------------------------------------------
+
+# site → (landing, the listing's logged_in_selector, IdP host, import_after);
+# the listing values as of 2026-11-04 (sites.json, `check_url` /
+# `logged_in_selector`)
+SC: dict[str, tuple[str, str, str, bool]] = {
+    "anibis": (
+        "https://www.anibis.ch/fr/myads/active",
+        'input[data-testid="myads-searchbox"]',
+        "auth.anibis.ch",
+        True,
+    ),
+    "tutti": (
+        "https://www.tutti.ch/de/myads/active",
+        'input[data-testid="myads-searchbox"]',
+        "auth.tutti.ch",
+        True,
+    ),
+    "kleinanzeigen": (
+        "https://www.kleinanzeigen.de/m-meine-anzeigen.html",
+        "a#user-logout",
+        "login.kleinanzeigen.de",
+        True,
+    ),
+    "ricardo": (
+        "https://www.ricardo.ch/de/my-ricardo/saved/articles/",
+        'button[title="Nachrichten"]',
+        "login.ricardo.ch",
+        False,
+    ),
+    "galaxus": (
+        "https://www.galaxus.ch/de/orders",
+        '[data-testid="customer-account-button"]',
+        "id.digitecgalaxus.ch",
+        True,
+    ),
+    "galaxus-de": (
+        "https://www.galaxus.de/de/orders",
+        '[data-testid="customer-account-button"]',
+        "id.galaxus.eu",
+        True,
+    ),
+}
+ITEM = "Shop Item"  # the listing's vault item name (fake)
+
+
+def test_the_safari_cookie_routes_prove_in_safari_from_their_landing_page() -> None:
+    for site, (landing, sentinel, idp, imports) in SC.items():
+        recipe = alsafari.RECIPES[site]
+        assert al.SAFARI_ROUTES[site] == al.SafariRoute(landing, "in_safari")
+        assert recipe.start_url == landing and recipe.sentinel == sentinel
+        assert recipe.import_after is imports and recipe.broker
+        assert not recipe.identity
+        assert urllib.parse.urlsplit(landing).hostname == recipe.sentinel_host
+        assert al.safari_target_url(site, "") == landing
+        assert {s.host for s in recipe.steps} == {idp}
+        assert {s.kind for s in recipe.steps} == {"login", "user"}
+        assert al.login_columns(site).safari
+
+
+@pytest.fixture
+def sc(run: dict[str, Any], monkeypatch: pytest.MonkeyPatch) -> dict[str, Any]:
+    """`run` for the real SC recipes: the listing row (vault item, broker
+    rules) from a fake `broker_state`, Safari's jar unreadable (no flush
+    wait)."""
+
+    def listing(**_k: Any) -> tuple[str, list[dict[str, Any]]]:
+        rows = [
+            {
+                "site": site,
+                "name": ITEM,
+                # the recipe's own start page and sentinel win
+                "login_url": "https://wrong.example.org/",
+                "logged_in_selector": "#wrong",
+                "no_submit": site in ("galaxus", "galaxus-de"),
+            }
+            for site in SC
+        ]
+        return "running, Bitwarden readable", rows
+
+    monkeypatch.setattr(al, "broker_state", listing)
+    monkeypatch.setattr(al, "_safari_jar", lambda _s: ([], "test"))
+    return run
+
+
+def _go_sc(st: dict[str, Any], site: str, script: list, **kw: Any) -> int:
+    st["safari"] = Safari(alsafari.RECIPES[site], script)
+    rc: int = al.safari_target_action(site, "", **kw)
+    return rc
+
+
+def _landed(site: str) -> tuple[str, dict]:
+    return (SC[site][0], w._page(sentinel=True))
+
+
+def _one_page(site: str) -> list:
+    idp = SC[site][2]
+    page = w._page(
+        user=True, password=True, steps=[[True, False], [False, True], [False, False]]
+    )
+    return [(f"https://{idp}/login", page), _landed(site)]
+
+
+def _two_page(site: str) -> list:
+    idp = SC[site][2]
+    return [
+        (
+            f"https://{idp}/login",
+            w._page(user=True, steps=[[False, False], [True, False], [False, False]]),
+        ),
+        (
+            f"https://{idp}/password",
+            w._page(
+                password=True, steps=[[False, False], [False, True], [True, False]]
+            ),
+        ),
+        _landed(site),
+    ]
+
+
+def _value(call: list[str], opt: str) -> str:
+    return call[call.index(opt) + 1]
+
+
+@pytest.mark.parametrize("site", sorted(SC))
+def test_sc_a_live_session_opens_the_landing_page_with_zero_fills(
+    site: str, sc: dict[str, Any]
+) -> None:
+    assert _go_sc(sc, site, [_landed(site)]) == 0
+    fake = sc["safari"]
+    assert not fake.ops(*FILLS)
+    # the proof window opens on the landing page, the landing tab last
+    assert fake.ops("--open")[0][:3] == ["--open", SC[site][0], "--new-window"]
+    assert fake.landing_opens() == [["--open", SC[site][0], "--wait", "20"]]
+    assert not sc["broker"]
+
+
+@pytest.mark.parametrize("site", sorted(SC))
+def test_sc_prove_only_on_a_login_form_is_safari_logged_out(
+    site: str, sc: dict[str, Any], capsys: pytest.CaptureFixture[str]
+) -> None:
+    assert _go_sc(sc, site, _one_page(site), prove_only=True) == 2
+    assert "safari_logged_out" in capsys.readouterr().out
+    fake = sc["safari"]
+    assert not fake.ops(*FILLS) and not fake.landing_opens()
+    assert not sc["broker"] and not sc["imports"] and not sc["mail"]
+
+
+@pytest.mark.parametrize("shape", ["one_page", "two_page"])
+@pytest.mark.parametrize("site", sorted(SC))
+def test_sc_a_login_form_fills_through_safari_py_on_the_idp_host(
+    site: str, shape: str, sc: dict[str, Any]
+) -> None:
+    script = _one_page(site) if shape == "one_page" else _two_page(site)
+    assert _go_sc(sc, site, script) == 0
+    fake = sc["safari"]
+    fills = fake.ops(*FILLS)
+    assert fills and all(c[0] == "--login" for c in fills)
+    steps = alsafari.RECIPES[site].steps
+    want = (
+        [steps[0].submit] if shape == "one_page" else [steps[1].submit, steps[2].submit]
+    )
+    assert len(fills) == len(want)
+    for call, submit in zip(fills, want, strict=True):
+        assert call[1] == ITEM
+        assert _value(call, "--expect-host") == SC[site][2]  # the IdP, every time
+        assert _value(call, "--submit") == submit
+    assert fake.landing_opens() == [["--open", SC[site][0], "--wait", "20"]]
+    assert not sc["broker"]  # no broker op: safari.py fills (safari_fill)
+
+
+@pytest.mark.parametrize("prove_only", [False, True])
+@pytest.mark.parametrize("site", ["anibis", "tutti"])
+def test_sc_an_auth0_captcha_is_alberts_and_nothing_is_submitted(
+    site: str, prove_only: bool, sc: dict[str, Any]
+) -> None:
+    page = w._page(
+        captcha=True, user=True, steps=[[False, False], [True, False], [False, False]]
+    )
+    script = [(f"https://{SC[site][2]}/u/login/identifier", page)]
+    assert _go_sc(sc, site, script, prove_only=prove_only) == 4
+    assert sc["records"][-1][3]["code"] == "needs_albert_captcha"
+    fake = sc["safari"]
+    assert not fake.ops(*FILLS) and not fake.landing_opens()
+    assert not sc["imports"]
+    assert al.als.quarantined(site) is None  # nothing typed: no quarantine
+
+
+@pytest.mark.parametrize("site", ["galaxus", "galaxus-de"])
+def test_galaxus_no_submit_stays_the_brokers_rule_only(
+    site: str, sc: dict[str, Any]
+) -> None:
+    # Safari submits although the listing row says no_submit: that rule is
+    # the broker's headless login's, never read on the Safari path
+    assert _go_sc(sc, site, _one_page(site)) == 0
+    (fill,) = sc["safari"].ops("--login")
+    assert _value(fill, "--submit") == "Weiter"
+    assert not sc["broker"]  # no broker op, no headless login
+    # the broker's headless rule is untouched
+    assert {"galaxus", "galaxus-de"} <= vault.NO_SUBMIT_SITES
+    assert vault.no_submit_by_origin([f"https://{SC[site][2]}"])
+
+
+@pytest.mark.parametrize("live", [True, False])
+def test_ricardo_never_imports(live: bool, sc: dict[str, Any]) -> None:
+    script = [_landed("ricardo")] if live else _two_page("ricardo")
+    assert _go_sc(sc, "ricardo", script) == 0
+    assert not sc["imports"]
+    assert sc["safari"].landing_opens()
+
+
+@pytest.mark.parametrize("site", sorted(set(SC) - {"ricardo"}))
+def test_the_other_sc_sites_import_when_chromium_is_logged_out(
+    site: str, sc: dict[str, Any]
+) -> None:
+    assert _go_sc(sc, site, [_landed(site)]) == 0
+    assert sc["imports"] == [site]
 
 
 # ---------------------------------------------------------------------------

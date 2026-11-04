@@ -292,7 +292,7 @@ SAFARI_INFEASIBLE_TEXT: dict[str, str]  # one line per code, value-free
 
 Execution order from here: B8-B9 first, then B6-B7 (overseer decision).
 
-- [ ] B8 batch SC (runs FIRST after B5): `SAFARI_ROUTES` entries for anibis, tutti,
+- [x] B8 batch SC (runs FIRST after B5): `SAFARI_ROUTES` entries for anibis, tutti,
   kleinanzeigen, galaxus, galaxus-de (`in_safari`; recipe `import_after` True) and
   ricardo (`in_safari`; recipe `import_after` False), landings as in the Inventory;
   `start_url` of each recipe → its landing page (a live session then shows the
