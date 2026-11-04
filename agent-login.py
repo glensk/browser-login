@@ -21,10 +21,13 @@ feature its recipe needs; the credentials from the login broker, else your
 Vaultwarden tab) when it has lapsed there too — claude.ai through its automated
 magic link, Notion headlessly with the e-mail code in the shared Chromium when
 no Safari session imports (no window, also while you are away; only its Safari
-fallback is attended). When Albert says "log me into notion" or "open this
-page in my Safari", `-L notion -s [URL]` logs HIS Safari in (attended: the Mac
-unlocked and in use) and opens the workspace home or that page; Safari already
-logged in → no code mail, it only opens the page. Only a CAPTCHA, an SMS code,
+fallback is attended). When Albert says "log me into SITE" or "open this
+page in my Safari", `-L SITE -s [URL]` logs HIS Safari in (attended: the Mac
+unlocked and in use) and opens the site's landing page or that page; Safari
+already logged in → no login, it only opens the page (`-O`: prove only, never
+log in). The `-s` sites come from one route table (see -s); a site that can
+never have one shows ⛔ in the Safari column, and `-L SITE -s` names its reason
+(exit 2). Only a CAPTCHA, an SMS code,
 a push / security-key approval (exit 4, named) and the Touch ID touch stay
 yours: a locked vault is the agent's — it runs
 `~/.local/libexec/vault-touchid unlock-safari -a main` (you touch Touch ID once) or onboards the
@@ -942,7 +945,8 @@ def _summary_reason(  # pylint: disable=too-many-return-statements
     code = str(rec.get("code") or "")
     text = phases.text(str(rec.get("phase") or ""), code)
     if code.startswith("needs_albert_"):
-        return f"not logged in — {phases.CODE_TEXT.get(code, 'needs Albert')}"
+        fixed = phases.CODE_TEXT.get(code) or SAFARI_CODE_TEXT.get(code)
+        return f"not logged in — {fixed or 'needs Albert'}"
     if code == "vault_locked":  # the agent's own fix, named (never Albert's)
         return f"not logged in — {phases.CODE_TEXT[code]}"
     if isinstance(row.get("quarantine"), dict):
@@ -1065,6 +1069,22 @@ SAFARI_INFEASIBLE_TEXT: dict[str, str] = {
     "second_account": "Safari already holds another account of this site",
     "not_held": "Safari holds no session of this site's accounts",
 }
+# tp#1644: stop codes of the Safari routes that broker/phases.py does not
+# name yet (a live broker module: it changes only with a broker reinstall).
+SAFARI_CODE_TEXT: dict[str, str] = {
+    "needs_albert_access": (
+        "needs Albert: a Cloudflare Access login in Safari (his own, never an agent's)"
+    ),
+}
+
+
+def code_text(phase: str, code: str) -> str:
+    """`phases.text`, with this file's `SAFARI_CODE_TEXT` for the codes the
+    broker's table does not name — fixed strings only."""
+    extra = SAFARI_CODE_TEXT.get(code)
+    if extra is None or code in phases.CODE_TEXT:
+        return phases.text(phase, code)
+    return f"{phases.text(phase)}: {extra}"
 
 
 def _listing_row(site: str) -> dict:
@@ -3940,7 +3960,7 @@ def _safari_fail(
     if out.stuck:
         where = f" on {out.stuck_host}" if out.stuck_host else ""
         why = f" ({out.stuck}{where})"
-    print(f"❌ {site}: {who} — {phases.text(out.phase, out.code)}{why}")
+    print(f"❌ {site}: {who} — {code_text(out.phase, out.code)}{why}")
     if quarantined:
         print(
             f"   quarantined (a credential step ran) — the main session releases "
@@ -5488,16 +5508,19 @@ def build_parser() -> argparse.ArgumentParser:
         metavar="URL",
         help="with -L SITE: log Albert's SAFARI in to SITE (attended: the Mac "
         "unlocked and in use) and leave it on the site's landing page, or on "
-        "URL (an https page of the site, else exit 2 bad_url); Safari already "
-        "logged in (proven in a throwaway context, never a second account) → "
-        "no code mail, it only opens the page in a new tab; else the e-mail "
-        "code login in a new Safari window (one code mail per 15 min, shared "
-        "with -L SITE's headless route); imports the session when the shared "
-        "Chromium is logged "
-        "out. Exit 0 = Safari logged in AND the page opened; 3 = the Mac is "
-        "locked or idle; 4 = needs Albert (CAPTCHA). For Albert's 'log me "
-        "into notion' / 'open this page in my Safari'. Sites: "
-        + ", ".join(sorted(SAFARI_ROUTES)),
+        "URL (an https page of the site, else exit 2 bad_url). Safari's "
+        "session is proven first (builtin: in a throwaway context; in_safari: "
+        "the login page's sentinel in a new Safari window), never a second "
+        "account (exit 2 wrong_account) → no login, it only opens the page in "
+        "a new tab; else the site's recipe logs Safari in (notion: one code "
+        "mail per 15 min, shared with -L SITE's headless route); imports the "
+        "session when the recipe says so and the shared Chromium is logged "
+        "out. Exit 0 = Safari logged in AND the page opened; 2 = no route "
+        "(no_safari_route, with its ⛔ reason code when the site can never "
+        "have one); 3 = the Mac is locked or idle; 4 = needs Albert (CAPTCHA, "
+        "SMS, push / passkey, a Cloudflare Access login). For Albert's 'log "
+        "me into SITE' / 'open this page in my Safari'. Sites (the route "
+        "table SAFARI_ROUTES): " + ", ".join(sorted(SAFARI_ROUTES)),
     )
     ap.add_argument(
         "-O",
@@ -5506,7 +5529,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="with -L SITE -s: prove Albert's Safari session only, never log "
         "in — a live session → the page opens (exit 0); a logged-out Safari "
         "→ exit 2 safari_logged_out (nothing typed, no broker fill, no code "
-        "mail); exit 4 = needs Albert",
+        "mail); exit 4 = needs Albert. Live canaries run -O first",
     )
     ap.add_argument(
         "-l",

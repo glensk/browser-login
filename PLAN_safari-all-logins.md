@@ -270,7 +270,7 @@ SAFARI_INFEASIBLE_TEXT: dict[str, str]  # one line per code, value-free
   identity JS goes through a file, never argv; `cloudflareaccess.com` tab → exit 4
   `needs_albert_access` (not `safari_tab_moved`), zero fills; `import_after` false →
   `_import_run` never called; notion's existing suite green.
-- [ ] B3 docs for the mechanism: README §"Agents renew…" (the `-s` sites now come
+- [x] B3 docs for the mechanism: README §"Agents renew…" (the `-s` sites now come
   from one table; the ⛔ reasons; `-O`), the `-s` / `-O` help text ("Sites:" from the
   table), the `-h` intro paragraph; regenerate agents.md (`agent-login.py -A`). Skill
   stow source (mydotfiles `dotfiles/claude/.claude/skills/browser-login/SKILL.md`:

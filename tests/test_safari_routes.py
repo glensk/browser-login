@@ -531,6 +531,7 @@ def test_a_cloudflare_access_tab_is_alberts(
     assert _go(run, [(url, w._page(user=True))]) == 4
     out = capsys.readouterr().out
     assert run["records"][-1][3]["code"] == "needs_albert_access"
+    assert "Cloudflare Access" in out
     assert "safari_tab_moved" not in out
     assert not run["safari"].ops(*FILLS) and not run["safari"].landing_opens()
 

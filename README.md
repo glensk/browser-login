@@ -1106,7 +1106,8 @@ security review: `plans-done/PLAN_ws1b-durability_DONE.md`.
      gate is open (else exit 3). `-L notion -n` also shows whether the
      headless route is ready, the 15-min cooldown and `safari fp: <8 hex>`
      (a value-free fingerprint of Safari's notion session).
-   - **Safari target (`-L SITE -s [URL]`, tp#1643; today: notion):** the
+   - **Safari target (`-L SITE -s [URL]`, tp#1643; today: notion; the
+     route table below, tp#1644):** the
      target is Albert's Safari, not the shared Chromium — for "log me into
      notion" / "open this page in my Safari". Order: URL check (https, a host
      of the site's recipe, no port / userinfo / backslash; else exit 2
@@ -1120,9 +1121,8 @@ security review: `plans-done/PLAN_ws1b-durability_DONE.md`.
      (notion: the workspace home) or the given page in a new tab. Exit 0 =
      Safari logged in AND the page opened. `-L SITE -s -n` shows the target
      origin, gate, Safari session + `safari fp`, cooldown, quarantine and the
-     next step, read-only. Sites come from `SAFARI_ROUTES` in `agent-login.py`.
-     The Safari recipe starts on `https://app.notion.com/login` (the login
-     page's host since 2026-11; `www.notion.so/login` redirects there), waits
+     next step, read-only. Notion's recipe starts on
+     `https://app.notion.com/login` (the login page's host since 2026-11; `www.notion.so/login` redirects there), waits
      for the code field before it types the code, and gives a code page that
      lingers after the submit 30 s to reach the sidebar; a `recipe_stuck` stop
      names its reason and tab host (`no_step_for_host`,
@@ -1132,6 +1132,31 @@ security review: `plans-done/PLAN_ws1b-durability_DONE.md`.
      (`notion.so/logout` or the in-app Log out) revokes it server-side and
      logs the shared Chromium out too, unless Chromium has since logged in on
      its own (headless e-mail code).
+   - **One route table (tp#1644).** The `-s` sites come from `SAFARI_ROUTES`
+     in `agent-login.py` (landing page + proof kind; the recipe in
+     `agent_login_safari.py`); `-h` lists them. Proof `builtin` is the
+     throwaway-context proof above; proof `in_safari` runs the Safari recipe
+     in a new window and stops at its sentinel when Safari is logged in
+     (zero steps, nothing typed). A site that can never have a route is ⛔
+     with a fixed reason code: `SAFARI_INFEASIBLE` (`albert_only`,
+     `account_unproven`, `not_opted_in`, `refused`, `on_demand`, and later
+     `second_account` / `not_held`), plus `admin_account` for every listing
+     row with `privilege` admin. The overview's Safari cell is ✅ (route),
+     ❌ (not built yet) or ⛔; `-L SITE -s` (also `-n`) on a ⛔ site exits 2
+     `no_safari_route (<code>)` with its text; `-j` carries
+     `login_columns.safari_why`; agents.md lists the ⛔ sites in one line.
+     `-O/--prove-only` proves only: a live session opens the page (exit 0),
+     a login page ends `safari_logged_out` (exit 2: nothing typed, no broker
+     fill, no code mail); every live canary runs `-O` first. A Cloudflare
+     Access page in the login window is Albert's (exit 4
+     `needs_albert_access`), never `safari_tab_moved`.
+   - **Known limit — the in-Safari identity read is forgeable (tp#1644
+     B2).** For a listing row with an `identity`, the `in_safari` proof
+     runs `identity.RECIPE_JS` in the page's main world against the
+     broker's challenge. Page JavaScript can see the nonce and answer with
+     a name of its choice (`test_page_js_can_forge_the_identity_answer`),
+     so the read is not a proof against a hostile page. No route with an
+     identity read is enabled yet; the fix waits for Albert's decision.
 3. **Otherwise the agent logs Safari in.** It uses mydotfiles' `safari.py` in a
    NEW Safari window (`--new-window`). Every action names that window
    (`--handle`) and the host the tab must be on (`--expect-host`, re-checked
@@ -1646,7 +1671,7 @@ agent-login.py — which of Albert's logins can agents use through the login bro
 
 Without arguments: a health line for the broker, then every login we want agents to use, once: ✅ when it works for agents (setup complete AND the latest real check, -c/-t, passed) or ❌ with the reason. Read-only: it asks the broker for its site list (never a secret), reads the names and expiry dates (never values) of Safari's cookies, and logs into nothing unless you pass -t, -g or -c. Two columns after the login name say what an agent can do there by itself (legend line under the header): Safari = -L SITE -s logs Albert's Safari in and opens the page · Chromium = an agent gets the shared Chromium logged in itself (-j: `login_columns` per row).
 
-The marketplace sites (anibis, tutti, Ricardo, Kleinanzeigen), Galaxus and Galaxus DE run on YOUR Safari session: `browser.py login SITE` copies that site's session cookies into the shared Chromium (Kleinanzeigen falls back to the broker). The broker never submits a password for galaxus and galaxus-de (their bot check rejects it; any item opts in with agent_no_submit=true). When such a session or one of Notion, Slack, OpenAI or claude.ai lapses, an AGENT renews it: `-L SITE` imports your Safari session — logging Safari in first (safari.py with every feature its recipe needs; the credentials from the login broker, else your Vaultwarden tab) when it has lapsed there too — claude.ai through its automated magic link, Notion headlessly with the e-mail code in the shared Chromium when no Safari session imports (no window, also while you are away; only its Safari fallback is attended). When Albert says "log me into notion" or "open this page in my Safari", `-L notion -s [URL]` logs HIS Safari in (attended: the Mac unlocked and in use) and opens the workspace home or that page; Safari already logged in → no code mail, it only opens the page. Only a CAPTCHA, an SMS code, a push / security-key approval (exit 4, named) and the Touch ID touch stay yours: a locked vault is the agent's — it runs `~/.local/libexec/vault-touchid unlock-safari -a main` (you touch Touch ID once) or onboards the item into the broker (`broker-add.py ITEM -Y`/`-Z`); `-g SITE` is still there for a login by hand. CSCS and Smartsheet log in through the broker. SWITCH Cloud logs in with the portal's SSO click, on the browser's own edu-ID session first, then on the broker's (no window).
+The marketplace sites (anibis, tutti, Ricardo, Kleinanzeigen), Galaxus and Galaxus DE run on YOUR Safari session: `browser.py login SITE` copies that site's session cookies into the shared Chromium (Kleinanzeigen falls back to the broker). The broker never submits a password for galaxus and galaxus-de (their bot check rejects it; any item opts in with agent_no_submit=true). When such a session or one of Notion, Slack, OpenAI or claude.ai lapses, an AGENT renews it: `-L SITE` imports your Safari session — logging Safari in first (safari.py with every feature its recipe needs; the credentials from the login broker, else your Vaultwarden tab) when it has lapsed there too — claude.ai through its automated magic link, Notion headlessly with the e-mail code in the shared Chromium when no Safari session imports (no window, also while you are away; only its Safari fallback is attended). When Albert says "log me into SITE" or "open this page in my Safari", `-L SITE -s [URL]` logs HIS Safari in (attended: the Mac unlocked and in use) and opens the site's landing page or that page; Safari already logged in → no login, it only opens the page (`-O`: prove only, never log in). The `-s` sites come from one route table (see -s); a site that can never have one shows ⛔ in the Safari column, and `-L SITE -s` names its reason (exit 2). Only a CAPTCHA, an SMS code, a push / security-key approval (exit 4, named) and the Touch ID touch stay yours: a locked vault is the agent's — it runs `~/.local/libexec/vault-touchid unlock-safari -a main` (you touch Touch ID once) or onboards the item into the broker (`broker-add.py ITEM -Y`/`-Z`); `-g SITE` is still there for a login by hand. CSCS and Smartsheet log in through the broker. SWITCH Cloud logs in with the portal's SSO click, on the browser's own edu-ID session first, then on the broker's (no window).
 
 Examples:
 
@@ -1713,7 +1738,8 @@ Fill-only items (`agent_fill_only = true`, tp#1082): the broker never logs in wi
 | `-D`, `--remove` `SITE` | remove a broker site, run twice: while it is listed -> demote + browser.py logout; after its vault item is gone -> drop every trace (broker `forget`, state files, cache files); audited |
 | `-Q`, `--release` `SITE` | release SITE's quarantine (after a failed login that may have submitted the password) — the main session's decision, audited |
 | `-L`, `--safari-login` `SITE` | an AGENT's login through Albert's Safari (WS1b): free check, else import Safari's own session (works without new safari.py features), else log Safari in (safari.py, a new window; the login broker's credentials, else his Vaultwarden tab and clipboard) and import it; claude.ai: the automated magic link; notion: after the import the headless e-mail code (`browser.py login notion -M`, also while Albert is away), the Safari login only as its fallback. One run, no retries; never from a LaunchAgent. Exit 4 = needs Albert (CAPTCHA, SMS, push / security key); a locked vault is the agent's: `vault-touchid unlock-safari -a main` (Albert touches once); exit 3 = the Mac is locked or idle (for notion only before its Safari fallback): retry later. With -s: the target is Albert's SAFARI, not the shared Chromium (see -s) |
-| `-s`, `--in-safari` `[URL]` | with -L SITE: log Albert's SAFARI in to SITE (attended: the Mac unlocked and in use) and leave it on the site's landing page, or on URL (an https page of the site, else exit 2 bad_url); Safari already logged in (proven in a throwaway context, never a second account) → no code mail, it only opens the page in a new tab; else the e-mail code login in a new Safari window (one code mail per 15 min, shared with -L SITE's headless route); imports the session when the shared Chromium is logged out. Exit 0 = Safari logged in AND the page opened; 3 = the Mac is locked or idle; 4 = needs Albert (CAPTCHA). For Albert's 'log me into notion' / 'open this page in my Safari'. Sites: notion |
+| `-s`, `--in-safari` `[URL]` | with -L SITE: log Albert's SAFARI in to SITE (attended: the Mac unlocked and in use) and leave it on the site's landing page, or on URL (an https page of the site, else exit 2 bad_url). Safari's session is proven first (builtin: in a throwaway context; in_safari: the login page's sentinel in a new Safari window), never a second account (exit 2 wrong_account) → no login, it only opens the page in a new tab; else the site's recipe logs Safari in (notion: one code mail per 15 min, shared with -L SITE's headless route); imports the session when the recipe says so and the shared Chromium is logged out. Exit 0 = Safari logged in AND the page opened; 2 = no route (no_safari_route, with its ⛔ reason code when the site can never have one); 3 = the Mac is locked or idle; 4 = needs Albert (CAPTCHA, SMS, push / passkey, a Cloudflare Access login). For Albert's 'log me into SITE' / 'open this page in my Safari'. Sites (the route table SAFARI_ROUTES): notion |
+| `-O`, `--prove-only` | with -L SITE -s: prove Albert's Safari session only, never log in — a live session → the page opens (exit 0); a logged-out Safari → exit 2 safari_logged_out (nothing typed, no broker fill, no code mail); exit 4 = needs Albert. Live canaries run -O first |
 | `-l`, `--fillable` | list every item agents can fill into Albert's Safari (fill-only items and login items with agent_safari_fill): site, name, fill origins — names only, never a value (from the broker's site listing; -r asks the broker now; -j: JSON) |
 | `-n`, `--dry-run` | with -L: report what it would do (no import, no Safari login) |
 | `-H`, `--identity-history` `[SITE]` | read-only: the last identity proofs of SITE (no SITE: of every site) that did not say match — when, state, verdict, the recipe's reason word, HTTP status, code, redacted detail (checks.json keeps the last 10 per site; the latest check overwrites its detail); -j: JSON |

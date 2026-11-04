@@ -840,7 +840,7 @@ def test_a_code_that_changes_between_polls_is_not_taken_early() -> None:
     real = s.find_code
 
     def flip(*a: Any) -> tuple[str | None, str]:
-        got = real(*a)
+        got: tuple[str | None, str] = real(*a)
         seen.append(got[0])
         if len(seen) == 1:  # a second, different code arrives
             box.mails.clear()
@@ -1039,7 +1039,7 @@ def _detect(html: str, recipe: s.Recipe) -> dict[str, Any]:
             raw = page.evaluate("() => " + s.detector_js(recipe, "#account"))
         finally:
             browser.close()
-    parsed = s.parse_page(raw, len(recipe.steps))
+    parsed: dict[str, Any] | None = s.parse_page(raw, len(recipe.steps))
     assert parsed is not None
     return parsed
 
