@@ -1666,13 +1666,24 @@ def test_the_deadline_itself_decides_not_only_the_watchdog(
             return None
 
     launched: list[int] = []
+    fake_pw = object()
 
-    def launch(*_a: Any, **_k: Any) -> _Ctx:
+    def launch(pw: Any, *_a: Any, **_k: Any) -> _Ctx:
+        assert pw is fake_pw  # the stub below, not a real Playwright
         launched.append(1)
         return _Ctx()
 
     monkeypatch.setattr(daemon, "RunWatchdog", _NeverFires)
     monkeypatch.setattr(runner, "_launch", launch)
+    # No real Playwright start inside the deadline: under load it alone can
+    # take seconds and eat the budget before the launch.
+    import playwright.sync_api  # pylint: disable=import-outside-toplevel
+
+    monkeypatch.setattr(
+        playwright.sync_api,
+        "sync_playwright",
+        lambda: contextlib.nullcontext(fake_pw),
+    )
     item = vault.site_item_from_json(
         {
             "id": "x",
@@ -1689,7 +1700,7 @@ def test_the_deadline_itself_decides_not_only_the_watchdog(
             raise AssertionError("no secret")
 
     gate = _Gate()
-    gate.deadline = time.monotonic() + 3.0  # room for Playwright's start
+    gate.deadline = time.monotonic() + 1.0  # room for the stubbed launch
 
     def finish_late(*_a: Any, **_k: Any) -> dict[str, Any]:
         time.sleep(max(0.0, gate.deadline - time.monotonic()) + 0.1)

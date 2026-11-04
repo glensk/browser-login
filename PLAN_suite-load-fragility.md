@@ -311,7 +311,7 @@ Build rounds (at most 3 boxes per round, one writer agent per round, rounds in o
 - [ ] B7 `pyproject.toml` `--durations=25`, plus a `README.md` two-tier test section with
   the low-load wall time from one full run done by the overseer at load < 8 (the overseer
   makes that run, not an agent under load).
-- [ ] B9 `tests/test_ws2_cscs.py` `test_the_deadline_itself_decides_not_only_the_watchdog`
+- [x] B9 `tests/test_ws2_cscs.py` `test_the_deadline_itself_decides_not_only_the_watchdog`
   (~1656, found in R2, overseer 2026-11-04): it gives the gate 3 s including a real
   `sync_playwright()` start (only `_launch` stubbed), so it fails under load. Stub
   `sync_playwright` in that test, or start the deadline clock after Playwright is up;
