@@ -24,9 +24,9 @@ no Safari session imports (no window, also while you are away; only its Safari
 fallback is attended). When Albert says "log me into notion" or "open this
 page in my Safari", `-L notion -s [URL]` logs HIS Safari in (attended: the Mac
 unlocked and in use) and opens the workspace home or that page; Safari already
-logged in → no code mail, it only opens the page (the Safari code fill is not
-proven live yet). Only a CAPTCHA, an SMS code, a push / security-key approval (exit 4,
-named) and the Touch ID touch stay yours: a locked vault is the agent's — it runs
+logged in → no code mail, it only opens the page. Only a CAPTCHA, an SMS code,
+a push / security-key approval (exit 4, named) and the Touch ID touch stay
+yours: a locked vault is the agent's — it runs
 `~/.local/libexec/vault-touchid unlock-safari -a main` (you touch Touch ID once) or onboards the
 item into the broker (`broker-add.py ITEM -Y`/`-Z`); `-g SITE` is still there
 for a login by hand. CSCS and Smartsheet log in through the broker.
@@ -1092,8 +1092,7 @@ def safari_route_sentence() -> str:
     )
     return (
         f"{says} (his own Safari, attended — exit 3 = the Mac is locked or idle; "
-        "`-s URL` also opens that page of the site; the Safari code fill is not "
-        "proven live yet)."
+        "`-s URL` also opens that page of the site)."
     )
 
 
@@ -5121,8 +5120,8 @@ def build_parser() -> argparse.ArgumentParser:
         "logged in (proven in a throwaway context, never a second account) → "
         "no code mail, it only opens the page in a new tab; else the e-mail "
         "code login in a new Safari window (one code mail per 15 min, shared "
-        "with -L SITE's headless route; the Safari code fill is not proven "
-        "live yet); imports the session when the shared Chromium is logged "
+        "with -L SITE's headless route); imports the session when the shared "
+        "Chromium is logged "
         "out. Exit 0 = Safari logged in AND the page opened; 3 = the Mac is "
         "locked or idle; 4 = needs Albert (CAPTCHA). For Albert's 'log me "
         "into notion' / 'open this page in my Safari'. Sites: "

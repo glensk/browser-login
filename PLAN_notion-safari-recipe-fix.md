@@ -228,7 +228,7 @@ click, no fill, no navigation).
   another session may be committing other files there), then remove the worktree
   and delete the branch (`git -C <live> worktree remove …`, `git -C <live> branch -D
   notion-safari-fix`).
-- [ ] B4 LIVE CANARY (= parent B13; Albert present at the Mac; he asked for a real
+- [x] B4 LIVE CANARY (= parent B13; Albert present at the Mac; he asked for a real
   logout test on 2026-11-03, which overrides the parent's "never forced by a logout"
   rule for this run only). Preconditions: the cooldown is free (`stat -f %m
   ~/.local/state/agent-login/notion-mail-code.json` ≥ 15 min ago — tonight's headless
