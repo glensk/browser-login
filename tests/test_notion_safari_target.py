@@ -641,7 +641,8 @@ def pipe(monkeypatch: pytest.MonkeyPatch) -> dict[str, Any]:
         return al.BrowserRun(st["import_rc"], False, "", 0.0, {"code": "x"})
 
     def features(_c: Any) -> frozenset[str]:
-        return alsafari.BASE_FEATURES | recipe.features()
+        got: frozenset[str] = alsafari.BASE_FEATURES | recipe.features()
+        return got
 
     def free(_s: str) -> tuple[int, dict]:
         return st["free"][0], {"code": st["free"][1]}
@@ -674,7 +675,8 @@ def _kinds(st: dict[str, Any]) -> list[str]:
 
 
 def _stamp_path() -> Path:
-    return als.state_dir() / "notion-mail-code.json"
+    path: Path = als.state_dir() / "notion-mail-code.json"
+    return path
 
 
 def test_match_opens_without_machine_mail_or_stamp(pipe: dict[str, Any]) -> None:
@@ -852,7 +854,8 @@ def _dry(
 
     def features(c: Any) -> frozenset[str]:
         c(["--capabilities"])
-        return alsafari.BASE_FEATURES | alsafari.RECIPES[site].features()
+        got: frozenset[str] = alsafari.BASE_FEATURES | alsafari.RECIPES[site].features()
+        return got
 
     monkeypatch.setattr(alsafari, "run_safari_py", lambda _b: call)
     monkeypatch.setattr(alsafari, "features", features)

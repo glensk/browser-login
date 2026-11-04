@@ -257,7 +257,7 @@ SAFARI_INFEASIBLE_TEXT: dict[str, str]  # one line per code, value-free
   for an identity proof is reachable from agent-login.py without a browser lease
   (identity_ops / daemon); else the identity read is built in browser.py and B1 adds
   it to the lint lines.
-- [ ] B2 tests, new `tests/test_safari_routes.py` (no network, no real Safari / Chrome;
+- [x] B2 tests, new `tests/test_safari_routes.py` (no network, no real Safari / Chrome;
   fakes as in `test_notion_safari_target.py`): every listing row lands in exactly
   one of `SAFARI_ROUTES` / `SAFARI_INFEASIBLE` (incl. derived admin) / "not built
   yet" (a table-driven test over a listing snapshot fixture, so a new broker item
