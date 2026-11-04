@@ -317,7 +317,7 @@ Build rounds (at most 3 boxes per round, one writer agent per round, rounds in o
   `sync_playwright` in that test, or start the deadline clock after Playwright is up;
   never just raise the 3 s. Keep what the test asserts about the deadline vs the watchdog.
   Verify with two normal `-k` runs.
-- [ ] B10 `tests/test_username_only.py::test_username_only_login_is_typed_submitted_and_proven[selfsubmit]`
+- [x] B10 `tests/test_username_only.py::test_username_only_login_is_typed_submitted_and_proven[selfsubmit]`
   (found by the B7 full run, overseer 2026-11-04): failed once under load 8-15 with
   `origin_violation` "the field's frame is not on a fill origin (frame: unknown)" in phase
   `submit`; passed on a targeted rerun. Find the root cause first (likely the self-submitting

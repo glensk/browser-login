@@ -509,6 +509,73 @@ def test_no_marker_no_request() -> None:
         trip.check()
 
 
+class _RacingField:
+    """The account field while the broker guards it before the submit. The
+    page's own submit is routed (``trip._handle``) DURING the guard's frame
+    read, and its navigation then detaches the field: the ordering of the
+    tp#1672 flake, forced instead of left to load. `frame_url` "" = detached."""
+
+    def __init__(
+        self, log: list[str], trip: recipes.SubmitTripwire | None, frame_url: str
+    ) -> None:
+        self.log = log
+        self.trip = trip
+        self.frame_url = frame_url
+
+    def owner_frame(self) -> Any:
+        if self.trip is not None:
+            self.trip._handle(_Route(self.log))  # the page submits itself now
+        if not self.frame_url:
+            raise RuntimeError("Element is not attached to the DOM")
+        return SimpleNamespace(url=self.frame_url)
+
+    def evaluate(self, _js: str, *_args: Any) -> Any:
+        self.log.append("evaluate")
+        return {"action": None}
+
+    def press(self, key: str) -> None:
+        self.log.append(f"press {key}")
+
+
+def _racing_submit(racing: _RacingField, trip: recipes.SubmitTripwire) -> None:
+    only = vault.Secret(username="", password=ACCOUNT, mode=vault.USERNAME_ONLY)
+    recipes._submit_password(
+        SimpleNamespace(url="https://mullvad.net/en/account/login"),
+        racing,
+        ["https://mullvad.net"],
+        dev=False,
+        attempt=trip.attempt,
+        secret=only,
+        tripwire=trip,
+    )
+
+
+def test_a_self_submit_during_the_guard_is_not_an_origin_violation() -> None:
+    """The page sends the account number by itself while the broker reads
+    the field's frame for the submit guard; the navigation detaches the field
+    (frame unknown). The secret already went to a fill origin: no refusal and
+    no second submit (tp#1672)."""
+    log: list[str] = []
+    attempt = recipes.AttemptController()
+    trip = _trip(attempt)
+    _racing_submit(_RacingField(log, trip, ""), trip)
+    assert log == ["continue"] and trip.secret_sent and attempt.submitted
+
+
+@pytest.mark.parametrize("frame_url", ["", "https://evil.example/frame"])
+def test_an_unknown_or_foreign_frame_without_a_self_submit_is_refused(
+    frame_url: str,
+) -> None:
+    """Fail-closed stays: a detached field or a foreign frame, with no proof
+    that the page sent the secret to a fill origin, refuses the submit."""
+    log: list[str] = []
+    attempt = recipes.AttemptController()
+    trip = _trip(attempt)
+    with pytest.raises(recipes.OriginViolation, match="field's frame"):
+        _racing_submit(_RacingField(log, None, frame_url), trip)
+    assert not log and not trip.secret_sent and not attempt.submitted
+
+
 def test_holds_accepts_a_regrouped_account_number_only() -> None:
     only = vault.Secret(username="", password=ACCOUNT, mode=vault.USERNAME_ONLY)
     assert recipes._holds(_grouped(ACCOUNT), only)

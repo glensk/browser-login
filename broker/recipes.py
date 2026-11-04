@@ -2404,10 +2404,19 @@ def _submit_password(  # pylint: disable=too-many-arguments
     submit: the field, the button's own frame and its ``formaction`` stay on
     a fill origin. ``attempt.mark_submitted()`` runs only right before the
     Enter or the click on the identified button. A username-only login the
-    page already sent by itself is not submitted again (``_sent_by_itself``)."""
+    page already sent by itself is not submitted again (``_sent_by_itself``),
+    also when it sends it WHILE the field is guarded: its navigation detaches
+    the field, whose frame then reads as unknown (tp#1672). Only the
+    tripwire's proof that the whole secret went to a fill origin stops the
+    refusal; without it the guard's ``OriginViolation`` stands."""
     if _sent_by_itself(tripwire, secret):
         return
-    _guard(page, pw_field, allowed, dev=dev)
+    try:
+        _guard(page, pw_field, allowed, dev=dev)
+    except OriginViolation:
+        if _sent_by_itself(tripwire, secret):
+            return  # the page sent it by itself meanwhile: nothing to submit
+        raise
     read = read_submit_buttons(pw_field)
     if read is None:
         if _sent_by_itself(tripwire, secret):
