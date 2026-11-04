@@ -276,13 +276,14 @@ SAFARI_INFEASIBLE_TEXT: dict[str, str]  # one line per code, value-free
   stow source (mydotfiles `dotfiles/claude/.claude/skills/browser-login/SKILL.md`:
   "log me into SITE" → `-L SITE -s`) needs its own `[commit: …/mydotfiles]` grant,
   else the overseer edits it.
-- [ ] B4 verify + install of B1-B3: ruff format / check, mypy, `uv run pylint` on
+- [x] B4 verify + install of B1-B3: ruff format / check, mypy, `uv run pylint` on
   every touched file, the Verification block against the worktree root; install
   as in PLAN_notion-safari-recipe-fix.md B3 (`<base>` = live HEAD at worktree
   creation; unchanged-since-base check; backups in
   `~/.local/state/agent-login/bak-1644/`; module → script order, `cp -p` + `mv`;
   live `-h` smokes; commit from live with explicit paths). Every later batch box
   (B5, B7, B9, B11, B13, B15, B17) reuses this install path for its own files.
+  ↳ evidence 2026-11-04: B1-B3 installed into live at e53ec8c 2026-11-04 16:07 (unchanged-since-base 75b829a check, backups bak-1644, module->script cp -p + mv); live status clean; worktree ruff/mypy/pylint + 6 target test files green; live -h exit 0; live pytest test_safari_routes/notion_safari_target/ws1b_safari/notion_s…
 - [ ] B5 **[Albert]** LIVE CANARY of the mechanism (no login): `-L notion -s -O` and
   `-L notion -s` still exit 0 with no code mail (cooldown mtime unchanged);
   `-L google-kindle -s` and `-L abs-root -s` → exit 2 `no_safari_route (albert_only |
