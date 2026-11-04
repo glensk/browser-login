@@ -271,7 +271,7 @@ Build rounds (at most 3 boxes per round, one writer agent per round, rounds in o
   `away()` conditional on it. The wrong-key test sets it to False and asserts that the page
   is still on `PORTAL + "/profile/"` at the end. That assertion is what tells the new test
   apart from the old one, which passes on a lucky run.
-- [ ] B6 Landing of B1 in production, after B1 and B2 are merged to `origin/main`. (1)
+- [x] B6 Landing of B1 in production, after B1 and B2 are merged to `origin/main`. (1)
   Record the current release: `readlink /usr/local/libexec/login-broker/current`, in the
   report. (2) `sudo -n install/install.sh -n` (dry run), then
   `sudo -n install/install.sh` from a clean checkout at `origin/main`. It installs a new
