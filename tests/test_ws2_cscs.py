@@ -547,7 +547,8 @@ class _CountingVault:
         self.secret_calls = 0
 
     def items(self) -> list[vault.SiteItem]:
-        return self._inner.items()
+        items: list[vault.SiteItem] = self._inner.items()
+        return items
 
     def secret(self, site: str) -> vault.Secret:
         self.secret_calls += 1
@@ -576,7 +577,8 @@ class _Rig:
     runner: _RoutedRunner
 
     def login(self) -> dict[str, Any]:
-        return self.brk._login_request("cscs", {})
+        reply: dict[str, Any] = self.brk._login_request("cscs", {})
+        return reply
 
     def limiter_bytes(self) -> bytes:
         path = self.home / "limiter.json"
@@ -866,11 +868,12 @@ def _revoke_before_export(
 ) -> Callable[..., Any]:
     """The token dies between the proof and the export (the export's own
     server check must catch it)."""
-    real = daemon.PlaywrightRunner._cscs_portal_storage
+    real: Callable[..., Any] = daemon.PlaywrightRunner._cscs_portal_storage
 
     def revoked(self: Any, ctx: Any, item: Any) -> dict[str, str]:
         app.revoke_all()
-        return real(self, ctx, item)
+        storage: dict[str, str] = real(self, ctx, item)
+        return storage
 
     monkeypatch.setattr(daemon.PlaywrightRunner, "_cscs_portal_storage", revoked)
     return real
@@ -1401,7 +1404,8 @@ def test_a_login_is_not_started_late(
     def slow_preflight(*_a: Any, **_k: Any) -> str:
         ran.append("preflight")
         time.sleep(0.3)  # the Keycloak form wait eats into the run
-        return recipes.INVALID
+        invalid: str = recipes.INVALID
+        return invalid
 
     monkeypatch.setitem(daemon.PREFLIGHTS, "cscs", slow_preflight)
     # enough left BEFORE the preflight, too little after it (debate R2-C4)
