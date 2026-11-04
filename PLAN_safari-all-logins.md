@@ -245,7 +245,7 @@ SAFARI_INFEASIBLE_TEXT: dict[str, str]  # one line per code, value-free
 
 ## Boxes
 
-- [ ] B1 `agent-login.py` + `agent_login_safari.py` (worktree): `SafariRoute`,
+- [x] B1 `agent-login.py` + `agent_login_safari.py` (worktree): `SafariRoute`,
   `SAFARI_INFEASIBLE` (+ texts, + the derived `admin_account` rule),
   `login_columns().safari_why`, the ⛔ cell + legend + `-j` + agents.md line, the
   `no_safari_route (<code>)` refusal; `-s` dispatch by `route.proof` (`builtin` →

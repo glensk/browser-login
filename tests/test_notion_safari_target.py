@@ -499,7 +499,11 @@ def test_login_columns(monkeypatch: pytest.MonkeyPatch) -> None:
     assert not al.login_columns("shop", {**row, "fill_only": True}).chromium
     assert not al.login_columns("shop", {**row, "status": "refused"}).chromium
     # a second route (non-mail-code recipe) is one table entry
-    monkeypatch.setitem(al.SAFARI_ROUTES, "galaxus", "https://www.galaxus.ch/")
+    monkeypatch.setitem(
+        al.SAFARI_ROUTES,
+        "galaxus",
+        al.SafariRoute("https://www.galaxus.ch/", "in_safari"),
+    )
     assert al.login_columns("galaxus").safari
     host = alsafari.RECIPES["galaxus"].hosts[0]
     assert al.safari_target_url("galaxus", f"https://{host}/x") is not None
@@ -953,7 +957,9 @@ def test_a_second_route_is_one_table_entry(
     assert not any(s.kind == "mail_code" for s in alsafari.RECIPES[site].steps)
     assert not al.login_columns(site).safari
     host = alsafari.RECIPES[site].hosts[0]
-    monkeypatch.setitem(al.SAFARI_ROUTES, site, f"https://{host}/")
+    monkeypatch.setitem(
+        al.SAFARI_ROUTES, site, al.SafariRoute(f"https://{host}/", "in_safari")
+    )
     assert al.login_columns(site).safari
     text, _seen = _dry(pipe, monkeypatch, site)
     assert f"▶ {site}: Safari target https://{host} (the landing page)" in text
@@ -1023,10 +1029,26 @@ def test_json_rows_carry_login_columns(
     monkeypatch.setattr(sys, "argv", ["agent-login.py", "-j"])
     assert al.main() == 0
     rows = {r["site"]: r for r in json.loads(capsys.readouterr().out)["rows"]}
-    assert rows["notion"]["login_columns"] == {"safari": True, "chromium": True}
-    assert rows["anthropic"]["login_columns"] == {"safari": False, "chromium": True}
-    assert rows["shop"]["login_columns"] == {"safari": False, "chromium": True}
-    assert rows["plain"]["login_columns"] == {"safari": False, "chromium": False}
+    assert rows["notion"]["login_columns"] == {
+        "safari": True,
+        "chromium": True,
+        "safari_why": "",
+    }
+    assert rows["anthropic"]["login_columns"] == {
+        "safari": False,
+        "chromium": True,
+        "safari_why": "",
+    }
+    assert rows["shop"]["login_columns"] == {
+        "safari": False,
+        "chromium": True,
+        "safari_why": "",
+    }
+    assert rows["plain"]["login_columns"] == {
+        "safari": False,
+        "chromium": False,
+        "safari_why": "",
+    }
 
 
 def test_agents_md_names_the_safari_route_from_the_table(

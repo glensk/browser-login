@@ -101,6 +101,7 @@ import hashlib
 import hmac
 import json
 import os
+import secrets
 import shutil
 import socket
 import sys
@@ -109,6 +110,7 @@ import urllib.parse
 from collections.abc import Callable, Iterator
 from dataclasses import asdict, dataclass
 from pathlib import Path
+from typing import Any
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))  # the repo's `broker` package
 # pylint: disable=wrong-import-position
@@ -976,6 +978,9 @@ def _route_header(rows: list[dict]) -> str:
     safari = safari_route_sentence()  # tp#1643: from SAFARI_ROUTES
     if safari:
         rest += f" {safari}"
+    blocked = safari_infeasible_sentence(rows)  # tp#1644
+    if blocked:
+        rest += f" {blocked}"
     if not routed:
         return rest
     return (
@@ -1015,11 +1020,78 @@ def _safari_session_live(row: dict) -> bool:
     return row.get("safari") is True and fresh
 
 
-# site -> landing URL a `-L SITE -s` run leaves Safari on (tp#1643). For a
-# recipe without a mail_code step, adding a site here (with its RECIPES entry)
-# is the whole of a new Safari route; a mail-code site also needs its mail env
-# (`MAIL_CODE_ENV`).
-SAFARI_ROUTES: dict[str, str] = {"notion": "https://app.notion.com/"}
+# tp#1644: the Safari route table. A site with an entry is a `-L SITE -s`
+# route (with its recipe); `proof` says how Safari's session is proven:
+# "builtin" = `browser.py import-safari SITE -P` (a throwaway context),
+# "in_safari" = the Safari Machine's sentinel run (a live session ends ok
+# with zero steps). `then`: a chain's second route (switch after eduid).
+# A mail-code recipe also needs its mail env (`MAIL_CODE_ENV`). The import
+# decision stays the recipe's `import_after`.
+@dataclass(frozen=True)
+class SafariRoute:
+    """One `-L SITE -s` route: its landing page and proof kind."""
+
+    landing: str  # the https page `-s` leaves Safari on
+    proof: str  # "builtin" | "in_safari"
+    then: str = ""  # chain: a second route run after this one
+
+
+SAFARI_PROOFS = frozenset({"builtin", "in_safari"})
+SAFARI_ROUTES: dict[str, SafariRoute] = {
+    "notion": SafariRoute("https://app.notion.com/", "builtin"),
+}
+# tp#1644: sites that can NOT have a Safari route (⛔), with a fixed reason
+# code. Admin accounts (listing `privilege` admin) are derived, not listed:
+# `safari_why` → `admin_account` unless the site has a route.
+SAFARI_INFEASIBLE: dict[str, str] = {
+    "google-kindle": "albert_only",
+    "authentik-test3": "account_unproven",
+    "mullvad": "not_opted_in",
+    "cloudflare": "refused",
+    "myfritz": "on_demand",
+}
+# One value-free line per reason code.
+SAFARI_INFEASIBLE_TEXT: dict[str, str] = {
+    "admin_account": "an admin account — never logged in in Albert's Safari",
+    "albert_only": (
+        "Albert's own login (Google push / passkey / captcha, a second Google account)"
+    ),
+    "account_unproven": "the account cannot be proven and the item is not opted in",
+    "not_opted_in": "the item is not opted in to Safari fills (safari_fill)",
+    "refused": (
+        "the item is refused (never a Cloudflare Access team session through agents)"
+    ),
+    "on_demand": "an on-demand, quarantined login — Albert releases it by hand",
+    "second_account": "Safari already holds another account of this site",
+    "not_held": "Safari holds no session of this site's accounts",
+}
+
+
+def _listing_row(site: str) -> dict:
+    """`site`'s entry of the last `sites` snapshot ({} when none) — read
+    only, never a broker call."""
+    return next((s for s in _snapshot_sites() if s.get("site") == site), {})
+
+
+def safari_why(site: str, row: dict | None = None) -> str:
+    """The ⛔ reason code of `site` ('' = it has a route, or none is built
+    yet): `SAFARI_INFEASIBLE`, else `admin_account` for a row whose
+    `privilege` is admin (`row`, else the listing snapshot)."""
+    if site in SAFARI_ROUTES:
+        return ""
+    if site in SAFARI_INFEASIBLE:
+        return SAFARI_INFEASIBLE[site]
+    privilege = (row if row is not None else _listing_row(site)).get("privilege")
+    return "admin_account" if privilege == "admin" else ""
+
+
+def safari_routed(site: str) -> bool:
+    """`site` has a Safari route: a `SAFARI_ROUTES` entry and its recipe."""
+    return site in SAFARI_ROUTES and site in alsafari.RECIPES
+
+
+def _routed_sites() -> list[str]:
+    return sorted(s for s in SAFARI_ROUTES if safari_routed(s))
 
 
 @dataclass(frozen=True)
@@ -1030,20 +1102,23 @@ class LoginColumns:
     safari: bool
     # an agent can get the shared Chromium logged in itself
     chromium: bool
+    # tp#1644: the ⛔ reason code ('' = ✅, or no route built yet)
+    safari_why: str = ""
 
 
 def login_columns(site: str, row: dict | None = None) -> LoginColumns:
-    """Safari = `site` has a Safari route (`SAFARI_ROUTES` and a recipe);
-    Chromium = `agent_route` (unchanged), the headless e-mail code, the
-    magic link, or a broker login usable by agents."""
-    safari = site in SAFARI_ROUTES and site in alsafari.RECIPES
+    """Safari = `site` has a Safari route (`SAFARI_ROUTES` and a recipe),
+    else its ⛔ reason (`safari_why`); Chromium = `agent_route`
+    (unchanged), the headless e-mail code, the magic link, or a broker
+    login usable by agents."""
+    safari = safari_routed(site)
     chromium = (
         agent_route(site, row)
         or site in MAIL_CODE_SITES
         or site in alsafari.MAGIC_LINK_SITES
         or _broker_logs_in(row)
     )
-    return LoginColumns(safari, chromium)
+    return LoginColumns(safari, chromium, "" if safari else safari_why(site, row))
 
 
 def _broker_logs_in(row: dict | None) -> bool:
@@ -1064,18 +1139,20 @@ SAFARI_COL = "Safari"
 CHROMIUM_COL = "Chromium"
 LOGIN_COLUMNS_LEGEND = (
     "Safari = -L SITE -s logs Albert's Safari in and opens the page · "
-    "Chromium = an agent gets the shared Chromium logged in itself"
+    "Chromium = an agent gets the shared Chromium logged in itself · "
+    "⛔ = Albert's (reason: -L SITE -s -n, -j login_columns.safari_why)"
 )
 
 
-def _yes_no_cell(yes: bool, header: str) -> str:
-    """✅ / ❌ padded to `header`'s display width (both icons are two
-    terminal columns wide, like the status icon)."""
-    return ("✅" if yes else "❌") + " " * (len(header) - 2)
+def _yes_no_cell(yes: bool, header: str, *, why: str = "") -> str:
+    """✅ / ❌ (⛔ with a reason) padded to `header`'s display width (the
+    icons are two terminal columns wide, like the status icon)."""
+    return ("✅" if yes else "⛔" if why else "❌") + " " * (len(header) - 2)
 
 
 def with_login_columns(rows: list[dict]) -> list[dict]:
-    """`-j`: each row gains ``login_columns`` {"safari", "chromium"}."""
+    """`-j`: each row gains ``login_columns`` {"safari", "chromium",
+    "safari_why"}."""
     for row in rows:
         row["login_columns"] = asdict(login_columns(str(row.get("site") or ""), row))
     return rows
@@ -1084,7 +1161,7 @@ def with_login_columns(rows: list[dict]) -> list[dict]:
 def safari_route_sentence() -> str:
     """agents.md's `-L SITE -s` sentence, its sites from `SAFARI_ROUTES`
     (only sites with a recipe; '' when none)."""
-    sites = sorted(s for s in SAFARI_ROUTES if s in alsafari.RECIPES)
+    sites = _routed_sites()
     if not sites:
         return ""
     says = "; ".join(
@@ -1094,6 +1171,21 @@ def safari_route_sentence() -> str:
         f"{says} (his own Safari, attended — exit 3 = the Mac is locked or idle; "
         "`-s URL` also opens that page of the site)."
     )
+
+
+def safari_infeasible_sentence(rows: list[dict]) -> str:
+    """agents.md's one line of ⛔ Safari sites with their reason codes
+    (`SAFARI_INFEASIBLE` plus the admin rows of `rows`; '' when none)."""
+    why = {s: c for s, c in SAFARI_INFEASIBLE.items() if s not in SAFARI_ROUTES}
+    for r in rows:
+        site = str(r.get("site") or "")
+        code = safari_why(site, r) if SITE_ID_RE.match(site) else ""
+        if code:
+            why[site] = code
+    if not why:
+        return ""
+    listed = ", ".join(f"{s} ({why[s]})" for s in sorted(why))
+    return f"Safari logins that stay Albert's (⛔, never try them): {listed}."
 
 
 def route_hint(site: str, row: dict | None = None) -> str:
@@ -1700,7 +1792,7 @@ def print_overview(data: dict) -> None:
         cols = login_columns(r["site"], r)
         line = (
             f"  {icon} {_c('1', r['name'].ljust(width))}  "
-            f"{_yes_no_cell(cols.safari, SAFARI_COL)}  "
+            f"{_yes_no_cell(cols.safari, SAFARI_COL, why=cols.safari_why)}  "
             f"{_yes_no_cell(cols.chromium, CHROMIUM_COL)}  {bw}  "
         )
         rec = checks.get(r["site"]) or {}
@@ -4108,10 +4200,7 @@ def _safari_drive_stage(  # pylint: disable=too-many-return-statements
     fingerprint before the drive, for the flush wait). A mail-code site
     drives through `_mail_code_safari_drive` (tp#1643: lock, cooldown /
     quarantine, stamp before the trigger, its mail env)."""
-    if site in MAIL_CODE_SITES:
-        out = _mail_code_safari_drive(site, recipe)
-    else:
-        out = _drive_safari(site, recipe)
+    out = _safari_drive(site, recipe)
     if out.mail_archived == "failed":
         print(f"⚠️ {site}: the login-code mail could not be archived (left in INBOX)")
     if not out.ok:
@@ -4170,6 +4259,34 @@ MAIL_CODE_BLOCKS = frozenset({"cooldown", "quarantined"})
 SAFARI_OPEN_WAIT_S = 20
 
 
+def has_mail_code(recipe: alsafari.Recipe) -> bool:
+    """tp#1644: the recipe logs in with an e-mail code (a `mail_code`
+    step) — it drives through `_mail_code_safari_drive`. `MAIL_CODE_SITES`
+    stays the headless `-M` set."""
+    return any(s.kind == "mail_code" for s in recipe.steps)
+
+
+def _safari_drive(
+    site: str,
+    recipe: alsafari.Recipe,
+    *,
+    proof_only: bool = False,
+    on_sentinel: Callable[[alsafari.Runner, list[str]], str] | None = None,
+) -> alsafari.Outcome:
+    """One Safari drive of `site`: the mail-code drive for a recipe with a
+    `mail_code` step, else the plain one (tp#1644: `proof_only` /
+    `on_sentinel` for the Machine, passed only when set: the call of a
+    plain run stays today's)."""
+    extra: dict[str, Any] = {}
+    if proof_only:
+        extra["proof_only"] = True
+    if on_sentinel is not None:
+        extra["on_sentinel"] = on_sentinel
+    if has_mail_code(recipe):
+        return _mail_code_safari_drive(site, recipe, **extra)
+    return _drive_safari(site, recipe, **extra)
+
+
 def _mail_code_block(site: str) -> str:
     """Why no code mail may go out for `site` now ('' = none): quarantined,
     else the shared cooldown — an unreadable stamp counts (fail closed)."""
@@ -4181,13 +4298,15 @@ def _mail_code_block(site: str) -> str:
     return ""
 
 
-def _mail_code_safari_drive(site: str, recipe: alsafari.Recipe) -> alsafari.Outcome:
+def _mail_code_safari_drive(
+    site: str, recipe: alsafari.Recipe, **machine: Any
+) -> alsafari.Outcome:
     """One Safari drive of a mail-code site (`-s` and the `-L` fallback):
     under `mail_code_lock(site)` (busy → 75), blocked (cooldown /
     quarantined) → the Machine runs WITHOUT any code mail (no mailbox read,
     no click; a live session still reaches the sentinel), else the cooldown
     stamp is written right before the trigger click; himalaya with the
-    site's mail env."""
+    site's mail env. `machine`: tp#1644's `proof_only` / `on_sentinel`."""
     with als.mail_code_lock(site) as held:
         if held is None:
             return alsafari.Outcome(2, "state_unwritable", phase="precheck")
@@ -4214,6 +4333,7 @@ def _mail_code_safari_drive(site: str, recipe: alsafari.Recipe) -> alsafari.Outc
             env=dict(MAIL_CODE_ENV.get(site, {})),
             before_trigger=hook,
             no_trigger=block,
+            **machine,
         )
 
 
@@ -4242,7 +4362,8 @@ def safari_target_url(site: str, given: str) -> str | None:
     """The page `-L SITE -s [URL]` opens (`given`, else the landing page), or
     None (`bad_url`): https only, no userinfo, no port, no backslash or
     whitespace anywhere, a host of the site's recipe (exact)."""
-    raw = given or SAFARI_ROUTES.get(site, "")
+    route = SAFARI_ROUTES.get(site)
+    raw = given or (route.landing if route else "")
     recipe = alsafari.RECIPES.get(site)
     if not raw or recipe is None or "\\" in raw or any(c <= " " for c in raw):
         return None
@@ -4279,11 +4400,20 @@ def _safari_py_ready(recipe: alsafari.Recipe) -> tuple[alsafari.Runner | None, s
     return call, ""
 
 
-def safari_target_dry_run(site: str, recipe: alsafari.Recipe) -> int:
+def _cookie_rule(site: str) -> bool:
+    """`site` has Safari cookie rules (broker/safari_cookies.py): its jar
+    can be read and fingerprinted (a broker site has none)."""
+    return site in safari_cookies.SAFARI_SITES or site in safari_cookies.SAFARI_BUILTIN
+
+
+def safari_target_dry_run(
+    site: str, recipe: alsafari.Recipe, *, prove_only: bool = False
+) -> int:
     """`-L SITE -s [URL] -n`: READ-ONLY — the gate, safari.py (only
     `--capabilities` / `--status`), Safari's session (`safari fp`), the
     quarantine, the cooldown, the mailbox, and the step a real run takes.
     No proof run, no lease, no mail, no record."""
+    route = SAFARI_ROUTES[site]
     gate = alsafari.interactive_gate()
     print(
         f"ℹ️ {site}: interactive gate "
@@ -4298,18 +4428,23 @@ def safari_target_dry_run(site: str, recipe: alsafari.Recipe) -> int:
             else f"NOT ready — {phases.CODE_TEXT.get(stop, stop)} ({stop})"
         )
     )
-    cookies, why = _safari_jar(site)
-    held = why is None and safari_cookies.has_session(site, cookies)
-    if why is not None:
-        print(
-            f"ℹ️ {site}: Safari's cookie file unreadable ({why}) — counts as logged out"
-        )
+    held: bool | None = None
+    if _cookie_rule(site):
+        cookies, why = _safari_jar(site)
+        held = why is None and safari_cookies.has_session(site, cookies)
+        if why is not None:
+            print(
+                f"ℹ️ {site}: Safari's cookie file unreadable ({why}) — counts as "
+                "logged out"
+            )
+        else:
+            print(
+                f"ℹ️ {site}: Safari {'holds' if held else 'holds NO'} session — "
+                f"safari fp: {_safari_fp(site, cookies)}"
+            )
+        cookies.clear()
     else:
-        print(
-            f"ℹ️ {site}: Safari {'holds' if held else 'holds NO'} session — "
-            f"safari fp: {_safari_fp(site, cookies)}"
-        )
-    cookies.clear()
+        print(f"ℹ️ {site}: Safari's session is proven in Safari (no cookie rules)")
     q = als.quarantined(site)
     print(
         f"ℹ️ {site}: "
@@ -4320,33 +4455,71 @@ def safari_target_dry_run(site: str, recipe: alsafari.Recipe) -> int:
         )
     )
     block = ""
-    if site in MAIL_CODE_SITES:
+    if has_mail_code(recipe):
         _mail_code_dry_run(site)
         block = _mail_code_block(site)
-    if gate is not None or stop:
-        nxt = f"stop with exit 3 ({gate or stop}), nothing done"
-    elif held:
-        nxt = (
-            "prove Safari's session, import if the shared Chromium is logged "
-            "out, then open"
-        )
-    elif block:
-        nxt = f"try Safari without a code mail ({block}), then open"
-    elif site in MAIL_CODE_SITES:
-        nxt = "log Safari in with the e-mail code, then open"
-    else:
-        nxt = "log Safari in, then open"
-    print(f"ℹ️ {site}: -s would {nxt}")
+    print(
+        f"ℹ️ {site}: -s would {_dry_run_next(route, gate or stop, held, block, recipe, prove_only)}"
+    )
     return 0
+
+
+# One return per branch of what a real run does first.
+def _dry_run_next(  # pylint: disable=too-many-arguments,too-many-positional-arguments,too-many-return-statements
+    route: SafariRoute,
+    stop: str,
+    held: bool | None,
+    block: str,
+    recipe: alsafari.Recipe,
+    prove_only: bool,
+) -> str:
+    """The `-s would …` words of a dry run."""
+    if stop:
+        return f"stop with exit 3 ({stop}), nothing done"
+    tail = (
+        "import if the shared Chromium is logged out, then open"
+        if recipe.import_after
+        else "then open"
+    )
+    if route.proof == "in_safari":
+        if prove_only:
+            return "prove Safari's session in a new window (no login), then open"
+        return f"prove Safari's session in a new window, else log Safari in, {tail}"
+    if held:
+        return f"prove Safari's session, {tail}"
+    if prove_only:
+        return "stop with exit 2 (safari_logged_out), nothing done"
+    if block:
+        return f"try Safari without a code mail ({block}), then open"
+    if has_mail_code(recipe):
+        return "log Safari in with the e-mail code, then open"
+    return "log Safari in, then open"
+
+
+def _no_route(site: str) -> int:
+    """`-s` on a site without a route: exit 2 `no_safari_route`, with its
+    ⛔ reason code and text when it has one; nothing called."""
+    code = safari_why(site)
+    if code:
+        print(
+            f"❌ {site}: no_safari_route ({code}) — "
+            f"{SAFARI_INFEASIBLE_TEXT.get(code, code)}; Albert's own login, "
+            "nothing done"
+        )
+        return 2
+    print(f"❌ {site}: no_safari_route — -s works for: " + ", ".join(_routed_sites()))
+    return 2
 
 
 # One return per stage of the -s pipeline (tp#1643 Design).
 def safari_target_action(  # pylint: disable=too-many-return-statements
-    site: str, url: str, *, dry_run: bool = False
+    site: str, url: str, *, dry_run: bool = False, prove_only: bool = False
 ) -> int:
     """`-L SITE -s [URL]`: prove Safari's session (else log Safari in), import
     into the shared Chromium when that is logged out, open the page in
-    Safari. Attended only; one run, no retries."""
+    Safari. Attended only; one run, no retries. `prove_only` (`-O`,
+    tp#1644): never log in — a logged-out Safari ends exit 2
+    `safari_logged_out`."""
     site = resolve_site(site)
     if alsafari.scheduled():
         print(
@@ -4354,11 +4527,11 @@ def safari_target_action(  # pylint: disable=too-many-return-statements
             f"({alsafari.SCHEDULED_ENV}=1)"
         )
         return 2
-    if site not in SAFARI_ROUTES or site not in alsafari.RECIPES:
-        print(
-            f"❌ {site}: no_safari_route — -s works for: "
-            + ", ".join(sorted(s for s in SAFARI_ROUTES if s in alsafari.RECIPES))
-        )
+    if not safari_routed(site):
+        return _no_route(site)
+    route = SAFARI_ROUTES[site]
+    if route.proof not in SAFARI_PROOFS:
+        print(f"❌ {site}: no_safari_route — unknown proof kind {route.proof!r}")
         return 2
     recipe = alsafari.RECIPES[site]
     target = safari_target_url(site, url)
@@ -4371,7 +4544,7 @@ def safari_target_action(  # pylint: disable=too-many-return-statements
     what = "the given page" if url else "the landing page"
     print(f"▶ {site}: Safari target {_origin(target)} ({what})")
     if dry_run:
-        return safari_target_dry_run(site, recipe)
+        return safari_target_dry_run(site, recipe, prove_only=prove_only)
     gate = alsafari.interactive_gate()
     if gate is not None:
         print(f"❌ {site}: {phases.CODE_TEXT.get(gate, gate)} ({gate})")
@@ -4384,28 +4557,39 @@ def safari_target_action(  # pylint: disable=too-many-return-statements
         if not got:
             print(f"⏸  {site}: another Safari login runs — try again later")
             return BUSY_RC
-        return _safari_target_locked(site, recipe, call, target, what)
+        if route.proof == "in_safari":
+            return _safari_target_in_safari(
+                site, recipe, call, (target, what), prove_only=prove_only
+            )
+        return _safari_target_locked(
+            site, recipe, call, target, what, prove_only=prove_only
+        )
 
 
-def _safari_target_locked(
+def _safari_target_locked(  # pylint: disable=too-many-arguments
     site: str,
     recipe: alsafari.Recipe,
     call: alsafari.Runner,
     target: str,
     what: str,
+    *,
+    prove_only: bool = False,
 ) -> int:
-    """`safari_target_action` under the Safari-login lock (steps 6-9)."""
+    """`safari_target_action` under the Safari-login lock (steps 6-9) for a
+    `builtin` proof (`import-safari SITE -P`)."""
     state, before = _safari_proof(site)
     if isinstance(state, int):
         return state
     out: alsafari.Outcome | None = None
+    if state == "logged_out" and prove_only:
+        print(
+            f"❌ {site}: safari_logged_out — Albert's Safari is not logged in "
+            "(-O: nothing typed, no code mail)"
+        )
+        return 2
     if state == "logged_out":
         print(f"▶ {site}: Safari is not logged in — logging Safari in")
-        out = (
-            _mail_code_safari_drive(site, recipe)
-            if site in MAIL_CODE_SITES
-            else _drive_safari(site, recipe)
-        )
+        out = _safari_drive(site, recipe)
         if out.mail_archived == "failed":
             print(
                 f"⚠️ {site}: the login-code mail could not be archived (left in INBOX)"
@@ -4416,6 +4600,19 @@ def _safari_target_locked(
             print(f"⚠️ {site}: Safari did not write the new session yet")
     else:
         print(f"✅ {site}: Albert's Safari holds a working session — no login needed")
+    return _safari_target_finish(site, recipe, call, (target, what), out)
+
+
+def _safari_target_finish(
+    site: str,
+    recipe: alsafari.Recipe,
+    call: alsafari.Runner,
+    page: tuple[str, str],
+    out: alsafari.Outcome | None,
+) -> int:
+    """Steps 8-9: the import (only when `recipe.import_after`), then open
+    `page` (target URL, its words) in Safari."""
+    target, what = page
     if recipe.import_after:
         _safari_target_import(site, out)
     reply = call(["--open", target, "--wait", str(SAFARI_OPEN_WAIT_S)])
@@ -4429,6 +4626,164 @@ def _safari_target_locked(
         f"✅ {site}: Albert's Safari is logged in — opened {_origin(target)} ({what})"
     )
     return 0
+
+
+def _safari_target_in_safari(
+    site: str,
+    recipe: alsafari.Recipe,
+    call: alsafari.Runner,
+    page: tuple[str, str],
+    *,
+    prove_only: bool = False,
+) -> int:
+    """`safari_target_action` under the lock for an `in_safari` proof: ONE
+    Machine run (tp#1644) — the sentinel first (a live session: zero
+    steps), then the identity read for a row with a listing `identity`,
+    else the recipe's login (never with `prove_only`: the first login page
+    ends `safari_logged_out`)."""
+    before = ""
+    if recipe.import_after and _cookie_rule(site):
+        cookies, why = _safari_jar(site)
+        before = "" if why else safari_cookies.session_fingerprint(site, cookies)
+        cookies.clear()
+    entry = _listing_row(site)
+    read = _safari_identity_reader(site, entry) if entry.get("identity") else None
+    out = _safari_drive(site, recipe, proof_only=prove_only, on_sentinel=read)
+    if out.mail_archived == "failed":
+        print(f"⚠️ {site}: the login-code mail could not be archived (left in INBOX)")
+    if out.code == "safari_logged_out":
+        print(
+            f"❌ {site}: safari_logged_out — Albert's Safari is not logged in "
+            "(-O: nothing typed, no broker fill, no code mail)"
+        )
+        return 2
+    if out.code == "wrong_account":
+        print(
+            f"❌ {site}: wrong_account — Albert's Safari is logged in as ANOTHER "
+            "account; nothing done (never a second account)"
+        )
+        return 2
+    if not out.ok:
+        return _safari_drive_fail(site, out, route="safari-target")
+    if out.steps:
+        print(f"✅ {site}: Albert's Safari is logged in (an agent's login)")
+        if before and not _wait_flush(site, before):
+            print(f"⚠️ {site}: Safari did not write the new session yet")
+    else:
+        print(f"✅ {site}: Albert's Safari holds a working session — no login needed")
+    return _safari_target_finish(site, recipe, call, page, out if out.steps else None)
+
+
+# Safari's identity read (tp#1644): polls of the parked recipe answer
+# (RECIPE_JS ends itself within identity.TOTAL_MS), the broker's timeout.
+IDENTITY_READ_POLLS = 30
+IDENTITY_READ_POLL_S = 0.5
+IDENTITY_BROKER_TIMEOUT_S = 15.0
+
+
+def _safari_identity_reader(
+    site: str, entry: dict
+) -> Callable[[alsafari.Runner, list[str]], str]:
+    """The Machine's `on_sentinel` for a multi-account row: the WS5 identity
+    proof in Albert's Safari window (broker/identity.py's RECIPE_JS with the
+    broker's one-use challenge, through `safari.py --eval` 0600 files —
+    never argv). '' = match; `wrong_account` / `indeterminate` stop."""
+
+    def read(call: alsafari.Runner, on: list[str]) -> str:
+        said = _safari_identity_verdict(site, entry, call, on)
+        if said == "match":
+            print(f"✅ {site}: Safari's account is the item's (identity match)")
+            return ""
+        if said == "mismatch":
+            return "wrong_account"
+        print(f"⏸  {site}: Safari's account could not be proven ({said})")
+        return "indeterminate"
+
+    return read
+
+
+# One return per verdict of the protocol, in the order they are decided.
+def _safari_identity_verdict(  # pylint: disable=too-many-return-statements
+    site: str, entry: dict, call: alsafari.Runner, on: list[str]
+) -> str:
+    """``match`` / ``mismatch`` / a fixed reason word (unknown). Only the
+    digest of `nonce || account name` leaves the page; the broker judges."""
+    check_url = str(entry.get("check_url") or entry.get("login_url") or "")
+    privilege = str(entry.get("privilege") or "")
+    recipe = identity.item_recipe(
+        entry.get("identity"), site=site, check_url=check_url, privilege=privilege
+    )
+    if recipe is None or privilege not in identity.PRIVILEGES:
+        return "identity_unproven"
+    try:
+        chal = broker_request(
+            "identity_challenge",
+            timeout=IDENTITY_BROKER_TIMEOUT_S,
+            site=site,
+            instance=identity.instance_of(entry),
+        )
+    except (OSError, ValueError):
+        return "broker"
+    nonce, cid = chal.get("nonce"), chal.get("challenge_id")
+    if not chal.get("ok"):
+        return _slug_or_none(chal.get("error")) or "refused"
+    if (
+        not identity.is_digest(nonce)
+        or not isinstance(cid, str)
+        or not cid
+        or chal.get("identity") != recipe.name
+        or chal.get("privilege") != privilege
+    ):
+        return "schema"
+    answer = _safari_identity_answer(call, on, recipe, check_url, str(nonce))
+    digest = answer.get("digest")
+    if answer.get("state") != "found" or not identity.is_digest(digest):
+        return "logged_out" if answer.get("state") == identity.LOGGED_OUT else "page"
+    try:
+        reply = broker_request(
+            "identity_answer",
+            timeout=IDENTITY_BROKER_TIMEOUT_S,
+            challenge_id=cid,
+            digest=str(digest),
+        )
+    except (OSError, ValueError):
+        return "broker"
+    result = reply.get("result") if reply.get("ok") else None
+    if result == "mismatch":
+        return "mismatch"
+    if result != identity.MATCH:
+        return "expired"
+    if identity.admin_verdict(answer.get("admin"), privilege) != identity.MATCH:
+        return "admin"
+    return "match"
+
+
+def _safari_identity_answer(
+    call: alsafari.Runner,
+    on: list[str],
+    recipe: identity.IdentityRecipe,
+    check_url: str,
+    nonce: str,
+) -> dict:
+    """Start RECIPE_JS in the window (`on`: its handle + pinned host), then
+    read its parked answer until it settles ({} = none)."""
+    key = f"__agentLoginIdentity_{secrets.token_hex(8)}"
+    args = identity.recipe_args(recipe, check_url, nonce)
+    start = alsafari.identity_start_js(identity.RECIPE_JS, args, key)
+    with alsafari.private_js(start) as path:
+        reply = call(["--eval", path, *on])
+    if reply.rc != 0:
+        return {}
+    for _ in range(IDENTITY_READ_POLLS):
+        time.sleep(IDENTITY_READ_POLL_S)
+        with alsafari.private_js(alsafari.identity_read_js(key)) as path:
+            reply = call(["--eval", path, *on])
+        res = alsafari.json_object(reply.data.get("result")) if reply.rc == 0 else None
+        if res is None:
+            return {}
+        if not res.get("pending"):
+            return res
+    return {}
 
 
 def _safari_proof(site: str) -> tuple[str | int, str]:  # pylint: disable=too-many-return-statements
@@ -4745,12 +5100,16 @@ def _drive_safari(  # pylint: disable=too-many-return-statements
     env: dict[str, str] | None = None,
     before_trigger: Callable[[], str | None] | None = None,
     no_trigger: str = "",
+    proof_only: bool = False,
+    on_sentinel: Callable[[alsafari.Runner, list[str]], str] | None = None,
 ) -> alsafari.Outcome:
     """Resolve what the recipe needs, check safari.py, run the step machine.
     `env`: extra environment for the MailReader's himalaya (a site's mail
     env); `before_trigger`: the Machine's hook right before a code-mail
     trigger click; `no_trigger`: a code that runs the Machine without any
-    code mail (tp#1643). All default to today's behaviour."""
+    code mail (tp#1643); `proof_only` / `on_sentinel`: the Machine's
+    prove-only mode and sentinel read (tp#1644). All default to today's
+    behaviour."""
     binary = alsafari.safari_py_bin()
     if binary is None:
         return alsafari.Outcome(3, "safari_py_missing")
@@ -4770,9 +5129,22 @@ def _drive_safari(  # pylint: disable=too-many-return-statements
     plan = _safari_plan(site, recipe, over, env=env)
     if plan is None:
         return alsafari.Outcome(2, "safari_no_recipe")
-    print(f"▶ {site}: logging in in Albert's Safari (a new window; his clipboard)")
+    if proof_only:
+        print(f"▶ {site}: proving Albert's Safari session (a new window, no login)")
+    else:
+        print(f"▶ {site}: logging in in Albert's Safari (a new window; his clipboard)")
+    extra: dict[str, Any] = {}  # tp#1644, only when set (a plain run as before)
+    if proof_only:
+        extra["proof_only"] = True
+    if on_sentinel is not None:
+        extra["on_sentinel"] = on_sentinel
     return alsafari.Machine(
-        recipe, plan, call, before_trigger=before_trigger, no_trigger=no_trigger
+        recipe,
+        plan,
+        call,
+        before_trigger=before_trigger,
+        no_trigger=no_trigger,
+        **extra,
     ).run()
 
 
@@ -5128,6 +5500,15 @@ def build_parser() -> argparse.ArgumentParser:
         + ", ".join(sorted(SAFARI_ROUTES)),
     )
     ap.add_argument(
+        "-O",
+        "--prove-only",
+        action="store_true",
+        help="with -L SITE -s: prove Albert's Safari session only, never log "
+        "in — a live session → the page opens (exit 0); a logged-out Safari "
+        "→ exit 2 safari_logged_out (nothing typed, no broker fill, no code "
+        "mail); exit 4 = needs Albert",
+    )
+    ap.add_argument(
         "-l",
         "--fillable",
         action="store_true",
@@ -5198,7 +5579,10 @@ def login_action(args: argparse.Namespace) -> int | None:  # pylint: disable=too
         return remove_action(args.remove, force=args.force)
     if args.safari_login and args.in_safari is not None:
         return safari_target_action(
-            args.safari_login, args.in_safari, dry_run=args.dry_run
+            args.safari_login,
+            args.in_safari,
+            dry_run=args.dry_run,
+            prove_only=args.prove_only,
         )
     if args.safari_login:
         return safari_login_action(args.safari_login, dry_run=args.dry_run)
@@ -5231,6 +5615,8 @@ def _check_pairs(ap: argparse.ArgumentParser, args: argparse.Namespace) -> None:
         ap.error("-n/--dry-run only works together with -L/--safari-login")
     if args.in_safari is not None and not args.safari_login:
         ap.error("-s/--in-safari only works together with -L/--safari-login SITE")
+    if args.prove_only and args.in_safari is None:
+        ap.error("-O/--prove-only only works together with -L SITE -s")
 
 
 # One early exit per CLI mode.

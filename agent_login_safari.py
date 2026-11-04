@@ -852,6 +852,9 @@ PAGE_FLAGS = (
 )
 # The page stops that are Albert's, in the order they are checked.
 ALBERT_STOPS = ("captcha", "sms", "push", "hardware_key")
+# tp#1644: Cloudflare Access's login host (`*.dom42.space` apps): a tab there
+# is Albert's login (exit 4 `needs_albert_access`), not a moved tab.
+ACCESS_HOST = "cloudflareaccess.com"
 
 
 def detector_js(recipe: Recipe, sentinel: str) -> str:
@@ -1309,6 +1312,47 @@ async (P) => {
 """
 
 
+# tp#1644: the in-Safari identity read. safari.py's `--eval` (`do
+# JavaScript`) cannot await, so the async identity recipe (broker/identity.py
+# RECIPE_JS) is STARTED by one eval, which parks its answer (state + digest
+# only — the page's value never leaves the page) under a per-run random key,
+# and READ by later evals; the read deletes it.
+IDENTITY_START_JS = r"""// agent-login:identity-start
+(() => {
+  const K = __KEY__;
+  window[K] = { state: "pending" };
+  (__RECIPE__)(__ARGS__).then(
+    (r) => { window[K] = r && typeof r === "object" ? r : { state: "error" }; },
+    () => { window[K] = { state: "error" }; },
+  );
+  return JSON.stringify({ ok: true });
+})()
+"""
+IDENTITY_READ_JS = r"""// agent-login:identity-read
+(() => {
+  const K = __KEY__;
+  const r = window[K];
+  if (!r || r.state === "pending") return JSON.stringify({ pending: !!r });
+  delete window[K];
+  return JSON.stringify({ state: r.state, digest: r.digest, admin: r.admin, why: r.why, status: r.status });
+})()
+"""
+
+
+def identity_start_js(recipe_js: str, args: dict[str, Any], key: str) -> str:
+    """The start eval of the identity read (`key`: the run's random slot)."""
+    return (
+        IDENTITY_START_JS.replace("__KEY__", json.dumps(key))
+        .replace("__ARGS__", json.dumps(args))
+        .replace("__RECIPE__", recipe_js)
+    )
+
+
+def identity_read_js(key: str) -> str:
+    """The read eval of the identity read: its answer once settled."""
+    return IDENTITY_READ_JS.replace("__KEY__", json.dumps(key))
+
+
 @contextlib.contextmanager
 def private_js(body: str) -> Iterator[str]:
     """`body` in a 0600 temp file (created exclusively) for ``safari.py
@@ -1368,6 +1412,14 @@ class Machine:  # pylint: disable=too-many-instance-attributes
     # until `submit_deadline` (clock) a page still on the code waits
     submitted: bool = False
     submit_deadline: float = 0.0
+    # tp#1644: prove only — the sentinel ends ok, the first page where a
+    # recipe step would run ends `safari_logged_out` (nothing typed, no
+    # broker fill, no code mail); Albert stops stay exit 4.
+    proof_only: bool = False
+    # tp#1644: run on the sentinel page BEFORE the window closes (the
+    # in-Safari identity read): (safari.py runner, the `--handle …
+    # --expect-host HOST` args) -> '' (go on, ok) or a stop code (its stop_rc).
+    on_sentinel: Callable[[Runner, list[str]], str] | None = None
 
     # -- safari.py calls ---------------------------------------------------
 
@@ -1388,7 +1440,8 @@ class Machine:  # pylint: disable=too-many-instance-attributes
         """The window handle + the host safari.py must find the tab on."""
         return ["--handle", self.handle, "--expect-host", host]
 
-    def tab_host(self) -> tuple[str, str]:
+    # one return per tab state, the Access stop before the hosts check
+    def tab_host(self) -> tuple[str, str]:  # pylint: disable=too-many-return-statements
         """(host of the login window's only tab, '' or a stop code)."""
         reply = self.call(["--tabs"])
         if reply.rc != 0:
@@ -1407,6 +1460,9 @@ class Machine:  # pylint: disable=too-many-instance-attributes
         if url in ("", "about:blank"):
             return "", ""  # still loading
         host = safe_host(url)
+        if host == ACCESS_HOST or host.endswith(f".{ACCESS_HOST}"):
+            # tp#1644: Cloudflare Access asks first — that login is Albert's
+            return "", "needs_albert_access"
         if not host or host not in self.recipe.hosts:
             return "", "safari_tab_moved"
         return host, ""
@@ -1474,11 +1530,13 @@ class Machine:  # pylint: disable=too-many-instance-attributes
                 self.sleep(POLL_S)
                 continue
             if page["sentinel"] and host == self.recipe.sentinel_host:
-                return self._end(0, "ok")
+                return self._sentinel_reached(host)
             for flag in ALBERT_STOPS:
                 if page[flag]:
                     return self._end(NEEDS_ALBERT_RC, f"needs_albert_{flag}")
             index = self._next_step(host, page)
+            if index is not None and self.proof_only:
+                return self._end(2, "safari_logged_out")
             if index is None:
                 if page["email_code"]:
                     return self._end(2, "email_code")
@@ -1497,6 +1555,15 @@ class Machine:  # pylint: disable=too-many-instance-attributes
         if self.submitted:
             return self._stuck("after_submit", "")
         return self._end(2, "recipe_stuck")
+
+    def _sentinel_reached(self, host: str) -> Outcome:
+        """The sentinel shows on the sentinel host: ok, unless the
+        `on_sentinel` read (tp#1644, before the window closes) names a stop."""
+        if self.on_sentinel is not None:
+            stop = self.on_sentinel(self.call, self._on(host))
+            if stop:
+                return self._end(stop_rc(stop), stop)
+        return self._end(0, "ok")
 
     def _post_submit_wait(self, host: str, page: dict[str, Any] | None) -> bool:
         """True while the submitted code may still be verifying: the page is
