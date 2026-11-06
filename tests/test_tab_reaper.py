@@ -443,8 +443,11 @@ def test_launchagent_runs_reap_idle_every_15_min():
     plists = {label: text for label, text, _what in jobs.agent_plists()}
     text = plists[jobs.TAB_REAPER_LABEL]
     assert str(jobs.BROWSER_PY) in text
-    assert "<string>reap-idle</string>" in text and "<string>-A</string>" in text
-    assert "<integer>900</integer>" in text
+    # tp#1759: the umbrella `reap` every 2 h, not `reap-idle` every 15 min
+    assert "<string>reap</string>" in text and "<string>-A</string>" in text
+    assert "<string>-q</string>" in text
+    assert "<string>reap-idle</string>" not in text
+    assert "<integer>7200</integer>" in text
     assert "<false/>" in text  # no RunAtLoad
 
 

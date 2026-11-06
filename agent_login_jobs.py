@@ -51,10 +51,11 @@ SNAPSHOT_INTERVAL_S = 600
 # JWT) between daily checks; never logs in, never submits a password.
 REFRESH_LABEL = "com.albert.agent-login-refresh"
 REFRESH_INTERVAL_S = 6 * 3600
-# tp#1109: the idle-tab reaper (`browser.py reap-idle -A -q`) of every running
-# shared-browser instance: closes unpinned tabs idle past its threshold.
+# tp#1109, tp#1759: the tab reaper (`browser.py reap -A -q`) of every running
+# shared-browser instance: dead owners' tabs + orphan markers, extra blanks,
+# unpinned tabs idle past the threshold, orphaned Playwright MCP servers.
 TAB_REAPER_LABEL = "com.albert.browser-tab-reaper"
-TAB_REAPER_INTERVAL_S = 900
+TAB_REAPER_INTERVAL_S = 2 * 3600
 # tp#1421: the Claude Console balance reader (`console-balance.py -q`): writes
 # each account's credit balance + spend limit for ccc's `balance_json` source.
 CONSOLE_BALANCE_LABEL = "com.albert.console-balance"
@@ -173,10 +174,11 @@ def refresh_plist() -> str:
 
 
 def tab_reaper_plist() -> str:
-    """The every-15-min idle-tab reaper LaunchAgent (tp#1109), as text. Pure."""
+    """The every-2-h tab reaper LaunchAgent (`browser.py reap`, tp#1109,
+    tp#1759), as text. Pure."""
     return launchagent_plist(
         label=TAB_REAPER_LABEL,
-        args=("reap-idle", "-A", "-q"),
+        args=("reap", "-A", "-q"),
         schedule=(
             f"<key>StartInterval</key>\n    <integer>{TAB_REAPER_INTERVAL_S}</integer>"
         ),
@@ -236,7 +238,7 @@ def agent_plists() -> list[tuple[str, str, str]]:
         (
             TAB_REAPER_LABEL,
             tab_reaper_plist(),
-            f"every {TAB_REAPER_INTERVAL_S // 60} min, browser.py reap-idle -A -q",
+            f"every {TAB_REAPER_INTERVAL_S // 3600} h, browser.py reap -A -q",
         ),
         (
             CONSOLE_BALANCE_LABEL,

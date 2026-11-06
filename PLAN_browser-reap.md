@@ -195,7 +195,7 @@ CPU after 10 min idle with the same 3 test tabs) with and without the flags.
 - [x] B6 **Launch flags**: add the set above; disposable-instance measurement
       before/after (`CLAUDE_BROWSER_CACHE_DIR=<tmp> browser.py --cdp-port <free> up`,
       own profile, no real cookies); `doctor` on that instance.
-- [ ] B7 **Timer**: `agent_plists()` reaper args → `reap -A -q`, `TAB_REAPER_INTERVAL_S`
+- [x] B7 **Timer**: `agent_plists()` reaper args → `reap -A -q`, `TAB_REAPER_INTERVAL_S`
       (`StartInterval`) 900 → 7200 (2 h, Albert's decision); test of the generated plist;
       reload of that one label (bootout + bootstrap gui/<uid>).
 - [x] B8 **Docs**: README "Tabs: who opened what…" section (+ `reap`, MCP orphans, idle

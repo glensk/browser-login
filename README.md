@@ -549,9 +549,11 @@ browser.py reap -o -q               # only dead owners' tabs + orphan markers (w
   At most `-m` (20) closes per run; each is journaled (`tab_reaped`: origin,
   idle, opener session). `-n` takes no lock and writes nothing.
 - **Schedule**: LaunchAgent `com.albert.browser-tab-reaper` runs
-  `browser.py reap-idle -A -q` every 15 min over every running instance (it
-  never starts one); log `~/Library/Logs/com.albert.browser-tab-reaper.log`
-  (quiet: only closes and failures). It is one of `agent-login.py`'s
+  `browser.py reap -A -q` (the whole cleanup below: dead owners, orphan
+  markers, extra blanks, `reap-idle`, MCP orphans) every 2 h over every
+  running instance (it never starts one; tp#1759, was `reap-idle` every
+  15 min); log `~/Library/Logs/com.albert.browser-tab-reaper.log` (quiet:
+  only closes, kills and failures). It is one of `agent-login.py`'s
   LaunchAgents (`agent_login_jobs.agent_plists()`). Its sibling
   `com.albert.browser-access-sweep` runs `browser.py sweep-access -A -q -S`
   every 60 s (not at load) at background priority (`ProcessType Background`,
@@ -1806,7 +1808,7 @@ Fill-only items (`agent_fill_only = true`, tp#1082): the broker never logs in wi
 | `-S`, `--snapshot` | recover a stale guided login whose watchdog died (one line), refresh the site-list and secret-run snapshots and the agents file (which also lists the secrets agents can inject), print nothing else (LaunchAgent, every 10 min) |
 | `-K`, `--keychain` | rescan the login keychain (~15 s) and list every item (names only) with whether agents can read it |
 | `-A`, `--agents` | print the summary agent sessions get at start (the agents file) |
-| `-I`, `--install-daily` | install + load the LaunchAgents com.albert.agent-login-check (`-c` daily 09:15), com.albert.agent-login-snapshot (`-S` every 10 min), com.albert.agent-login-refresh (`-R` every 6 h), com.albert.browser-tab-reaper (`browser.py reap-idle` every 15 min), com.albert.console-balance (`console-balance.py` every 60 min) and com.albert.browser-access-sweep (`browser.py sweep-access` every 60 s) as one transaction (any failure restores the previous set) |
+| `-I`, `--install-daily` | install + load the LaunchAgents com.albert.agent-login-check (`-c` daily 09:15), com.albert.agent-login-snapshot (`-S` every 10 min), com.albert.agent-login-refresh (`-R` every 6 h), com.albert.browser-tab-reaper (`browser.py reap` every 2 h), com.albert.console-balance (`console-balance.py` every 60 min) and com.albert.browser-access-sweep (`browser.py sweep-access` every 60 s) as one transaction (any failure restores the previous set) |
 | `-U`, `--uninstall-daily` | unload + remove all 6 LaunchAgents of -I |
 | `-P`, `--print-plist` | print all 6 LaunchAgent plists of -I (writes nothing) |
 | `-j`, `--json` | print the overview (with -x: the matrix) as JSON |

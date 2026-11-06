@@ -5420,7 +5420,7 @@ def build_parser() -> argparse.ArgumentParser:
         f"(`-c` daily {LAUNCH_HOUR:02d}:{LAUNCH_MINUTE:02d}), {SNAPSHOT_LABEL} "
         f"(`-S` every {SNAPSHOT_INTERVAL_S // 60} min), {REFRESH_LABEL} "
         f"(`-R` every {REFRESH_INTERVAL_S // 3600} h), {TAB_REAPER_LABEL} "
-        f"(`browser.py reap-idle` every {TAB_REAPER_INTERVAL_S // 60} min), "
+        f"(`browser.py reap` every {TAB_REAPER_INTERVAL_S // 3600} h), "
         f"{CONSOLE_BALANCE_LABEL} (`console-balance.py` every "
         f"{CONSOLE_BALANCE_INTERVAL_S // 60} min) and {ACCESS_SWEEP_LABEL} "
         f"(`browser.py sweep-access` every {ACCESS_SWEEP_INTERVAL_S} s) as one "
