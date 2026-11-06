@@ -484,7 +484,10 @@ Rules for anything that drives this browser:
   so a few heavy tabs (Smartsheet's desktop app) slow down EVERY consumer of
   the browser. `close` registers, takes the interaction lease (bounded by
   `-w`, inside one `-d` deadline; on a lease timeout it exits 1 and closes
-  nothing), re-reads the tab list right before each close (id mode: the tab
+  nothing) — except `close -i` when the caller owns every id (opened by its
+  own `open -N`, same recorded opener: session, cwd, pid, tool; or its live
+  owned-tab ledger), which needs no lease (tp#1765) —, re-reads the tab list
+  right before each close (id mode: the tab
   must still exist; URL mode: its URL must still match), and opens a blank
   keep-alive first when the tab is the last one. Exit 0 when every requested
   tab is closed or already gone, when nothing matches, or when the browser is

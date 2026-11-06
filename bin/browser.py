@@ -930,7 +930,8 @@ def _add_close_parser(sub: Any) -> argparse.ArgumentParser:
         "close",
         help="Close tabs you own: by CDP target id (-i, the ids `open -N` "
         "printed), or — manual cleanup only — by exact URL. Takes the "
-        "interaction lease, re-checks each tab right before closing it, and "
+        "interaction lease (not for ids the caller itself opened), re-checks "
+        "each tab right before closing it, and "
         "never closes the last tab (opens a blank keep-alive first). Exit 0 "
         "when every requested tab is closed or already gone (also: no match, "
         "browser down); 1 on a refused URL, lease timeout, unreadable tab list, "
@@ -4973,7 +4974,9 @@ def _close_approved(port: int, cands: list[TargetProbe]) -> int:
 # the interaction lease right before each close, never close the last page
 # (tp#317), and run under ONE monotonic deadline over raw CDP, so a wedged
 # foreign tab cannot stall them. Unregistered clients take no lease, so the
-# re-check is best-effort against them.
+# re-check is best-effort against them. `close -i` on ids the CALLER owns
+# (tab state: opened by `open` with the caller's exact opener identity; or its
+# live owned-tab ledger) skips the lease wait (tp#1765): no login drives them.
 
 
 def _close_refusal(url: str) -> str | None:
@@ -5026,8 +5029,10 @@ def cmd_close(  # pylint: disable=too-many-arguments
     lease (gate → lease, the existing lock order), all under one monotonic
     deadline (`deadline_s`); the lease wait is ``min(wait_s, left)``. A lease
     timeout exits 1 with nothing closed (`_interaction_lease` raises
-    SystemExit; the registration is released in the ``finally``). Exit codes:
-    see the `close` help.
+    SystemExit; the registration is released in the ``finally``). Id mode
+    skips the lease when the caller owns every id (`_caller_owns_all`,
+    tp#1765); the re-check and the keep-alive stay. Exit codes: see the
+    `close` help.
     """
     deadline = time.monotonic() + deadline_s
 
@@ -5046,10 +5051,81 @@ def cmd_close(  # pylint: disable=too-many-arguments
         return 0
     release = _registry_register("browser.py", _purpose(), port, wait_s=left())
     try:
+        if not urls and _caller_owns_all(ids):
+            # tp#1765: nobody else drives the caller's own tab — no lease wait.
+            return _close_locked(port, urls, ids, dry_run, left)
         with _interaction_lease("close", wait_s=min(wait_s, left())):
             return _close_locked(port, urls, ids, dry_run, left)
     finally:
         release()
+
+
+def _lstart_epoch(lstart: str | None) -> float | None:
+    """`_proc_lstart`'s ``Fri Nov  6 09:50:21 2026`` (``LC_ALL=C``) as epoch s."""
+    try:
+        parsed = time.strptime(" ".join((lstart or "").split()), "%a %b %d %H:%M:%S %Y")
+    except ValueError:
+        return None
+    return time.mktime(parsed)
+
+
+def _opened_by_caller(entry: object, me: dict[str, object]) -> bool:
+    """True when tab-state `entry` was made by `open` from exactly the caller.
+
+    The whole recorded opener (session, cwd, pid, tool) must equal
+    `_opener_identity()` here, and the opener pid must have started no later
+    than the tab was created (a recycled pid starts after it)."""
+    if not isinstance(entry, dict) or entry.get("via") != "open":
+        return False
+    pid, created = me.get("pid"), entry.get("created")
+    if entry.get("opener") != me or not isinstance(pid, int) or pid <= 1:
+        return False
+    if not isinstance(created, (int, float)) or isinstance(created, bool):
+        return False
+    started = _lstart_epoch(_proc_lstart(pid))
+    return started is not None and started <= created
+
+
+def _caller_ledger_tids() -> set[str]:
+    """Target ids in the LIVE owned-tab ledgers of this process's parent (the
+    caller), resolved strictly: stem pid, recorded pid and liveness."""
+    ppid, found = os.getppid(), set[str]()
+    directory = _owned_dir()
+    if ppid <= 1 or not directory.is_dir():
+        return found
+    for stem in _ledger_stems(directory):
+        path = directory / f"{stem}.json"
+        if _stem_pid(stem) != ppid or not path.exists():
+            continue
+        rec = _read_json_dict(path)
+        if not rec or rec.get("pid") != ppid or _owner_state(path) != "live":
+            continue
+        for entry in rec.get("entries") or []:
+            if isinstance(entry, dict) and isinstance(entry.get("tid"), str):
+                found.add(entry["tid"])
+    return found
+
+
+def _caller_owns_all(ids: Sequence[str]) -> bool:
+    """`close -i`: does the caller own EVERY id — opened by it via `open`
+    (tab state, `_opened_by_caller`) or in its live owned-tab ledger? Anything
+    unreadable or unrecorded is False (then `close` takes the lease)."""
+    if not ids:
+        return False
+    try:
+        targets = _tabstate_read()["targets"]
+    except (TabStateError, OSError):
+        targets = {}
+    me = _opener_identity()
+    ledger: set[str] | None = None
+    for tid in ids:
+        if _opened_by_caller(targets.get(tid), me):
+            continue
+        if ledger is None:
+            ledger = _caller_ledger_tids()
+        if tid not in ledger:
+            return False
+    return True
 
 
 def _close_candidates(
@@ -5081,7 +5157,8 @@ def _close_locked(
     dry_run: bool,
     left: Callable[[], float],
 ) -> int:
-    """`close` body; the caller holds the registration and the lease."""
+    """`close` body; the caller holds the registration and the lease (or owns
+    every id, `_caller_owns_all`)."""
     ws_url = _browser_ws_url(port, timeout=max(0.01, min(2.0, left())))
     if ws_url is None:
         return _fail("could not read the browser endpoint — closed nothing.")

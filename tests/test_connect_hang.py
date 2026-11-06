@@ -623,6 +623,135 @@ def test_close_registers_and_releases(fake, cache):
     assert not _lease_is_held(cache)
 
 
+def _open_ours(fake: FakeCdp, url: str = "https://app.example.com/sheets/X") -> str:
+    """`open -N` in-process: the tab state records THIS caller as the opener."""
+    before = set(fake.targets)
+    assert browser.cmd_open(fake.port, url, new=True) == 0
+    (tid,) = set(fake.targets) - before
+    return tid
+
+
+def test_close_id_owned_skips_a_held_lease(fake, cache, capsys):
+    """tp#1765: a login holds the lease; the caller's own tab still closes."""
+    fake.add("OTHER001", "https://ok.example/b", "other")
+    tid = _open_ours(fake)
+    fd = _hold_lease(cache)
+    try:
+        t0 = time.monotonic()
+        rc = browser.cmd_close(fake.port, None, [tid], wait_s=0.5)
+        assert time.monotonic() - t0 < 3
+    finally:
+        os.close(fd)
+    assert rc == 0
+    assert fake.closed == [tid]
+    assert "✓ closed:" in capsys.readouterr().out
+    assert browser._registry_live_clients() == []
+
+
+def test_close_id_owned_keeps_keepalive_and_gone_recheck(fake, cache, capsys):
+    fake.add("OTHER001", "https://ok.example/b", "other")
+    tid = _open_ours(fake)
+    fake.targets.pop("OTHER001")  # ours is now the last page
+    creates = len(fake.created)
+    fd = _hold_lease(cache)
+    try:
+        assert browser.cmd_close(fake.port, None, [tid], wait_s=0.5) == 0
+        assert len(fake.created) == creates + 1  # the blank keep-alive
+        assert fake.closed == [tid]
+        fake.targets.pop(tid, None)
+        assert browser.cmd_close(fake.port, None, [tid], wait_s=0.5) == 0
+        assert "- gone:" in capsys.readouterr().out
+    finally:
+        os.close(fd)
+
+
+@pytest.mark.parametrize(
+    "spoil",
+    ["session", "pid", "unrecorded", "recycled_pid", "url_mode", "mixed"],
+)
+def test_close_not_owned_still_waits_for_the_lease(fake, cache, monkeypatch, spoil):
+    """Foreign / unprovable ownership, or URL mode: the lease is taken."""
+    fake.add("OTHER001", "https://ok.example/b", "other")
+    fake.add("FOREIGN1", "https://ok.example/f", "foreign")
+    monkeypatch.setenv("CLAUDE_CODE_SESSION_ID", "session-a")
+    tid = _open_ours(fake)
+    ids: list[str] | None = [tid]
+    urls: list[str] | None = None
+    if spoil == "session":
+        monkeypatch.setenv("CLAUDE_CODE_SESSION_ID", "session-b")
+    elif spoil == "pid":
+        monkeypatch.setenv("CLAUDE_PID", "999999")
+    elif spoil == "unrecorded":
+        ids = ["FOREIGN1"]
+    elif spoil == "recycled_pid":  # the opener pid started after the tab
+        monkeypatch.setattr(
+            browser, "_proc_lstart", lambda _pid: "Fri Dec 31 23:59:59 2100"
+        )
+    elif spoil == "url_mode":
+        ids, urls = None, ["https://app.example.com/sheets/X"]
+    else:
+        ids = [tid, "FOREIGN1"]
+    fd = _hold_lease(cache)
+    try:
+        with pytest.raises(SystemExit) as exc:
+            browser.cmd_close(fake.port, urls, ids, wait_s=0.5)
+    finally:
+        os.close(fd)
+    assert "holds the lease" in str(exc.value.code)
+    assert not fake.closed
+
+
+def test_close_id_in_the_callers_live_ledger_skips_the_lease(fake, cache):
+    """A tab in the parent process's live owned-tab ledger is the caller's."""
+    fake.add("OTHER001", "https://ok.example/b", "other")
+    fake.add("LEDGER01", "https://ok.example/l", "ledgered")
+    owned = cache / "owned"
+    owned.mkdir()
+    ppid = os.getppid()
+    rec = {
+        "pid": ppid,
+        "pid_start_time": browser._proc_lstart(ppid),
+        "entries": [{"marker": "m", "tid": "LEDGER01", "parent": None}],
+    }
+    (owned / f"{ppid}-abcd1234.json").write_text(json.dumps(rec))
+    fd = _hold_lease(cache)
+    try:
+        assert browser.cmd_close(fake.port, None, ["LEDGER01"], wait_s=0.5) == 0
+        # Somebody else's ledger (another pid) proves nothing.
+        fake.add("LEDGER02", "https://ok.example/m", "theirs")
+        rec2 = {**rec, "pid": 1, "entries": [{"marker": "n", "tid": "LEDGER02"}]}
+        (owned / "1-abcd1234.json").write_text(json.dumps(rec2))
+        with pytest.raises(SystemExit):
+            browser.cmd_close(fake.port, None, ["LEDGER02"], wait_s=0.5)
+    finally:
+        os.close(fd)
+    assert fake.closed == ["LEDGER01"]
+
+
+def test_cli_open_new_then_close_id_while_lease_is_held(fake, tmp_path):
+    """tp#1765 end to end: two CLI children of one caller, a held lease."""
+    fake.add("EXIST001", "https://ok.example/", "ok")
+    proc, _took = _run_cli(
+        fake, tmp_path, "open", "-N", "https://example.org/", env={}, deadline=60
+    )
+    assert proc.returncode == 0, proc.stderr
+    ids = [ln[7:] for ln in proc.stdout.splitlines() if ln.startswith("target=")]
+    fd = _hold_lease(tmp_path)
+    try:
+        proc, _took = _run_cli(
+            fake, tmp_path, "close", "-w", "1", "-i", ids[0], env={}, deadline=60
+        )
+        assert proc.returncode == 0, proc.stderr
+        assert fake.closed == ids
+        proc, _took = _run_cli(
+            fake, tmp_path, "close", "-w", "1", "-i", "EXIST001", env={}, deadline=60
+        )
+        assert proc.returncode == 1 and "holds the lease" in proc.stderr
+    finally:
+        os.close(fd)
+    assert "EXIST001" in fake.targets
+
+
 def test_close_browser_down_is_rc0(cache, capsys):
     with socket.socket() as s:
         s.bind(("127.0.0.1", 0))

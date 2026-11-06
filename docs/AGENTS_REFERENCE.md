@@ -194,7 +194,9 @@ framework. It is a **provider**: other repos depend on it, not the reverse. See
   `open -N`, which is proof of ownership, not a heuristic. Its URL mode
   (`close URL…`, exact match sans query/fragment, http(s) only) is manual
   cleanup of leftover tabs only; no tool uses it. Both modes re-read
-  `/json/list` under the lease right before each `Target.closeTarget`, never
+  `/json/list` under the lease right before each `Target.closeTarget` (id
+  mode on tabs the caller owns — `_caller_owns_all`, tp#1765 — without the
+  lease), never
   close the last page (a blank keep-alive first, tp#317), and run over raw CDP
   under one deadline. `open -N` and `eval -T` are raw CDP too (no Playwright
   attach).
