@@ -669,9 +669,12 @@ def _add_reap_parser(sub: Any) -> None:
         "reap-owned",
         help="Close the tabs that browser.py processes which died (crash, kill) "
         "left open — only those of PROVEN-dead owners in the owned-tab ledger "
-        "(<cache>/owned), descendants (popups) first. Live or unknown owners and "
+        "(<cache>/owned), descendants (popups) first — and orphan marker tabs "
+        "(about:blank#owned-…) no ledger names: a v2 marker whose owner pid is "
+        "dead, a legacy marker seen ≥ 10 min. Live or unknown owners and "
         "`open -N` tabs are never touched. Exit 0 nothing left open (also: "
-        "another reaper is running), 1 a tab could not be closed, 75 busy.",
+        "another reaper is running), 1 a tab could not be closed or a ledger "
+        "is unreadable, 75 busy.",
     )
     pro.add_argument(
         "-n",
@@ -11801,6 +11804,14 @@ OWNED_DIR_NAME = "owned"
 OWNED_REAPER_LOCK_NAME = "owned-reaper.lock"
 # `reap-owned`: one budget for closing a dead owner's tabs.
 REAP_CLOSE_BUDGET_S = 30.0
+# Orphan markers (tp#1759): a marker tab no ledger names. A legacy one (no
+# owner in its URL) is closed once tabs.json saw it this long — its pending
+# entry is always written before `createTarget`, so a ledger-less marker that
+# old has no owner. All orphan closes of one pass share one budget.
+ORPHAN_MARKER_GRACE_S = 600.0
+ORPHAN_CLOSE_BUDGET_S = 10.0
+# The raw URLs of a blank page (an owned marker is never one).
+BLANK_PAGE_URLS = ("about:blank", "chrome://newtab/")
 # How long a gate-exclusive caller (the watchdog) waits for the gate to reap.
 REAP_GATE_WAIT_S = 5.0
 # How long the deadline watcher thread waits for the ledger's in-process lock.
@@ -12346,6 +12357,21 @@ def _close_owned_tab(
 
 
 @dataclass
+class OrphanReport:
+    """What the orphan-marker rule of one `_reap_owned` pass did (tp#1759).
+
+    ``closed`` / ``would`` / ``failed`` hold `_orphan_label` strings; ``error``
+    = why the rule stopped (fail closed); ``warnings`` = what it could not
+    record (the pass went on)."""
+
+    closed: list[str] = dataclasses.field(default_factory=list)
+    would: list[str] = dataclasses.field(default_factory=list)
+    failed: list[str] = dataclasses.field(default_factory=list)
+    error: str | None = None
+    warnings: list[str] = dataclasses.field(default_factory=list)
+
+
+@dataclass
 class ReapReport:
     """What one `_reap_owned` pass did (or, dry run, would do)."""
 
@@ -12355,6 +12381,7 @@ class ReapReport:
     left: list[str] = dataclasses.field(default_factory=list)
     would_close: list[str] = dataclasses.field(default_factory=list)
     skipped: dict[str, str] = dataclasses.field(default_factory=dict)
+    orphans: OrphanReport = dataclasses.field(default_factory=OrphanReport)
 
 
 @dataclass
@@ -12488,10 +12515,196 @@ def _reap_claim(
     )
 
 
+def _is_blank_page_url(url: object) -> bool:
+    """True for a RAW URL that is exactly a blank page (`BLANK_PAGE_URLS`)."""
+    return isinstance(url, str) and url in BLANK_PAGE_URLS and not _is_owned_marker(url)
+
+
+def _ledger_refs(directory: Path) -> tuple[set[str], set[str]] | None:
+    """``(markers, tids)`` every ledger file in `directory` names — data and
+    ``.<stem>.json.*.tmp`` files, whatever the owner's state; None when the
+    directory or a file cannot be read (the orphan rule then stops)."""
+    if not directory.exists():
+        return set(), set()
+    try:
+        names = sorted(p.name for p in directory.iterdir())  # tmp files first
+    except OSError:
+        return None
+    markers: set[str] = set()
+    tids: set[str] = set()
+    for name in names:
+        tmp = name.startswith(".") and name.endswith(".tmp") and ".json." in name
+        if not tmp and not (name.endswith(".json") and not name.startswith(".")):
+            continue
+        path = directory / name
+        rec = _read_json_dict(path)
+        if rec is None:
+            if not path.exists():
+                continue  # renamed or deleted meanwhile (read in its new place)
+            return None
+        entries = rec.get("entries") or []
+        if not isinstance(entries, list):
+            return None
+        for entry in entries:
+            if not isinstance(entry, dict):
+                return None
+            marker, tid = entry.get("marker"), entry.get("tid")
+            if isinstance(marker, str) and marker:
+                markers.add(marker)
+            if isinstance(tid, str) and tid:
+                tids.add(tid)
+    return markers, tids
+
+
+def _tabstate_observe_reapable(state: dict, pages: Sequence[dict], now: float) -> bool:
+    """Record ``first_seen`` / ``url_h`` of every marker and blank page in
+    `state` (in place): ``setdefault`` only — no pruning, never ``opener`` /
+    ``created`` / ``via``. True when something was added."""
+    changed = False
+    for info in pages:
+        tid, url = info.get("targetId"), info.get("url")
+        if not isinstance(tid, str) or not tid:
+            continue
+        if not (_is_owned_marker(url) or _is_blank_page_url(url)):
+            continue
+        entry = state["targets"].setdefault(tid, {})
+        for key, value in (("first_seen", now), ("url_h", _url_hash(url))):
+            if key not in entry:
+                entry[key] = value
+                changed = True
+    return changed
+
+
+def _reap_observe(
+    snapshot: Sequence[dict], orphans: OrphanReport, *, dry_run: bool
+) -> dict:
+    """The observation pass (tp#1759): marker and blank pages age in tabs.json
+    whatever the gate or the unknown clients say (so they age even while
+    `reap-idle` is skipped). Dry run: on a copy, nothing written. The state
+    it read (empty when unusable: then no legacy marker is old enough)."""
+    pages = [i for i in snapshot if i.get("type") == "page"]
+    now = time.time()
+    try:
+        if dry_run:
+            state = copy.deepcopy(_tabstate_read())
+            _tabstate_observe_reapable(state, pages, now)
+            return state
+        with _tabstate_locked():
+            state = _tabstate_read()
+            if _tabstate_observe_reapable(state, pages, now):
+                _json_write_atomic(_tabstate_path(), state)
+            return state
+    except (TabStateError, OSError) as exc:
+        orphans.warnings.append(f"tab state not updated: {exc}")
+        return _tabstate_empty()
+
+
+def _orphan_markers(
+    snapshot: Sequence[dict],
+    ledger_refs: tuple[set[str], set[str]],
+    observed: dict,
+    now: float,
+    pid_state: Callable[[str], str],
+) -> list[tuple[dict, str]]:
+    """The orphan marker pages to close → ``[(info, kind)]`` (pure).
+
+    A page exactly on a recognised marker URL that no ledger names (by marker
+    or tid). ``v2``: its owner (`pid_state`) is ``dead``. ``legacy``: tabs.json
+    (`observed`: its ``targets``) first saw it ≥ ORPHAN_MARKER_GRACE_S ago.
+    Never so many that no page is left (tp#317)."""
+    markers, tids = ledger_refs
+    raw = observed.get("targets")
+    targets: dict = raw if isinstance(raw, dict) else {}
+    pages = [i for i in snapshot if i.get("type") == "page"]
+    found: list[tuple[dict, str]] = []
+    for info in pages:
+        tid, marker = info.get("targetId"), _marker_of_url(info.get("url"))
+        if not isinstance(tid, str) or not tid or marker is None:
+            continue
+        if marker in markers or tid in tids:
+            continue
+        if _marker_owner(marker) is not None:
+            if pid_state(marker) == "dead":
+                found.append((info, "v2"))
+            continue
+        seen = (targets.get(tid) or {}).get("first_seen")
+        if (
+            isinstance(seen, (int, float))
+            and not isinstance(seen, bool)
+            and now - seen >= ORPHAN_MARKER_GRACE_S
+        ):
+            found.append((info, "legacy"))
+    return found[: max(0, len(pages) - 1)]
+
+
+def _tabstate_forget(tid: str, state: dict) -> None:
+    """Drop `tid`'s tabs.json entry (in place)."""
+    state["targets"].pop(tid, None)
+
+
+def _orphan_label(info: dict, kind: str) -> str:
+    return f"orphan marker ({kind}) {_id8(info.get('targetId'))}"
+
+
+def _reap_orphan_markers(
+    port: int,
+    snapshot: Sequence[dict],
+    refs: tuple[set[str], set[str]] | None,
+    orphans: OrphanReport,
+    dry_run: bool,
+) -> None:
+    """The observation pass, then: close the orphan marker pages
+    (`_orphan_markers`), each after a fresh snapshot shows it still on its
+    exact marker URL and more than one page; all within
+    ORPHAN_CLOSE_BUDGET_S. Journal: ``orphan_marker``."""
+    observed = _reap_observe(snapshot, orphans, dry_run=dry_run)
+    if refs is None:
+        orphans.error = "an owned-tab ledger is unreadable — closed no orphan marker"
+        return
+    states: dict[str, str] = {}
+
+    def pid_state(marker: str) -> str:
+        if marker not in states:
+            states[marker] = _marker_owner_state(marker)
+        return states[marker]
+
+    cands = _orphan_markers(snapshot, refs, observed, time.time(), pid_state)
+    if dry_run:
+        orphans.would += [_orphan_label(info, kind) for info, kind in cands]
+        return
+    deadline = time.monotonic() + ORPHAN_CLOSE_BUDGET_S
+    for info, kind in cands:
+        tid, label = str(info.get("targetId")), _orphan_label(info, kind)
+        left = deadline - time.monotonic()
+        fresh = _target_snapshot(port, budget_s=min(3.0, left)) if left > 0 else None
+        if fresh is None:
+            orphans.failed.append(label)
+            continue
+        pages = [i for i in fresh if i.get("type") == "page"]
+        cur = next((p for p in pages if p.get("targetId") == tid), None)
+        if cur is None or cur.get("url") != info.get("url") or len(pages) <= 1:
+            continue  # gone, navigated, or the last page: leave it
+        if not _cdp_close_target(
+            port, tid, max(0.1, min(2.0, deadline - time.monotonic()))
+        ):
+            orphans.failed.append(label)
+            continue
+        orphans.closed.append(label)
+        owner = _marker_owner(str(_marker_of_url(info.get("url"))))
+        _journal(
+            "orphan_marker",
+            target=_id8(tid),
+            kind=kind,
+            owner_pid=owner[0] if owner else None,
+        )
+        _tabstate_try(functools.partial(_tabstate_forget, tid), "orphan marker closed")
+
+
 def _reap_owned(
     port: int, *, dry_run: bool = False, coordinated: bool = True
 ) -> ReapReport:
-    """Close the tabs of proven-DEAD owners' ledgers; the report.
+    """Close the tabs of proven-DEAD owners' ledgers, then the orphan marker
+    tabs no ledger names (tp#1759); the report.
 
     `coordinated` = the caller already holds the coordination this needs (the
     guided-login transaction: record + interaction lease; the watchdog: the
@@ -12509,8 +12722,7 @@ def _reap_owned(
             release()
     report = ReapReport()
     directory = _owned_dir()
-    if not directory.is_dir():
-        return report
+    CACHE_DIR.mkdir(parents=True, exist_ok=True)
     lock_path = CACHE_DIR / OWNED_REAPER_LOCK_NAME
     gate = os.open(str(lock_path), os.O_RDWR | os.O_CREAT, 0o600)
     try:
@@ -12521,19 +12733,24 @@ def _reap_owned(
             return report
         claims: list[_Claim] = []
         try:
-            for stem in _ledger_stems(directory):
+            for stem in _ledger_stems(directory) if directory.is_dir() else []:
                 got = _claim_ledger(directory, stem)
                 if isinstance(got, _Claim):
                     claims.append(got)
                     report.owners.append(stem)
                 elif got != "gone":
                     report.skipped[stem] = got
-            if claims:
-                snapshot = _target_snapshot(port)
-                for claim in claims:
-                    _reap_claim(
-                        port, directory, claim, snapshot, report=report, dry_run=dry_run
-                    )
+            # One snapshot, THEN the ledger references (tp#1759): a marker tab
+            # it lists had its pending entry on disk before it was created.
+            snapshot = _target_snapshot(port)
+            # (A dead owner's tabs are named by its ledger: never an orphan.)
+            if snapshot is not None:
+                refs = _ledger_refs(directory)
+                _reap_orphan_markers(port, snapshot, refs, report.orphans, dry_run)
+            for claim in claims:
+                _reap_claim(
+                    port, directory, claim, snapshot, report=report, dry_run=dry_run
+                )
         finally:
             for claim in claims:
                 with contextlib.suppress(OSError):
@@ -12552,21 +12769,40 @@ def _reap_quietly(port: int, why: str) -> None:
     except Exception as exc:  # pylint: disable=broad-exception-caught
         print(f"⚠ reaping dead owners' tabs failed ({why}): {exc}", file=sys.stderr)
         return
-    if report.closed or report.left:
+    if report.closed or report.left or report.orphans.closed:
         print(
             f"ℹ️  closed {len(report.closed)} tab(s) of dead owner(s) ({why})"
-            + (f"; {len(report.left)} still open" if report.left else ""),
+            + (f"; {len(report.left)} still open" if report.left else "")
+            + (
+                f"; {len(report.orphans.closed)} orphan marker(s)"
+                if report.orphans.closed
+                else ""
+            ),
             file=sys.stderr,
         )
+
+
+def _reap_orphans_print(orphans: OrphanReport, *, dry_run: bool) -> bool:
+    """`reap-owned`'s orphan-marker lines; True when the rule failed (exit 1)."""
+    for warning in orphans.warnings:
+        print(f"⚠ {warning}", file=sys.stderr)
+    for label in orphans.would if dry_run else orphans.closed:
+        print(f"would close: {label}" if dry_run else f"✓ closed {label}")
+    for label in orphans.failed:
+        print(f"❌ failed: {label}", file=sys.stderr)
+    if orphans.error:
+        print(f"❌ {orphans.error}", file=sys.stderr)
+    return bool(orphans.error or orphans.failed)
 
 
 def cmd_reap_owned(port: int, dry_run: bool = False) -> int:
     """`reap-owned`: close the tabs that crashed `browser.py` processes left.
 
-    Exit 0 when nothing of a dead owner is left open (also: another reaper
-    is running, nothing to reap), 1 when a tab could not be closed (its
-    ledger stays, to be reaped again), 75 while a guided login owns the
-    browser. Live and unknown owners are never touched.
+    Also the orphan marker tabs no ledger names (tp#1759). Exit 0 when
+    nothing of a dead owner is left open (also: another reaper is running,
+    nothing to reap), 1 when a tab could not be closed (its ledger stays, to
+    be reaped again) or a ledger is unreadable, 75 while a guided login owns
+    the browser. Live and unknown owners are never touched.
     """
     report = _reap_owned(port, dry_run=dry_run, coordinated=False)
     if report.busy:
@@ -12577,11 +12813,14 @@ def cmd_reap_owned(port: int, dry_run: bool = False) -> int:
     if dry_run:
         for tid in report.would_close:
             print(f"would close: {_id8(tid)}")
+        failed = _reap_orphans_print(report.orphans, dry_run=True)
         print(
             f"✅ dry run: {len(report.owners)} dead owner(s), "
-            f"{len(report.would_close)} tab(s) would be closed"
+            f"{len(report.would_close)} tab(s) would be closed, "
+            f"{len(report.orphans.would)} orphan marker(s)"
         )
-        return 0
+        return 1 if failed else 0
+    failed = _reap_orphans_print(report.orphans, dry_run=False)
     if report.left:
         print(
             f"❌ {len(report.left)} tab(s) of dead owners still open — retry "
@@ -12590,10 +12829,11 @@ def cmd_reap_owned(port: int, dry_run: bool = False) -> int:
         )
         return 1
     print(
-        f"✅ reaped {len(report.owners)} dead owner(s), closed "
-        f"{len(report.closed)} tab(s)"
+        f"{'❌' if failed else '✅'} reaped {len(report.owners)} dead owner(s), "
+        f"closed {len(report.closed)} tab(s) and "
+        f"{len(report.orphans.closed)} orphan marker(s)"
     )
-    return 0
+    return 1 if failed else 0
 
 
 def _doctor_owned_ledgers(log: list[str]) -> None:

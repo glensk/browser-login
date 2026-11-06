@@ -172,7 +172,7 @@ CPU after 10 min idle with the same 3 test tabs) with and without the flags.
       objection 5: rely on marker v2). Tests: marker round trip, hash = raw-lstart hash
       (no epoch), legacy marker → None, lstart unknown → legacy form, late listing within
       the poll is bound and closed.
-- [ ] B2 **Orphan marker rule + observation pass** in `_reap_owned` (pure
+- [x] B2 **Orphan marker rule + observation pass** in `_reap_owned` (pure
       `_orphan_markers(snapshot, ledger_refs, observed, now, pid_state)`), reported in
       `reap-owned` output. Tests: v2 dead/live/reused pid, `ps` failure spared, legacy
       within/after grace, marker named by a ledger of any state (incl. tmp file),
