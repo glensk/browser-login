@@ -210,13 +210,13 @@ CPU after 10 min idle with the same 3 test tabs) with and without the flags.
 ## Verification
 
 ```commands
-ruff format --check /Users/albert/obsidian/42-Git/home/browser-login/bin/browser.py /Users/albert/obsidian/42-Git/home/browser-login/agent_login_jobs.py
-ruff check /Users/albert/obsidian/42-Git/home/browser-login/bin/browser.py /Users/albert/obsidian/42-Git/home/browser-login/agent_login_jobs.py
-uv run --project /Users/albert/obsidian/42-Git/home/browser-login mypy /Users/albert/obsidian/42-Git/home/browser-login/bin/browser.py /Users/albert/obsidian/42-Git/home/browser-login/agent_login_jobs.py
-uv run --project /Users/albert/obsidian/42-Git/home/browser-login pylint /Users/albert/obsidian/42-Git/home/browser-login/bin/browser.py /Users/albert/obsidian/42-Git/home/browser-login/agent_login_jobs.py
-uv run --project /Users/albert/obsidian/42-Git/home/browser-login pytest -q /Users/albert/obsidian/42-Git/home/browser-login/tests/test_browser_reap_tp1759.py /Users/albert/obsidian/42-Git/home/browser-login/tests/test_tab_reaper.py /Users/albert/obsidian/42-Git/home/browser-login/tests/test_owned_tabs_tp845.py /Users/albert/obsidian/42-Git/home/browser-login/tests/test_owned_ledger.py /Users/albert/obsidian/42-Git/home/browser-login/tests/test_connect_hang.py /Users/albert/obsidian/42-Git/home/browser-login/tests/test_agent_login.py
-/Users/albert/obsidian/42-Git/home/browser-login/bin/browser.py reap -h
-/Users/albert/obsidian/42-Git/home/browser-login/bin/browser.py reap-owned -h
+cd /Users/albert/obsidian/42-Git/home/browser-login && ruff format --check bin/browser.py agent_login_jobs.py
+cd /Users/albert/obsidian/42-Git/home/browser-login && ruff check bin/browser.py agent_login_jobs.py
+cd /Users/albert/obsidian/42-Git/home/browser-login && uv run mypy bin/browser.py agent_login_jobs.py
+cd /Users/albert/obsidian/42-Git/home/browser-login && uv run pylint bin/browser.py agent_login_jobs.py
+cd /Users/albert/obsidian/42-Git/home/browser-login && uv run pytest -q tests/test_browser_reap_tp1759.py tests/test_tab_reaper.py tests/test_owned_tabs_tp845.py tests/test_owned_ledger.py tests/test_connect_hang.py tests/test_agent_login.py
+cd /Users/albert/obsidian/42-Git/home/browser-login && bin/browser.py reap -h
+cd /Users/albert/obsidian/42-Git/home/browser-login && bin/browser.py reap-owned -h
 ```
 
 (`tests/test_down.py` is not needed: with idle stop out of scope nothing uses the `down`
