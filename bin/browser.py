@@ -683,6 +683,50 @@ def _add_reap_parser(sub: Any) -> None:
         help="only print what would be closed (`would close:` per tab); close "
         "nothing, change no ledger.",
     )
+    prp = sub.add_parser(
+        "reap",
+        help="Run every reaper on a running instance (never starts one), in "
+        "order, each with its own budget: dead owners' tabs + orphan markers "
+        "(as `reap-owned`) → extra blank tabs (about:blank / New Tab beyond "
+        "one, idle ≥ 30 min) → idle http(s) tabs (as `reap-idle`) → Playwright "
+        "MCP servers on this CDP port whose parent died (ppid 1). Overall "
+        f"deadline {REAP_TOTAL_S:g}s. Exit 1 a step failed, 75 a step was "
+        "skipped (busy, guided login, deadline), else 0.",
+    )
+    prp.add_argument(
+        "-n",
+        "--dry-run",
+        action="store_true",
+        help="pure read: print `would close:` / `would kill:` lines; take no "
+        "lock or lease, write nothing, close and kill nothing.",
+    )
+    prp.add_argument(
+        "-A",
+        "--all-instances",
+        action="store_true",
+        help="run once per known instance whose CDP port answers (never starts one).",
+    )
+    prp.add_argument(
+        "-q",
+        "--quiet",
+        action="store_true",
+        help="print only closes, kills and ❌ failures.",
+    )
+    prp.add_argument(
+        "-I",
+        "--idle-hours",
+        type=_positive_seconds,
+        default=None,
+        metavar="HOURS",
+        help="idle threshold of the idle-tab step (passed to `reap-idle -I`).",
+    )
+    prp.add_argument(
+        "-o",
+        "--orphans-only",
+        action="store_true",
+        help="only the dead owners' tabs and orphan markers (the cheap pass "
+        "`up` runs): no blank trim, no idle tabs, no MCP kills.",
+    )
     _add_tab_parsers(sub)  # the other reaper, its pins and the tab list
 
 
@@ -4034,6 +4078,7 @@ _PREFLIGHT_SKIP_CMDS = frozenset(
         "close-hung",
         "close",
         "reap-owned",
+        "reap",
         "maintenance-watchdog",
         # Raw CDP only (tp#1109): they never attach Playwright.
         "tabs",
@@ -20760,6 +20805,218 @@ def _reap_idle_summary(run: ReapIdleRun, *, dry_run: bool, quiet: bool) -> None:
         )
 
 
+# --- `reap`: the umbrella (tp#1759) ------------------------------------------------
+
+# One overall deadline; a step not started before it is reported skipped.
+REAP_TOTAL_S = 75.0
+# `up` spawns a detached `reap -o -q` at most this often per instance (stamp mtime).
+REAP_AFTER_UP_INTERVAL_S = 600.0
+REAP_AFTER_UP_STAMP = "reap-after-up.stamp"
+REAP_AFTER_UP_LOG = "reap-after-up.log"
+
+
+@dataclass
+class ReapOpts:
+    """The `reap` flags one pass needs."""
+
+    dry_run: bool = False
+    quiet: bool = False
+    idle_h: float | None = None
+    orphans_only: bool = False
+
+
+def _reap_step_owned(port: int, opts: ReapOpts) -> int:
+    """Dead owners' tabs + orphan markers (`_reap_owned`). A dry run is a pure
+    read: no registration, no lease (it closes nothing)."""
+    report = _reap_owned(port, dry_run=opts.dry_run, coordinated=opts.dry_run)
+    if report.busy:
+        if not opts.quiet:
+            print("✅ owned tabs: another reaper is running — nothing to do")
+        return 0
+    if not opts.quiet:
+        for stem, state in report.skipped.items():
+            print(f"   {stem}: owner {state} — left alone")
+    if opts.dry_run:
+        for tid in report.would_close:
+            print(f"would close: dead owner's tab {_id8(tid)}")
+    else:
+        for tid in report.closed:
+            print(f"✓ closed dead owner's tab {_id8(tid)}")
+    failed = _reap_orphans_print(report.orphans, dry_run=opts.dry_run)
+    if report.left:
+        print(
+            f"❌ {len(report.left)} tab(s) of dead owners still open "
+            "(journal: reap_owned)",
+            file=sys.stderr,
+        )
+        failed = True
+    if not opts.quiet:
+        n = len(report.would_close if opts.dry_run else report.closed)
+        m = len(report.orphans.would if opts.dry_run else report.orphans.closed)
+        verb = "would close" if opts.dry_run else "closed"
+        print(
+            f"{'❌' if failed else '✅'} owned tabs: {len(report.owners)} dead "
+            f"owner(s), {verb} {n} tab(s) and {m} orphan marker(s)"
+        )
+    return 1 if failed else 0
+
+
+def _reap_step_blank(port: int, opts: ReapOpts) -> int:
+    """The blank trim (`_blank_trim_pass`); a real run registers and holds
+    the interaction lease, a dry run is a pure read."""
+    if opts.dry_run:
+        run = _blank_trim_pass(port, dry_run=True)
+    else:
+        release = _registry_register("browser.py", _purpose(), port)
+        try:
+            with _interaction_lease("reap-blank", wait_s=REAP_IDLE_LEASE_WAIT_S):
+                run = _blank_trim_pass(port, dry_run=False)
+        finally:
+            release()
+    for warning in run.warnings:
+        print(f"⚠ {warning}", file=sys.stderr)
+    for label in run.would if opts.dry_run else run.closed:
+        print(
+            f"would close: blank {label}" if opts.dry_run else f"✓ closed blank {label}"
+        )
+    for label in run.failed:
+        print(f"❌ failed: blank {label}", file=sys.stderr)
+    if run.error:
+        print(f"❌ {run.error}", file=sys.stderr)
+    bad = bool(run.error or run.failed)
+    if not opts.quiet:
+        n = len(run.would if opts.dry_run else run.closed)
+        scope = " (restricted: NTP + startup blank only)" if run.restricted else ""
+        verb = "would close" if opts.dry_run else "closed"
+        print(f"{'❌' if bad else '✅'} blank tabs: {verb} {n}{scope}")
+    return 1 if bad else 0
+
+
+def _reap_step_idle(port: int, opts: ReapOpts) -> int:
+    """`reap-idle` for this instance, its own rules unchanged."""
+    return cmd_reap_idle(
+        port,
+        dry_run=opts.dry_run,
+        idle_h=opts.idle_h,
+        max_n=REAP_IDLE_MAX_DEFAULT,
+        all_instances=False,
+        quiet=opts.quiet,
+    )
+
+
+def _reap_step_mcp(port: int, opts: ReapOpts) -> int:
+    """Orphaned Playwright MCP servers on this port (`_mcp_reap_pass`)."""
+    run = _mcp_reap_pass(port, dry_run=opts.dry_run)
+    for label in run.would if opts.dry_run else run.killed:
+        print(f"would kill: {label}" if opts.dry_run else f"✓ killed {label}")
+    for label in run.failed:
+        print(f"❌ failed to kill: {label}", file=sys.stderr)
+    if run.error:
+        print(f"❌ {run.error}", file=sys.stderr)
+    bad = bool(run.error or run.failed)
+    if not opts.quiet:
+        n = len(run.would if opts.dry_run else run.killed)
+        verb = "would kill" if opts.dry_run else "killed"
+        print(f"{'❌' if bad else '✅'} MCP orphans: {verb} {n}")
+    return 1 if bad else 0
+
+
+def _reap_run_step(
+    name: str, step: Callable[[int, ReapOpts], int], port: int, opts: ReapOpts
+) -> int:
+    """One step, wrapped: a SystemExit (a guided login's 75, a busy lease) is
+    "skipped" with 75, any other error is ❌ 1 — the next step runs either way."""
+    try:
+        rc = step(port, opts)
+    except SystemExit as exc:
+        if not opts.quiet:
+            why = str(exc.code).strip().splitlines()[0] if exc.code is not None else ""
+            print(f"⏸ {name}: skipped ({why.lstrip('❌ ') or 'exit'})")
+        return BUSY_RC
+    except Exception as exc:  # pylint: disable=broad-exception-caught
+        print(f"❌ {name}: {_exc_line(exc)}", file=sys.stderr)
+        return 1
+    if rc == BUSY_RC and not opts.quiet:
+        print(f"⏸ {name}: skipped (busy)")
+    return rc
+
+
+def _reap_this_instance(port: int, opts: ReapOpts) -> int:
+    """Every step in order, each with its own budget, all under REAP_TOTAL_S;
+    exit aggregated 1 > 75 > 0."""
+    if not _is_up(port):
+        if not opts.quiet:
+            print("✅ browser is down — nothing to reap.")
+        return 0
+    stop = time.monotonic() + REAP_TOTAL_S
+    steps: list[tuple[str, Callable[[int, ReapOpts], int]]] = [
+        ("owned tabs", _reap_step_owned),
+        ("blank tabs", _reap_step_blank),
+        ("idle tabs", _reap_step_idle),
+        ("MCP orphans", _reap_step_mcp),
+    ]
+    codes: list[int] = []
+    for name, step in steps[:1] if opts.orphans_only else steps:
+        if time.monotonic() >= stop:
+            if not opts.quiet:
+                print(f"⏸ {name}: skipped (overall {REAP_TOTAL_S:g}s deadline)")
+            codes.append(BUSY_RC)
+            continue
+        codes.append(_reap_run_step(name, step, port, opts))
+    return _worst_rc(codes)
+
+
+def cmd_reap(port: int, opts: ReapOpts, *, all_instances: bool) -> int:
+    """`reap`: dead owners' tabs + orphan markers → blank trim → `reap-idle` →
+    orphaned MCP servers (`-o`: the first step only)."""
+    if all_instances and not _fanout_pinned_env():
+        argv = ["reap"] + (["-n"] if opts.dry_run else [])
+        argv += (["-q"] if opts.quiet else []) + (["-o"] if opts.orphans_only else [])
+        argv += ["-I", str(opts.idle_h)] if opts.idle_h is not None else []
+        return _reap_idle_fanout(argv)
+    return _reap_this_instance(port, opts)
+
+
+def _reap_after_up(port: int) -> bool:
+    """After a successful `up`: spawn a detached `reap -o -q` (own session,
+    output to REAP_AFTER_UP_LOG) so `up` never waits on it — at most once per
+    REAP_AFTER_UP_INTERVAL_S per instance (the stamp's mtime). True when spawned."""
+    stamp = CACHE_DIR / REAP_AFTER_UP_STAMP
+    try:
+        if time.time() - stamp.stat().st_mtime < REAP_AFTER_UP_INTERVAL_S:
+            return False
+    except FileNotFoundError:
+        pass
+    except OSError:
+        return False
+    argv = [
+        sys.executable,
+        str(Path(__file__).resolve()),
+        "--cdp-port",
+        str(port),
+        "reap",
+        "-o",
+        "-q",
+    ]
+    env = {k: v for k, v in os.environ.items() if k != MAINTENANCE_ENV}
+    try:
+        CACHE_DIR.mkdir(parents=True, exist_ok=True)
+        stamp.touch()
+        with open(CACHE_DIR / REAP_AFTER_UP_LOG, "w", encoding="utf-8") as log:
+            subprocess.Popen(  # pylint: disable=consider-using-with
+                argv,
+                stdin=subprocess.DEVNULL,
+                stdout=log,
+                stderr=log,
+                start_new_session=True,
+                env=env,
+            )
+    except OSError as exc:
+        print(f"⚠ could not start the reap after `up`: {exc}", file=sys.stderr)
+        return False
+    return True
+
+
 def _instance_pinned(args: argparse.Namespace) -> bool:
     """This process is pinned to ONE browser: an explicit non-default
     instance, any `--cdp-port` on the command line (`_self_run` always passes
@@ -20936,7 +21193,10 @@ def _dispatch(args: argparse.Namespace, port: int) -> int:  # pylint: disable=to
     # would need a per-command adapter lambda — more indirection, not less.
     # pylint: disable=too-many-return-statements,too-many-branches
     if args.cmd == "up":
-        return cmd_up(port)
+        rc = cmd_up(port)
+        if rc == 0 and os.environ.get(TEST_NO_LAUNCH_ENV) != "1":
+            _reap_after_up(port)
+        return rc
     if args.cmd == "status":
         if args.probe:
             return cmd_status(port, args.full_urls, probe=True)
@@ -21006,6 +21266,14 @@ def _dispatch(args: argparse.Namespace, port: int) -> int:  # pylint: disable=to
         return cmd_eval_fresh(port, args.url, args.js, timeout_s=args.timeout)
     if args.cmd == "reap-owned":
         return cmd_reap_owned(port, dry_run=args.dry_run)
+    if args.cmd == "reap":
+        opts = ReapOpts(
+            dry_run=args.dry_run,
+            quiet=args.quiet,
+            idle_h=args.idle_hours,
+            orphans_only=args.orphans_only,
+        )
+        return cmd_reap(port, opts, all_instances=args.all_instances)
     if args.cmd == "token":
         return cmd_token(port)
     if args.cmd == "slack-session":

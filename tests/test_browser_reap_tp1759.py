@@ -712,3 +712,132 @@ def test_mcp_pass_dry_run_and_ps_failure(cache, monkeypatch):
     monkeypatch.setattr(browser, "_ps_rows", lambda: None)
     run = browser._mcp_reap_pass(9222, dry_run=False)
     assert run.error and not run.killed
+
+
+# --- B5: `reap` umbrella + detached reap after `up` ---------------------------------
+
+
+def _reapable(fake: FakeCdp, cache: Path) -> None:
+    """A dead owner's v2 marker, two old blanks (one extra) — all reapable."""
+    _old_blanks(fake, cache)
+    fake.add("ORPH0001", _marker_url(_v2(_dead_pid(), LSTART)))
+
+
+def _step_spies(monkeypatch, rcs: dict[str, object]) -> list[str]:
+    called: list[str] = []
+
+    def spy(name: str):
+        def step(port, opts):
+            called.append(name)
+            rc = rcs.get(name, 0)
+            if isinstance(rc, BaseException):
+                raise rc
+            return rc
+
+        return step
+
+    for name in ("owned", "blank", "idle", "mcp"):
+        monkeypatch.setattr(browser, f"_reap_step_{name}", spy(name))
+    return called
+
+
+def test_reap_dry_run_persists_closes_and_kills_nothing(
+    fake, cache, monkeypatch, capsys
+):
+    _reapable(fake, cache)
+    before = (cache / browser.TABSTATE_NAME).read_text()
+    monkeypatch.setattr(browser, "_unknown_cdp_clients", lambda port: [])
+    monkeypatch.setattr(browser, "_ps_rows", lambda: _pair(100, 1, port=fake.port))
+    monkeypatch.setattr(browser, "_mcp_kill_groups", lambda *a: pytest.fail("killed"))
+    rc = browser._reap_this_instance(fake.port, browser.ReapOpts(dry_run=True))
+    out = capsys.readouterr().out
+    assert rc == 0 and not fake.closed
+    assert (cache / browser.TABSTATE_NAME).read_text() == before
+    assert not (cache / "clients").exists() or not list((cache / "clients").iterdir())
+    assert "would close: orphan marker (v2)" in out and "would close: blank" in out
+    assert "would kill: orphaned playwright-mcp pid 100" in out
+
+
+def test_reap_real_run_closes_marker_and_extra_blank(fake, cache, monkeypatch):
+    _reapable(fake, cache)
+    monkeypatch.setattr(browser, "_unknown_cdp_clients", lambda port: [])
+    monkeypatch.setattr(browser, "_ps_rows", lambda: [])
+    rc = browser._reap_this_instance(fake.port, browser.ReapOpts(quiet=True))
+    assert rc == 0
+    assert sorted(fake.closed) == ["B2", "ORPH0001"] and KEEP in fake.targets
+
+
+def test_reap_orphans_only_skips_blank_idle_and_mcp(fake, monkeypatch):
+    called = _step_spies(monkeypatch, {})
+    opts = browser.ReapOpts(orphans_only=True)
+    assert browser._reap_this_instance(fake.port, opts) == 0
+    assert called == ["owned"]
+
+
+def test_reap_system_exit_in_one_step_does_not_stop_the_next(fake, monkeypatch, capsys):
+    called = _step_spies(
+        monkeypatch, {"owned": SystemExit(75), "blank": SystemExit("❌ lease")}
+    )
+    rc = browser._reap_this_instance(fake.port, browser.ReapOpts())
+    assert called == ["owned", "blank", "idle", "mcp"] and rc == browser.BUSY_RC
+    assert "skipped" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize(
+    ("rcs", "want"),
+    [
+        ({}, 0),
+        ({"idle": 75}, 75),
+        ({"idle": 75, "mcp": 1}, 1),
+        ({"blank": RuntimeError("boom")}, 1),
+    ],
+)
+def test_reap_exit_aggregation(fake, monkeypatch, rcs, want):
+    called = _step_spies(monkeypatch, rcs)
+    assert browser._reap_this_instance(fake.port, browser.ReapOpts()) == want
+    assert len(called) == 4
+
+
+def test_reap_overall_deadline_skips_the_rest(fake, monkeypatch):
+    called = _step_spies(monkeypatch, {})
+    monkeypatch.setattr(browser, "REAP_TOTAL_S", 0.0)
+    assert browser._reap_this_instance(fake.port, browser.ReapOpts()) == 75
+    assert not called
+
+
+def test_reap_browser_down_is_nothing_to_do(monkeypatch):
+    called = _step_spies(monkeypatch, {})
+    monkeypatch.setattr(browser, "_is_up", lambda port: False)
+    assert browser._reap_this_instance(1, browser.ReapOpts()) == 0 and not called
+
+
+def test_reap_after_up_spawns_at_most_once_per_interval(cache, monkeypatch):
+    spawned: list[list[str]] = []
+
+    class Popen:  # pylint: disable=too-few-public-methods
+        def __init__(self, argv, **kw):
+            assert kw["start_new_session"] and kw["stdin"] is subprocess.DEVNULL
+            spawned.append(list(argv))
+
+    monkeypatch.setattr(browser.subprocess, "Popen", Popen)
+    assert browser._reap_after_up(9222)
+    assert not browser._reap_after_up(9222)
+    assert spawned and spawned[0][-3:] == ["reap", "-o", "-q"]
+    assert "9222" in spawned[0]
+    stamp = cache / browser.REAP_AFTER_UP_STAMP
+    old = time.time() - browser.REAP_AFTER_UP_INTERVAL_S - 5
+    os.utime(stamp, (old, old))
+    assert browser._reap_after_up(9222) and len(spawned) == 2
+
+
+def test_reap_help_lists_every_flag():
+    r = subprocess.run(
+        [sys.executable, str(_BROWSER_PY), "reap", "-h"],
+        capture_output=True,
+        text=True,
+        timeout=60,
+        check=False,
+    )
+    assert r.returncode == 0
+    for flag in ("-n", "-A", "-q", "-I", "-o"):
+        assert f"{flag}, --" in r.stdout

@@ -187,7 +187,7 @@ CPU after 10 min idle with the same 3 test tabs) with and without the flags.
       re-check). Tests: ppid-1 group killed, live non-claude parent spared, live claude
       parent spared, other port spared, `localhost` vs `127.0.0.1`, npm+node pair as one
       group, pid reuse between signals.
-- [ ] B5 **`browser.py reap`** umbrella (flags above, per-step budgets, SystemExit → 75
+- [x] B5 **`browser.py reap`** umbrella (flags above, per-step budgets, SystemExit → 75
       skipped, -A fan-out, dry run pure read, severity aggregation) + detached rate-limited
       `reap -o -q` after `up`. Tests with the fake CDP: dry run persists/closes nothing,
       `-o` skips blank/idle/MCP, SystemExit in one step does not stop the next, exit
