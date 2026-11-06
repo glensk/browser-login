@@ -3332,6 +3332,15 @@ def _launch_and_record(port: int, headless: bool) -> int:
         "--disable-backgrounding-occluded-windows",
         "--disable-renderer-backgrounding",
         "--disable-background-timer-throttling",
+        # Lighter agent browser (tp#1759): Playwright's own defaults that do not
+        # touch logins — no background fetches, component/default-app/sync
+        # services, Translate, Cast, hint downloads or the NTP's Google bar.
+        # NOT --renderer-process-limit (site isolation and stability).
+        "--disable-background-networking",
+        "--disable-component-update",
+        "--disable-default-apps",
+        "--disable-sync",
+        "--disable-features=Translate,MediaRouter,OptimizationHints,NtpOneGoogleBar",
     ]
     if headless:
         # `--headless=new` is the real browser minus the window (full CDP, same

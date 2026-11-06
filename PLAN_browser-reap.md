@@ -192,7 +192,7 @@ CPU after 10 min idle with the same 3 test tabs) with and without the flags.
       `reap -o -q` after `up`. Tests with the fake CDP: dry run persists/closes nothing,
       `-o` skips blank/idle/MCP, SystemExit in one step does not stop the next, exit
       aggregation, stamp file limits the spawn to once per 10 min.
-- [ ] B6 **Launch flags**: add the set above; disposable-instance measurement
+- [x] B6 **Launch flags**: add the set above; disposable-instance measurement
       before/after (`CLAUDE_BROWSER_CACHE_DIR=<tmp> browser.py --cdp-port <free> up`,
       own profile, no real cookies); `doctor` on that instance.
 - [ ] B7 **Timer**: `agent_plists()` reaper args → `reap -A -q`, `TAB_REAPER_INTERVAL_S`
