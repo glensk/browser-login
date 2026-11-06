@@ -11826,6 +11826,73 @@ def _is_owned_marker(url: object) -> bool:
     return isinstance(url, str) and url.startswith(OWNED_MARKER_PREFIX)
 
 
+# Marker v2 (tp#1759): ``p<pid>-<h12>-<hex16>`` — `h12` = the first 12 hex
+# digits of sha256 over the owner's RAW `_proc_lstart` string (the value its
+# ledger stores as ``pid_start_time``; never an epoch). It proves the owner
+# from the URL alone, even when no ledger names the tab. The legacy form (32
+# hex digits, no owner) stays recognised; it is also the fallback when the
+# owner's own start time cannot be read.
+OWNED_MARKER_V2_RE = re.compile(r"p([1-9][0-9]{0,9})-([0-9a-f]{12})-[0-9a-f]{16}")
+OWNED_MARKER_LEGACY_RE = re.compile(r"[0-9a-f]{32}")
+# `_create_owned_target`: the createTarget reply budget, then how long a lost
+# reply's tab is looked for by its marker before the entry is dropped.
+OWNED_CREATE_BUDGET_S = 5.0
+OWNED_CREATE_POLL_S = 5.0
+# This process's own start time, per pid (a forked child reads its own).
+_SELF_LSTART: dict[int, str | None] = {}
+
+
+def _lstart_hash(lstart: str) -> str:
+    """The marker's 12-hex owner start-time hash of a RAW ``ps`` lstart string."""
+    return hashlib.sha256(lstart.encode("utf-8", "replace")).hexdigest()[:12]
+
+
+def _new_owned_marker() -> str:
+    """A fresh marker: v2 (owner pid + start-time hash), or the legacy
+    32-hex form when this process's start time cannot be read."""
+    pid = os.getpid()
+    if pid not in _SELF_LSTART:
+        _SELF_LSTART[pid] = _proc_lstart(pid)
+    lstart = _SELF_LSTART[pid]
+    if not lstart:
+        return secrets.token_hex(16)
+    return f"p{pid}-{_lstart_hash(lstart)}-{secrets.token_hex(8)}"
+
+
+def _marker_of_url(url: object) -> str | None:
+    """The marker of a tab on EXACTLY a recognised marker URL (v2 or legacy)."""
+    if not _is_owned_marker(url):
+        return None
+    marker = str(url)[len(OWNED_MARKER_PREFIX) :]
+    if OWNED_MARKER_V2_RE.fullmatch(marker) or OWNED_MARKER_LEGACY_RE.fullmatch(marker):
+        return marker
+    return None
+
+
+def _marker_owner(marker: str) -> tuple[int, str] | None:
+    """``(pid, lstart hash)`` a v2 marker names; None for any other marker."""
+    m = OWNED_MARKER_V2_RE.fullmatch(marker)
+    return (int(m.group(1)), m.group(2)) if m else None
+
+
+def _marker_owner_state(marker: str) -> str:
+    """``live`` / ``dead`` / ``unknown`` for the owner a v2 marker names.
+
+    Dead: the pid is gone, or it runs with another start time (reused).
+    Unknown: a legacy marker (no owner in it) or ``ps`` could not tell —
+    never closed on that."""
+    owner = _marker_owner(marker)
+    if owner is None:
+        return "unknown"
+    pid, want = owner
+    if not _pid_alive(pid):
+        return "dead"
+    current = _proc_lstart(pid)
+    if current is None:
+        return "unknown"
+    return "live" if _lstart_hash(current) == want else "dead"
+
+
 class OwnedLedger:
     """This process's owned-tab ledger (see the section comment above).
 
@@ -12169,7 +12236,7 @@ def _owned_background_page(
         )
     release = _registry_register("browser.py", _purpose(), port)
     tid: str | None = None
-    marker = secrets.token_hex(16)
+    marker = _new_owned_marker()
     ledger = _owned_ledger()
     assert ledger is not None
     dl = _active_deadline()
@@ -12213,8 +12280,12 @@ def _create_owned_target(
 ) -> tuple[str, bool]:
     """Phase 1 + create: the ledger entry, then ``Target.createTarget`` on the
     marker URL → ``(tid, lost_reply)``. A lost reply is recovered by the marker
+    — looked for up to OWNED_CREATE_POLL_S, a slow browser lists it late —
     (``lost_reply`` True: the caller binds and closes that tab, never uses it);
-    no tab at all → the entry is dropped and `OwnedTabError` raised."""
+    no tab by then → the entry is dropped and `OwnedTabError` raised. A tab
+    that appears even later carries a v2 marker naming this process, so the
+    orphan-marker rule of `_reap_owned` closes it once this process is gone
+    (tp#1759; no entry is kept pending)."""
     _deadline_step("bg:ledger")
     try:
         ledger.pending(marker)
@@ -12223,10 +12294,20 @@ def _create_owned_target(
     _deadline_step("bg:create")
     ws_url = _browser_ws_url(port)
     url = _owned_marker_url(marker)
-    tid = _cdp_create_background_target(ws_url, url, 5.0) if ws_url else None
+    tid = (
+        _cdp_create_background_target(ws_url, url, OWNED_CREATE_BUDGET_S)
+        if ws_url
+        else None
+    )
     if tid is not None:
         return tid, False
-    tid = _marker_target(port, marker)  # created after all, reply lost?
+    # Created after all, reply lost? (No websocket: nothing was ever sent.)
+    stop = time.monotonic() + (OWNED_CREATE_POLL_S if ws_url else 0.0)
+    while True:
+        tid = _marker_target(port, marker)
+        if tid is not None or time.monotonic() >= stop:
+            break
+        time.sleep(0.25)
     if tid is None:
         ledger.drop([], markers=[marker])
         raise OwnedTabError("could not create a background tab")

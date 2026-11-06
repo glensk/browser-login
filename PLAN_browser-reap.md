@@ -166,7 +166,7 @@ CPU after 10 min idle with the same 3 test tabs) with and without the flags.
 
 ## Steps
 
-- [ ] B1 **Marker v2 + create fix.** `_new_owned_marker()`, `_marker_owner(marker)` →
+- [x] B1 **Marker v2 + create fix.** `_new_owned_marker()`, `_marker_owner(marker)` →
       (pid, lstart hash) | None, `_marker_owner_state(marker)` → live/dead/unknown;
       `_create_owned_target` late-reply poll (5 s), no keep-pending (lighter option of
       objection 5: rely on marker v2). Tests: marker round trip, hash = raw-lstart hash
