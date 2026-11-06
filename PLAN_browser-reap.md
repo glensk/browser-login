@@ -202,10 +202,11 @@ CPU after 10 min idle with the same 3 test tabs) with and without the flags.
       stop out of scope), `docs/AGENTS_REFERENCE.md` "Owned-tab ledger" / "Idle-tab
       reaper" bullets (reaping now also via `reap`; orphan-marker and blank rules),
       AGENTS.md hard-rule line "Nothing closes a real tab outside …" gains `reap`.
-- [ ] B9 **Live rollout** (9222): `reap -A -n` dry run, review list; first real run with
+- [x] B9 **Live rollout** (9222): `reap -A -n` dry run, review list; first real run with
       `-o` only (dead-owner tabs + v2-dead markers); legacy orphan markers only after the
       go below; before/after windows/tabs/RSS recorded in the ticket; LaunchAgent reloaded
       and its first run logged without ❌.
+  ↳ evidence 2026-11-06: reaper LaunchAgent reloaded 2026-11-06 15:11 CET with reap -A -q / 7200 s; reap -A -n dry run: 0 to close/kill (only default instance up); first launchd run (kickstart) exit 0, quiet log; 9222 before/after 1 page, 11 procs, 4 renderers; legacy-marker path not exercised (no markers present)
 
 ## Verification
 
