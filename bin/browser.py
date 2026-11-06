@@ -3299,6 +3299,9 @@ def _launch_and_record(port: int, headless: bool) -> int:
             flags.append(f"--user-agent={user_agent}")
     # Only the hosts in bin/pac_hosts.json via their SOCKS proxy, all else DIRECT.
     flags.extend(_proxy_flags())
+    # The start URL, last: a plain blank page instead of the New Tab Page and
+    # its Google widgets (tp#1759); recorded as `via: "startup"` once up.
+    flags.append("about:blank")
     pref_problem = _apply_profile_prefs()
     if pref_problem is not None:
         print(f"⚠ profile prefs not applied: {pref_problem}", file=sys.stderr)
@@ -3310,6 +3313,7 @@ def _launch_and_record(port: int, headless: bool) -> int:
     for _ in range(50):  # up to ~10s
         if _is_up(port):
             pid = _record_running(port, want, pid, rec["nonce"])
+            _tabstate_record_startup(port)
             if headless:
                 print(
                     f"✓ Shared browser launched HEADLESS "
@@ -12698,6 +12702,162 @@ def _reap_orphan_markers(
             owner_pid=owner[0] if owner else None,
         )
         _tabstate_try(functools.partial(_tabstate_forget, tid), "orphan marker closed")
+
+
+# --- blank trim (tp#1759) ----------------------------------------------------------
+
+# Blank pages beyond one are closed once idle this long; one budget per pass.
+BLANK_GRACE_S = 1800.0
+BLANK_CLOSE_BUDGET_S = 5.0
+NTP_URL = "chrome://newtab/"
+
+
+@dataclass
+class BlankTrimRun:
+    """What one `_blank_trim_pass` decided and did (labels, origins only)."""
+
+    closed: list[str] = dataclasses.field(default_factory=list)
+    would: list[str] = dataclasses.field(default_factory=list)
+    failed: list[str] = dataclasses.field(default_factory=list)
+    error: str | None = None
+    restricted: bool = False
+    warnings: list[str] = dataclasses.field(default_factory=list)
+
+
+def _blank_extras(
+    pages: Sequence[dict],
+    state: dict,
+    owned: set[str],
+    restricted: bool,
+    now: float,
+) -> list[dict]:
+    """The blank pages to close (pure): all blanks beyond ONE, idle ≥
+    BLANK_GRACE_S. Never a tab a ledger names (`owned`), a pinned one, the
+    last page. `restricted` (unknown CDP clients, or no lsof): only the NTP
+    and the startup blank (``via: "startup"``) may go. The survivor is a
+    blank that stays anyway, else ``about:blank`` before the NTP, the oldest."""
+    targets = state["targets"]
+    pool: list[tuple[dict, dict, bool, float]] = []
+    for info in pages:
+        tid, url = str(info.get("targetId") or ""), info.get("url")
+        if not tid or not _is_blank_page_url(url) or tid in owned:
+            continue
+        entry = targets.get(tid) or {}
+        closable = not _tab_pinned(state, tid, url) and (
+            not restricted or url == NTP_URL or entry.get("via") == "startup"
+        )
+        borns = [
+            v
+            for k in ("created", "first_seen")
+            if isinstance(v := entry.get(k), (int, float)) and not isinstance(v, bool)
+        ]
+        pool.append((info, entry, closable, min(borns) if borns else now))
+    pool.sort(key=lambda p: (p[2], p[0].get("url") != "about:blank", p[3]))
+    out = []
+    for info, entry, closable, _born in pool[1:]:
+        idle = _tab_idle_s(entry, now)
+        if closable and idle is not None and idle >= BLANK_GRACE_S:
+            out.append(info)
+    return out[: max(0, len(pages) - 1)]
+
+
+def _blank_close_one(port: int, info: dict, left: float) -> bool | None:
+    """Close `info` after a fresh re-check under the state lock: True closed,
+    None spared (gone, navigated, the last page), False failed."""
+    tid = str(info.get("targetId"))
+    with _tabstate_locked():
+        fresh = _target_infos(port, budget_s=max(0.1, min(3.0, left)))
+        if fresh is None:
+            return False
+        pages = [i for i in fresh if i.get("type") == "page"]
+        cur = next((p for p in pages if p.get("targetId") == tid), None)
+        if cur is None or cur.get("url") != info.get("url") or len(pages) <= 1:
+            return None
+        if not _cdp_close_target(port, tid, max(0.1, min(2.0, left))):
+            return False
+        state = _tabstate_read()
+        state["targets"].pop(tid, None)
+        _json_write_atomic(_tabstate_path(), state)
+    return True
+
+
+def _blank_trim_pass(port: int, *, dry_run: bool) -> BlankTrimRun:
+    """One blank-trim pass over this instance (the caller coordinates)."""
+    run = BlankTrimRun()
+    infos = _target_infos(port)
+    if infos is None:
+        run.error = "could not read the target list — trimmed nothing"
+        return run
+    owned = _owned_ledger_tids(infos)
+    if owned is None:
+        run.error = "an owned-tab ledger is unreadable — trimmed nothing"
+        return run
+    unknown = _unknown_cdp_clients(port)
+    run.restricted = unknown is None or bool(unknown)
+    observed = OrphanReport()
+    state = _reap_observe(infos, observed, dry_run=dry_run)
+    run.warnings += observed.warnings
+    pages = [i for i in infos if i.get("type") == "page"]
+    extras = _blank_extras(pages, state, owned, run.restricted, time.time())
+    labels = {
+        str(i.get("targetId")): _target_label(
+            i.get("url"), i.get("title"), i.get("targetId")
+        )
+        for i in extras
+    }
+    if dry_run:
+        run.would += labels.values()
+        return run
+    deadline = time.monotonic() + BLANK_CLOSE_BUDGET_S
+    for info in extras:
+        tid = str(info.get("targetId"))
+        left = deadline - time.monotonic()
+        try:
+            done = _blank_close_one(port, info, left) if left > 0 else False
+        except (TabStateError, OSError):
+            done = False
+        if done is False:
+            run.failed.append(labels[tid])
+        elif done:
+            run.closed.append(labels[tid])
+            _journal("blank_trimmed", target=_id8(tid), restricted=run.restricted)
+    return run
+
+
+def _tabstate_record_startup(port: int, wait_s: float = 2.0) -> None:
+    """Best effort, right after a launch: the start page(s) — blank — go into
+    tabs.json as ``via: "startup"`` (proves no ownership: `_opened_by_caller`
+    wants ``via == "open"``), so a restricted blank trim may close them."""
+    stop = time.monotonic() + wait_s
+    while True:
+        infos = _target_infos(port, budget_s=1.0) or []
+        pages = [
+            i
+            for i in infos
+            if i.get("type") == "page"
+            and _is_blank_page_url(i.get("url"))
+            and isinstance(i.get("targetId"), str)
+        ]
+        if pages or time.monotonic() >= stop:
+            break
+        time.sleep(0.2)
+    if not pages:
+        return
+    now = time.time()
+
+    def edit(state: dict) -> None:
+        for info in pages:
+            entry = state["targets"].setdefault(str(info["targetId"]), {})
+            if entry.get("via"):
+                continue
+            entry.update(
+                created=now,
+                via="startup",
+                first_seen=entry.get("first_seen", now),
+                url_h=_url_hash(info.get("url")),
+            )
+
+    _tabstate_try(edit, "startup page")
 
 
 def _reap_owned(

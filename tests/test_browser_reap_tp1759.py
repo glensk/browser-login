@@ -350,3 +350,188 @@ def test_observation_keeps_opener_created_and_via(fake, cache):
     assert entry["BLANK001"]["via"] == "open" and entry["BLANK001"]["created"] == 1.0
     assert entry["BLANK001"]["opener"] == {"pid": 1}
     assert "first_seen" in entry["BLANK001"] and KEEP not in entry
+
+
+# --- B3: blank trim + about:blank start URL + startup record ------------------------
+
+OLD = 3 * 3600.0  # idle well past BLANK_GRACE_S
+
+
+def _page(tid: str, url: str) -> dict:
+    return {"targetId": tid, "type": "page", "url": url, "title": ""}
+
+
+def _state(**entries: dict) -> dict:
+    state: dict = browser._tabstate_empty()
+    state["targets"].update(entries)
+    return state
+
+
+def _ids(infos: list[dict]) -> list[str]:
+    return sorted(str(i["targetId"]) for i in infos)
+
+
+def _extras(pages, state, owned=frozenset(), restricted=False, now=None):
+    now = time.time() if now is None else now
+    return _ids(browser._blank_extras(pages, state, set(owned), restricted, now))
+
+
+def test_blank_trim_keeps_exactly_one_and_prefers_about_blank():
+    now = time.time()
+    pages = [
+        _page("NTP1", "chrome://newtab/"),
+        _page("B1", "about:blank"),
+        _page("B2", "about:blank"),
+        _page("W1", "https://work.example/"),
+    ]
+    state = _state(
+        NTP1={"first_seen": now - OLD - 100},  # oldest, but the NTP
+        B1={"first_seen": now - OLD - 50},
+        B2={"first_seen": now - OLD},
+    )
+    assert _extras(pages, state, now=now) == ["B2", "NTP1"]
+
+
+def test_blank_trim_grace_pinned_and_last_page():
+    now = time.time()
+    pages = [_page("B1", "about:blank"), _page("B2", "about:blank")]
+    young = _state(B1={"first_seen": now - OLD}, B2={"first_seen": now - 60})
+    assert not _extras(pages, young, now=now)
+    pinned = _state(
+        B1={"first_seen": now - OLD}, B2={"first_seen": now - OLD + 1, "keep": True}
+    )
+    # The pinned one is never closed, so it is the survivor: the other goes.
+    assert _extras(pages, pinned, now=now) == ["B1"]
+    assert not _extras([pages[0]], _state(B1={"first_seen": now - OLD}), now=now)
+
+
+def test_blank_trim_never_a_ledger_tab():
+    now = time.time()
+    pages = [_page("B1", "about:blank"), _page("B2", "about:blank")]
+    state = _state(B1={"first_seen": now - OLD}, B2={"first_seen": now - OLD})
+    assert not _extras(pages, state, owned={"B2"}, now=now)
+
+
+def test_marker_urls_are_never_blank():
+    now = time.time()
+    pages = [
+        _page("B1", "about:blank"),
+        _page("M1", _marker_url("0f" * 16)),
+        _page("X1", "about:blank#x"),
+        _page("N2", "chrome://newtab/#x"),
+    ]
+    state = _state(**{t: {"first_seen": now - OLD} for t in ("B1", "M1", "X1", "N2")})
+    assert not _extras(pages, state, now=now)
+
+
+def test_restricted_trims_only_the_ntp_and_the_startup_blank():
+    now = time.time()
+    pages = [
+        _page("S1", "about:blank"),
+        _page("NTP1", "chrome://newtab/"),
+        _page("B1", "about:blank"),  # maybe an MCP's tab: never in restricted mode
+        _page("W1", "https://work.example/"),
+    ]
+    state = _state(
+        S1={"created": now - OLD - 100, "via": "startup"},
+        NTP1={"first_seen": now - OLD},
+        B1={"first_seen": now - OLD},
+    )
+    assert _extras(pages, state, restricted=True, now=now) == ["NTP1", "S1"]
+    assert _extras(pages, state, restricted=False, now=now) == ["B1", "NTP1"]
+
+
+def _old_blanks(fake: FakeCdp, cache: Path) -> None:
+    fake.add("B1", "about:blank")
+    fake.add("B2", "about:blank")
+    now = time.time()
+    state = _state(B1={"first_seen": now - OLD - 10}, B2={"first_seen": now - OLD})
+    (cache / browser.TABSTATE_NAME).write_text(json.dumps(state), encoding="utf-8")
+
+
+@pytest.mark.parametrize("unknown", [None, [(1, "mcp")]])
+def test_unknown_client_or_no_lsof_restricts_the_pass(
+    fake, cache, monkeypatch, unknown
+):
+    _old_blanks(fake, cache)
+    monkeypatch.setattr(browser, "_unknown_cdp_clients", lambda port: unknown)
+    run = browser._blank_trim_pass(fake.port, dry_run=False)
+    assert run.restricted and not run.closed and not fake.closed
+
+
+def test_blank_trim_pass_closes_the_extra_and_drops_its_state(fake, cache, monkeypatch):
+    _old_blanks(fake, cache)
+    monkeypatch.setattr(browser, "_unknown_cdp_clients", lambda port: [])
+    run = browser._blank_trim_pass(fake.port, dry_run=False)
+    assert fake.closed == ["B2"] and len(run.closed) == 1 and not run.failed
+    targets = json.loads((cache / browser.TABSTATE_NAME).read_text())["targets"]
+    assert "B2" not in targets and "B1" in targets
+
+
+def test_blank_trim_dry_run_closes_and_writes_nothing(fake, cache, monkeypatch):
+    _old_blanks(fake, cache)
+    before = (cache / browser.TABSTATE_NAME).read_text()
+    monkeypatch.setattr(browser, "_unknown_cdp_clients", lambda port: [])
+    run = browser._blank_trim_pass(fake.port, dry_run=True)
+    assert len(run.would) == 1 and not fake.closed
+    assert (cache / browser.TABSTATE_NAME).read_text() == before
+
+
+def test_blank_trim_pass_spares_a_ledger_root_and_its_child(fake, cache, monkeypatch):
+    _old_blanks(fake, cache)
+    fake.targets["B2"].opener = "ROOT0001"  # a popup of a ledgered tab
+    fake.add("ROOT0001", "about:blank")
+    rec = {
+        "pid": os.getpid(),
+        "pid_start_time": _own_lstart(),
+        "entries": [
+            {"marker": None, "tid": "ROOT0001", "parent": None, "created": "x"}
+        ],
+    }
+    _write_ledger(cache, f"{os.getpid()}-abcd1234.json", rec)
+    monkeypatch.setattr(browser, "_unknown_cdp_clients", lambda port: [])
+    run = browser._blank_trim_pass(fake.port, dry_run=False)
+    assert not fake.closed and not run.closed
+
+
+def test_an_unreadable_ledger_trims_nothing(fake, cache, monkeypatch):
+    _old_blanks(fake, cache)
+    _write_ledger(cache, f"{os.getpid()}-garbage1.json", "{not json")
+    monkeypatch.setattr(browser, "_unknown_cdp_clients", lambda port: [])
+    run = browser._blank_trim_pass(fake.port, dry_run=False)
+    assert run.error and not fake.closed
+
+
+def test_startup_page_is_recorded_as_startup_not_open(fake, cache):
+    fake.add("START001", "about:blank")
+    browser._tabstate_record_startup(fake.port, wait_s=0.5)
+    entry = json.loads((cache / browser.TABSTATE_NAME).read_text())["targets"]
+    assert entry["START001"]["via"] == "startup" and "opener" not in entry["START001"]
+    assert KEEP not in entry
+
+
+def test_launch_passes_about_blank_as_the_last_flag(cache, monkeypatch):
+    seen: list[list[str]] = []
+
+    class Stop(Exception):
+        pass
+
+    def launch(binary, flags, headless=False):
+        seen.append(list(flags))
+        raise Stop
+
+    monkeypatch.setattr(browser, "PROFILE_DIR", cache / "profile")
+    for name, value in {
+        "_launch_guard": lambda port: None,
+        "_clear_session_restore": lambda: None,
+        "_chromium_binary": lambda: "/nonexistent/chrome",
+        "_headless_user_agent": lambda binary: None,
+        "_proxy_flags": lambda: [],
+        "_apply_profile_prefs": lambda: None,
+        "_lifecycle_write": lambda *a, **k: {"nonce": "n"},
+        "_launch_browser": launch,
+    }.items():
+        monkeypatch.setattr(browser, name, value)
+    with pytest.raises(Stop):
+        browser._launch_and_record(1, headless=True)
+    assert seen and seen[0][-1] == "about:blank"

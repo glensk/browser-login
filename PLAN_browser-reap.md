@@ -178,7 +178,7 @@ CPU after 10 min idle with the same 3 test tabs) with and without the flags.
       within/after grace, marker named by a ledger of any state (incl. tmp file),
       unreadable ledger stops, last-page veto, URL changed before close, dry run writes
       nothing, "reap-idle skipped (75), legacy marker still aged".
-- [ ] B3 **Blank trim** (pure `_blank_extras(pages, state, owned, restricted, now)`) +
+- [x] B3 **Blank trim** (pure `_blank_extras(pages, state, owned, restricted, now)`) +
       `about:blank` start URL + `via: "startup"` record at launch. Tests: keeps exactly
       one, prefers about:blank, grace, pinned, last page, ledger root and child excluded,
       marker URL and `about:blank#x` never blank, unknown client → only NTP + startup
