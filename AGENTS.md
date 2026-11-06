@@ -62,8 +62,9 @@ framework. It is a **provider**: other repos depend on it, not the reverse. See
 - Proxy = one inline `data:` per-host PAC (`bin/pac_hosts.json`) only; never a global
   `--proxy-server` or `$ALL_PROXY`.
 - Playwright attaches are bounded; anything that must work with a wedged tab uses raw CDP
-  (`_cdp_ws_call`). Nothing closes a real tab outside `close-hung`'s contract or
-  `close -i` on ids from `open -N`.
+  (`_cdp_ws_call`). Nothing closes a real tab outside `close-hung`'s contract,
+  `close -i` on ids from `open -N`, or the reapers' rules (`reap-owned`, `reap-idle`,
+  `reap`: dead owners, orphan markers, extra blanks, idle http(s) tabs).
 - Unattended `login`/`logged-in` run under a `LoginDeadline`; runner calls
   (`run_browser`/`_browser`) always pass an explicit `timeout_s`.
 - Login recipes: call `attempt.entered()` before typing the password and

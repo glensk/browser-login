@@ -198,7 +198,7 @@ CPU after 10 min idle with the same 3 test tabs) with and without the flags.
 - [ ] B7 **Timer**: `agent_plists()` reaper args → `reap -A -q`, `TAB_REAPER_INTERVAL_S`
       (`StartInterval`) 900 → 7200 (2 h, Albert's decision); test of the generated plist;
       reload of that one label (bootout + bootstrap gui/<uid>).
-- [ ] B8 **Docs**: README "Tabs: who opened what…" section (+ `reap`, MCP orphans, idle
+- [x] B8 **Docs**: README "Tabs: who opened what…" section (+ `reap`, MCP orphans, idle
       stop out of scope), `docs/AGENTS_REFERENCE.md` "Owned-tab ledger" / "Idle-tab
       reaper" bullets (reaping now also via `reap`; orphan-marker and blank rules),
       AGENTS.md hard-rule line "Nothing closes a real tab outside …" gains `reap`.

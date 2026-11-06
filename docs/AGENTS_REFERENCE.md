@@ -69,8 +69,20 @@ framework. It is a **provider**: other repos depend on it, not the reverse. See
   navigated only after that. Liveness is tri-state
   (`_owner_state`: live = flock held or pid+start time match; dead = flock free
   and pid gone/reused; unknown = unreadable → never reaped). Reaping only via
-  `reap-owned`, the guided-login transaction (start, `_guided_a`'s finally) and
-  the maintenance watchdog — never `_preflight`, never `status`.
+  `reap-owned`, `reap` (its first step; `up` spawns a detached `reap -o -q`),
+  the guided-login transaction (start, `_guided_a`'s finally) and
+  the maintenance watchdog — never `_preflight`, never `status`. Markers are v2
+  `p<pid>-<h12>-<hex16>` (tp#1759; `h12` = sha256 of the RAW `_proc_lstart`
+  string the ledger stores as `pid_start_time`, never an epoch), legacy 32-hex
+  when the own start time is unreadable; both stay recognised. The ledger FILE
+  format is unchanged — `_caller_ledger_tids`, `_owned_ledger_tids` and
+  `_reap_owned` read it alike (tp#1765), and any format change updates all
+  three with a shared test. **Orphan-marker rule** (`_orphan_markers`, inside
+  `_reap_owned`): a page exactly on a marker URL that no ledger (any state, tmp
+  files included) names is closed only when its v2 owner is dead (pid gone or
+  hash differs; `ps` failure = spared) or its legacy marker was first seen
+  ≥ `ORPHAN_MARKER_GRACE_S` ago; fresh re-check, never the last page;
+  unreadable ledger dir/file = stop (fail closed).
 - **Idle-tab reaper and keep pins** (tp#1109, README "Tabs: who opened
   what"): `<cache>/tabs.json` records openers (`open`), last use (`open`,
   `eval`), pins and observations — never a raw URL (a fragment-less sha256),
@@ -83,7 +95,19 @@ framework. It is a **provider**: other repos depend on it, not the reverse. See
   last page; its pass stays a few seconds (clients wait on the gate). A
   malformed state file stops it. Pins are durable writes (`keep`, `open -k`
   fail loud); activity/observations are best effort. Never make `attached`
-  count as activity or add a URL-substring `keep`.
+  count as activity or add a URL-substring `keep`. `reap` (tp#1759) only
+  orchestrates `reap-idle`; its own heuristic is the **blank trim**
+  (`_blank_extras`): raw URL exactly `about:blank`/`chrome://newtab/` and not a
+  marker, never a ledger tid (roots and children; unreadable = trim nothing),
+  pinned tab or the last page; one survivor, the rest closed after
+  `BLANK_GRACE_S` idle; full trim only when `_unknown_cdp_clients(port) == []`,
+  else only the NTP and the `via: "startup"` blank (`attached` is no veto: an
+  MCP attaches to every target). Observation passes (`setdefault` of
+  `first_seen`) never prune or rewrite `opener`/`created`/`via` (they prove
+  ownership for `close -i`, tp#1765). **MCP orphans** (`_mcp_orphans`): the
+  only criterion is ppid 1 of the group's top npm/node process with
+  `--cdp-endpoint` on this port — no parent-name allow-list; pid + raw lstart
+  re-checked before every signal; never from `reap -o`.
 - This repo declares **no** `EXTERNAL_DEPS` registry (extdeps package) — it is a
   provider, not a consumer. Its own external tools (`op`, `himalaya`, `security`, Playwright) are
   **optional** and degrade gracefully (assisted fallback); they are documented in

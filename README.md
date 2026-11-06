@@ -104,6 +104,10 @@ browser.py eval-fresh -t 30 https://claude.ai/ 'location.host'  # JS in a FRESH 
 browser.py reap-owned [-n]    # close the tabs crashed/killed browser.py runs left (owned-tab
                               #   ledger, proven-dead owners only; -n = dry run); exit 0 nothing
                               #   left, 1 a tab could not be closed, 75 busy
+browser.py reap -A [-n] [-o]  # the whole cleanup per instance (tp#1759): dead owners' tabs +
+                              #   orphan markers → extra blank tabs → reap-idle → orphaned
+                              #   Playwright MCP servers; -o only the first step; -n = dry run
+                              #   (see "Tabs: who opened what…")
 browser.py login anthropic -e EMAIL  # (inside a guided login) assisted claude.ai login until
                               #   /api/account is EMAIL (≤15 min); 2 = another account
 browser.py down [-f]          # quit the shared browser (graceful CDP close → validated escalation);
@@ -128,10 +132,13 @@ drive it, and close it again with every popup it opened — never a tab picked
 by URL, which could be another client's tab or a guided login's login tab.
 Logins navigate that tab only under the interaction lease. Each such tab is
 recorded first in the process's **owned-tab ledger** (`<cache>/owned/`, a
-random marker URL `about:blank#owned-…` before the target id is known), so a
-crashed or killed run cannot leak it: `browser.py reap-owned` closes the tabs
-of PROVEN-dead owners only (the owner's flock is free and its pid gone or
-reused; anything unreadable is left alone), descendants first; the guided
+marker URL `about:blank#owned-p<pid>-<h12>-<hex16>` before the target id is
+known; `h12` hashes the owner's process start time, so the URL alone names its
+owner — tp#1759), so a crashed or killed run cannot leak it:
+`browser.py reap-owned` (also the first step of `browser.py reap`) closes the
+tabs of PROVEN-dead owners only (the owner's flock is free and its pid gone or
+reused; anything unreadable is left alone), descendants first, plus orphan
+markers no ledger names (see "Tabs: who opened what…"); the guided
 login reaps at its start, after a window-flow `login` child, and in its
 watchdog. `open -N` tabs are the caller's and are never ledgered or reaped.
 `status` is never destructive (it never reaps); `doctor` only reports dead
@@ -496,11 +503,12 @@ Rules for anything that drives this browser:
   best-effort against them: they can still navigate a tab in the
   milliseconds between the re-list and the close.
 
-## Tabs: who opened what, keep pins, the idle reaper (tp#1109)
+## Tabs: who opened what, keep pins, the idle reaper, `reap` (tp#1109, tp#1759)
 
 Tabs outlive the agent sessions that opened them; a few days of leftovers
 (ad-heavy pages, admin consoles) cost gigabytes and a busy main process. Three
-commands keep that visible and bounded. Their state is
+commands keep that visible and bounded, and `reap` runs every cleanup in one
+pass (below). Their state is
 `<cache>/tabs.json` (per instance, 0600): who opened a tab, when browser.py last
 used it, the pins, and when `tabs`/`reap-idle` first saw it or saw its URL
 change — a hash of the URL only, never the URL.
@@ -513,6 +521,8 @@ browser.py keep <target-id>         # pin a tab (full id or ≥ 8-char prefix)
 browser.py keep -o https://app.example.com       # pin every tab of an origin
 browser.py keep -r <target-id>      # release a pin;  keep -l lists the pins
 browser.py reap-idle -A -n          # what the reaper would close (dry run)
+browser.py reap -A -n               # what the whole cleanup would close/kill (dry run)
+browser.py reap -o -q               # only dead owners' tabs + orphan markers (what `up` runs)
 ```
 
 - **`tabs`** shows per tab: the opener (agent session id + cwd, recorded by
@@ -553,6 +563,68 @@ browser.py reap-idle -A -n          # what the reaper would close (dry run)
 - **Agents that need a tab for long** (a dashboard they come back to) pin it:
   `open -N -k URL`, `keep <id>` or `keep -o <origin>`. A closed tab costs only
   a reload — the session lives in the profile's cookies.
+
+### `reap`: the whole cleanup in one pass (tp#1759)
+
+`browser.py reap` runs, per instance and in this order, each step with its own
+budget: **dead owners' tabs + orphan markers** (`reap-owned`'s rules, 30 s +
+10 s) → **blank trim** (5 s) → **`reap-idle`** (its rules unchanged, ~13 s) →
+**orphaned Playwright MCP servers** (5 s); the whole pass stops at 75 s and a
+step not started by then is reported skipped. A step that exits (e.g. 75 while
+a guided login holds the browser) is reported `⏸ skipped` and the next step
+still runs. Exit: 1 if any step failed, else 75 if any was skipped, else 0.
+Flags: `-n/--dry-run` (pure read: `would close:` / `would kill:` lines, no
+lock, no lease, nothing written), `-A/--all-instances` (every instance whose
+CDP port answers; never starts one), `-q/--quiet` (only closes, kills and ❌),
+`-I/--idle-hours` (passed to `reap-idle -I`), `-o/--orphans-only` (only the
+first step). Output names tabs by origin only.
+
+- **Orphan markers**: a page whose URL is exactly
+  `about:blank#owned-<marker>` and that no ledger in `<cache>/owned/` names
+  (any state, half-written `.tmp` files included) — the tab a `createTarget`
+  without a reply left behind. A v2 marker (`p<pid>-<h12>-…`) is closed when
+  its owner is dead: the pid is gone or its start-time hash differs (a failing
+  `ps` spares it). A legacy marker (32 hex, no owner in the URL) is closed once
+  it was first seen at least 10 min ago (the ledger entry is always written
+  before the tab exists, so a marker that old with no ledger has no owner).
+  Right before each close a fresh listing must still show it on the exact
+  marker URL, and it is never the last page. An unreadable ledger stops the
+  rule (exit 1). Journal: `orphan_marker`. Before deciding, the step records
+  `first_seen` of every marker and blank page in `tabs.json`, so they age even
+  while `reap-idle` is skipped.
+- **Blank trim**: a blank page is exactly `about:blank` or `chrome://newtab/`
+  (never a marker, never `about:blank#…`). Every tab an owned-tab ledger names
+  (and its popups), pinned tabs and the last page are excluded. Of the rest
+  ONE survives (the oldest seen, `about:blank` preferred over the New Tab
+  Page); the others are closed once idle for 30 min, each after a fresh
+  re-check. While any client other than browser.py is attached (a Playwright
+  MCP, or `lsof` is missing) only the New Tab Page and the startup blank (the
+  tab `up` opened, recorded as `via: "startup"`) are trimmed — an MCP's own
+  fresh `about:blank` is never touched. Journal: `blank_trimmed`.
+- **Orphaned MCP servers**: `npm exec @playwright/mcp…` / `node …playwright-mcp…`
+  processes whose command line has `--cdp-endpoint` on THIS instance's port
+  (`localhost` or `127.0.0.1`), grouped by their top npm/node ancestor. The only
+  orphan criterion: that top process has parent pid 1 (its Claude session
+  died). A live parent of any name spares the group. The group is killed with
+  SIGTERM, then SIGKILL after 3 s; pid and process start time are re-checked
+  before each signal, so a reused pid is never hit. Nothing without
+  `--cdp-endpoint` to this port is touched. Journal: `mcp_orphan_killed`.
+- **After `up`**: every successful `up` (fresh launch or already running)
+  starts a detached `reap -o -q` (own session; `up` never waits for it), at
+  most once per 10 min per instance (stamp `<cache>/reap-after-up.stamp`). Its
+  output goes to `<cache>/reap-after-up.log` (overwritten by each run), not to
+  the journal. It never kills MCP servers — only a full `reap` does.
+- **Lighter launch**: `up` starts with `about:blank` (no New Tab Page, no One
+  Google Bar) and adds Playwright's own defaults for an agent browser that do
+  not touch logins: `--disable-background-networking`,
+  `--disable-component-update`, `--disable-default-apps`, `--disable-sync`,
+  `--disable-features=Translate,MediaRouter,OptimizationHints,NtpOneGoogleBar`.
+  Not `--renderer-process-limit` (it would merge sites into shared renderers:
+  isolation and stability cost).
+- **No idle stop/restart**: the browser is never stopped for being idle. Any
+  stop logs out sessions held in browser-session cookies (the SWITCH portal),
+  the hourly/half-hourly checks keep it busy anyway, and a launchd job cannot
+  cold-start it again (tp#1663).
 
 ## Multi-site login
 
@@ -1507,6 +1579,11 @@ rc = subprocess.run(["browser.py", "login", "anthropic"], check=False).returncod
 running, or nothing to reap), 1 a tab could not be closed (its ledger stays and
 is reaped again next time), 75 busy. agent-login runs it after every run it had
 to kill and at the start of the daily `-c` check.
+
+`reap`: 0 every step done (also: nothing to reap, browser down), 1 a step
+failed (a tab or MCP server could not be closed/killed, an unreadable ledger),
+75 a step was skipped (busy, a client registered, the 75 s deadline) — the
+other steps still ran.
 
 Resolution is **PATH-first**: with `bin/` on `$PATH`, `browser.py` is callable from
 anywhere. Tools that use the external-dependency convention resolve it as
