@@ -12860,6 +12860,211 @@ def _tabstate_record_startup(port: int, wait_s: float = 2.0) -> None:
     _tabstate_try(edit, "startup page")
 
 
+# --- MCP orphans (tp#1759) ---------------------------------------------------------
+
+# A Playwright MCP server on THIS instance's CDP port whose parent died (its top
+# npm/node process re-parented to launchd, ppid 1) is killed: SIGTERM, up to
+# MCP_TERM_WAIT_S, then SIGKILL — all within MCP_REAP_BUDGET_S. From the timer
+# (`reap`) only, never from the `reap -o` after `up`.
+MCP_REAP_BUDGET_S = 5.0
+MCP_TERM_WAIT_S = 3.0
+MCP_PS_TIMEOUT_S = 3.0
+_MCP_NAME_RE = re.compile(r"@playwright/mcp|playwright-mcp")
+_MCP_ENDPOINT_RE = re.compile(
+    r"--cdp-endpoint(?:=|\s+)(?:https?|wss?)://(?:localhost|127\.0\.0\.1):(\d+)"
+    r"(?=[/\s]|$)"
+)
+_MCP_LAUNCHERS = frozenset({"npm", "npx", "node"})
+
+
+class PsRow(NamedTuple):
+    """One process of a ``ps -axo pid,ppid,lstart,command`` snapshot."""
+
+    pid: int
+    ppid: int
+    lstart: str
+    command: str
+
+
+@dataclass
+class McpReapRun:
+    """What one `_mcp_reap_pass` decided and did (pids only — an MCP's command
+    line can carry its environment, so it is never printed)."""
+
+    killed: list[str] = dataclasses.field(default_factory=list)
+    would: list[str] = dataclasses.field(default_factory=list)
+    failed: list[str] = dataclasses.field(default_factory=list)
+    error: str | None = None
+
+
+def _ws_norm(text: str) -> str:
+    """`text` with every whitespace run collapsed (``lstart`` pads the day)."""
+    return " ".join(text.split())
+
+
+def _ps_rows() -> list[PsRow] | None:
+    """ONE ``ps -axo pid,ppid,lstart,command`` snapshot (``LC_ALL=C``,
+    MCP_PS_TIMEOUT_S), or None when ``ps`` fails."""
+    try:
+        r = subprocess.run(
+            [
+                "ps",
+                "-axww",
+                "-o",
+                "pid=",
+                "-o",
+                "ppid=",
+                "-o",
+                "lstart=",
+                "-o",
+                "command=",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=MCP_PS_TIMEOUT_S,
+            check=False,
+            env={**os.environ, "LC_ALL": "C"},
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if r.returncode != 0:
+        return None
+    rows: list[PsRow] = []
+    for line in str(r.stdout or "").splitlines():
+        parts = line.split(None, 7)
+        if len(parts) == 8 and parts[0].isdigit() and parts[1].isdigit():
+            rows.append(
+                PsRow(int(parts[0]), int(parts[1]), " ".join(parts[2:7]), parts[7])
+            )
+    return rows
+
+
+def _is_mcp_for_port(command: str, port: int) -> bool:
+    """True when `command` is a npm/npx/node Playwright MCP process whose
+    ``--cdp-endpoint`` is this instance's port on ``localhost``/``127.0.0.1``."""
+    words = command.split(None, 1)
+    if not words or os.path.basename(words[0]) not in _MCP_LAUNCHERS:
+        return False
+    if not _MCP_NAME_RE.search(command):
+        return False
+    return any(int(p) == port for p in _MCP_ENDPOINT_RE.findall(command))
+
+
+def _mcp_orphans(ps_rows: Sequence[PsRow], port: int) -> list[list[PsRow]]:
+    """The orphaned Playwright MCP groups on `port` (pure): ``[[top, *descendants]]``.
+
+    Only processes `_is_mcp_for_port` matches take part; each is grouped under
+    its top matching ancestor. The ONLY orphan criterion: that top process has
+    ppid 1 — a live parent of any name spares the whole group."""
+    mcp = {r.pid: r for r in ps_rows if _is_mcp_for_port(r.command, port)}
+
+    def top_of(row: PsRow) -> PsRow:
+        seen = {row.pid}
+        while row.ppid in mcp and row.ppid not in seen:
+            row = mcp[row.ppid]
+            seen.add(row.pid)
+        return row
+
+    def depth(row: PsRow) -> int:
+        n, seen = 0, {row.pid}
+        while row.ppid in mcp and row.ppid not in seen:
+            row = mcp[row.ppid]
+            seen.add(row.pid)
+            n += 1
+        return n
+
+    groups: dict[int, list[PsRow]] = {}
+    for row in mcp.values():
+        groups.setdefault(top_of(row).pid, []).append(row)
+    out = []
+    for top_pid in sorted(groups):
+        top = mcp[top_pid]
+        if top.ppid != 1:
+            continue
+        rest = sorted((r for r in groups[top_pid] if r.pid != top_pid), key=depth)
+        out.append([top, *rest])
+    return out
+
+
+def _mcp_label(group: Sequence[PsRow]) -> str:
+    extra = f" (+{len(group) - 1} child)" if len(group) > 1 else ""
+    return f"orphaned playwright-mcp pid {group[0].pid}{extra}"
+
+
+def _same_process(row: PsRow) -> bool:
+    """`row`'s pid still runs the process the snapshot saw (same raw lstart)."""
+    cur = _proc_lstart(row.pid)
+    return cur is not None and _ws_norm(cur) == _ws_norm(row.lstart)
+
+
+def _signal_same(row: PsRow, sig: int) -> bool | None:
+    """Send `sig` to `row` after the pid + lstart re-check: True sent, None
+    gone (or the pid now names another process), False refused."""
+    if not _same_process(row):
+        return None
+    try:
+        os.kill(row.pid, sig)
+    except ProcessLookupError:
+        return None
+    except OSError:
+        return False
+    return True
+
+
+def _mcp_kill_groups(groups: Sequence[Sequence[PsRow]], run: McpReapRun) -> None:
+    """SIGTERM every process of `groups`, wait up to MCP_TERM_WAIT_S, SIGKILL
+    the survivors — each signal after a pid + lstart re-check; all within
+    MCP_REAP_BUDGET_S. Journal: ``mcp_orphan_killed``."""
+    deadline = time.monotonic() + MCP_REAP_BUDGET_S
+    refused: set[int] = set()
+    for group in groups:
+        for row in group:
+            if _signal_same(row, signal.SIGTERM) is False:
+                refused.add(row.pid)
+    alive = [r for g in groups for r in g if r.pid not in refused]
+    term_stop = min(deadline, time.monotonic() + MCP_TERM_WAIT_S)
+    while alive and time.monotonic() < term_stop:
+        time.sleep(0.1)
+        alive = [r for r in alive if _same_process(r)]
+    killed: set[int] = set()
+    for row in alive:
+        if _signal_same(row, signal.SIGKILL):
+            killed.add(row.pid)
+    while alive and time.monotonic() < deadline:
+        alive = [r for r in alive if _same_process(r)]
+        if alive:
+            time.sleep(0.1)
+    left = refused | {r.pid for r in alive}
+    for group in groups:
+        label = _mcp_label(group)
+        if any(r.pid in left for r in group):
+            run.failed.append(label)
+            continue
+        run.killed.append(label)
+        _journal(
+            "mcp_orphan_killed",
+            pids=",".join(str(r.pid) for r in group),
+            sigkill=any(r.pid in killed for r in group),
+        )
+
+
+def _mcp_reap_pass(port: int, *, dry_run: bool) -> McpReapRun:
+    """Kill this instance's orphaned Playwright MCP servers (`_mcp_orphans`);
+    dry run: only the ``would`` list."""
+    run = McpReapRun()
+    rows = _ps_rows()
+    if rows is None:
+        run.error = "the process list is unreadable (ps) — killed nothing"
+        return run
+    groups = _mcp_orphans(rows, port)
+    if dry_run:
+        run.would += [_mcp_label(g) for g in groups]
+        return run
+    if groups:
+        _mcp_kill_groups(groups, run)
+    return run
+
+
 def _reap_owned(
     port: int, *, dry_run: bool = False, coordinated: bool = True
 ) -> ReapReport:

@@ -183,7 +183,7 @@ CPU after 10 min idle with the same 3 test tabs) with and without the flags.
       one, prefers about:blank, grace, pinned, last page, ledger root and child excluded,
       marker URL and `about:blank#x` never blank, unknown client → only NTP + startup
       blank, lsof None → restricted.
-- [ ] B4 **MCP orphans** (pure `_mcp_orphans(ps_rows, port)`, kill with pid+lstart
+- [x] B4 **MCP orphans** (pure `_mcp_orphans(ps_rows, port)`, kill with pid+lstart
       re-check). Tests: ppid-1 group killed, live non-claude parent spared, live claude
       parent spared, other port spared, `localhost` vs `127.0.0.1`, npm+node pair as one
       group, pid reuse between signals.

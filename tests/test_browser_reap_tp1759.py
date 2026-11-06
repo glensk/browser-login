@@ -22,6 +22,7 @@ import hashlib
 import importlib.util
 import json
 import os
+import signal
 import subprocess
 import sys
 import threading
@@ -535,3 +536,179 @@ def test_launch_passes_about_blank_as_the_last_flag(cache, monkeypatch):
     with pytest.raises(Stop):
         browser._launch_and_record(1, headless=True)
     assert seen and seen[0][-1] == "about:blank"
+
+
+# --- B4: MCP orphans ----------------------------------------------------------------
+
+NPM_MCP = "npm exec @playwright/mcp@0.0.76 --cdp-endpoint http://{host}:{port}"
+NODE_MCP = (
+    "node /Users/x/.npm/_npx/c44b/node_modules/.bin/playwright-mcp "
+    "--cdp-endpoint http://{host}:{port}"
+)
+
+
+def _row(pid: int, ppid: int, cmd: str, lstart: str = LSTART):
+    return browser.PsRow(pid, ppid, lstart, cmd)
+
+
+def _pair(npm_pid: int, parent: int, port: int = 9222, host: str = "localhost"):
+    return [
+        _row(npm_pid, parent, NPM_MCP.format(host=host, port=port)),
+        _row(npm_pid + 1, npm_pid, NODE_MCP.format(host=host, port=port)),
+    ]
+
+
+def _groups(rows, port: int = 9222) -> list[list[int]]:
+    return [[r.pid for r in g] for g in browser._mcp_orphans(rows, port)]
+
+
+def test_mcp_group_with_ppid_1_is_an_orphan_npm_and_node_as_one_group():
+    rows = _pair(100, 1)
+    assert _groups(rows) == [[100, 101]]
+
+
+def test_mcp_with_a_live_parent_of_any_name_is_spared():
+    claude = _row(50, 1, "claude --resume abc")
+    other = _row(60, 1, "/usr/bin/python3 some_tool.py")
+    rows = [claude, other, *_pair(100, 50), *_pair(200, 60)]
+    assert not _groups(rows)
+
+
+def test_mcp_on_another_port_or_without_endpoint_is_spared():
+    rows = [
+        *_pair(100, 1, port=9223),
+        _row(300, 1, "npm exec @playwright/mcp@0.0.76"),
+        _row(400, 1, "node /x/playwright-mcp --cdp-endpoint http://localhost:92221"),
+        _row(
+            500,
+            1,
+            "python3 fake.py @playwright/mcp --cdp-endpoint http://localhost:9222",
+        ),
+    ]
+    assert not _groups(rows)
+    assert _groups(rows, port=9223) == [[100, 101]]
+
+
+@pytest.mark.parametrize("host", ["localhost", "127.0.0.1"])
+def test_mcp_endpoint_host_localhost_or_loopback(host):
+    assert _groups(_pair(100, 1, host=host)) == [[100, 101]]
+    assert not _groups(_pair(100, 1, host="10.0.0.5"))
+
+
+def test_mcp_node_child_orphaned_alone_is_its_own_group():
+    rows = [_row(101, 1, NODE_MCP.format(host="127.0.0.1", port=9222))]
+    assert _groups(rows) == [[101]]
+
+
+def test_ps_rows_parse_this_process():
+    rows = browser._ps_rows()
+    assert rows is not None
+    me = next(r for r in rows if r.pid == os.getpid())
+    assert me.ppid == os.getppid()
+    own = browser._proc_lstart(os.getpid())
+    assert own and browser._ws_norm(own) == me.lstart
+
+
+class _Procs:
+    """A fake process table: pid → lstart; os.kill records and may kill."""
+
+    def __init__(self, table: dict[int, str], dies_on: dict[int, int]):
+        self.table = dict(table)
+        self.dies_on = dies_on  # pid → the signal that ends it
+        self.sent: list[tuple[int, int]] = []
+
+    def lstart(self, pid: int) -> str | None:
+        return self.table.get(pid)
+
+    def kill(self, pid: int, sig: int) -> None:
+        if pid not in self.table:
+            raise ProcessLookupError(pid)
+        self.sent.append((pid, sig))
+        if self.dies_on.get(pid) == sig:
+            del self.table[pid]
+
+
+def _fake_procs(monkeypatch, procs: _Procs) -> None:
+    monkeypatch.setattr(browser, "_proc_lstart", procs.lstart)
+    monkeypatch.setattr(browser.os, "kill", procs.kill)
+    monkeypatch.setattr(browser, "MCP_TERM_WAIT_S", 0.3)
+    monkeypatch.setattr(browser, "MCP_REAP_BUDGET_S", 0.8)
+
+
+def test_mcp_kill_term_then_kill_with_lstart_recheck(cache, monkeypatch):
+
+    group = _pair(100, 1)
+    procs = _Procs(
+        {100: LSTART, 101: LSTART},
+        {100: signal.SIGTERM, 101: signal.SIGKILL},
+    )
+    _fake_procs(monkeypatch, procs)
+    run = browser.McpReapRun()
+    browser._mcp_kill_groups([group], run)
+    assert procs.sent == [
+        (100, signal.SIGTERM),
+        (101, signal.SIGTERM),
+        (101, signal.SIGKILL),
+    ]
+    assert len(run.killed) == 1 and not run.failed
+
+
+def test_mcp_pid_reused_between_signals_is_never_killed(cache, monkeypatch):
+
+    group = _pair(100, 1)
+    procs = _Procs({100: LSTART, 101: LSTART}, {100: signal.SIGTERM})
+
+    def kill(pid: int, sig: int) -> None:
+        procs.sent.append((pid, sig))
+        if pid == 101:  # 101 exits on TERM and its pid is taken by a newcomer
+            procs.table[101] = "Fri Nov  7 10:00:00 2026"
+        elif procs.dies_on.get(pid) == sig:
+            del procs.table[pid]
+
+    monkeypatch.setattr(browser, "_proc_lstart", procs.lstart)
+    monkeypatch.setattr(browser.os, "kill", kill)
+    monkeypatch.setattr(browser, "MCP_TERM_WAIT_S", 0.3)
+    run = browser.McpReapRun()
+    browser._mcp_kill_groups([group], run)
+    assert (101, signal.SIGKILL) not in procs.sent
+    assert procs.sent == [(100, signal.SIGTERM), (101, signal.SIGTERM)]
+    assert len(run.killed) == 1
+
+
+def test_mcp_pid_reused_before_the_first_signal_is_never_signalled(cache, monkeypatch):
+    group = _pair(100, 1)
+    procs = _Procs({100: "Fri Nov  7 10:00:00 2026"}, {})
+    _fake_procs(monkeypatch, procs)
+    run = browser.McpReapRun()
+    browser._mcp_kill_groups([group], run)
+    assert not procs.sent and len(run.killed) == 1
+
+
+def test_mcp_refused_signal_is_a_failure(cache, monkeypatch):
+
+    group = _pair(100, 1)
+    procs = _Procs({100: LSTART, 101: LSTART}, {101: signal.SIGTERM})
+
+    def kill(pid: int, sig: int) -> None:
+        if pid == 100:
+            raise PermissionError(pid)
+        procs.kill(pid, sig)
+
+    monkeypatch.setattr(browser, "_proc_lstart", procs.lstart)
+    monkeypatch.setattr(browser.os, "kill", kill)
+    monkeypatch.setattr(browser, "MCP_TERM_WAIT_S", 0.3)
+    run = browser.McpReapRun()
+    browser._mcp_kill_groups([group], run)
+    assert run.failed and not run.killed
+
+
+def test_mcp_pass_dry_run_and_ps_failure(cache, monkeypatch):
+    monkeypatch.setattr(browser, "_ps_rows", lambda: _pair(100, 1))
+    monkeypatch.setattr(
+        browser, "_mcp_kill_groups", lambda *a: pytest.fail("dry run killed")
+    )
+    run = browser._mcp_reap_pass(9222, dry_run=True)
+    assert run.would == ["orphaned playwright-mcp pid 100 (+1 child)"]
+    monkeypatch.setattr(browser, "_ps_rows", lambda: None)
+    run = browser._mcp_reap_pass(9222, dry_run=False)
+    assert run.error and not run.killed
