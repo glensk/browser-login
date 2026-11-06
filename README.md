@@ -584,7 +584,9 @@ first step). Output names tabs by origin only.
 - **Orphan markers**: a page whose URL is exactly
   `about:blank#owned-<marker>` and that no ledger in `<cache>/owned/` names
   (any state, half-written `.tmp` files included) — the tab a `createTarget`
-  without a reply left behind. A v2 marker (`p<pid>-<h12>-…`) is closed when
+  without a reply left behind (an owned tab's, or an `open -N` tab's: since
+  tp#1792 `open` creates its tab on a v2 marker and only then navigates it to
+  the URL, so a late-created tab is never an unowned content tab). A v2 marker (`p<pid>-<h12>-…`) is closed when
   its owner is dead: the pid is gone or its start-time hash differs (a failing
   `ps` spares it). A legacy marker (32 hex, no owner in the URL) is closed once
   it was first seen at least 10 min ago (the ledger entry is always written

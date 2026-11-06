@@ -6009,10 +6009,79 @@ def _await_target_load(port: int, tid: str, timeout_s: float = 15.0) -> dict:
             if isinstance(t, dict) and t.get("id") == tid:
                 info = t
                 break
-        if info.get("url") not in (None, "", "about:blank"):
+        url = info.get("url")
+        if url not in (None, "", "about:blank") and not _is_owned_marker(url):
             break
         time.sleep(0.25)
     return info
+
+
+# `open -N` (tp#1792): how long the new tab's ``Page.navigate`` may take to
+# answer (it answers on commit), its page websocket included.
+OPEN_NAVIGATE_BUDGET_S = 10.0
+
+
+def _open_create_target(port: int, ws_url: str, url: str) -> tuple[str | None, str]:
+    """`open -N`'s tab → ``(tid, "")``, or ``(None, why)`` with nothing left open.
+
+    Created like an owned tab (tp#1759): ``Target.createTarget`` on a fresh
+    v2 marker URL naming this process, then navigated to `url`
+    (`_cdp_navigate_target`). A lost create reply is recovered by the marker
+    — looked for up to OWNED_CREATE_POLL_S, then closed; a tab that appears
+    even later is still on that marker, so the orphan-marker rule of
+    `_reap_owned` closes it once this process is gone. A failed navigation
+    closes the tab by its id (a failed close leaves it on its marker: same
+    rule). Before tp#1792 the tab was created on `url` itself, so a late one
+    was an unowned content tab no reap rule closes.
+    """
+    marker = _new_owned_marker()
+    tid = _cdp_create_background_target(
+        ws_url, _owned_marker_url(marker), OWNED_CREATE_BUDGET_S
+    )
+    if tid is None:
+        stop = time.monotonic() + OWNED_CREATE_POLL_S
+        while True:
+            late = _marker_target(port, marker)
+            if late is not None or time.monotonic() >= stop:
+                break
+            time.sleep(0.25)
+        if late is not None:
+            closed = _cdp_close_target(port, late, ws_url=ws_url)
+            _journal("open_lost_reply", target=_id8(late), closed=closed)
+        return None, "could not create a background tab (Target.createTarget)."
+    err = _cdp_navigate_target(port, tid, url, OPEN_NAVIGATE_BUDGET_S)
+    if err is None:
+        return tid, ""
+    _cdp_close_target(port, tid, ws_url=ws_url)
+    return None, f"could not navigate the new tab {_id8(tid)}: {err} (tab closed)."
+
+
+def _cdp_navigate_target(port: int, tid: str, url: str, budget_s: float) -> str | None:
+    """``Page.navigate`` target `tid` to `url` over its own websocket; None on
+    success, else why. A page error (``errorText``: DNS, refused …) still
+    counts as success — the tab shows Chrome's error page, as a tab created
+    on `url` would. The target's websocket URL is looked for in
+    ``/json/list`` until it is listed, within the same budget."""
+    deadline = time.monotonic() + budget_s
+
+    def left() -> float:
+        return max(0.0, deadline - time.monotonic())
+
+    page_ws: object = None
+    while True:
+        listing = _cdp_get(port, "/json/list", timeout=max(0.01, min(2.0, left())))
+        for t in listing if isinstance(listing, list) else []:
+            if isinstance(t, dict) and t.get("id") == tid:
+                page_ws = t.get("webSocketDebuggerUrl")
+        if isinstance(page_ws, str) and page_ws:
+            break
+        if left() <= 0:
+            return "the new tab is not listed"
+        time.sleep(min(0.1, left()))
+    res = _cdp_ws_call(page_ws, "Page.navigate", {"url": url}, left())
+    if res.status != "ok" or res.error:
+        return res.error or res.status
+    return None
 
 
 def _open_background_tab(port: int, browser, url: str) -> dict:
@@ -6225,9 +6294,11 @@ def _open_new_raw(port: int, url: str, keep: bool = False) -> int:
     release = _registry_register("browser.py", _purpose(), port)
     try:
         ws_url = _browser_ws_url(port)
-        tid = _cdp_create_background_target(ws_url, url) if ws_url else None
-        if tid is None:
+        if not ws_url:
             return _fail("could not create a background tab (Target.createTarget).")
+        tid, why = _open_create_target(port, ws_url, url)
+        if tid is None:
+            return _fail(why)
         info = _await_target_load(port, tid)
         print(f"✓ Opened: {info.get('url', url)}  (title: {info.get('title', '')!r})")
         print(f"target={tid}")

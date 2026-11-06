@@ -780,7 +780,10 @@ def test_open_new_twice_gives_distinct_targets(fake, cache, capsys):
     assert len(ids) == 2 and len(set(ids)) == 2
     assert set(ids) == set(fake.created)
     creates = [m for m in fake.browser_log if m.get("method") == "Target.createTarget"]
-    assert all(m["params"] == {"url": url, "background": True} for m in creates)
+    # Created on an owned marker, then navigated to the URL (tp#1792).
+    assert all(browser._is_owned_marker(m["params"]["url"]) for m in creates)
+    assert all(m["params"]["background"] is True for m in creates)
+    assert all(fake.targets[t].url == url for t in ids)
     assert "EXIST001" in fake.targets  # never reused, never navigated
 
 
@@ -789,6 +792,52 @@ def test_open_new_create_failure_rc1(fake, cache, capsys):
     fake.create_fail = True
     assert browser.cmd_open(fake.port, "https://x.example/", new=True) == 1
     assert "target=" not in capsys.readouterr().out
+
+
+def test_open_new_lost_create_reply_closes_the_late_tab(
+    fake, cache, monkeypatch, capsys
+):
+    """tp#1792: the create reply is lost but the tab exists — found by its
+    marker and closed, never left behind as an unowned content tab."""
+    fake.add("EXIST001", "https://ok.example/", "ok")
+    fake.create_lose_reply = True
+    monkeypatch.setattr(browser, "OWNED_CREATE_BUDGET_S", 0.5)
+    assert browser.cmd_open(fake.port, "https://x.example/", new=True) == 1
+    assert "target=" not in capsys.readouterr().out
+    (tid,) = fake.created
+    assert tid in fake.closed and tid not in fake.targets
+    assert set(fake.targets) == {"EXIST001"}
+    marker = browser._marker_of_url(fake.create_params[0]["url"])
+    assert marker is not None
+    assert browser._marker_owner(marker)[0] == os.getpid()
+
+
+def test_open_new_late_tab_after_the_poll_is_an_orphan_marker(fake, cache, monkeypatch):
+    """tp#1792: a tab that appears only after the poll is still on a v2
+    marker naming this process — the orphan-marker rule's case."""
+    fake.add("EXIST001", "https://ok.example/", "ok")
+    fake.create_stall = True
+    monkeypatch.setattr(browser, "OWNED_CREATE_BUDGET_S", 0.2)
+    monkeypatch.setattr(browser, "OWNED_CREATE_POLL_S", 0.2)
+    assert browser.cmd_open(fake.port, "https://x.example/", new=True) == 1
+    url = fake.create_params[0]["url"]
+    fake.add("LATE0001", url)  # the browser creates it after all, too late
+    marker = browser._marker_of_url(url)
+    assert marker is not None
+    snap = [fake.info(t) for t in fake.targets.values()]
+    found = browser._orphan_markers(
+        snap, (set(), set()), {}, time.time(), lambda _m: "dead"
+    )
+    assert [(i["targetId"], kind) for i, kind in found] == [("LATE0001", "v2")]
+
+
+def test_open_new_navigate_failure_closes_the_tab(fake, cache, capsys):
+    fake.add("EXIST001", "https://ok.example/", "ok")
+    fake.navigate_fail = True
+    assert browser.cmd_open(fake.port, "https://x.example/", new=True) == 1
+    assert "target=" not in capsys.readouterr().out
+    (tid,) = fake.created
+    assert tid in fake.closed and set(fake.targets) == {"EXIST001"}
 
 
 def test_eval_target_hits_named_target(fake, cache, capsys):

@@ -707,9 +707,12 @@ class _OpenBrowser:
 
 def _assert_new_tab_only(fake: FakeCdp, url: str, out: str) -> None:
     creates = [m for m in fake.browser_log if m.get("method") == "Target.createTarget"]
-    assert [m["params"] for m in creates] == [{"url": url, "background": True}]
+    # Created on an owned marker, then navigated to `url` (tp#1792).
+    assert [m["params"]["background"] for m in creates] == [True]
+    assert browser._is_owned_marker(creates[0]["params"]["url"])
     ids = [ln[7:] for ln in out.splitlines() if ln.startswith("target=")]
     assert ids == fake.created and FOREIGN not in ids
+    assert fake.targets[ids[0]].url == url
     assert fake.targets[FOREIGN].url == "about:blank"
     assert not fake.targets[FOREIGN].received  # no Page.navigate, nothing at all
     assert FOREIGN not in fake.closed

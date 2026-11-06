@@ -98,6 +98,7 @@ class FakeCdp:
         # Target.createTarget creates the target but its reply never arrives.
         self.create_lose_reply = False
         self.get_targets_fail = False  # Target.getTargets answers with an error
+        self.navigate_fail = False  # Page.navigate answers with a CDP error
         self.create_params: list[dict] = []
         self.created: list[str] = []
         self.browser_log: list[dict] = []
@@ -228,12 +229,21 @@ class FakeCdp:
             for raw in conn:
                 msg = json.loads(raw)
                 target.received.append(msg)
-                if mode == "ok":
+                if mode == "ok" and msg.get("method") == "Page.navigate":
+                    conn.send(json.dumps(self._navigate(target, msg)))
+                elif mode == "ok":
                     conn.send(
                         json.dumps({"id": msg["id"], "result": self._eval(target)})
                     )
         except ConnectionClosed:
             pass
+
+    def _navigate(self, target: FakeTarget, msg: dict) -> dict:
+        """``Page.navigate``: the target commits at once (tp#1792)."""
+        if self.navigate_fail:
+            return {"id": msg["id"], "error": {"code": -32000, "message": "nope"}}
+        target.url = str((msg.get("params") or {}).get("url") or "")
+        return {"id": msg["id"], "result": {"frameId": target.tid, "loaderId": "L"}}
 
     @staticmethod
     def _eval(target: FakeTarget) -> dict:
