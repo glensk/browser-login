@@ -37,7 +37,8 @@ SWITCH Cloud logs in with the portal's SSO click, on the browser's own edu-ID
 session first, then on the broker's (no window).
 
 Examples:
-  ./agent-login.py              # overview
+  ./agent-login.py              # overview (on a terminal: one line per login)
+  ./agent-login.py -w           # the same with the full status text (pipes: always)
   ./agent-login.py -t anibis    # real test: `browser.py login` (Safari session first,
                                 # then the broker), then the positive logged-in check
   ./agent-login.py -c           # every usable site: logged in? if not, log in
@@ -109,6 +110,7 @@ import shutil
 import socket
 import sys
 import time
+import unicodedata
 import urllib.parse
 from collections.abc import Callable, Iterator
 from dataclasses import asdict, dataclass
@@ -1782,8 +1784,159 @@ def cookie_warning(rec: dict) -> str:
     return ""
 
 
-def print_overview(data: dict) -> None:
-    """The human report: every login once, ✅ works for agents / ❌ + why."""
+# tp#1924: on a terminal every overview line fits its width (`-w`: full text).
+LOGIN_COLUMNS_LEGEND_SHORT = (
+    "Safari: -L SITE -s logs Safari in · Chromium: an agent logs it in itself · "
+    "⛔ = Albert's (why: -L SITE -s -n)"
+)
+_SHORT_STATE = {
+    "unknown": "could not tell",
+    "unreachable": "unreachable",
+    "failed": "failed",
+}
+
+
+def fit_width(*, wide: bool = False, tty: bool | None = None) -> int | None:
+    """The terminal width every overview line is cut to, or None (full
+    text) with `-w` or when stdout is not a terminal (pipes, LaunchAgents,
+    mail keep every word)."""
+    if wide or not (sys.stdout.isatty() if tty is None else tty):
+        return None
+    return shutil.get_terminal_size(fallback=(160, 24)).columns
+
+
+def text_width(text: str) -> int:
+    """Terminal columns of plain `text`: wide emoji 2, combining marks 0, a
+    variation selector turns the emoji before it wide (⚠️)."""
+    cols = 0
+    for ch in text:
+        if unicodedata.combining(ch):
+            continue
+        if ch == "️":
+            cols += 1
+        else:
+            cols += 2 if unicodedata.east_asian_width(ch) in "WF" else 1
+    return cols
+
+
+def fit(text: str, cols: int | None) -> str:
+    """Plain `text` cut to `cols` terminal columns with a trailing `…`
+    (unchanged when it fits or `cols` is None)."""
+    if cols is None or text_width(text) <= cols:
+        return text
+    if cols <= 0:
+        return ""
+    # an emoji and its variation selector / combining marks stay one unit
+    units: list[str] = []
+    for ch in text:
+        if units and (ch == "️" or unicodedata.combining(ch)):
+            units[-1] += ch
+        else:
+            units.append(ch)
+    out, used = [], 0
+    for unit in units:
+        w = text_width(unit)
+        if used + w > cols - 1:
+            break
+        out.append(unit)
+        used += w
+    return "".join(out).rstrip() + "…"
+
+
+def _short_when(rec: dict) -> str:
+    """A check's time without the current year (``11-08 09:15``)."""
+    at = str(rec.get("at_text") or "?")
+    year = time.strftime("%Y-")
+    return at[len(year) :] if at.startswith(year) else at
+
+
+def _short_code(rec: dict) -> str:
+    """A check code's text up to its first dash clause, without a leading
+    article (``shared Chromium is down``)."""
+    code = str(rec.get("code") or "")
+    text = phases.CODE_TEXT.get(code) or code or "?"
+    return text.split(" — ", 1)[0].removeprefix("the ")
+
+
+def _short_stale(row: dict, rec: dict) -> str:
+    """The compact why of a ``stale`` row (the same tests as `row_state`)."""
+    when = _short_when(rec)
+    checked_in = str(rec.get("instance", SITE_INSTANCE.get(row["site"], "")) or "")
+    if checked_in != row_instance(row):
+        return f"stale {when}: checked in the {checked_in or 'default'} browser"
+    if als.freshness(rec) == "stale":
+        return f"stale {when}: older than {als.max_status_age_s() / 3600:g} h"
+    return f"stale {when}: account not proven"
+
+
+def row_tags(row: dict, rec: dict) -> list[str]:
+    """The short tags of `_row_flags` and `cookie_warning` (no commands):
+    instance, ADMIN, alias, sentinel, quarantine, limiter, held, pending,
+    Safari session, cookie expiry."""
+    site = row["site"]
+    tags = []
+    if row_instance(row) in identity.ROLE_INSTANCES:
+        tags.append(f"{row_instance(row)} browser")
+    if row.get("privilege") == "admin":
+        tags.append("ADMIN")
+    if row.get("alias"):
+        tags.append(f"alias {row['alias']}")
+    if needs_sentinel(row):
+        tags.append("needs sentinel")
+    if isinstance(row.get("quarantine"), dict):
+        tags.append("quarantined")
+    limit = row.get("limit") or {}
+    if limit.get("state") in ("locked", "cooldown", "quarantined", "busy"):
+        tags.append(str(limit["state"]))
+    if row.get("held"):
+        tags.append("held")
+    if (
+        row.get("stage") == "pending"
+        and row["status"] in ("ready", "extra")
+        and site not in ON_DEMAND_SITES
+    ):
+        tags.append("pending")
+    if (
+        row["status"] == "safari"
+        and agent_route(site, row)
+        and row.get("safari") is False
+    ):
+        tags.append("Safari session missing")
+    days = rec.get("cookie_days_left")
+    if isinstance(days, int) and not isinstance(days, bool) and days < 30:
+        tags.append(f"cookie expires in {days} d")
+    return tags
+
+
+# One branch per row state.
+def compact_status(row: dict, state: str, why: str, rec: dict) -> str:  # pylint: disable=too-many-return-statements
+    """The one-line status of a row on a terminal: verdict and date
+    (``could not tell 11-08 09:15: shared Chromium is down``), from the
+    row and its check record; the full text is `-w`."""
+    if state == "ok":
+        return f"ok {_short_when(rec)}"
+    if state == "on-demand":
+        if not rec:
+            return "on demand, never checked"
+        return f"on demand, last {_short_when(rec)}: {rec.get('state')}"
+    if state == "unchecked":
+        return "not checked yet"
+    if state in _SHORT_STATE and rec:
+        return f"{_SHORT_STATE[state]} {_short_when(rec)}: {_short_code(rec)}"
+    if state == "stale" and rec:
+        return _short_stale(row, rec)
+    if state == "unproven":
+        shared = shares_login(row)
+        return "account unproven" + (
+            f" (shares login with {', '.join(shared)})" if shared else ""
+        )
+    return why.split(" — ", 1)[0] if state == "held" else why
+
+
+def print_overview(data: dict, width: int | None = None) -> None:
+    """The human report: every login once, ✅ works for agents / ❌ + why.
+    With a `width` (a terminal, `fit_width`) every line fits it: the status
+    is compact and cut with `…`; None prints the full text."""
     rows = data["rows"]
     ok = data["broker_ok"]
     print(
@@ -1806,7 +1959,7 @@ def print_overview(data: dict) -> None:
         "unproven": 2,
     }
     judged.sort(key=lambda x: (order.get(x[1], 3), x[0]["name"].lower()))
-    width = max(len(r["name"]) for r in rows)
+    width_name = max(len(r["name"]) for r in rows)
     col = "agent_fill_origins"
     icons = {
         "ok": "✅",
@@ -1821,42 +1974,62 @@ def print_overview(data: dict) -> None:
     print(
         _c(
             "2",
-            f"     {'login'.ljust(width)}  {SAFARI_COL}  {CHROMIUM_COL}  {col}  status",
+            f"     {'login'.ljust(width_name)}  {SAFARI_COL}  {CHROMIUM_COL}  {col}  status",
         )
     )
-    print(_c("2", f"     {LOGIN_COLUMNS_LEGEND}"))
+    legend = LOGIN_COLUMNS_LEGEND if width is None else LOGIN_COLUMNS_LEGEND_SHORT
+    print(_c("2", "     " + fit(legend, None if width is None else width - 5)))
+    # the columns before the status: indent, icon (2), name, the two
+    # capability cells, agent_fill_origins, each with its two-space gap
+    lead = 5 + width_name + 2 + len(SAFARI_COL) + 2 + len(CHROMIUM_COL) + 2
+    room = None if width is None else width - (lead + len(col) + 2)
     for r, state, why in judged:
         bw = str(bool(r.get("in_bitwarden"))).ljust(len(col))
         icon = icons.get(state, "❌")
         cols = login_columns(r["site"], r)
         line = (
-            f"  {icon} {_c('1', r['name'].ljust(width))}  "
+            f"  {icon} {_c('1', r['name'].ljust(width_name))}  "
             f"{_yes_no_cell(cols.safari, SAFARI_COL, why=cols.safari_why)}  "
             f"{_yes_no_cell(cols.chromium, CHROMIUM_COL)}  {bw}  "
         )
         rec = checks.get(r["site"]) or {}
-        if state == "failed":
-            if rec.get("detail"):
-                why += f" — {rec['detail']}"
-            if rec.get("screenshot"):
-                why += f"  📷 {rec['screenshot']}"
-        flags = "; ".join(f for f in (_row_flags(r), cookie_warning(rec)) if f)
-        if flags:
-            why += f"  [{flags}]"
+        if room is not None:
+            why = compact_status(r, state, why, rec)
+            tags = row_tags(r, rec)
+            tail = f"  [{', '.join(tags)}]" if tags else ""
+            # the status gives way first: the tags stay readable
+            why = fit(why, max(room - text_width(tail), room // 2))
+            why = fit(why + tail, room)
+        else:
+            if state == "failed":
+                if rec.get("detail"):
+                    why += f" — {rec['detail']}"
+                if rec.get("screenshot"):
+                    why += f"  📷 {rec['screenshot']}"
+            flags = "; ".join(f for f in (_row_flags(r), cookie_warning(rec)) if f)
+            if flags:
+                why += f"  [{flags}]"
         print(line + (_c("2", why) if state == "ok" else why))
     print()
+    hint = "" if width is None else "  ·  full text: -w"
     print(
         _c(
             "2",
-            "  re-check all: ./agent-login.py -c  ·  one site: -t <site>  ·  "
-            "your own login: -g <site>",
+            fit(
+                "  re-check all: ./agent-login.py -c  ·  one site: -t <site>  ·  "
+                "your own login: -g <site>" + hint,
+                width,
+            ),
         )
     )
     print(
         _c(
             "2",
-            "  add a site: move its item into the agent-login collection and add a "
-            "custom text field agent_fill_origins",
+            fit(
+                "  add a site: move its item into the agent-login collection and "
+                "add a custom text field agent_fill_origins",
+                width,
+            ),
         )
     )
 
@@ -5446,6 +5619,13 @@ def build_parser() -> argparse.ArgumentParser:
         help="print the overview (with -x: the matrix) as JSON",
     )
     ap.add_argument(
+        "-w",
+        "--wide",
+        action="store_true",
+        help="the overview's full status text on a terminal too (by default "
+        "each line is cut to the terminal width; pipes always get it in full)",
+    )
+    ap.add_argument(
         "-x",
         "--matrix",
         action="store_true",
@@ -5730,14 +5910,24 @@ def main() -> int:  # pylint: disable=too-many-return-statements,too-many-branch
         with_login_columns(data["rows"])  # tp#1643
         print(json.dumps(data, indent=1))
     else:
-        print_overview(data)
-        for line in agent_login_toolchain.describe():  # WS1b D9
-            print(f"  {line}")
-        print()
-        agent_login_keychain.print_list(_state_path("keychain.json"), _c)
-        print()
-        agent_login_cred.print_section(_c)  # tp#991: credctl's daily verdicts
+        print_report(data, fit_width(wide=args.wide))
     return 0 if data["broker_ok"] else 1
+
+
+def print_report(data: dict, width: int | None) -> None:
+    """The whole human overview: logins, toolchain, keychain, credentials;
+    every line cut to `width` (None: the full text, tp#1924)."""
+
+    def cut(text: str) -> str:
+        return fit(text, width)
+
+    print_overview(data, width)
+    for line in agent_login_toolchain.describe():  # WS1b D9
+        print(cut(f"  {line}"))
+    print()
+    agent_login_keychain.print_list(_state_path("keychain.json"), _c, fit=cut)
+    print()
+    agent_login_cred.print_section(_c, fit=cut)  # tp#991: credctl's daily verdicts
 
 
 if __name__ == "__main__":

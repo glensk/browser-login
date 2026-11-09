@@ -252,8 +252,10 @@ def print_section(
     *,
     path: Path | None = None,
     now: float | None = None,
+    fit: Callable[[str], str] | None = None,
 ) -> None:
-    """The overview section (after the login-keychain list)."""
+    """The overview section (after the login-keychain list); `fit` cuts
+    each verdict line to the terminal width (tp#1924)."""
     state = load(path)
     when = f", last run {state.completed_at}" if state.completed_at else ""
     print(
@@ -266,4 +268,5 @@ def print_section(
     ):
         shown.append((QUIET, "no credential is stored in two or more places"))
     for mark, text in shown:
-        print(f"  {mark} {text}")
+        line = f"  {mark} {text}"
+        print(fit(line) if fit else line)

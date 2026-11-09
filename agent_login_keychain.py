@@ -227,9 +227,14 @@ def still_present(
 
 
 def print_list(
-    path: Path, _c: Callable[[str, str], str], *, full: bool = False
+    path: Path,
+    _c: Callable[[str, str], str],
+    *,
+    full: bool = False,
+    fit: Callable[[str], str] = str,
 ) -> None:
-    """The login-keychain list: names only, and whether agents can read it.
+    """The login-keychain list: names only, and whether agents can read it;
+    `fit` cuts each line to the terminal width (tp#1924).
 
     The readability scan is cached (~15 s, at most hourly), but which items
     EXIST is re-read on every call (`live_names`, ~30 ms): an item deleted
@@ -260,12 +265,14 @@ def print_list(
     print(
         _c(
             "2",
-            f"  {len(readable)} of {len(items)} items readable by any agent without "
-            f"a prompt ({state}; -K rescans + lists all)",
+            fit(
+                f"  {len(readable)} of {len(items)} items readable by any agent "
+                f"without a prompt ({state}; -K rescans + lists all)"
+            ),
         )
     )
     width = max(len(i["service"]) for i in shown) if shown else 10
-    print(_c("2", f"     {'item'.ljust(width)}  account  ·  readable by agents"))
+    print(_c("2", fit(f"     {'item'.ljust(width)}  account  ·  readable by agents")))
     for i in shown:
         icon = "🔓" if i["readable"] else "🔒"
-        print(f"  {icon} {i['service'].ljust(width)}  {i['account'] or '-'}")
+        print(fit(f"  {icon} {i['service'].ljust(width)}  {i['account'] or '-'}"))

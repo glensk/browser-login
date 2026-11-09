@@ -1760,7 +1760,8 @@ The marketplace sites (anibis, tutti, Ricardo, Kleinanzeigen), Galaxus and Galax
 Examples:
 
 ```bash
-./agent-login.py              # overview
+./agent-login.py              # overview (on a terminal: one line per login)
+./agent-login.py -w           # the same with the full status text (pipes: always)
 ./agent-login.py -t anibis    # real test: `browser.py login` (Safari session first,
                               # then the broker), then the positive logged-in check
 ./agent-login.py -c           # every usable site: logged in? if not, log in

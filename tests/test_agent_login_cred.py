@@ -327,7 +327,7 @@ def test_agent_login_overview_prints_the_section() -> None:
     """The wiring in ./agent-login.py: the section follows the keychain list."""
     src = (Path(__file__).resolve().parent.parent / "agent-login.py").read_text()
     keychain = src.index(
-        'agent_login_keychain.print_list(_state_path("keychain.json"), _c)\n'
+        'agent_login_keychain.print_list(_state_path("keychain.json"), _c, fit=cut)\n'
     )
-    assert src.index("agent_login_cred.print_section(_c)", keychain) > keychain
+    assert src.index("agent_login_cred.print_section(_c, fit=cut)", keychain) > keychain
     assert 'data["credentials"] = agent_login_cred.summary(' in src
