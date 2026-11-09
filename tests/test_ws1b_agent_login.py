@@ -686,7 +686,7 @@ def test_access_sweep_plist_is_valid_plist() -> None:
 
     doc = plistlib.loads(jobs.access_sweep_plist().encode())
     assert doc["Label"] == jobs.ACCESS_SWEEP_LABEL
-    assert doc["ProgramArguments"][1:] == [
+    assert doc["ProgramArguments"][-4:] == [
         str(jobs.ACCESS_SWEEP_PY),
         "-A",
         "-q",
@@ -695,6 +695,26 @@ def test_access_sweep_plist_is_valid_plist() -> None:
     assert doc["StartInterval"] == 60 and doc["RunAtLoad"] is False
     assert doc["ProcessType"] == "Background" and doc["LowPriorityIO"] is True
     assert doc["EnvironmentVariables"][jobs.SCHEDULED_ENV] == "1"
+
+
+def test_every_job_runs_under_log_ts(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """tp#1963: each LaunchAgent starts `log-ts.py --` with its own absolute
+    interpreter (tp#947), then its own command unchanged; without log-ts.py
+    the job runs unwrapped."""
+    import plistlib  # pylint: disable=import-outside-toplevel
+
+    log_ts = tmp_path / "log-ts.py"
+    log_ts.write_text("#!/usr/bin/env python3\n")
+    monkeypatch.setattr(jobs, "LOG_TS", log_ts)
+    for label, text, _what in jobs.agent_plists():
+        argv = plistlib.loads(text.encode())["ProgramArguments"]
+        assert argv[:3] == [jobs.job_python(), str(log_ts), "--"], label
+        assert argv[3] == jobs.job_python(), label
+    monkeypatch.setattr(jobs, "LOG_TS", tmp_path / "missing.py")
+    doc = plistlib.loads(jobs.access_sweep_plist().encode())
+    assert doc["ProgramArguments"][:2] == [jobs.job_python(), str(jobs.ACCESS_SWEEP_PY)]
 
 
 def test_uninstall_removes_the_access_sweep(

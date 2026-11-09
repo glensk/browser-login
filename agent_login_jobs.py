@@ -38,6 +38,20 @@ def job_python() -> str:
     return sys.executable
 
 
+# tp#1963: every LaunchAgent runs under mydotfiles' log-ts.py, which stamps
+# each log line and keeps each run's CPU and wall time in
+# ~/.local/state/job-cpu/<label>.json (decide's routing page colours a job by
+# its CPU). Started by the job's own interpreter (tp#947: no `env python3`);
+# where it does not exist the job runs unwrapped.
+LOG_TS = Path.home() / "obsidian/42-Git/home/mydotfiles/bin/log-ts.py"
+
+
+def log_ts_prefix(python: str) -> tuple[str, ...]:
+    """The ProgramArguments in front of a job's own command: `python
+    log-ts.py --`, or nothing when log-ts.py is not installed."""
+    return (python, str(LOG_TS), "--") if LOG_TS.is_file() else ()
+
+
 BROWSER_PY = Path(__file__).resolve().parent / "bin" / "browser.py"
 LAUNCH_LABEL = "com.albert.agent-login-check"
 LAUNCH_PLIST = Path.home() / "Library" / "LaunchAgents" / f"{LAUNCH_LABEL}.plist"
@@ -106,7 +120,7 @@ def launchagent_plist(
     """A LaunchAgent running this script; default: daily `-c` at 09:15, no mail
     (logged-out sites are an infra/status item). `background`: launchd runs
     it at background priority (`ProcessType Background` + `LowPriorityIO`).
-    Pure."""
+    The command runs under `log-ts.py --` (`log_ts_prefix`). Pure."""
     if not schedule:
         schedule = f"""<key>StartCalendarInterval</key>
     <dict>
@@ -116,7 +130,9 @@ def launchagent_plist(
         <integer>{LAUNCH_MINUTE}</integer>
     </dict>"""
     log = Path.home() / "Library" / "Logs" / f"{label}.log"
-    arg_xml = "".join(f"\n        <string>{a}</string>" for a in args)
+    python = python or job_python()
+    argv = (*log_ts_prefix(python), python, str(script), *args)
+    arg_xml = "".join(f"\n        <string>{a}</string>" for a in argv)
     search_path = ":".join(
         [
             str(Path.home() / ".local" / "bin"),
@@ -142,9 +158,7 @@ def launchagent_plist(
     <key>Label</key>
     <string>{label}</string>
     <key>ProgramArguments</key>
-    <array>
-        <string>{python or job_python()}</string>
-        <string>{script}</string>{arg_xml}
+    <array>{arg_xml}
     </array>
     {schedule}
     <key>StandardOutPath</key>
