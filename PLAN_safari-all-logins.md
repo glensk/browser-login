@@ -358,7 +358,7 @@ Execution order from here: B8-B9 first, then B6-B7 (overseer decision).
 - [x] B13 **[Albert]** label read + LIVE CANARY BP SaaS (as B11). A TOTP code is used
   once (`safari.py -O` waits for a fresh window); a push / passkey prompt → exit 4,
   Albert approves in that window, no retry.
-- [ ] B14 batch SSO: eduid (BP + TOTP on login.eduid.ch), switch (`then` chain
+- [x] B14 batch SSO: eduid (BP + TOTP on login.eduid.ch), switch (`then` chain
   eduid → SSO click), cscs (Keycloak + TOTP; its `BROKER_SAFARI_LABELS` entry carries
   the `sentinel` because the listing has none; Safari keeps its own localStorage
   token, no import), runai-test3 (custos Keycloak, identity read). authentik-glensk is

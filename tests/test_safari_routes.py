@@ -2346,3 +2346,360 @@ def test_a_blocked_safari_lock_says_it_waits(
     assert capsys.readouterr().err.splitlines() == [
         "   waiting for another Safari login run (lock) up to 1 s"
     ]
+
+
+# ---------------------------------------------------------------------------
+# tp#1644 B14: the SSO batch (eduid, the switch chains, cscs, runai-test3)
+# ---------------------------------------------------------------------------
+
+# Listing rows (the fields the recipes read; fake item names). cscs has no
+# listing sentinel; runai-test3 carries an identity.
+EDUID_ROW: dict[str, Any] = {
+    "site": "eduid",
+    "name": "Edu Item",
+    "safari_fill": True,
+    "refused": False,
+    "fill_only": False,
+    "fill_origins": ["https://login.eduid.ch"],
+    "check_url": "https://eduid.ch/account/organisations/",
+    "login_url": "https://eduid.ch/account/organisations/",
+    "logged_in_selector": 'a[href="/account/security"]',
+    "privilege": None,
+    "identity": None,
+}
+CSCS_ROW: dict[str, Any] = {
+    **EDUID_ROW,
+    "site": "cscs",
+    "name": "Cscs Item",
+    "fill_origins": ["https://auth.cscs.ch", "https://user.cscs.ch"],
+    "check_url": "https://portal.cscs.ch/profile/",
+    "login_url": "https://portal.cscs.ch/profile/",
+    "logged_in_selector": None,
+}
+RUNAI_ROW: dict[str, Any] = {
+    **EDUID_ROW,
+    "site": "runai-test3",
+    "name": "Runai Item",
+    "fill_origins": ["https://custos.datascience.ch"],
+    "check_url": "https://sdsc.run.ai/",
+    "login_url": "https://sdsc.run.ai/",
+    "logged_in_selector": "#runai-me",
+    "privilege": "user",
+    "identity": "runai",
+}
+# synthetic probe labels (B15 reads the real ones)
+EDU_LABELS = alsafari.BrokerLabels(
+    "two_step", pass_submit="Login", user_submit="Continue", otp_submit="Verify"
+)
+CSCS_LABELS = alsafari.BrokerLabels(
+    "one_page", pass_submit="Sign In", idp="auth.cscs.ch", sentinel="#cscs-me"
+)
+SSO_LABEL = "SSO Button"
+EDU_HOME = "https://eduid.ch/account/organisations/"
+EDU_LOGIN = "https://login.eduid.ch/idp/profile/oidc/authorize"
+SWITCH_HOME = "https://cloud.switch.ch/"
+SWITCH_PAGE = [[True, False]]  # the sign-in form shows (the click's `when`)
+
+
+@pytest.fixture
+def sso(run: dict[str, Any], monkeypatch: pytest.MonkeyPatch) -> dict[str, Any]:
+    """`run` with the B14 labels (synthetic) and the listing rows."""
+    rows = [EDUID_ROW, CSCS_ROW, RUNAI_ROW]
+    monkeypatch.setitem(alsafari.BROKER_SAFARI_LABELS, "eduid", EDU_LABELS)
+    monkeypatch.setitem(alsafari.BROKER_SAFARI_LABELS, "cscs", CSCS_LABELS)
+    monkeypatch.setitem(alsafari.BROKER_SAFARI_LABELS, "runai-test3", EDU_LABELS)
+    for site in ("switch", "switch-engines"):
+        monkeypatch.setitem(
+            alsafari.SSO_SAFARI_LABELS,
+            site,
+            alsafari.SsoLabels(SSO_LABEL, "#portal-me" if site == "switch" else ""),
+        )
+    _snapshot(monkeypatch, rows)
+    monkeypatch.setattr(al, "broker_state", lambda **_k: ("ok", rows))
+    monkeypatch.setattr(al, "record_safari_fail", lambda *a: None)
+    every = w.ALL_FEATURES | frozenset(alsafari.STEP_FEATURES.values())
+    monkeypatch.setattr(alsafari, "features", lambda _c: every)
+    return run
+
+
+class Chain:  # pylint: disable=too-few-public-methods
+    """safari.py over a chain: each new login window goes to the stage fake
+    of its start page's host; every call is logged in order."""
+
+    def __init__(self, stages: dict[str, Safari]) -> None:
+        self.stages = stages
+        self.cur: Safari | None = None
+        self.calls: list[list[str]] = []
+        self.order: list[str] = []
+
+    def __call__(self, args: list[str]) -> alsafari.Reply:
+        self.calls.append(list(args))
+        if args[0] == "--open" and "--new-window" in args:
+            host = urllib.parse.urlsplit(args[1]).hostname or ""
+            self.order.append(host)
+            self.cur = self.stages[host]
+        return (self.cur or next(iter(self.stages.values())))(args)
+
+    def fills(self) -> list[list[str]]:
+        return [c for c in self.calls if c[0] in FILLS]
+
+    def landing_opens(self) -> list[list[str]]:
+        return [c for c in self.calls if c[0] == "--open" and "--new-window" not in c]
+
+
+def _chain(
+    st: dict[str, Any], edu: list, portal: list, site: str = "switch", **kw: Any
+) -> tuple[int, Chain]:
+    first, second = al.safari_recipe("eduid"), al.safari_recipe(site)
+    assert first is not None and second is not None
+    host = second.sentinel_host
+    fake = Chain({"eduid.ch": Safari(first, edu), host: Safari(second, portal)})
+    st["safari"] = fake
+    rc: int = al.safari_target_action(site, "", **kw)
+    return rc, fake
+
+
+def _host(call: list[str]) -> str:
+    return call[call.index("--expect-host") + 1]
+
+
+def test_b14_routes_are_listed_and_unbuilt_without_labels() -> None:
+    for site in ("eduid", "cscs", "runai-test3", "switch", "switch-engines"):
+        assert al.SAFARI_ROUTES[site].proof == "in_safari"
+        assert not al.safari_routed(site)  # ❌ until B15's label read
+    assert al.SAFARI_ROUTES["switch"].then == "eduid"
+    assert al.SAFARI_ROUTES["switch-engines"].then == "eduid"
+    assert not al.SAFARI_ROUTES["eduid"].then
+    for site in ("eduid", "cscs", "runai-test3"):
+        assert site not in alsafari.BROKER_SAFARI_LABELS
+    assert not alsafari.SSO_SAFARI_LABELS
+    assert "authentik-glensk" not in al.SAFARI_ROUTES  # admin → ⛔
+    assert al.safari_why("authentik-glensk", {"privilege": "admin"}) == "admin_account"
+
+
+def test_the_sso_recipe_only_clicks_and_never_imports(sso: dict[str, Any]) -> None:
+    recipe = al.safari_recipe("switch")
+    assert recipe is not None
+    assert [s.kind for s in recipe.steps] == ["click"]
+    assert recipe.steps[0].trigger == SSO_LABEL
+    assert recipe.steps[0].when == alsafari.EDUID_SSO_FORM
+    assert recipe.hosts == ("cloud.switch.ch", "login.eduid.ch")
+    assert recipe.start_url == SWITCH_HOME and recipe.sentinel == "#portal-me"
+    assert not recipe.import_after and not recipe.broker
+    engines = al.safari_recipe("switch-engines")
+    assert engines is not None and engines.proof_hosts == ("admin.switch.ch",)
+    assert engines.sentinel == 'a.dropdown-item[href$="/auth/logout"]'
+    # no label → no recipe; switch without a read sentinel → none either
+    del alsafari.SSO_SAFARI_LABELS["switch"]
+    assert al.safari_recipe("switch") is None and not al.safari_routed("switch")
+    alsafari.SSO_SAFARI_LABELS["switch"] = alsafari.SsoLabels(SSO_LABEL)
+    assert al.safari_recipe("switch") is None
+
+
+def test_a_chain_needs_its_first_stage_routed(
+    sso: dict[str, Any],
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    assert al.safari_routed("eduid") and al.safari_routed("switch")
+    monkeypatch.delitem(alsafari.BROKER_SAFARI_LABELS, "eduid")
+    assert al.safari_recipe("switch") is not None
+    assert not al.safari_routed("switch")
+    assert al.safari_target_action("switch", "") == 2
+    assert "no_safari_route" in capsys.readouterr().out
+
+
+def test_a_live_edu_id_session_means_zero_fills_on_both_stages(
+    sso: dict[str, Any], capsys: pytest.CaptureFixture[str]
+) -> None:
+    edu = [(EDU_HOME, w._page(sentinel=True))]
+    portal = [(SWITCH_HOME, w._page(sentinel=True))]
+    rc, fake = _chain(sso, edu, portal)
+    assert rc == 0
+    assert fake.order == ["eduid.ch", "cloud.switch.ch"]  # eduid's proof first
+    assert not fake.fills() and not sso["imports"]
+    assert fake.landing_opens() == [["--open", SWITCH_HOME, "--wait", "20"]]
+    out = capsys.readouterr().out
+    assert "eduid in Albert's Safari: a working session, no login needed" in out
+
+
+def test_the_chain_proves_eduid_first_and_never_types_on_the_portal(
+    sso: dict[str, Any],
+) -> None:
+    edu = [(EDU_HOME, w._page(sentinel=True))]
+    portal = [
+        (SWITCH_HOME, w._page(steps=SWITCH_PAGE)),
+        (SWITCH_HOME, w._page(sentinel=True)),
+    ]
+    rc, fake = _chain(sso, edu, portal)
+    assert rc == 0
+    assert fake.order == ["eduid.ch", "cloud.switch.ch"]
+    assert fake.fills() == [
+        [
+            "--click",
+            SSO_LABEL,
+            "--row",
+            SSO_LABEL,
+            "--handle",
+            "41",
+            "--expect-host",
+            "cloud.switch.ch",
+        ]
+    ]
+    assert not [c for c in fake.calls if c[0] in ("--login", "--otp")]
+
+
+def test_a_logged_out_edu_id_logs_in_on_its_idp_then_clicks(
+    sso: dict[str, Any],
+) -> None:
+    edu = [
+        (EDU_LOGIN, w._page(user=True, steps=_USER_PAGE)),
+        (EDU_LOGIN, w._page(password=True, steps=_PASS_PAGE)),
+        (EDU_LOGIN, w._page(code=True, steps=_CODE_PAGE)),
+        (EDU_HOME, w._page(sentinel=True)),
+    ]
+    portal = [(SWITCH_HOME, w._page(sentinel=True))]
+    rc, fake = _chain(sso, edu, portal)
+    assert rc == 0
+    kinds = [(c[0], _host(c)) for c in fake.fills()]
+    assert [k for k, _h in kinds] == ["--login", "--login", "--otp"]
+    assert {h for _k, h in kinds} == {"login.eduid.ch"}
+    assert fake.order == ["eduid.ch", "cloud.switch.ch"]
+
+
+def test_prove_only_on_the_chain_stops_at_eduid_when_it_needs_a_login(
+    sso: dict[str, Any], capsys: pytest.CaptureFixture[str]
+) -> None:
+    edu = [(EDU_LOGIN, w._page(user=True, steps=_USER_PAGE))]
+    portal = [(SWITCH_HOME, w._page(sentinel=True))]
+    rc, fake = _chain(sso, edu, portal, prove_only=True)
+    assert rc == 2
+    assert fake.order == ["eduid.ch"]  # the portal stage never ran
+    assert not fake.fills() and not fake.landing_opens()
+    assert "safari_logged_out" in capsys.readouterr().out
+
+
+def test_prove_only_on_the_chain_stops_at_the_portal_click(
+    sso: dict[str, Any], capsys: pytest.CaptureFixture[str]
+) -> None:
+    edu = [(EDU_HOME, w._page(sentinel=True))]
+    portal = [(SWITCH_HOME, w._page(steps=SWITCH_PAGE))]
+    rc, fake = _chain(sso, edu, portal, prove_only=True)
+    assert rc == 2
+    assert fake.order == ["eduid.ch", "cloud.switch.ch"]
+    assert not fake.fills() and not fake.landing_opens()
+    assert "safari_logged_out" in capsys.readouterr().out
+
+
+def test_an_edu_id_form_after_the_click_is_never_typed_into(
+    sso: dict[str, Any],
+) -> None:
+    edu = [(EDU_HOME, w._page(sentinel=True))]
+    portal = [
+        (SWITCH_HOME, w._page(steps=SWITCH_PAGE)),
+        (EDU_LOGIN, w._page(user=True, password=True, steps=[[False, False]])),
+    ]
+    rc, fake = _chain(sso, edu, portal)
+    assert rc == 2
+    assert [c[0] for c in fake.fills()] == ["--click"]
+    assert not fake.landing_opens()
+
+
+def test_switch_engines_proves_on_the_callback_host(sso: dict[str, Any]) -> None:
+    edu = [(EDU_HOME, w._page(sentinel=True))]
+    portal = [
+        ("https://engines.admin.switch.ch/auth/login", w._page(steps=SWITCH_PAGE)),
+        ("https://admin.switch.ch/", w._page(sentinel=True)),
+    ]
+    rc, fake = _chain(sso, edu, portal, site="switch-engines")
+    assert rc == 0
+    assert fake.order == ["eduid.ch", "engines.admin.switch.ch"]
+    assert [c[0] for c in fake.fills()] == ["--click"]
+    assert fake.landing_opens() == [
+        ["--open", "https://engines.admin.switch.ch/", "--wait", "20"]
+    ]
+
+
+def test_the_chain_dry_run_names_both_stages(
+    sso: dict[str, Any], capsys: pytest.CaptureFixture[str]
+) -> None:
+    sso["safari"] = Safari(al.safari_recipe("switch"), [])
+    assert al.safari_target_action("switch", "", dry_run=True, prove_only=True) == 0
+    out = capsys.readouterr().out
+    assert "run eduid's route first (prove it (no login)), then switch's" in out
+    assert not sso["safari"].ops("--open", *FILLS)
+
+
+def test_cscs_plan_takes_the_labels_sentinel_and_never_imports(
+    sso: dict[str, Any], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    recipe = al.safari_recipe("cscs")
+    assert recipe is not None and recipe.sentinel == "#cscs-me"
+    assert not recipe.import_after and recipe.sentinel_host == "portal.cscs.ch"
+    plan = al._safari_plan("cscs", recipe, {})
+    assert plan is not None  # no safari_no_recipe
+    assert (plan.sentinel, plan.item) == ("#cscs-me", "Cscs Item")
+    assert plan.start_url == "https://portal.cscs.ch/profile/"
+    # without the labels' sentinel the listing has none: no plan
+    bare = alsafari.BrokerLabels("one_page", pass_submit="Sign In", idp="auth.cscs.ch")
+    monkeypatch.setitem(alsafari.BROKER_SAFARI_LABELS, "cscs", bare)
+    no_sentinel = al.safari_recipe("cscs")
+    assert no_sentinel is not None and al._safari_plan("cscs", no_sentinel, {}) is None
+
+
+def test_cscs_s_never_calls_the_bundle_or_token_path(
+    sso: dict[str, Any], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def never(*_a: Any, **_k: Any) -> Any:
+        raise AssertionError("the broker bundle / token path ran")
+
+    for name in ("_browser", "run_browser", "_safari_target_import"):
+        if hasattr(al, name):
+            monkeypatch.setattr(al, name, never)
+    recipe = al.safari_recipe("cscs")
+    assert recipe is not None
+    landing = "https://portal.cscs.ch/profile/"
+    sso["safari"] = Safari(recipe, [(landing, w._page(sentinel=True))])
+    assert al.safari_target_action("cscs", "") == 0
+    assert not sso["imports"] and not sso["broker"]
+    assert not sso["safari"].ops(*FILLS)
+    assert sso["safari"].landing_opens() == [["--open", landing, "--wait", "20"]]
+
+
+def test_runai_is_unrouted_until_the_identity_read_is_isolated(
+    sso: dict[str, Any],
+) -> None:
+    assert al.safari_recipe("runai-test3") is None
+    assert not al.safari_routed("runai-test3")
+
+
+def test_runai_identity_mismatch_is_exit_2(
+    sso: dict[str, Any],
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    monkeypatch.setattr(al, "SAFARI_IDENTITY_READ_SAFE", True)
+    monkeypatch.setattr(
+        al.identity, "item_recipe", lambda *_a, **_k: identity.IDENTITIES["runai"]
+    )
+    sso["nonce"] = secrets.token_hex(32)
+    sso["verdict"] = "mismatch"
+    fixture_broker = al.broker_request
+
+    def broker(op: str, **kw: Any) -> dict[str, Any]:
+        reply: dict[str, Any] = fixture_broker(op, **kw)
+        return {**reply, "identity": "runai"} if op == "identity_challenge" else reply
+
+    monkeypatch.setattr(al, "broker_request", broker)
+    recipe = al.safari_recipe("runai-test3")
+    assert recipe is not None and recipe.identity == "runai-test3"
+    sso["safari"] = Safari(recipe, [("https://sdsc.run.ai/", w._page(sentinel=True))])
+    sso["safari"].answer = {
+        "state": "found",
+        "digest": secrets.token_hex(32),
+        "admin": False,
+    }
+    assert al.safari_target_action("runai-test3", "") == 2
+    assert "wrong_account" in capsys.readouterr().out
+    assert not sso["safari"].ops(*FILLS)
+    assert not sso["safari"].landing_opens()

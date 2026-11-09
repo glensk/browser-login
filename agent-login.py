@@ -1040,7 +1040,7 @@ def _safari_session_live(row: dict) -> bool:
 # route (with its recipe); `proof` says how Safari's session is proven:
 # "builtin" = `browser.py import-safari SITE -P` (a throwaway context),
 # "in_safari" = the Safari Machine's sentinel run (a live session ends ok
-# with zero steps). `then`: a chain's second route (switch after eduid).
+# with zero steps). `then`: a chain's first stage (switch: eduid, then switch).
 # A mail-code recipe also needs its mail env (`MAIL_CODE_ENV`). The import
 # decision stays the recipe's `import_after`.
 @dataclass(frozen=True)
@@ -1049,7 +1049,9 @@ class SafariRoute:
 
     landing: str  # the https page `-s` leaves Safari on
     proof: str  # "builtin" | "in_safari"
-    then: str = ""  # chain: a second route run after this one
+    # chain (tp#1644 B14): the route that runs FIRST, under the same lock and
+    # with the same -O; this one then (switch: eduid's route, then the click)
+    then: str = ""
 
 
 SAFARI_PROOFS = frozenset({"builtin", "in_safari"})
@@ -1120,6 +1122,21 @@ SAFARI_ROUTES: dict[str, SafariRoute] = {
             ("smartsheet", "https://app.smartsheet.com/b/home"),
         )
     },
+    # tp#1644 B14: the SSO batch, proven in Safari. eduid and cscs are broker
+    # recipes (labels from B15's probe; cscs' entry also carries the
+    # sentinel the listing lacks; Safari keeps its own Waldur token, no
+    # import); runai-test3 carries a listing identity (no recipe while
+    # SAFARI_IDENTITY_READ_SAFE is False). switch and switch-engines share
+    # EDUID_SSO_FLOW (broker_site eduid, one EduidPortal code path): a chain,
+    # eduid's route first, then the portal's one SSO click
+    # (`alsafari.SSO_PORTALS`; its label from B15's probe).
+    "eduid": SafariRoute("https://eduid.ch/account/organisations/", "in_safari"),
+    "cscs": SafariRoute("https://portal.cscs.ch/profile/", "in_safari"),
+    "runai-test3": SafariRoute("https://sdsc.run.ai/", "in_safari"),
+    "switch": SafariRoute("https://cloud.switch.ch/", "in_safari", then="eduid"),
+    "switch-engines": SafariRoute(
+        "https://engines.admin.switch.ch/", "in_safari", then="eduid"
+    ),
 }
 # tp#1644 B10: sites whose accounts share one Safari cookie scope — Safari
 # holds at most ONE of them. `SAFARI_HELD[group]`: the member Safari holds
@@ -1216,8 +1233,8 @@ def safari_recipe(site: str, row: dict | None = None) -> alsafari.Recipe | None:
     broker recipe of its listing row (`row` over the snapshot's) and its
     `BROKER_SAFARI_LABELS` entry — None without labels, and for a row with
     an `identity` while the in-Safari identity read is not isolated."""
-    recipe = alsafari.RECIPES.get(site)
-    if recipe is not None:
+    recipe = alsafari.RECIPES.get(site) or alsafari.sso_recipe(site)
+    if recipe is not None or site in alsafari.SSO_PORTALS:
         return recipe
     labels = alsafari.BROKER_SAFARI_LABELS.get(site)
     if labels is None:
@@ -1231,11 +1248,14 @@ def safari_recipe(site: str, row: dict | None = None) -> alsafari.Recipe | None:
 
 def safari_routed(site: str) -> bool:
     """`site` has a Safari route: a `SAFARI_ROUTES` entry and its recipe
-    (and Safari does not hold another account of its group)."""
+    (and Safari does not hold another account of its group); a chain's
+    first stage routed as well (tp#1644 B14)."""
+    route = SAFARI_ROUTES.get(site)
     return (
-        site in SAFARI_ROUTES
+        route is not None
         and safari_recipe(site) is not None
         and not _group_why(site)
+        and (not route.then or (route.then != site and safari_routed(route.then)))
     )
 
 
@@ -4889,6 +4909,12 @@ def safari_target_dry_run(
     if has_mail_code(recipe):
         _mail_code_dry_run(site)
         block = _mail_code_block(site)
+    if route.then and not (gate or stop):
+        first = "prove it (no login)" if prove_only else "prove it, else log Safari in"
+        print(
+            f"ℹ️ {site}: -s would run {route.then}'s route first ({first}), "
+            f"then {site}'s"
+        )
     print(
         f"ℹ️ {site}: -s would {_dry_run_next(route, gate or stop, held, block, recipe, prove_only)}"
     )
@@ -4943,7 +4969,7 @@ def _no_route(site: str) -> int:
 
 
 # One return per stage of the -s pipeline (tp#1643 Design).
-def safari_target_action(  # pylint: disable=too-many-return-statements
+def safari_target_action(  # pylint: disable=too-many-return-statements,too-many-branches
     site: str, url: str, *, dry_run: bool = False, prove_only: bool = False
 ) -> int:
     """`-L SITE -s [URL]`: prove Safari's session (else log Safari in), import
@@ -4982,7 +5008,10 @@ def safari_target_action(  # pylint: disable=too-many-return-statements
     if gate is not None:
         print(f"❌ {site}: {phases.CODE_TEXT.get(gate, gate)} ({gate})")
         return 3
+    first = safari_recipe(route.then) if route.then else None
     call, stop = _safari_py_ready(recipe)
+    if call is not None and first is not None:
+        call, stop = _safari_py_ready(first)  # the chain's first stage too
     if call is None:
         print(f"❌ {site}: {phases.CODE_TEXT.get(stop, stop)} ({stop})")
         return 3
@@ -4990,6 +5019,10 @@ def safari_target_action(  # pylint: disable=too-many-return-statements
         if not got:
             print(f"⏸  {site}: another Safari login runs — try again later")
             return BUSY_RC
+        if first is not None:
+            rc = _safari_chain_first(site, route.then, first, prove_only=prove_only)
+            if rc:
+                return rc
         if route.proof == "in_safari":
             return _safari_target_in_safari(
                 site, recipe, call, (target, what), prove_only=prove_only
@@ -4997,6 +5030,30 @@ def safari_target_action(  # pylint: disable=too-many-return-statements
         return _safari_target_locked(
             site, recipe, call, target, what, prove_only=prove_only
         )
+
+
+def _safari_chain_first(
+    site: str, first: str, recipe: alsafari.Recipe, *, prove_only: bool
+) -> int:
+    """A chain's first stage under the lock (tp#1644 B14): `first`'s
+    in-Safari run — its sentinel first (a live session: zero steps), else
+    its login, never with `prove_only` (its first login page ends
+    `safari_logged_out`, the chain stops there). 0 = proven, go on to
+    `site`'s stage; else the exit code (nothing opened)."""
+    print(f"▶ {site}: chain — {first}'s Safari session first")
+    out = _safari_drive(first, recipe, proof_only=prove_only, status_checked=True)
+    if out.code == "safari_logged_out":
+        print(
+            f"❌ {site}: safari_logged_out — Albert's Safari is not logged in to "
+            f"{first} (-O: nothing typed, no broker fill; {site} not tried)"
+        )
+        return 2
+    if not out.ok:
+        return _safari_drive_fail(first, out, route="safari-target")
+    clear_safari_fail(first)
+    how = "an agent's login" if out.steps else "a working session, no login needed"
+    print(f"✅ {site}: {first} in Albert's Safari: {how}")
+    return 0
 
 
 def _safari_target_locked(  # pylint: disable=too-many-arguments

@@ -312,10 +312,17 @@ class Recipe:  # pylint: disable=too-many-instance-attributes
     identity: str = ""  # built-in import's account proof (browser.py)
     stops: tuple[SiteStop, ...] = ()  # tp#1644: the site's own Albert stops
     albert_wait: AlbertWait | None = None  # tp#1644: None = stuck as before
+    # tp#1644 B14: further hosts whose page proves the session with the same
+    # sentinel (SWITCHengines: the OIDC callback lands on admin.switch.ch)
+    proof_hosts: tuple[str, ...] = ()
 
     def features(self) -> frozenset[str]:
         """safari.py features this recipe needs."""
         return BASE_FEATURES | {STEP_FEATURES[s.kind] for s in self.steps}
+
+    def proves_on(self, host: str) -> bool:
+        """The sentinel counts on `host`: the sentinel host or a proof host."""
+        return host == self.sentinel_host or host in self.proof_hosts
 
 
 def _two_step(idp: str, *, user_submit: str, pass_submit: str) -> tuple[Step, ...]:
@@ -849,6 +856,97 @@ def broker_recipe(
         identity=site if row.get("identity") else "",
         stops=stops,
         albert_wait=labels.albert_wait,
+    )
+
+
+# ---------------------------------------------------------------------------
+# SSO-click portals (tp#1644 B14): edu-ID's route first, then one click
+# ---------------------------------------------------------------------------
+
+EDUID_IDP_HOST = "login.eduid.ch"
+
+
+@dataclass(frozen=True)
+class SsoPortal:
+    """A portal whose whole login is ONE click on its edu-ID button, run in
+    Safari after the `eduid` route proved (or logged in) the IdP session
+    (bin/browser.py `EduidPortal`). `form` = the sign-in form the click step
+    needs (its `when`); `sentinel` = a positive logged-in proof read from
+    code ('' = none known); `proof_hosts` = further hosts that page may land
+    on (the OIDC callback's)."""
+
+    host: str
+    start_url: str
+    form: str
+    sentinel: str = ""
+    proof_hosts: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
+class SsoLabels:
+    """What B15's read-only probe found on the portal's sign-in page: the
+    edu-ID button's label, and a sentinel where code knows none."""
+
+    trigger: str
+    sentinel: str = ""
+
+
+# bin/browser.py: both portals' /auth/login carries ONE form that POSTs to
+# /auth/openid_connect_eduid_ch (EduidPortal). The anonymous root of
+# cloud.switch.ch renders that form with HTTP 200, the engines root answers
+# 302 to /auth/login: the start page is the root (a live session shows the
+# portal itself; /auth/login would read as a login page either way).
+EDUID_SSO_FORM = 'form[action="/auth/openid_connect_eduid_ch"]'
+SSO_PORTALS: dict[str, SsoPortal] = {
+    # no positive logged-in proof in code (browser.py proves by the form's
+    # absence): the sentinel comes from B15's read
+    "switch": SsoPortal("cloud.switch.ch", "https://cloud.switch.ch/", EDUID_SSO_FORM),
+    # SWITCH_ENGINES_SENTINEL (verified 2026-11-09 in the shared Chromium);
+    # the callback lands on admin.switch.ch (same navbar, same session)
+    "switch-engines": SsoPortal(
+        "engines.admin.switch.ch",
+        "https://engines.admin.switch.ch/",
+        EDUID_SSO_FORM,
+        'a.dropdown-item[href$="/auth/logout"]',
+        ("admin.switch.ch",),
+    ),
+}
+# site → its button label from B15's probe. No entry → no recipe (❌), never
+# a guessed label.
+SSO_SAFARI_LABELS: dict[str, SsoLabels] = {}
+
+
+def sso_recipe(site: str) -> Recipe | None:
+    """`site`'s SSO-click recipe (None without a portal, a label or a
+    sentinel): the one click on the edu-ID button where the sign-in form
+    shows and no password field does — nothing is ever typed on the portal
+    or on login.eduid.ch (a login form there ends the run stuck). Safari-only
+    (no import: the shared Chromium has its own SSO click)."""
+    portal = SSO_PORTALS.get(site)
+    labels = SSO_SAFARI_LABELS.get(site)
+    if portal is None or labels is None or not labels.trigger:
+        return None
+    sentinel = labels.sentinel or portal.sentinel
+    if not sentinel:
+        return None
+    return Recipe(
+        site=site,
+        hosts=(portal.host, *portal.proof_hosts, EDUID_IDP_HOST),
+        sentinel_host=portal.host,
+        steps=(
+            Step(
+                "click",
+                portal.host,
+                trigger=labels.trigger,
+                when=portal.form,
+                unless=_PASSWORD,
+            ),
+        ),
+        start_url=portal.start_url,
+        sentinel=sentinel,
+        broker=False,
+        import_after=False,
+        proof_hosts=portal.proof_hosts,
     )
 
 
@@ -2044,7 +2142,7 @@ class Machine:  # pylint: disable=too-many-instance-attributes
                     return self._stuck("page_unreadable", host)
                 self.sleep(POLL_S)
                 continue
-            if page["sentinel"] and host == self.recipe.sentinel_host:
+            if page["sentinel"] and self.recipe.proves_on(host):
                 return self._sentinel_reached(host)
             for flag in ALBERT_STOPS:
                 if page[flag]:
@@ -2099,7 +2197,7 @@ class Machine:  # pylint: disable=too-many-instance-attributes
             return False
         if page is None:
             return True
-        if page["sentinel"] and host == self.recipe.sentinel_host:
+        if page["sentinel"] and self.recipe.proves_on(host):
             return False
         if any(page[flag] for flag in ALBERT_STOPS):
             return False
