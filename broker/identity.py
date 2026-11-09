@@ -488,6 +488,11 @@ STATIC_SITE_NAMES = frozenset(
         "switch-cloud",
         "cloud.switch.ch",
         "scp",
+        # SWITCHengines AdminUI (tp#1957)
+        "switch-engines",
+        "engines",
+        "engines.admin.switch.ch",
+        "switchengines",
     }
 )
 

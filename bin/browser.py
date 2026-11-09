@@ -10419,13 +10419,68 @@ SWITCH_IDP_LOGIN_INPUT_SELECTOR = (
 SWITCH_IDP_FORM_SETTLE_S = 1.5
 
 
-def _switch_verdict(url: str, has_sign_in_form: bool) -> str:
+@dataclass(frozen=True)
+class EduidPortal:
+    """One SWITCH web portal behind the same edu-ID sign-in page (tp#1957).
+
+    The Switch Cloud Portal and the SWITCHengines AdminUI are the same Rails
+    app family: ``/auth/login`` carries the single SWITCH edu-ID button that
+    POSTs to ``/auth/openid_connect_eduid_ch``. Every ``_switch_*`` helper
+    below takes one of these, so a second portal reuses the whole flow (probe,
+    background SSO click, broker edu-ID session, guided gate) instead of a copy.
+    `sentinel` is an optional POSITIVE logged-in proof (CSS) on top of "no
+    sign-in form"; None keeps the form-absence proof alone. `proof_origins`
+    are further origins whose pages may carry that proof (where the OIDC
+    callback lands, sharing the portal's session cookie).
+    """
+
+    site: str
+    label: str
+    origin: str
+    sentinel: str | None = None
+    proof_origins: tuple[str, ...] = ()
+
+    @property
+    def host(self) -> str:
+        """The portal's host name, for messages."""
+        return urllib.parse.urlsplit(self.origin).hostname or self.origin
+
+
+SWITCH_PORTAL = EduidPortal("switch", "Switch Cloud Portal", SWITCH_ORIGIN)
+# SWITCHengines AdminUI (tp#1957). An anonymous request for any page answers
+# 302 to /auth/login (verified 2026-11-09 with curl), whose card holds the same
+# edu-ID form as cloud.switch.ch. Positive sentinel (verified 2026-11-09 in the
+# shared Chromium): the signed-in navbar's user dropdown holds a "Log out" item
+# ``a.dropdown-item[href$="/auth/logout"]``; the anonymous navbar renders an
+# empty ``.dropdown``. The OIDC callback lands on the parent AdminUI
+# (https://admin.switch.ch/, same navbar), and the session cookie is scoped to
+# ``.admin.switch.ch``, so that page proves the engines session too.
+SWITCH_ENGINES_ORIGIN = "https://engines.admin.switch.ch"
+SWITCH_ADMIN_ORIGIN = "https://admin.switch.ch"
+SWITCH_ENGINES_SENTINEL = 'a.dropdown-item[href$="/auth/logout"]'
+SWITCH_ENGINES_PORTAL = EduidPortal(
+    "switch-engines",
+    "SWITCHengines AdminUI",
+    SWITCH_ENGINES_ORIGIN,
+    SWITCH_ENGINES_SENTINEL,
+    (SWITCH_ADMIN_ORIGIN,),
+)
+
+
+def _switch_verdict(
+    url: str,
+    has_sign_in_form: bool,
+    portal: EduidPortal = SWITCH_PORTAL,
+    has_sentinel: bool = True,
+) -> str:
     """Classify a portal page as ``login`` / ``logged-in`` / ``unknown`` (pure).
 
     The FORM is the primary evidence, the URL only secondary: an anonymous
     ``GET /`` answers 200 **at** ``/`` and renders the edu-ID sign-in page right
     there (verified 2026-09-14 with curl), so "the tab is on cloud.switch.ch" is
-    never evidence of a session — the absence of that form is.
+    never evidence of a session — the absence of that form is. A portal with a
+    positive `sentinel` also needs `has_sentinel` for ``logged-in``; without it
+    the page is ``unknown``.
 
     Everything that is not positively one of the two — an off-origin IdP page
     (login.eduid.ch), ``about:blank``, a ``chrome-error://`` page, an empty URL,
@@ -10434,9 +10489,11 @@ def _switch_verdict(url: str, has_sign_in_form: bool) -> str:
     """
     if has_sign_in_form or SWITCH_LOGIN_PATH in url:
         return "login"
-    if url == SWITCH_ORIGIN or url.startswith(SWITCH_ORIGIN + "/"):
-        if not url[len(SWITCH_ORIGIN) :].startswith("/auth/"):
-            return "logged-in"
+    for origin in (portal.origin, *portal.proof_origins):
+        if url == origin or url.startswith(origin + "/"):
+            if not url[len(origin) :].startswith("/auth/"):
+                if portal.sentinel is None or has_sentinel:
+                    return "logged-in"
     return "unknown"
 
 
@@ -10453,7 +10510,18 @@ def _switch_has_sign_in_form(page) -> bool | None:
         return None
 
 
-def _switch_page_verdict(page) -> str:
+def _switch_has_sentinel(page, portal: EduidPortal) -> bool | None:
+    """True/False whether the portal's positive sentinel is in the DOM (True
+    for a portal without one); None when the DOM could not be read."""
+    if portal.sentinel is None:
+        return True
+    try:
+        return page.query_selector(portal.sentinel) is not None
+    except Exception:  # pylint: disable=broad-exception-caught
+        return None
+
+
+def _switch_page_verdict(page, portal: EduidPortal = SWITCH_PORTAL) -> str:
     """`_switch_verdict` for a live page, with the fail-closed rule applied: a
     DOM we could not read never yields ``logged-in``."""
     try:
@@ -10461,8 +10529,9 @@ def _switch_page_verdict(page) -> str:
     except Exception:  # pylint: disable=broad-exception-caught
         return "unknown"
     has_form = _switch_has_sign_in_form(page)
-    verdict = _switch_verdict(url, bool(has_form))
-    if has_form is None and verdict == "logged-in":
+    has_sentinel = _switch_has_sentinel(page, portal)
+    verdict = _switch_verdict(url, bool(has_form), portal, bool(has_sentinel))
+    if (has_form is None or has_sentinel is None) and verdict == "logged-in":
         return "unknown"
     return verdict
 
@@ -10514,7 +10583,7 @@ def _page_by_target(browser, tid: str):
 _switch_page_by_target = _page_by_target
 
 
-def _switch_probe(port: int) -> tuple[str, str]:
+def _switch_probe(port: int, portal: EduidPortal = SWITCH_PORTAL) -> tuple[str, str]:
     """READ-ONLY portal probe; returns (verdict, observed url). Never focuses.
 
     Takes NO interaction lease and touches no tab of the user's: the probe runs
@@ -10529,18 +10598,20 @@ def _switch_probe(port: int) -> tuple[str, str]:
     def probe(page) -> tuple[str, str]:
         page.wait_for_timeout(500)  # let a Turbo redirect land
         seen["url"] = page.url
-        return (_switch_page_verdict(page), seen["url"])
+        return (_switch_page_verdict(page, portal), seen["url"])
 
-    got = _background_page_run(port, SWITCH_ORIGIN + "/", _broker_probe_viewport, probe)
+    got = _background_page_run(port, portal.origin + "/", _broker_probe_viewport, probe)
     return got if got is not None else ("unknown", seen["url"])
 
 
-def _switch_wait_for_login(
+def _switch_wait_for_login(  # pylint: disable=too-many-arguments
     page,
     timeout_s: float,
     poll_s: float = 0.5,
     heartbeat: bool = False,
     idp_give_up_s: float | None = None,
+    *,
+    portal: EduidPortal = SWITCH_PORTAL,
 ) -> bool:
     """PASSIVE poll of the login tab: True as soon as it settles logged in.
 
@@ -10556,7 +10627,7 @@ def _switch_wait_for_login(
     last_beat = 0.0
     idp_since: float | None = None
     while time.monotonic() - start < timeout_s:
-        if _switch_page_verdict(page) == "logged-in":
+        if _switch_page_verdict(page, portal) == "logged-in":
             return True
         if idp_give_up_s is not None:
             if not _switch_on_idp_login_form(page):
@@ -10580,26 +10651,32 @@ def _switch_wait_for_login(
     return False
 
 
-def cmd_switch_logged_in(port: int) -> int:
-    """Exit 0 if the Switch Cloud Portal is logged in, 2 if not — and 2 when it
-    cannot be told (fail CLOSED; a monitoring check treats 2 as red).
+def cmd_switch_logged_in(port: int, portal: EduidPortal = SWITCH_PORTAL) -> int:
+    """Exit 0 if the Switch Cloud Portal (or `portal`) is logged in, 2 if not —
+    and 2 when it cannot be told (fail CLOSED; a monitoring check treats 2 as
+    red).
 
     READ-ONLY by contract: no interaction lease, no `bring_to_front`, no
     `new_page` — it opens one background tab and closes it again.
     """
-    verdict, url = _switch_probe(port)
+    verdict, url = _switch_probe(port, portal)
     if verdict == "logged-in":
-        print("✓ Logged into Switch Cloud Portal (cloud.switch.ch).")
+        print(f"✓ Logged into {portal.label} ({portal.host}).")
         return 0
     if verdict == "login":
-        print("Not logged into Switch Cloud Portal (cloud.switch.ch).", file=sys.stderr)
+        print(f"Not logged into {portal.label} ({portal.host}).", file=sys.stderr)
         return 2
     print(
-        f"Cannot tell whether Switch Cloud Portal is logged in — the probe "
-        f"landed on {url!r}.",
+        f"Cannot tell whether {portal.label} is logged in — the probe "
+        f"landed on {_tab_hint(url)!r}.",
         file=sys.stderr,
     )
     return 2
+
+
+def cmd_switch_engines_logged_in(port: int) -> int:
+    """`cmd_switch_logged_in` for the SWITCHengines AdminUI (tp#1957)."""
+    return cmd_switch_logged_in(port, SWITCH_ENGINES_PORTAL)
 
 
 def _switch_eduid_broker_listed() -> bool:
@@ -10615,7 +10692,9 @@ def _switch_eduid_broker_listed() -> bool:
     return entry is not None and not entry.get("refused")
 
 
-def _switch_sso_click_background(port: int, *, idp_give_up: bool = False) -> str:
+def _switch_sso_click_background(
+    port: int, *, idp_give_up: bool = False, portal: EduidPortal = SWITCH_PORTAL
+) -> str:
     """The edu-ID SSO click in a BACKGROUND tab; its outcome.
 
     ``logged-in`` (proof: `_switch_page_verdict` on that same tab, polled by
@@ -10637,16 +10716,17 @@ def _switch_sso_click_background(port: int, *, idp_give_up: bool = False) -> str
             page,
             timeout_s=20,
             idp_give_up_s=SWITCH_IDP_FORM_SETTLE_S if idp_give_up else None,
+            portal=portal,
         ):
             return "logged-in"
         return "eduid-login" if _switch_on_idp_login_form(page) else "not-logged-in"
 
-    with _interaction_lease("login switch"):
-        got = _with_background_page(port, SWITCH_ORIGIN + SWITCH_LOGIN_PATH, click)
+    with _interaction_lease(f"login {portal.site}"):
+        got = _with_background_page(port, portal.origin + SWITCH_LOGIN_PATH, click)
     return got if isinstance(got, str) else "not-logged-in"
 
 
-def _switch_login_via_sso_click(port: int) -> bool:
+def _switch_login_via_sso_click(port: int, portal: EduidPortal = SWITCH_PORTAL) -> bool:
     """The SSO click alone, on the profile's OWN edu-ID session (no broker).
 
     Returns True when the portal ends logged in (event ``sso-background``
@@ -10654,12 +10734,12 @@ def _switch_login_via_sso_click(port: int) -> bool:
     when the click lands on the edu-ID login form, so a dead IdP session costs
     seconds, not the full wait, before the broker path runs.
     """
-    _deadline_step("switch:sso-click")
+    _deadline_step(f"{portal.site}:sso-click")
     print("▶ SSO click on the browser's own edu-ID session (background).")
-    outcome = _switch_sso_click_background(port, idp_give_up=True)
+    outcome = _switch_sso_click_background(port, idp_give_up=True, portal=portal)
     if outcome == "logged-in":
-        print("✅ Logged into Switch Cloud Portal (live edu-ID session + SSO click).")
-        _record_login_event("switch", "sso-background")
+        print(f"✅ Logged into {portal.label} (live edu-ID session + SSO click).")
+        _record_login_event(portal.site, "sso-background")
         return True
     why = (
         "landed on the edu-ID login form (no live edu-ID session)"
@@ -10670,7 +10750,9 @@ def _switch_login_via_sso_click(port: int) -> bool:
     return False
 
 
-def _switch_login_via_eduid_broker(port: int) -> bool:
+def _switch_login_via_eduid_broker(
+    port: int, portal: EduidPortal = SWITCH_PORTAL
+) -> bool:
     """Chain the broker's ``eduid`` login into the portal's SSO click.
 
     Returns True when the portal ends logged in (event ``broker-sso`` recorded);
@@ -10680,7 +10762,7 @@ def _switch_login_via_eduid_broker(port: int) -> bool:
     """
     if not _switch_eduid_broker_listed():
         return False
-    _deadline_step("switch:broker")
+    _deadline_step(f"{portal.site}:broker")
     print("▶ edu-ID session from the login broker, then the SSO click (background).")
     rc = _broker_login(port, "eduid")
     if rc != 0:
@@ -10690,10 +10772,10 @@ def _switch_login_via_eduid_broker(port: int) -> bool:
             file=sys.stderr,
         )
         return False
-    _deadline_step("switch:broker-sso-click")
-    if _switch_sso_click_background(port) == "logged-in":
-        print("✅ Logged into Switch Cloud Portal (broker edu-ID session + SSO click).")
-        _record_login_event("switch", "broker-sso")
+    _deadline_step(f"{portal.site}:broker-sso-click")
+    if _switch_sso_click_background(port, portal=portal) == "logged-in":
+        print(f"✅ Logged into {portal.label} (broker edu-ID session + SSO click).")
+        _record_login_event(portal.site, "broker-sso")
         return True
     print(
         "⚠️ SSO click with the broker's edu-ID session did not log in — falling "
@@ -10703,19 +10785,19 @@ def _switch_login_via_eduid_broker(port: int) -> bool:
     return False
 
 
-def _switch_warm_or_via_broker(port: int) -> bool:
+def _switch_warm_or_via_broker(port: int, portal: EduidPortal = SWITCH_PORTAL) -> bool:
     """True when the portal is already logged in, or gets logged in without a
     window — the ways `cmd_switch_login` tries before the guided gate, in order:
     the warm probe, the SSO click on the profile's own edu-ID session
     (`_switch_login_via_sso_click`), then the broker's edu-ID session plus the
     click (`_switch_login_via_eduid_broker`)."""
-    _deadline_step("switch:probe")
-    if _switch_probe(port)[0] == "logged-in":
-        print("✓ Already logged into Switch Cloud Portal (cloud.switch.ch).")
+    _deadline_step(f"{portal.site}:probe")
+    if _switch_probe(port, portal)[0] == "logged-in":
+        print(f"✓ Already logged into {portal.label} ({portal.host}).")
         return True
-    if _switch_login_via_sso_click(port):
+    if _switch_login_via_sso_click(port, portal):
         return True
-    return _switch_login_via_eduid_broker(port)
+    return _switch_login_via_eduid_broker(port, portal)
 
 
 def _switch_broker_wait_hint() -> str:
@@ -10727,9 +10809,9 @@ def _switch_broker_wait_hint() -> str:
     return f"or wait: the broker rate-limits eduid — {detail or 'no detail given'}"
 
 
-def cmd_switch_login(port: int) -> int:
-    """Ensure the Switch Cloud Portal is logged in. Idempotent (a warm session
-    just returns 0).
+def cmd_switch_login(port: int, portal: EduidPortal = SWITCH_PORTAL) -> int:
+    """Ensure the Switch Cloud Portal (or `portal`) is logged in. Idempotent (a
+    warm session just returns 0).
 
     A cold session is one click: the /auth/login page's single edu-ID button
     completes the login with NO password while the browser's edu-ID IdP session
@@ -10749,59 +10831,64 @@ def cmd_switch_login(port: int) -> int:
     headed lease), closed again afterwards (tp#845).
     """
     # The window-free ways first; the guided gate only after all of them failed.
-    if _switch_warm_or_via_broker(port):
+    if _switch_warm_or_via_broker(port, portal):
         return 0
-    _deadline_step("switch:guided-gate")
+    _deadline_step(f"{portal.site}:guided-gate")
     if not _guided_login_allowed(
-        port, "switch", "Switch Cloud Portal", _switch_broker_wait_hint()
+        port, portal.site, portal.label, _switch_broker_wait_hint()
     ):
         return NEEDS_ALBERT_RC
     try:
         with _owned_background_page(port) as page:
-            with _interaction_lease("login switch"):
-                return _switch_login_owned(port, page)
+            with _interaction_lease(f"login {portal.site}"):
+                return _switch_login_owned(port, page, portal)
     except OwnedTabError as exc:
-        return _fail(f"login switch: {exc}")
+        return _fail(f"login {portal.site}: {exc}")
 
 
-def _switch_login_owned(port: int, page) -> int:
+def cmd_switch_engines_login(port: int) -> int:
+    """`cmd_switch_login` for the SWITCHengines AdminUI (tp#1957)."""
+    return cmd_switch_login(port, SWITCH_ENGINES_PORTAL)
+
+
+def _switch_login_owned(port: int, page, portal: EduidPortal = SWITCH_PORTAL) -> int:
     """`cmd_switch_login`'s window flow in its owned tab, under the lease."""
     from playwright.sync_api import Error as PlaywrightError
 
+    login_url = portal.origin + SWITCH_LOGIN_PATH
     try:
-        page.goto(SWITCH_ORIGIN + SWITCH_LOGIN_PATH, wait_until="domcontentloaded")
+        page.goto(login_url, wait_until="domcontentloaded")
     except PlaywrightError as exc:
-        return _fail(
-            f"could not open {SWITCH_ORIGIN}{SWITCH_LOGIN_PATH} in the shared "
-            f"browser: {exc}"
-        )
+        return _fail(f"could not open {login_url} in the shared browser: {exc}")
     with contextlib.suppress(PlaywrightError):
-        _bring_to_front(page, "login switch", port)
+        _bring_to_front(page, f"login {portal.site}", port)
     # A failed click is not fatal: it just means no sign-in form was
     # there (already mid-flow, or already logged in) — fall through to
     # the wait, which decides on evidence.
     with contextlib.suppress(PlaywrightError):
         page.click(SWITCH_SIGN_IN_BUTTON_SELECTOR, timeout=10_000)
-    if _switch_wait_for_login(page, timeout_s=15):
-        print("✓ Logged into Switch Cloud Portal (SSO, no password needed).")
-        _record_login_event("switch", "sso")
+    if _switch_wait_for_login(page, timeout_s=15, portal=portal):
+        print(f"✓ Logged into {portal.label} (SSO, no password needed).")
+        _record_login_event(portal.site, "sso")
         return 0
     print(
-        "\n🔐 Switch Cloud Portal (cloud.switch.ch) needs a login.\n"
+        f"\n🔐 {portal.label} ({portal.host}) needs a login.\n"
         "   In the shared Chrome window (now in front):\n"
         "     1. Sign in with your SWITCH edu-ID on the page that opened (email,\n"
         "        password, and the 2-step code unless this browser is remembered).\n"
-        "     2. Land back on cloud.switch.ch — success is auto-detected.\n",
+        f"     2. Land back on {portal.host} — success is auto-detected.\n",
         file=sys.stderr,
     )
-    if not _switch_wait_for_login(page, timeout_s=300, poll_s=2.0, heartbeat=True):
+    if not _switch_wait_for_login(
+        page, timeout_s=300, poll_s=2.0, heartbeat=True, portal=portal
+    ):
         return _fail(
-            "Switch Cloud Portal login not detected within 5 min. Finish the "
+            f"{portal.label} login not detected within 5 min. Finish the "
             "edu-ID login in the shared browser, then re-run: "
-            "browser.py login switch"
+            f"browser.py login {portal.site}"
         )
-    print("✓ Logged into Switch Cloud Portal (cloud.switch.ch).")
-    _record_login_event("switch", "assisted")
+    print(f"✓ Logged into {portal.label} ({portal.host}).")
+    _record_login_event(portal.site, "assisted")
     return 0
 
 
@@ -15146,6 +15233,7 @@ def _doctor_access_sweep(log: list[str], now: float | None = None) -> None:
     record or switch: no real sweep ran); ⚠ a drop in the last 24 h (labels
     and time); else ✅."""
     now = time.time() if now is None else now
+    now_s: float = now
     check = "access sweep"
     state = _read_json_dict(ACCESS_SWEEP_STATE_FILE)
 
@@ -15153,7 +15241,7 @@ def _doctor_access_sweep(log: list[str], now: float | None = None) -> None:
         return (
             isinstance(value, (int, float))
             and not isinstance(value, bool)
-            and now - float(value) <= ACCESS_SWEEP_STALE_S
+            and now_s - float(value) <= ACCESS_SWEEP_STALE_S
         )
 
     if state is None:
@@ -18306,9 +18394,12 @@ GUIDED_START_URLS = {
     "slack": SLACK_WORKSPACE_URL,
     "notion": NOTION_LOGIN_URL,
     "switch": SWITCH_ORIGIN + SWITCH_LOGIN_PATH,
+    "switch-engines": SWITCH_ENGINES_ORIGIN + SWITCH_LOGIN_PATH,
 }
 # Built-in sites whose own `login SITE` flow is the window flow of path A.
-GUIDED_BUILTIN_WINDOW = frozenset({"anthropic", "openai", "slack", "notion", "switch"})
+GUIDED_BUILTIN_WINDOW = frozenset(
+    {"anthropic", "openai", "slack", "notion", "switch", "switch-engines"}
+)
 # Test hooks, honoured ONLY with CLAUDE_BROWSER_CACHE_DIR set (a disposable
 # browser): extra sites from a JSON file, and the viewer URL written to a file
 # instead of opening a window.
@@ -19620,6 +19711,14 @@ def _sites() -> list[Site]:
             blurb="Switch Cloud Portal (edu-ID SSO click, assisted fallback; no token)",
             login=cmd_switch_login,
             logged_in=cmd_switch_logged_in,
+        ),
+        Site(
+            name="switch-engines",
+            aliases=("engines", "engines.admin.switch.ch", "switchengines"),
+            blurb="SWITCHengines AdminUI (edu-ID SSO click, assisted fallback; "
+            "no token)",
+            login=cmd_switch_engines_login,
+            logged_in=cmd_switch_engines_logged_in,
         ),
     ]
 

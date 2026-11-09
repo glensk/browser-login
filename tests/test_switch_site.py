@@ -128,3 +128,122 @@ def test_sso_is_an_automated_mode() -> None:
 
 def test_blurb_names_the_identity_provider() -> None:
     assert "edu-ID" in browser._resolve_site("switch").blurb
+
+
+# --- tp#1957: SWITCHengines AdminUI (engines.admin.switch.ch) --------------
+
+ENGINES = "https://engines.admin.switch.ch"
+
+
+@pytest.mark.parametrize(
+    "url,has_form,has_sentinel,expected",
+    [
+        # Anonymous: every page answers 302 to /auth/login, which has the form.
+        (ENGINES + "/auth/login", True, False, "login"),
+        (ENGINES + "/auth/login", False, False, "login"),
+        # Signed in: no form AND the signed-in navbar sentinel.
+        (ENGINES + "/costcenters/1096", False, True, "logged-in"),
+        (ENGINES + "/", False, True, "logged-in"),
+        # The OIDC callback lands on the parent AdminUI (.admin.switch.ch
+        # session cookie, same navbar): it proves the session as well.
+        ("https://admin.switch.ch/", False, True, "logged-in"),
+        ("https://admin.switch.ch/", False, False, "unknown"),
+        ("https://admin.switch.ch.evil.example/", False, True, "unknown"),
+        # No form but no sentinel either (an error page, a half-rendered page):
+        # never a session.
+        (ENGINES + "/costcenters/", False, False, "unknown"),
+        # The cloud portal's session is not the engines one, and vice versa.
+        ("https://cloud.switch.ch/projects", False, True, "unknown"),
+        (
+            ENGINES + "/auth/openid_connect_eduid_ch/callback?code=x",
+            False,
+            True,
+            "unknown",
+        ),
+        ("https://login.eduid.ch/idp/profile/oidc/authorize", False, False, "unknown"),
+        (ENGINES + ".evil.example/", False, True, "unknown"),
+    ],
+)
+def test_engines_verdict(
+    url: str, has_form: bool, has_sentinel: bool, expected: str
+) -> None:
+    got = browser._switch_verdict(
+        url, has_form, browser.SWITCH_ENGINES_PORTAL, has_sentinel
+    )
+    assert got == expected
+
+
+def test_cloud_portal_verdict_ignores_the_sentinel_flag() -> None:
+    """cloud.switch.ch has no positive sentinel: form absence alone decides."""
+    assert browser._switch_verdict(
+        "https://cloud.switch.ch/", False, has_sentinel=False
+    ) == ("logged-in")
+
+
+class _DomPage:
+    """A page at `url` whose DOM holds exactly the selectors in `present`."""
+
+    def __init__(self, url: str, present: set[str], raises: bool = False) -> None:
+        self.url = url
+        self._present = present
+        self._raises = raises
+
+    def query_selector(self, selector: str) -> object:
+        if self._raises:
+            raise RuntimeError("target closed")
+        return object() if selector in self._present else None
+
+
+def test_engines_page_verdict_needs_the_sentinel() -> None:
+    portal = browser.SWITCH_ENGINES_PORTAL
+    signed_in = _DomPage(ENGINES + "/costcenters/", {browser.SWITCH_ENGINES_SENTINEL})
+    assert browser._switch_page_verdict(signed_in, portal) == "logged-in"
+    bare = _DomPage(ENGINES + "/costcenters/", set())
+    assert browser._switch_page_verdict(bare, portal) == "unknown"
+    anon = _DomPage(ENGINES + "/auth/login", {browser.SWITCH_SIGN_IN_FORM_SELECTOR})
+    assert browser._switch_page_verdict(anon, portal) == "login"
+
+
+def test_engines_page_verdict_fails_closed_on_an_unreadable_dom() -> None:
+    page = _DomPage(ENGINES + "/costcenters/", set(), raises=True)
+    assert (
+        browser._switch_page_verdict(page, browser.SWITCH_ENGINES_PORTAL) == "unknown"
+    )
+
+
+def test_engines_site_resolves_by_name_and_aliases() -> None:
+    for name in (
+        "switch-engines",
+        "engines",
+        "engines.admin.switch.ch",
+        "switchengines",
+    ):
+        assert browser._resolve_site(name).name == "switch-engines"
+
+
+def test_engines_site_wires_the_shared_switch_flow() -> None:
+    site = browser._resolve_site("switch-engines")
+    assert site.login is browser.cmd_switch_engines_login
+    assert site.logged_in is browser.cmd_switch_engines_logged_in
+    assert site.store_creds is None and site.forget_creds is None
+    assert "edu-ID" in site.blurb
+
+
+def test_engines_is_a_guided_window_site() -> None:
+    assert "switch-engines" in browser.GUIDED_BUILTIN_WINDOW
+    assert browser.GUIDED_START_URLS["switch-engines"] == ENGINES + "/auth/login"
+
+
+def test_engines_logged_in_reports_its_own_portal(monkeypatch, capsys) -> None:
+    seen: list[object] = []
+
+    def probe(port, portal=None):
+        seen.append(portal)
+        return ("login", ENGINES + "/auth/login")
+
+    monkeypatch.setattr(browser, "_switch_probe", probe)
+    assert browser.cmd_switch_engines_logged_in(9222) == 2
+    assert seen == [browser.SWITCH_ENGINES_PORTAL]
+    assert "Not logged into SWITCHengines AdminUI (engines.admin.switch.ch)." in (
+        capsys.readouterr().err
+    )

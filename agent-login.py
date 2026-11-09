@@ -342,6 +342,16 @@ TARGETS = (
         "your own login: ./agent-login.py -g switch",
         broker_site="eduid",
     ),
+    Target(
+        "switch-engines",
+        "SWITCHengines AdminUI",
+        "https://engines.admin.switch.ch",
+        EDUID_SSO_FLOW,
+        "SWITCHengines AdminUI (cost centers, projects): SSO click on the "
+        "browser's own edu-ID session, else the broker's (no window); "
+        "your own login: ./agent-login.py -g switch-engines",
+        broker_site="eduid",
+    ),
 )
 
 # status -> (icon, label); order = how the overview sorts
@@ -4017,6 +4027,7 @@ MATRIX_META = {
     "console-private": ("console-balance.py (billing, read-only)", "admin"),
     "openai": ("ChatGPT Business admin", "admin"),
     "switch": ("Switch Cloud Portal", "user"),
+    "switch-engines": ("SWITCHengines AdminUI", "user"),
 }
 
 

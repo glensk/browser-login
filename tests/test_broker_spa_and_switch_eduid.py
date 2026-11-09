@@ -293,6 +293,7 @@ def switch_env(monkeypatch):
         "clicks": ["eduid-login", "logged-in"],
         "headed": False,
         "probe": "login",
+        "site": "switch",
     }
 
     def broker_site(site):
@@ -312,7 +313,7 @@ def switch_env(monkeypatch):
         return fn(page)
 
     def headed(port, site, label, hint=""):
-        assert site == "switch" and label
+        assert site == state["site"] and label
         log["headed"] += 1
         log["hints"].append(hint)
         return state["headed"]
@@ -322,14 +323,18 @@ def switch_env(monkeypatch):
         return browser._switch_page_verdict(page) == "logged-in"
 
     monkeypatch.setattr(browser, "_BROKER_REFUSALS", {})
-    monkeypatch.setattr(browser, "_switch_probe", lambda port: (state["probe"], ""))
+    monkeypatch.setattr(
+        browser, "_switch_probe", lambda port, portal=None: (state["probe"], "")
+    )
     monkeypatch.setattr(browser, "_broker_site", broker_site)
     monkeypatch.setattr(browser, "_broker_login", broker_login)
     monkeypatch.setattr(browser, "_with_background_page", bg)
     monkeypatch.setattr(
         browser,
         "_switch_page_verdict",
-        lambda page: "logged-in" if page.outcome == "logged-in" else "login",
+        lambda page, portal=None: (
+            "logged-in" if page.outcome == "logged-in" else "login"
+        ),
     )
     monkeypatch.setattr(browser, "_switch_wait_for_login", wait)
     monkeypatch.setattr(
@@ -438,6 +443,38 @@ def test_switch_warm_session_clicks_nothing(switch_env, capsys):
     assert not log["bg"] and not log["broker"] and not log["events"]
     assert log["headed"] == 0
     assert "Already logged into Switch Cloud Portal" in capsys.readouterr().out
+
+
+# --- tp#1957: the SWITCHengines AdminUI rides the same flow --------------------
+
+ENGINES_LOGIN_URL = browser.SWITCH_ENGINES_ORIGIN + browser.SWITCH_LOGIN_PATH
+
+
+def test_engines_click_alone_logs_in_on_its_own_origin(switch_env, capsys):
+    log, state = switch_env
+    state["clicks"] = ["logged-in"]
+    assert browser.cmd_switch_engines_login(9222) == 0
+    assert log["bg"] == [ENGINES_LOGIN_URL] and not log["broker"]
+    assert log["events"] == [("switch-engines", "sso-background")]
+    assert (
+        "✅ Logged into SWITCHengines AdminUI (live edu-ID" in capsys.readouterr().out
+    )
+
+
+def test_engines_chains_the_broker_eduid_session(switch_env):
+    log, _state = switch_env
+    assert browser.cmd_switch_engines_login(9222) == 0
+    assert log["broker"] == ["eduid"]
+    assert log["bg"] == [ENGINES_LOGIN_URL, ENGINES_LOGIN_URL]
+    assert log["events"] == [("switch-engines", "broker-sso")]
+
+
+def test_engines_both_fail_hits_the_guided_gate_for_its_own_site(switch_env):
+    log, state = switch_env
+    state["clicks"] = ["eduid-login", "login"]
+    state["site"] = "switch-engines"
+    assert browser.cmd_switch_engines_login(9222) == browser.NEEDS_ALBERT_RC
+    assert log["headed"] == 1 and not log["events"]
 
 
 class _FakeBrowser:
