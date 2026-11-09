@@ -244,6 +244,10 @@ class Step:  # pylint: disable=too-many-instance-attributes
     # tp#1644 B12: the fields this step fills, as (safari.py option, CSS
     # selector) pairs (`FIELD_OPTS`; none = safari.py's default fields).
     fields: tuple[tuple[str, str], ...] = ()
+    # tp#1644: a post-login prompt click's words for its prompt — a click
+    # that ran says one ▶ line naming it ('' = silent; a prompt that did not
+    # show says nothing).
+    prompt: str = ""
 
 
 @dataclass(frozen=True)
@@ -574,6 +578,11 @@ class BrokerLabels:  # pylint: disable=too-many-instance-attributes
 
 
 BROKER_SHAPES = frozenset({"one_page", "two_step"})
+# tp#1644: the post-click selectors' prompt titles (the ▶ line after a click;
+# an unlisted selector says "a post-login prompt").
+POST_CLICK_PROMPTS: dict[str, str] = {
+    ".trustbrowser_ui .trustbtn": "Trust this browser?",
+}
 # tp#1644 B13, Zoho (accounts.zoho.eu, read 2026-11-09 from the logged-out
 # sign-in page's markup and its signinnew.js; Albert's Safari and the shared
 # Chromium both held a live session, so no rendered identifier page): the
@@ -709,6 +718,13 @@ def _fields(*pairs: tuple[str, str]) -> tuple[tuple[str, str], ...]:
     return tuple((opt, sel) for opt, sel in pairs if sel)
 
 
+def _prompt_words(when: str) -> str:
+    """The ▶ line's words for a post-click on `when`: its quoted prompt
+    title (`POST_CLICK_PROMPTS`), else "a post-login prompt"."""
+    title = POST_CLICK_PROMPTS.get(when)
+    return f'"{title}"' if title else "a post-login prompt"
+
+
 def _broker_steps(labels: BrokerLabels, idp: str, pre_click: str) -> tuple[Step, ...]:
     """The login steps of `labels` on `idp`: the pre-click (a click step on
     its label, only where the listing's element shows and no password
@@ -777,6 +793,7 @@ def _broker_steps(labels: BrokerLabels, idp: str, pre_click: str) -> tuple[Step,
             when=when,
             after=labels.post_after,
             optional=True,
+            prompt=_prompt_words(when),
         )
         for label, when in labels.post_clicks
     ]
@@ -2181,6 +2198,10 @@ class Machine:  # pylint: disable=too-many-instance-attributes
             return None  # refused before anything was copied: not offered here
         if reply.rc != 0:
             return self._fail(reply, step.kind)
+        if step.prompt:
+            self.notify(
+                f"▶ {self.recipe.site}: clicked {step.trigger} on {step.prompt}"
+            )
         return None
 
     def _step_args(self, step: Step) -> list[str] | None:

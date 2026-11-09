@@ -4270,6 +4270,26 @@ def record_safari_fail(
         als.update(SAFARI_FAILS_FILE, put)
 
 
+def clear_safari_fail(site: str) -> None:
+    """tp#1644: a broker-built Safari route's proof passed — drop its
+    `SAFARI_FAILS_FILE` entry (the same locked update `record_safari_fail`
+    writes with); a stale failure would outlive the success. A site without
+    an entry leaves the file untouched; a hand-written route never has one."""
+    if not broker_built_route(site):
+        return
+    sites = als.read(SAFARI_FAILS_FILE).get("sites")
+    if not isinstance(sites, dict) or site not in sites:
+        return
+
+    def drop(data: dict) -> None:
+        held = data.get("sites")
+        if isinstance(held, dict):
+            held.pop(site, None)
+
+    with contextlib.suppress(als.StateError, OSError):
+        als.update(SAFARI_FAILS_FILE, drop)
+
+
 def _safari_detail(base: str, out: alsafari.Outcome) -> str:
     """tp#1644: `base` (a stuck reason or the caller's detail) plus the
     failed safari.py operation and its exit code:
@@ -5012,8 +5032,11 @@ def _safari_target_finish(
     out: alsafari.Outcome | None,
 ) -> int:
     """Steps 8-9: the import (only when `recipe.import_after`), then open
-    `page` (target URL, its words) in Safari."""
+    `page` (target URL, its words) in Safari. Reached only after Safari's
+    proof passed (`-s` and `-O`): a broker-built route's old failure entry
+    goes (tp#1644)."""
     target, what = page
+    clear_safari_fail(site)
     if recipe.import_after:
         _safari_target_import(site, out)
     reply = call(["--open", target, "--wait", str(SAFARI_OPEN_WAIT_S)])

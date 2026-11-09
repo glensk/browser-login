@@ -1426,6 +1426,57 @@ def test_record_safari_fail_writes_its_own_file() -> None:
     assert BSITE not in al.als.checks()
 
 
+def _old_fail(site: str) -> None:
+    """A stale failure entry of `site` in safari-checks.json."""
+
+    def put(data: dict[str, Any]) -> None:
+        data.setdefault("sites", {})[site] = {"state": "failed", "code": "x"}
+
+    al.als.update(al.SAFARI_FAILS_FILE, put)
+
+
+def _fails() -> dict[str, Any]:
+    sites: dict[str, Any] = al.als.read(al.SAFARI_FAILS_FILE).get("sites", {})
+    return sites
+
+
+@pytest.mark.parametrize("prove_only", [False, True], ids=["-s", "-O"])
+def test_a_passed_broker_proof_clears_its_old_failure(
+    broker_run: dict[str, Any], prove_only: bool
+) -> None:
+    # tp#1644 canary follow-up: zoho-desk's 16:44 recipe_stuck outlived the
+    # passing canary — a passed -s / -O proof drops the site's entry only
+    _old_fail(BSITE)
+    _old_fail("other-site")
+    assert _go_broker(broker_run, [B_SENTINEL], prove_only=prove_only) == 0
+    assert set(_fails()) == {"other-site"}
+    assert not broker_run["records"]  # checks.json (the Chromium row) untouched
+
+
+def test_a_failed_broker_proof_keeps_its_failure(broker_run: dict[str, Any]) -> None:
+    _old_fail(BSITE)
+    url = "https://x.cloudflareaccess.com/cdn-cgi/access/login"
+    assert _go_broker(broker_run, [(url, w._page(user=True))]) == 4
+    assert BSITE in _fails()
+
+
+def test_clearing_leaves_hand_written_routes_and_absent_entries_alone(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    hand = next(iter(alsafari.RECIPES))
+    assert not al.broker_built_route(hand)
+    _old_fail(hand)
+    al.clear_safari_fail(hand)
+    assert hand in _fails()
+    # a broker route without an entry: the file is not rewritten
+    monkeypatch.setitem(alsafari.BROKER_SAFARI_LABELS, BSITE, TWO_LABELS)
+    assert al.broker_built_route(BSITE)
+    writes: list[str] = []
+    monkeypatch.setattr(al.als, "update", lambda name, _fn: writes.append(name))
+    al.clear_safari_fail(BSITE)
+    assert not writes
+
+
 def test_a_listing_identity_row_is_no_route_until_the_read_is_isolated(
     broker_run: dict[str, Any], monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -2051,6 +2102,7 @@ ZOHO_USER = (ZOHO_ID, w._page(user=True, password=True, steps=_USER_PAGE, stops=
 ZOHO_LOADER = (ZOHO_ID, w._page(password=True, steps=_NO_STEP, stops=NO_HIT))
 ZOHO_TRUST = (ZOHO_ID, w._page(steps=_TRUST_PAGE, stops=NO_HIT))
 ZOHO_LANDED = ("https://desk.zoho.eu/agent", w._page(sentinel=True, stops=NO_HIT))
+TRUST_LINE = '▶ zoho-desk: clicked Trust on "Trust this browser?"'
 
 
 def _zoho_plan() -> alsafari.Plan:
@@ -2070,7 +2122,8 @@ def test_b13_zoho_passkey_first_waits_for_albert_then_trusts_and_lands(
     calls = [c for c in fake.calls if c[0] in FILLS]
     assert [c[0] for c in calls] == ["--login", "--click"]  # never the password
     assert "--user-only" in calls[0] and calls[1][:2] == ["--click", "Trust"]
-    assert len(lines) == 1 and "90 s" in lines[0] and "Touch ID" in lines[0]
+    assert len(lines) == 2 and "90 s" in lines[0] and "Touch ID" in lines[0]
+    assert lines[1] == TRUST_LINE
     assert m.clock() < 90 and fake.calls[-1][0] == "--close"
 
 
@@ -2119,7 +2172,8 @@ def test_b13_zoho_push_waits_for_the_approval_then_trusts(
     assert out.ok, out.code
     calls = [c for c in fake.calls if c[0] in FILLS]
     assert [c[0] for c in calls] == ["--login", "--login", "--click"]
-    assert len(lines) == 1 and "push approval" in lines[0]
+    assert len(lines) == 2 and "push approval" in lines[0]
+    assert lines[1] == TRUST_LINE
     # never approved: the push stop's code, a credential run (password sent)
     fake = w.FakeSafari(recipe, [ZOHO_USER, pw, push])
     out = _timed(fake, _zoho_plan()).run()
@@ -2162,6 +2216,51 @@ def test_b13_only_zoho_desk_answers_a_trust_prompt_with_trust() -> None:
         if label.strip().lower() in {"trust", "trust browser", "trust this browser"}
     }
     assert trusting == {"zoho-desk"}
+
+
+# tp#1644 canary follow-up: the Trust click says one ▶ line (TRUST_LINE), a
+# run whose prompt never showed (or whose click safari.py refused) says nothing.
+
+
+def test_the_trust_click_says_one_line_only_when_it_clicked(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    recipe = _zoho_recipe(monkeypatch)
+    pw = (ZOHO_ID, w._page(password=True, steps=_PASS_PAGE, stops=NO_HIT))
+    lines: list[str] = []
+    fake = w.FakeSafari(recipe, [ZOHO_USER, pw, ZOHO_TRUST, ZOHO_LANDED])
+    out = _timed(fake, _zoho_plan(), notify=lines.append).run()
+    assert out.ok, out.code
+    assert lines == [TRUST_LINE]
+    # no "Trust this browser?" prompt: no click, no line
+    lines.clear()
+    fake = w.FakeSafari(recipe, [ZOHO_USER, pw, ZOHO_LANDED])
+    out = _timed(fake, _zoho_plan(), notify=lines.append).run()
+    assert out.ok, out.code
+    assert not [c for c in fake.calls if c[0] == "--click"] and not lines
+
+
+def test_a_refused_trust_click_says_nothing(monkeypatch: pytest.MonkeyPatch) -> None:
+    recipe = _zoho_recipe(monkeypatch)
+    pw = (ZOHO_ID, w._page(password=True, steps=_PASS_PAGE, stops=NO_HIT))
+    refused = alsafari.Reply(2, {"ok": False, "error": "no such button"}, "")
+    fake = w.FakeSafari(
+        recipe, [ZOHO_USER, pw, ZOHO_TRUST, ZOHO_LANDED], fail={"--click": refused}
+    )
+    lines: list[str] = []
+    _timed(fake, _zoho_plan(), notify=lines.append).run()  # the page stays put
+    assert [c[0] for c in fake.calls if c[0] == "--click"] == ["--click"]
+    assert not [line for line in lines if line.startswith("▶")]
+
+
+def test_only_post_clicks_carry_a_prompt_line(monkeypatch: pytest.MonkeyPatch) -> None:
+    recipe = _zoho_recipe(monkeypatch)
+    assert [s.prompt for s in recipe.steps] == ["", "", '"Trust this browser?"']
+    labels = alsafari.BrokerLabels(
+        "one_page", "Log in", post_clicks=(("Not now", "#other"),)
+    )
+    other = alsafari.broker_recipe(BROW, labels)
+    assert other is not None and other.steps[-1].prompt == "a post-login prompt"
 
 
 # ---------------------------------------------------------------------------
