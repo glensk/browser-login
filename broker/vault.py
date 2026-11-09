@@ -61,6 +61,15 @@ Secrets for agents (``secret-run``) come from a SECOND collection,
 ``VaultCache`` for ``SECRET_TTL_S``. A cache entry from an older generation
 (bumped by every ``bw sync`` and by ``invalidate``) is never served. Python
 cannot zero ``str``/JSON copies: dropping a cache entry does not erase memory.
+
+tp#1963: with a ``RevisionProbe`` (the daemon's), ``items()`` and
+``secret_items()`` first ask Vaultwarden for the account revision date; while
+it equals the one read before the last full read (same generation, at most
+``REVISION_MAX_AGE_S`` old), the value-free listing of that read is served
+without ``bw``. A full ``items()`` read lists BOTH collections in one
+unlock + sync and fills the secret listing (never its values) too, so the
+``secrets`` op right after it reads nothing. ``secret``, ``fill_secret`` and
+the values always read in full; an unreadable revision reads in full.
 """
 
 from __future__ import annotations
@@ -97,6 +106,7 @@ from broker.storage_rules import parse_storage_keys
 from broker.vault_cache import (
     VaultCache,
 )
+from broker.vault_revision import RevisionProbe
 
 SITE_ID_RE = re.compile(r"^[a-z0-9][a-z0-9._-]{0,63}$")
 # Sites the broker NEVER submits a password for, whatever the item says: their
@@ -1233,15 +1243,46 @@ class _SecretSource:
     def _load_secrets(self, key: tuple[str, ...]) -> tuple[list[Any], list[Any] | None]:
         raise SecretsNotConfigured(NO_SECRETS_COLLECTION)
 
-    def _fill(self, key: tuple[str, ...], want: tuple[str, ...]) -> Any:
+    def _revision(self) -> str | None:
+        """tp#1963: the account revision now; None = unknown (read in full)."""
+        return None
+
+    def _memo_sites(self, login_raw: list[Any], gen: int, revision: str | None) -> None:
+        """tp#1963: a secret read that listed the login collection (gate
+        agent_script) also memoizes the site items it implies (no-op here)."""
+
+    def _put_listing(
+        self,
+        key: tuple[str, ...],
+        items: list[SecretItem],
+        gen: int,
+        revision: str | None,
+    ) -> tuple[SecretItem, ...]:
+        """Cache the secret listing of one read (and memo it at `revision`)."""
+        listing = tuple(items)
+        size = sum(len(json.dumps(it.public())) for it in items)
+        self.cache.put(("items", *key), listing, size=size, generation=gen)
+        if revision:
+            self.cache.memo_put(("items", *key), revision, listing, generation=gen)
+        return listing
+
+    def _fill(
+        self,
+        key: tuple[str, ...],
+        want: tuple[str, ...],
+        revision: str | None = None,
+    ) -> Any:
         """Under BW_LOCK: the cache again (a concurrent miss may have filled it),
-        else ONE read that fills every entry of the collection."""
+        else ONE read that fills every entry of the collection. `revision`:
+        the account revision read BEFORE this read (tags the listing)."""
         with BW_LOCK:
             hit = self.cache.get(want)
             if hit is not None:
                 return hit
             raw, login_raw = self._load_secrets(key)
             gen = self.cache.generation
+            if login_raw is not None:
+                self._memo_sites(login_raw, gen, revision)
             items, values = build_secret_items(
                 raw,
                 membership=self._membership(),
@@ -1264,9 +1305,7 @@ class _SecretSource:
                 self.cache.put(("service", *key, sid), got, size=size, generation=gen)
             if want[0] == "service":
                 return bound.get(want[-1], "unknown")
-            listing = tuple(items)
-            size = sum(len(json.dumps(it.public())) for it in items)
-            self.cache.put(("items", *key), listing, size=size, generation=gen)
+            listing = self._put_listing(key, items, gen, revision)
             if want[0] == "items":
                 return listing
             return values.get(want[-1])
@@ -1277,7 +1316,11 @@ class _SecretSource:
         want = ("items", *key)
         hit = self.cache.get(want)
         if hit is None:
-            hit = self._fill(key, want)
+            revision = self._revision()  # pylint: disable=assignment-from-none
+            if revision:
+                hit = self.cache.memo_get(want, revision)
+            if hit is None:
+                hit = self._fill(key, want, revision)
         return list(hit)
 
     def secret_values(self, secret_id: str) -> SecretValues:
@@ -1286,7 +1329,7 @@ class _SecretSource:
         want = ("values", *key, secret_id)
         hit = self.cache.get(want)
         if hit is None:
-            hit = self._fill(key, want)
+            hit = self._fill(key, want, self._revision())
         if hit is None:
             raise VaultError(f"unknown or refused secret {secret_id!r}")
         assert isinstance(hit, SecretValues)
@@ -1302,7 +1345,7 @@ class _SecretSource:
         want = ("service", *key, secret_id)
         hit = self.cache.get(want)
         if hit is None:
-            hit = self._fill(key, want)
+            hit = self._fill(key, want, self._revision())
         assert isinstance(hit, (SecretValues, str))
         return hit
 
@@ -2428,11 +2471,14 @@ class BwVault(_SecretSource):
         *,
         bw_bin: str = "bw",
         cache: VaultCache | None = None,
+        revision: RevisionProbe | None = None,
     ) -> None:
         self.boot = bootstrap
         self.appdata_dir = str(appdata_dir)
         self.bw_bin = bw_bin
         self.cache = cache if cache is not None else VaultCache()
+        # tp#1963: None = every listing reads in full (the CLI paths)
+        self.revision_probe = revision
 
     def _env(self, **extra: str) -> dict[str, str]:
         env = {
@@ -2511,12 +2557,47 @@ class BwVault(_SecretSource):
     def _raw(self, org_id: str | None, coll_id: str) -> list[Any]:
         """unlock + sync + list + lock under BW_LOCK; with `org_id` only that
         organisation's items that list `coll_id` are kept."""
+        return self._raw_many([(org_id, coll_id)])[0]
+
+    def _raw_many(self, reads: list[tuple[str | None, str]]) -> list[list[Any]]:
+        """`_raw` of several ``(org_id, coll_id)`` in ONE unlock + sync + lock
+        (one ``list`` each)."""
         with BW_LOCK, self._session() as session:
             env = self._env(BW_SESSION=session)
             self._run(["sync"], env)
             self.cache.bump()  # the vault may have changed: no older value served
-            out = self._run(["list", "items", "--collectionid", coll_id], env)
-        return filter_org(self._json_list(out, "items"), org_id, coll_id)
+            outs = [
+                self._run(["list", "items", "--collectionid", coll_id], env)
+                for _org, coll_id in reads
+            ]
+        return [
+            filter_org(self._json_list(out, "items"), org_id, coll_id)
+            for (org_id, coll_id), out in zip(reads, outs)
+        ]
+
+    def _revision(self) -> str | None:
+        if self.revision_probe is None:
+            return None
+        return self.revision_probe.revision(
+            self.boot.server_url, self.boot.client_id, self.boot.client_secret
+        )
+
+    def _sites_key(self) -> tuple[str, ...]:
+        """Everything `items()` depends on besides the vault itself."""
+        return (
+            "sites",
+            self._site_gate(),
+            self.boot.organization_id or "",
+            self.boot.collection_id,
+            self.boot.secrets_collection_id or "",
+        )
+
+    def _listing_key(self) -> tuple[str, ...] | None:
+        """`_secrets_key`, or None when the secret reads refuse."""
+        try:
+            return self._secrets_key()
+        except VaultError:
+            return None
 
     def _membership(self) -> Membership:
         return (self.boot.collection_id, self.boot.secrets_collection_id)
@@ -2530,12 +2611,40 @@ class BwVault(_SecretSource):
         return gate if gate in SECRET_GATES else GATE_COLLECTIONS
 
     def items(self) -> list[SiteItem]:
-        """Every item of the ``agent-logins`` collection."""
-        return build_items(
-            self._raw(self.boot.organization_id, self.boot.collection_id),
-            membership=self._membership(),
-            gate=self._site_gate(),
-        )
+        """Every item of the ``agent-logins`` collection: the memo while the
+        account revision is unchanged, else ONE read of both collections that
+        also refreshes the secret listing (tp#1963)."""
+        key = self._sites_key()
+        revision = self._revision()
+        if revision:
+            hit = self.cache.memo_get(key, revision)
+            if hit is not None:
+                return list(hit)
+        with BW_LOCK:
+            skey = self._listing_key()
+            reads: list[tuple[str | None, str]] = [
+                (self.boot.organization_id, self.boot.collection_id)
+            ]
+            if skey is not None and self.boot.secrets_collection_id:
+                reads.append(
+                    (self.boot.secrets_organization_id, self.boot.secrets_collection_id)
+                )
+            raws = self._raw_many(reads)
+            gen = self.cache.generation
+            items = build_items(
+                raws[0], membership=self._membership(), gate=self._site_gate()
+            )
+            if revision:
+                self.cache.memo_put(key, revision, tuple(items), generation=gen)
+            if skey is not None:
+                listing, _values = build_secret_items(
+                    raws[1] if len(raws) > 1 else [],
+                    membership=self._membership(),
+                    gate=skey[0],
+                    login_raw=raws[0] if skey[0] == GATE_AGENT_SCRIPT else None,
+                )
+                self._put_listing(skey, listing, gen, revision)
+        return items
 
     def secret(self, site: str) -> Secret:
         """Username, password and TOTP seed of `site` for a LOGIN (fresh unlock,
@@ -2606,15 +2715,28 @@ class BwVault(_SecretSource):
         )
 
     def _load_secrets(self, key: tuple[str, ...]) -> tuple[list[Any], list[Any] | None]:
-        raw: list[Any] = []
+        """Both collections a secret read needs, in ONE session (tp#1963)."""
+        reads: list[tuple[str | None, str]] = []
         if self.boot.secrets_collection_id:
-            raw = self._raw(
-                self.boot.secrets_organization_id, self.boot.secrets_collection_id
+            reads.append(
+                (self.boot.secrets_organization_id, self.boot.secrets_collection_id)
             )
-        login_raw = None
         if key[0] == GATE_AGENT_SCRIPT:
-            login_raw = self._raw(self.boot.organization_id, self.boot.collection_id)
+            reads.append((self.boot.organization_id, self.boot.collection_id))
+        if not reads:
+            return [], None
+        raws = self._raw_many(reads)
+        raw = raws[0] if self.boot.secrets_collection_id else []
+        login_raw = raws[-1] if key[0] == GATE_AGENT_SCRIPT else None
         return raw, login_raw
+
+    def _memo_sites(self, login_raw: list[Any], gen: int, revision: str | None) -> None:
+        if not revision:
+            return
+        items = build_items(
+            login_raw, membership=self._membership(), gate=self._site_gate()
+        )
+        self.cache.memo_put(self._sites_key(), revision, tuple(items), generation=gen)
 
     def collections(self) -> list[tuple[str, str, str, str]]:
         """``(org_id, org_name, collection_id, collection_name)`` of every

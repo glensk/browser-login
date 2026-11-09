@@ -274,6 +274,7 @@ from broker.vault import (  # noqa: E402
     selector_ok,
     slugify,
 )
+from broker.vault_revision import RevisionProbe  # noqa: E402
 
 # pylint: enable=wrong-import-position
 
@@ -1659,15 +1660,17 @@ class _Flight:
 class _LazyBwVault:
     """BwVault whose bootstrap is read per call — the daemon starts before
     enrolment, and ``install.sh -C``/``-X`` rewrite it at run time. The value
-    cache outlives the per-call BwVault (it is keyed by the collection IDs)."""
+    cache and the revision probe's token outlive the per-call BwVault (the
+    cache is keyed by the collection IDs, the token by server and client id)."""
 
     def __init__(self, home: Path) -> None:
         self.home = home
         self.cache = VaultCache()
+        self.revision = RevisionProbe()
 
     def _vault(self) -> BwVault:
         boot = BwBootstrap.load(self.home / "bootstrap.json")
-        return BwVault(boot, self.home / "bw", cache=self.cache)
+        return BwVault(boot, self.home / "bw", cache=self.cache, revision=self.revision)
 
     def secret_items(self) -> list[SecretItem]:
         """See ``BwVault.secret_items``."""
@@ -1852,7 +1855,9 @@ _CHALLENGE_BLOCKS = frozenset({"locked", "cooldown", "quarantined", "unreadable"
 
 # The site list (ids, origins, check URLs — no secrets) is kept this long: each
 # Bitwarden read is an unlock + sync + list + lock of ~30-40 s. Secrets are
-# always read fresh.
+# always read fresh. A `fresh` read (and one after the TTL) is answered from the
+# vault's revision memo while Vaultwarden's account revision is unchanged
+# (tp#1963, ``BwVault.items``).
 SITES_TTL_S = 600.0
 
 
