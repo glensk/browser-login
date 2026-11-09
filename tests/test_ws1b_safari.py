@@ -402,6 +402,42 @@ def test_features_and_missing_features(monkeypatch: pytest.MonkeyPatch) -> None:
     assert s.missing_features("no-such-site") == {"recipe"}
 
 
+def test_available_features_are_kept_on_disk_per_safari_py_file(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """tp#1963: one --capabilities call per safari.py file, across processes;
+    a changed file asks again; a failed answer is never kept."""
+    calls = tmp_path / "calls"
+    fake = tmp_path / "safari.py"
+
+    def write(features: str, rc: int = 0) -> None:
+        fake.write_text(
+            f"#!/bin/sh\necho x >> {calls}\n"
+            f'echo \'{{"v": 1, "features": [{features}]}}\'\nexit {rc}\n'
+        )
+        fake.chmod(0o700)
+
+    def ask() -> frozenset[str]:
+        s._FEATURE_CACHE.clear()  # pylint: disable=protected-access
+        return s.available_features()
+
+    def n_calls() -> int:
+        return len(calls.read_text().splitlines()) if calls.exists() else 0
+
+    monkeypatch.delenv(s.FEATURES_ENV, raising=False)
+    monkeypatch.setattr(s, "safari_py_bin", lambda: str(fake))
+    write('"open"', rc=1)
+    assert ask() == frozenset() and ask() == frozenset()
+    assert n_calls() == 2  # a failure is not kept
+    write('"open", "handle"')
+    assert ask() == {"open", "handle"}
+    assert ask() == {"open", "handle"}
+    assert n_calls() == 3  # the second process read the disk
+    write('"open", "handle", "otp"')
+    assert ask() == {"open", "handle", "otp"}
+    assert n_calls() == 4  # a changed safari.py asks again
+
+
 def test_override_file_must_be_private_and_known(tmp_path: Path) -> None:
     path = tmp_path / "o.json"
     assert not s.load_overrides(path)

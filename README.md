@@ -1734,7 +1734,7 @@ the `himalaya` helpers. The CDP endpoint is always `http://127.0.0.1:<port>` (ne
   | `browser.py` `_keychain_write` (`security -i` add)     | `add-generic-password`              | no — `store-creds` only                               |
   | `browser.py` `_kc_delete`                              | `delete-generic-password`           | no — `store-creds` / `forget-creds` only              |
   | `browser.py` `_kc_target_keychain`                     | `default-keychain -d user`          | no — `store-creds` only (never prompts)               |
-  | `agent_login_keychain.py` `scan`                       | `dump-keychain -a` (no secrets)     | yes — `agent-login.py -S` every 10 min (locked keychain) |
+  | `agent_login_keychain.py` `scan`                       | `dump-keychain -a` (no secrets)     | yes — `agent-login.py -S` when items came or went (else daily; locked keychain) |
 
   Chrome for Testing itself reads its "Safe Storage" key from the login keychain
   at launch; after a CfT upgrade (new binary) macOS can ask once whether the new

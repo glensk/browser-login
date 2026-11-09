@@ -39,6 +39,7 @@ import ipaddress
 import json
 import re
 import urllib.parse
+from collections import Counter
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from functools import lru_cache
@@ -611,11 +612,16 @@ def _group_findings(
 
 
 def item_findings(
-    view: Mapping[str, Any], views: Sequence[Mapping[str, Any]], *, dev: bool = False
+    view: Mapping[str, Any],
+    views: Sequence[Mapping[str, Any]],
+    *,
+    dev: bool = False,
+    conflicts: Mapping[str, tuple[str, ...]] | None = None,
 ) -> list[Finding]:
     """Every finding of ONE item (a ``sites`` view) inside the collection
     `views` (which may or may not contain it); `dev`: a dev broker's
-    ``http://127.0.0.1`` origins are fine."""
+    ``http://127.0.0.1`` origins are fine. `conflicts`: the collection's
+    `scope_conflicts`, computed once by `collection_findings` (tp#1963)."""
     site = safe_id(view.get("site"))
     out: list[Finding] = []
     if view.get("refused"):
@@ -634,9 +640,9 @@ def item_findings(
         # rule applies (the broker refuses only its own fields)
         return out
     others = [v for v in views if v.get("site") != view.get("site")]
-    siblings = _identity.scope_conflicts([dict(view), *others]).get(
-        str(view.get("site")), ()
-    )
+    if conflicts is None:
+        conflicts = _identity.scope_conflicts([dict(view), *others])
+    siblings = conflicts.get(str(view.get("site")), ())
     if not view.get("refused"):
         out += _proof_findings(site, view)
         out += _account_findings(site, view, siblings)
@@ -649,12 +655,23 @@ def item_findings(
 def collection_findings(
     views: Sequence[Mapping[str, Any]], *, dev: bool = False
 ) -> dict[str, list[Finding]]:
-    """``{site: findings}`` for every listed item (`-V`)."""
+    """``{site: findings}`` for every listed item (`-V`).
+
+    `scope_conflicts` is pairwise and order-free: for an item whose string
+    site id occurs once, one call over `views` gives the siblings its own
+    ``[view, *others]`` call would (O(n²) once, not per item — tp#1963).
+    An id listed twice (or not a string) keeps its per-item call."""
+    count = Counter(str(v.get("site")) for v in views)
+    shared = _identity.scope_conflicts(views)
     out: dict[str, list[Finding]] = {}
     for view in views:
         site = str(view.get("site") or "")
         if site:
-            out[safe_id(site)] = item_findings(view, views, dev=dev)
+            own = view.get("site")
+            single = isinstance(own, str) and count[own] == 1
+            out[safe_id(site)] = item_findings(
+                view, views, dev=dev, conflicts=shared if single else None
+            )
     return out
 
 

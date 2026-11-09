@@ -25,6 +25,9 @@ _SYSTEM = re.compile(
     re.IGNORECASE,
 )
 KEYCHAIN_MAX_AGE_S = 60 * 60  # the scan takes ~15 s: at most hourly
+# Past the hour a scan whose items all still exist (and no new one) is kept —
+# only access lists could have changed — up to this age (tp#1963).
+KEYCHAIN_MAX_STALE_S = 24 * 60 * 60
 
 
 # Some items carry the SECRET in their service attribute (stored the wrong way
@@ -166,9 +169,10 @@ def cached(path: Path) -> tuple[float, list[dict]]:
 
 
 def refresh(path: Path, *, force: bool = False) -> tuple[float, list[dict]]:
-    """Rescan (~15 s) when forced or the last scan is over an hour old."""
+    """Rescan (~15 s) when forced, or the last scan is over an hour old AND
+    the item set changed since (`live_names`, ~30 ms) or it is over a day old."""
     at, items = cached(path)
-    if not force and items and time.time() - at < KEYCHAIN_MAX_AGE_S:
+    if not force and items and _scan_current(at, items):
         return at, items
     items = scan()
     if not items:
@@ -226,6 +230,21 @@ def still_present(
     return kept, new
 
 
+def _scan_current(at: float, items: list[dict[str, object]]) -> bool:
+    """The cached scan needs no rescan: under an hour old, or under a day
+    old with every cached item still there and no new one (tp#1963)."""
+    age = time.time() - at
+    if age < KEYCHAIN_MAX_AGE_S:
+        return True
+    if age >= KEYCHAIN_MAX_STALE_S:
+        return False
+    live = live_names()
+    if live is None:
+        return False
+    kept, new = still_present(items, live)
+    return len(kept) == len(items) and new == 0
+
+
 def print_list(
     path: Path,
     _c: Callable[[str, str], str],
@@ -236,7 +255,8 @@ def print_list(
     """The login-keychain list: names only, and whether agents can read it;
     `fit` cuts each line to the terminal width (tp#1924).
 
-    The readability scan is cached (~15 s, at most hourly), but which items
+    The readability scan is cached (~15 s; redone when the item set changed,
+    at most hourly, or after a day — `refresh`), but which items
     EXIST is re-read on every call (`live_names`, ~30 ms): an item deleted
     since the scan is never listed as present (tp#1059), and items added
     since are counted so the reader knows a rescan (-K) is due.

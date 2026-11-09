@@ -220,6 +220,28 @@ def test_the_ws5_rule_names_siblings_and_fields() -> None:
     assert "agent_identity" in hit[0].text and "agent_same_account_as" in hit[0].text
 
 
+def test_collection_findings_match_the_per_item_review() -> None:
+    """tp#1963: one `scope_conflicts` over the collection gives every item
+    the findings its own per-item review gives (duplicates keep per-item)."""
+    views = _views(
+        _raw("gl-a", "gl.example", privilege="user"),
+        _raw("gl-b", "gl.example", instance="admin", privilege="admin"),
+        _raw("shop-a", "shop.example", same_account_as="shop-b"),
+        _raw("shop-b", "shop.example", same_account_as="shop-a", instance="alt"),
+        _raw("app1", "app1.dom.example"),
+        _raw("app2", "app2.dom.example"),
+        _raw("lone", "lone.example"),
+    )
+    per_item = {v["site"]: onboarding.item_findings(v, views) for v in views}
+    assert onboarding.collection_findings(views) == per_item
+    assert any(f.code == "account_unproven" for f in per_item["gl-b"])
+    dup = [*views, dict(views[0], fill_origins=["https://lone.example"])]
+    want = {
+        v["site"]: onboarding.item_findings(v, dup) for v in dup
+    }  # the last duplicate wins, as before
+    assert onboarding.collection_findings(dup) == want
+
+
 def test_same_account_pairs_get_an_attempt_group_hint_only() -> None:
     views = _views(
         _raw("shop-a", "shop.example", same_account_as="shop-b"),

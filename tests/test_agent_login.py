@@ -401,6 +401,50 @@ def test_keychain_list_drops_items_deleted_since_the_scan(
     assert "DELETED_PASSWORD" in out and "NOT re-checked" in out
 
 
+def test_keychain_refresh_skips_the_scan_while_the_item_set_is_unchanged(
+    monkeypatch, tmp_path
+) -> None:
+    """tp#1963: past the hour the ~15 s scan reruns only when an item came or
+    went (the ~30 ms name read) or the scan is over a day old."""
+    import agent_login_keychain as kc  # pylint: disable=import-outside-toplevel
+
+    item = {"kind": "password", "service": "KEPT", "account": "a", "readable": True}
+    cache = tmp_path / "keychain.json"
+    now = 1_000_000.0
+    scans: list[int] = []
+
+    def scan() -> list[dict]:
+        scans.append(1)
+        return [item]
+
+    def at(age: float) -> None:
+        cache.write_text(json.dumps({"at": now - age, "items": [item]}))
+
+    live = [("password", "KEPT", "a")]
+    monkeypatch.setattr(kc.time, "time", lambda: now)
+    monkeypatch.setattr(kc, "scan", scan)
+    monkeypatch.setattr(kc, "live_names", lambda: live)
+    at(2 * 3600)
+    assert kc.refresh(cache) == (now - 2 * 3600, [item]) and not scans
+    live = [*live, ("internet", "NEW", "a")]
+    assert kc.refresh(cache)[0] == now and len(scans) == 1  # an item came
+    at(2 * 3600)
+    live = []
+    kc.refresh(cache)
+    assert len(scans) == 2  # an item went
+    live = [("password", "KEPT", "a")]
+    at(kc.KEYCHAIN_MAX_STALE_S + 1)
+    kc.refresh(cache)
+    assert len(scans) == 3  # over a day old
+    at(2 * 3600)
+    monkeypatch.setattr(kc, "live_names", lambda: None)
+    kc.refresh(cache)
+    assert len(scans) == 4  # names unknown: rescan
+    at(60)
+    kc.refresh(cache)
+    assert len(scans) == 4  # under the hour: no name read either
+
+
 def test_keychain_names_without_broker_are_strict(monkeypatch) -> None:
     """No secret broker: only ENV_STYLE / colon names survive."""
     import agent_login_keychain as kc  # pylint: disable=import-outside-toplevel

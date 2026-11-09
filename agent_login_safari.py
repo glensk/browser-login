@@ -82,6 +82,7 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit
 
+from agent_login_state import state_dir
 from broker.attended import (
     IDLE_MAX_S,
     Run,
@@ -1108,6 +1109,51 @@ def error_code(reply: Reply) -> str:  # pylint: disable=too-many-return-statemen
 
 
 _FEATURE_CACHE: dict[tuple[str, str], frozenset[str]] = {}
+# safari.py --capabilities costs a Python start (~1-4 s) and its answer is a
+# constant of the file: kept on disk per (path, inode, size, mtime) (tp#1963).
+FEATURE_CACHE_FILE = "safari-features.json"
+
+
+def _binary_key(binary: str) -> str:
+    """Which safari.py file this is: path, inode, size, mtime ("" if gone)."""
+    try:
+        st = Path(binary).stat()
+    except OSError:
+        return ""
+    return f"{binary}|{st.st_ino}|{st.st_size}|{st.st_mtime_ns}"
+
+
+def _disk_features(key: str) -> frozenset[str] | None:
+    """The stored feature set of the safari.py file `key`; None when absent."""
+    try:
+        data = json.loads((state_dir() / FEATURE_CACHE_FILE).read_text("utf-8"))
+    except (OSError, ValueError):
+        return None
+    if not isinstance(data, dict) or data.get("key") != key:
+        return None
+    feats = data.get("features")
+    if not isinstance(feats, list):
+        return None
+    if not feats or not all(isinstance(f, str) for f in feats):
+        return None
+    return frozenset(feats)
+
+
+def _store_features(key: str, feats: frozenset[str]) -> None:
+    """Keep a non-empty feature set on disk (0600, atomic); best effort."""
+    if not feats or not key:
+        return
+    path = state_dir() / FEATURE_CACHE_FILE
+    with contextlib.suppress(OSError):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        fd, tmp = tempfile.mkstemp(dir=path.parent, prefix=".safari-features.")
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                json.dump({"key": key, "features": sorted(feats)}, fh)
+            os.replace(tmp, path)
+        finally:
+            with contextlib.suppress(OSError):
+                os.unlink(tmp)
 
 
 def features(call: Runner) -> frozenset[str]:
@@ -1131,9 +1177,14 @@ def available_features() -> frozenset[str]:
     binary = safari_py_bin()
     if binary is None:
         return frozenset()
-    key = (binary, str(Path(binary).stat().st_mtime) if Path(binary).exists() else "")
+    disk_key = _binary_key(binary)
+    key = (binary, disk_key)
     if key not in _FEATURE_CACHE:
-        _FEATURE_CACHE[key] = features(run_safari_py(binary))
+        feats = _disk_features(disk_key) if disk_key else None
+        if feats is None:
+            feats = features(run_safari_py(binary))
+            _store_features(disk_key, feats)
+        _FEATURE_CACHE[key] = feats
     return _FEATURE_CACHE[key]
 
 
