@@ -2162,3 +2162,74 @@ def test_b13_only_zoho_desk_answers_a_trust_prompt_with_trust() -> None:
         if label.strip().lower() in {"trust", "trust browser", "trust this browser"}
     }
     assert trusting == {"zoho-desk"}
+
+
+# ---------------------------------------------------------------------------
+# tp#1644 canary follow-up: a failed safari.py call names its step + exit code
+# ---------------------------------------------------------------------------
+
+LEAK = "no visible field #login_id (safari.py message)"
+
+
+def test_a_refused_user_step_names_op_user_and_its_exit_code(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    recipe = _zoho_recipe(monkeypatch)
+    fail = {"--login": alsafari.Reply(2, {"ok": False, "error": LEAK}, LEAK)}
+    fake = w.FakeSafari(recipe, [ZOHO_USER], fail=fail)
+    out = _timed(fake, _zoho_plan()).run()
+    assert (out.rc, out.code) == (2, "recipe_stuck") and not out.stuck
+    assert (out.failed_op, out.safari_rc) == ("user", 2)
+    fails: list[tuple] = []
+    monkeypatch.setattr(al, "record_safari_fail", lambda *a: fails.append(a))
+    monkeypatch.setattr(al.als, "quarantine", lambda *_a: None)
+    assert al._safari_fail("zoho-desk", out, "stopped") == 2
+    assert fails[-1][3]["detail"] == "op: user, safari_rc: 2"
+    got = capsys.readouterr()
+    assert got.err.splitlines() == ["   safari.py --user exited 2"]
+    assert LEAK not in got.out + got.err + json.dumps(fails)
+
+
+def test_a_failed_tabs_read_names_op_tabs(monkeypatch: pytest.MonkeyPatch) -> None:
+    recipe = _zoho_recipe(monkeypatch)
+    fail = {"--tabs": alsafari.Reply(1, {"ok": False, "error": LEAK}, LEAK)}
+    out = _timed(w.FakeSafari(recipe, [ZOHO_USER], fail=fail), _zoho_plan()).run()
+    assert (out.rc, out.code) == (2, "recipe_stuck")
+    assert (out.failed_op, out.safari_rc) == ("tabs", 1)
+
+
+def test_a_failed_open_names_op_open(monkeypatch: pytest.MonkeyPatch) -> None:
+    recipe = _zoho_recipe(monkeypatch)
+    fail = {"--open": alsafari.Reply(1, {"ok": False}, LEAK)}
+    out = _timed(w.FakeSafari(recipe, [ZOHO_USER], fail=fail), _zoho_plan()).run()
+    assert (out.code, out.failed_op, out.safari_rc) == ("recipe_stuck", "open", 1)
+
+
+def test_max_polls_is_its_own_stuck_reason(monkeypatch: pytest.MonkeyPatch) -> None:
+    recipe = _zoho_recipe(monkeypatch)
+    monkeypatch.setattr(alsafari, "MAX_POLLS", 1)  # the user step, then the end
+    out = _timed(w.FakeSafari(recipe, [ZOHO_USER, ZOHO_LOADER]), _zoho_plan()).run()
+    assert (out.rc, out.code) == (2, "recipe_stuck")
+    assert (out.stuck, out.stuck_host) == ("max_polls", "accounts.zoho.eu")
+    assert "max_polls" in alsafari.STUCK_REASONS and not out.failed_op
+
+
+def test_a_stuck_reason_and_a_failed_op_share_the_detail() -> None:
+    out = alsafari.Outcome(2, "recipe_stuck", stuck="code_field")
+    assert al._safari_detail("code_field", out) == "code_field"
+    out.failed_op, out.safari_rc = "eval", 1
+    assert al._safari_detail("code_field", out) == "code_field; op: eval, safari_rc: 1"
+    assert al._safari_detail("", out) == "op: eval, safari_rc: 1"
+
+
+def test_a_blocked_safari_lock_says_it_waits(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    with al.safari_login_lock(0) as first:
+        assert first
+        with al.safari_login_lock(0.6) as second:
+            assert not second
+    assert capsys.readouterr().err.splitlines() == [
+        "   waiting for another Safari login run (lock) up to 1 s"
+    ]

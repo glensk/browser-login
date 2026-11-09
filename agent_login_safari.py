@@ -161,7 +161,13 @@ STUCK_REASONS = frozenset(
         "page_unreadable",
         "code_field",
         "after_submit",
+        "max_polls",  # tp#1644: MAX_POLLS page reads, none ended the run
     }
+)
+# tp#1644 Outcome.failed_op: the safari.py operation whose failure ended a run
+# (`click` also covers a mail-code trigger click, `eval` a fill in the page)
+FAILED_OPS = frozenset(
+    {"open", "tabs", "user", "login", "otp", "click", "account", "eval", "close"}
 )
 MAIL_WAIT_S = 180.0
 MAIL_POLL_S = 5.0
@@ -854,6 +860,11 @@ class Outcome:  # pylint: disable=too-many-instance-attributes
     # and the tab host it ended on (a host from the recipe, never a URL)
     stuck: str = ""
     stuck_host: str = ""
+    # tp#1644: the safari.py operation whose failure ended the run
+    # (FAILED_OPS, "" = none) and its exit code (None = none) — never its
+    # message text
+    failed_op: str = ""
+    safari_rc: int | None = None
 
     @property
     def ok(self) -> bool:
@@ -1827,9 +1838,18 @@ class Machine:  # pylint: disable=too-many-instance-attributes
 
     # -- safari.py calls ---------------------------------------------------
 
-    def _fail(self, reply: Reply) -> Outcome:
+    def _fail(self, reply: Reply, op: str) -> Outcome:
+        """End with the fixed code of a failed safari.py call, naming the
+        operation (FAILED_OPS) and its exit code."""
+        self._failed(reply, op)
         code = error_code(reply)
         return self._end(stop_rc(code), code)
+
+    def _failed(self, reply: Reply, op: str) -> None:
+        """tp#1644: remember which safari.py operation failed (a fixed word)
+        and its exit code — never its message."""
+        self.out.failed_op = op if op in FAILED_OPS else ""
+        self.out.safari_rc = reply.rc
 
     def _end(self, rc: int, code: str) -> Outcome:
         self.out.rc, self.out.code = rc, code
@@ -1849,6 +1869,7 @@ class Machine:  # pylint: disable=too-many-instance-attributes
         """(host of the login window's only tab, '' or a stop code)."""
         reply = self.call(["--tabs"])
         if reply.rc != 0:
+            self._failed(reply, "tabs")  # its stop ends the run
             return "", error_code(reply)
         tabs = reply.data.get("tabs")
         if not isinstance(tabs, list):
@@ -1896,7 +1917,7 @@ class Machine:  # pylint: disable=too-many-instance-attributes
         if valid:
             self.handle = str(wid)
         if reply.rc != 0:
-            out = self._fail(reply)
+            out = self._fail(reply, "open")
             if valid:
                 self.call(["--close", "--handle", self.handle])
             return out
@@ -1920,12 +1941,14 @@ class Machine:  # pylint: disable=too-many-instance-attributes
     # one return per stop; the branches are the page states in check order
     def _loop(self) -> Outcome:  # pylint: disable=too-many-return-statements,too-many-branches
         idle = polls = 0
+        last_host = ""
         while polls < MAX_POLLS:
             if not self.wait_until:  # an Albert wait is bounded by its clock
                 polls += 1
             host, stop = self.tab_host()
             if stop:
                 return self._end(stop_rc(stop), stop)
+            last_host = host or last_host
             page = self.read_page(host) if host else None
             if self._post_submit_wait(host, page):
                 if self.clock() >= self.submit_deadline:
@@ -1980,7 +2003,7 @@ class Machine:  # pylint: disable=too-many-instance-attributes
             self.sleep(POLL_S)
         if self.submitted:
             return self._stuck("after_submit", "")
-        return self._end(2, "recipe_stuck")
+        return self._stuck("max_polls", last_host)
 
     def _sentinel_reached(self, host: str) -> Outcome:
         """The sentinel shows on the sentinel host: ok, unless the
@@ -2106,7 +2129,7 @@ class Machine:  # pylint: disable=too-many-instance-attributes
         if reply.rc == 2 and step.optional and not interrupted(reply):
             return None  # refused before anything was copied: not offered here
         if reply.rc != 0:
-            return self._fail(reply)
+            return self._fail(reply, step.kind)
         return None
 
     def _step_args(self, step: Step) -> list[str] | None:
@@ -2140,8 +2163,11 @@ class Machine:  # pylint: disable=too-many-instance-attributes
         """Run `body` in the login tab; True when it answered ``{"ok": true}``."""
         with private_js(body) as path:
             reply = self.call(["--eval", path, *self._on(host)])
+        if reply.rc != 0:
+            self._failed(reply, "eval")  # its caller ends the run
+            return False
         res = json_object(reply.data.get("result"))
-        return reply.rc == 0 and res is not None and res.get("ok") is True
+        return res is not None and res.get("ok") is True
 
     # The mail-code step: one return per stage (e-mail, trigger, mail, code).
     def _mail_code(  # pylint: disable=too-many-return-statements,too-many-branches
@@ -2179,7 +2205,7 @@ class Machine:  # pylint: disable=too-many-instance-attributes
                 ["--click", step.trigger, "--row", step.trigger, *self._on(step.host)]
             )
             if reply.rc != 0:
-                return self._fail(reply)
+                return self._fail(reply, "click")
         code = self._wait_code(reader, step)
         if code is None:
             return self._end(2, "email_code")

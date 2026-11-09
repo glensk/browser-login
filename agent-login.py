@@ -4187,18 +4187,28 @@ SAFARI_FP_SALT = "agent-login safari fp v1"
 def safari_login_lock(wait_s: float = SAFARI_LOCK_WAIT_S) -> Iterator[bool]:
     """One Safari login at a time (they share Albert's Safari and clipboard):
     an exclusive flock on ``<state>/safari-login.lock``; yields False when it
-    was not free within `wait_s`."""
+    was not free within `wait_s`. tp#1644: a blocked lock says so once on
+    stderr (the run waits, it is not hung)."""
     path = als.state_dir() / "safari-login.lock"
     path.parent.mkdir(parents=True, exist_ok=True)
     fd = os.open(str(path), os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
     try:
         deadline = time.monotonic() + wait_s
+        said = False
         while True:
             try:
                 fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
                 got = True
                 break
             except BlockingIOError:
+                if not said and wait_s > 0:
+                    said = True
+                    print(
+                        "   waiting for another Safari login run (lock) up to "
+                        f"{wait_s:.0f} s",
+                        file=sys.stderr,
+                        flush=True,
+                    )
                 if time.monotonic() >= deadline:
                     got = False
                     break
@@ -4249,6 +4259,16 @@ def record_safari_fail(
         als.update(SAFARI_FAILS_FILE, put)
 
 
+def _safari_detail(base: str, out: alsafari.Outcome) -> str:
+    """tp#1644: `base` (a stuck reason or the caller's detail) plus the
+    failed safari.py operation and its exit code:
+    ``"<base>; op: <op>, safari_rc: <rc>"`` — fixed words and a number only."""
+    if not out.failed_op:
+        return base
+    failed = f"op: {out.failed_op}, safari_rc: {out.safari_rc}"
+    return f"{base}; {failed}" if base else failed
+
+
 def _safari_fail(
     site: str,
     out: alsafari.Outcome,
@@ -4266,8 +4286,10 @@ def _safari_fail(
     vocabulary) and the tab host it ended on (tp#1643). A broker-built
     Safari route (tp#1644 B10) keeps the quarantine but records its failure
     apart (`record_safari_fail`): its checks.json row is the Chromium
-    check's."""
-    detail = detail or out.stuck
+    check's. tp#1644: a failed safari.py call adds its operation and exit
+    code to the detail (fixed words) and says them on stderr — never its
+    message."""
+    detail = _safari_detail(detail or out.stuck, out)
     if out.credential and not quarantined:
         try:
             als.quarantine(site, out.phase, out.code)
@@ -4293,6 +4315,12 @@ def _safari_fail(
         where = f" on {out.stuck_host}" if out.stuck_host else ""
         why = f" ({out.stuck}{where})"
     print(f"❌ {site}: {who} — {code_text(out.phase, out.code)}{why}")
+    if out.failed_op:
+        print(
+            f"   safari.py --{out.failed_op} exited {out.safari_rc}",
+            file=sys.stderr,
+            flush=True,
+        )
     if quarantined:
         print(
             f"   quarantined (a credential step ran) — the main session releases "
@@ -4629,16 +4657,19 @@ def _safari_drive(
     *,
     proof_only: bool = False,
     on_sentinel: Callable[[alsafari.Runner, list[str]], str] | None = None,
+    status_checked: bool = False,
 ) -> alsafari.Outcome:
     """One Safari drive of `site`: the mail-code drive for a recipe with a
     `mail_code` step, else the plain one (tp#1644: `proof_only` /
-    `on_sentinel` for the Machine, passed only when set: the call of a
-    plain run stays today's)."""
+    `on_sentinel` for the Machine, `status_checked` for `_drive_safari`,
+    passed only when set: the call of a plain run stays today's)."""
     extra: dict[str, Any] = {}
     if proof_only:
         extra["proof_only"] = True
     if on_sentinel is not None:
         extra["on_sentinel"] = on_sentinel
+    if status_checked:
+        extra["status_checked"] = True
     if has_mail_code(recipe):
         return _mail_code_safari_drive(site, recipe, **extra)
     return _drive_safari(site, recipe, **extra)
@@ -4948,7 +4979,7 @@ def _safari_target_locked(  # pylint: disable=too-many-arguments
         return 2
     if state == "logged_out":
         print(f"▶ {site}: Safari is not logged in — logging Safari in")
-        out = _safari_drive(site, recipe)
+        out = _safari_drive(site, recipe, status_checked=True)
         if out.mail_archived == "failed":
             print(
                 f"⚠️ {site}: the login-code mail could not be archived (left in INBOX)"
@@ -5007,7 +5038,9 @@ def _safari_target_in_safari(
         cookies.clear()
     entry = _listing_row(site)
     read = _safari_identity_reader(site, entry) if entry.get("identity") else None
-    out = _safari_drive(site, recipe, proof_only=prove_only, on_sentinel=read)
+    out = _safari_drive(
+        site, recipe, proof_only=prove_only, on_sentinel=read, status_checked=True
+    )
     if out.mail_archived == "failed":
         print(f"⚠️ {site}: the login-code mail could not be archived (left in INBOX)")
     if out.code == "safari_logged_out":
@@ -5461,14 +5494,16 @@ def _drive_safari(  # pylint: disable=too-many-return-statements
     no_trigger: str = "",
     proof_only: bool = False,
     on_sentinel: Callable[[alsafari.Runner, list[str]], str] | None = None,
+    status_checked: bool = False,
 ) -> alsafari.Outcome:
     """Resolve what the recipe needs, check safari.py, run the step machine.
     `env`: extra environment for the MailReader's himalaya (a site's mail
     env); `before_trigger`: the Machine's hook right before a code-mail
     trigger click; `no_trigger`: a code that runs the Machine without any
     code mail (tp#1643); `proof_only` / `on_sentinel`: the Machine's
-    prove-only mode and sentinel read (tp#1644). All default to today's
-    behaviour."""
+    prove-only mode and sentinel read (tp#1644); `status_checked`: the
+    caller's `_safari_py_ready` ran `--status` already (tp#1644: not twice).
+    All default to today's behaviour."""
     binary = alsafari.safari_py_bin()
     if binary is None:
         return alsafari.Outcome(3, "safari_py_missing")
@@ -5477,9 +5512,10 @@ def _drive_safari(  # pylint: disable=too-many-return-statements
     if missing:
         print(f"   safari.py lacks: {', '.join(sorted(missing))} (mydotfiles specs)")
         return alsafari.Outcome(3, "safari_py_outdated")
-    status = call(["--status"])
-    if status.rc != 0 or status.data.get("javascript") is not True:
-        return alsafari.Outcome(3, "safari_unavailable")
+    if not status_checked:
+        status = call(["--status"])
+        if status.rc != 0 or status.data.get("javascript") is not True:
+            return alsafari.Outcome(3, "safari_unavailable")
     try:
         over = alsafari.load_overrides().get(site, {})
     except alsafari.OverrideError as exc:
