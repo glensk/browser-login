@@ -4027,7 +4027,7 @@ MATRIX_META = {
     "console-private": ("console-balance.py (billing, read-only)", "admin"),
     "openai": ("ChatGPT Business admin", "admin"),
     "switch": ("Switch Cloud Portal", "user"),
-    "switch-engines": ("SWITCHengines AdminUI", "user"),
+    "switch-engines": ("SWITCHengines AdminUI (cost-center admin)", "admin"),
 }
 
 
