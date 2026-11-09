@@ -220,6 +220,24 @@ class Step:  # pylint: disable=too-many-instance-attributes
     # A page that does not offer this step's element (safari.py refuses, exit
     # 2, before anything is copied) skips the step instead of stopping the run.
     optional: bool = False
+    # tp#1644: a step kind that must have run first (a TOTP step only after
+    # the password step, never before).
+    after: str = ""
+
+
+@dataclass(frozen=True)
+class SiteStop:
+    """tp#1644: a site's own Albert stop (a push / passkey / SMS page the
+    generic detector does not name): `text` (a JS regex, case-insensitive)
+    on the page text, only after a step of kind `after` ran ('' = any time),
+    on a page of shape `page` (``fieldless`` = no password / user / code
+    field, ``code`` = a code field, ``any``); the run ends with `code`
+    (its `stop_rc`)."""
+
+    code: str
+    text: str
+    after: str = ""
+    page: str = "fieldless"  # fieldless | code | any
 
 
 @dataclass(frozen=True)
@@ -237,6 +255,7 @@ class Recipe:  # pylint: disable=too-many-instance-attributes
     broker: bool = True
     import_after: bool = True  # False: Safari-only use (Ricardo)
     identity: str = ""  # built-in import's account proof (browser.py)
+    stops: tuple[SiteStop, ...] = ()  # tp#1644: the site's own Albert stops
 
     def features(self) -> frozenset[str]:
         """safari.py features this recipe needs."""
@@ -464,6 +483,140 @@ RECIPES: dict[str, Recipe] = {
 MAGIC_LINK_SITES = frozenset(
     {"anthropic", "anthropic-private", "console", "console-private"}
 )
+
+
+# ---------------------------------------------------------------------------
+# broker-backed Safari recipes (tp#1644 B10): listing row + hand-written labels
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class BrokerLabels:  # pylint: disable=too-many-instance-attributes
+    """What a read-only probe of the site's login page in Albert's Safari
+    found (never guessed): the form's shape, the submit labels, the TOTP
+    page's submit ('' = no TOTP page), the IdP host ('' = the first fill
+    origin's host), the label of the listing `pre_click` element, and a
+    sentinel for a listing row without one. The `*_when` / `*_unless`
+    overrides replace the generic field selectors of a step."""
+
+    shape: str  # "one_page" | "two_step"
+    pass_submit: str
+    user_submit: str = ""  # two_step: the e-mail page's button
+    otp_submit: str = ""
+    idp: str = ""
+    pre_click_label: str = ""
+    sentinel: str = ""
+    user_when: str = ""
+    user_unless: str = ""
+    pass_when: str = ""
+    otp_when: str = ""
+
+
+BROKER_SHAPES = frozenset({"one_page", "two_step"})
+# site → its labels from B11 / B13's read-only probe. EMPTY until then: no
+# labels entry → no route (❌), never a guessed label.
+BROKER_SAFARI_LABELS: dict[str, BrokerLabels] = {}
+# site → its own Albert stops (push / passkey / SMS pages, B12). Empty.
+BROKER_SAFARI_STOPS: dict[str, tuple[SiteStop, ...]] = {}
+
+
+def _broker_steps(labels: BrokerLabels, idp: str, pre_click: str) -> tuple[Step, ...]:
+    """The login steps of `labels` on `idp`: the pre-click (a click step on
+    its label, only where the listing's element shows and no password
+    field), the one-page or two-step form, then the TOTP page — only after
+    the password step."""
+    steps: list[Step] = []
+    if pre_click:
+        steps.append(
+            Step(
+                "click",
+                idp,
+                trigger=labels.pre_click_label,
+                when=pre_click,
+                unless=_PASSWORD,
+                optional=True,
+            )
+        )
+    if labels.shape == "one_page":
+        steps.append(
+            Step(
+                "login",
+                idp,
+                submit=labels.pass_submit,
+                when=labels.pass_when or ONE_PAGE_FORM,
+            )
+        )
+    else:
+        steps += [
+            Step(
+                "user",
+                idp,
+                submit=labels.user_submit,
+                when=labels.user_when or _USER_FIELD,
+                unless=labels.user_unless or _PASSWORD,
+            ),
+            Step(
+                "login",
+                idp,
+                submit=labels.pass_submit,
+                when=labels.pass_when or _PASSWORD,
+                no_user=True,
+                after="user",
+            ),
+        ]
+    if labels.otp_submit:
+        steps.append(
+            Step(
+                "otp",
+                idp,
+                submit=labels.otp_submit,
+                when=labels.otp_when or _OTP_FIELD,
+                after="login",
+            )
+        )
+    return tuple(steps)
+
+
+def broker_recipe(
+    row: dict[str, Any], labels: BrokerLabels, stops: tuple[SiteStop, ...] = ()
+) -> Recipe | None:
+    """The Safari recipe of a broker listing `row` with its probe `labels`
+    (None: not a Safari-fillable login, or labels that do not fit it).
+    hosts = the fill origins + the check_url and login_url hosts; the start
+    page and sentinel host = the check_url's (a live session lands on the
+    sentinel at once); Safari-only (no import); the identity = the site
+    when the row names one."""
+    site = str(row.get("site") or "")
+    if not site or row.get("safari_fill") is not True:
+        return None
+    if row.get("refused") or row.get("fill_only") is True:
+        return None
+    check = safe_host(row.get("check_url"))
+    origins = [safe_host(o) for o in row.get("fill_origins") or ()]
+    if not check or "" in origins or labels.shape not in BROKER_SHAPES:
+        return None
+    if not labels.pass_submit or (
+        labels.shape == "two_step" and not labels.user_submit
+    ):
+        return None
+    named = [*origins, check, safe_host(row.get("login_url"))]
+    hosts = tuple(dict.fromkeys(h for h in named if h))
+    idp = labels.idp or (origins[0] if origins else "")
+    pre_click = str(row.get("pre_click") or "")
+    if idp not in hosts or (pre_click and not labels.pre_click_label):
+        return None
+    return Recipe(
+        site=site,
+        hosts=hosts,
+        sentinel_host=check,
+        steps=_broker_steps(labels, idp, pre_click),
+        start_url=str(row.get("check_url")),
+        sentinel=labels.sentinel,
+        broker=True,
+        import_after=False,
+        identity=site if row.get("identity") else "",
+        stops=stops,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -854,8 +1007,12 @@ DETECTOR_JS = r"""// agent-login:detector
     when: s.when ? (s.when === P.one_page ? onePage() : any(s.when)) : true,
     unless: s.unless ? any(s.unless) : false,
   }));
+  const stops = (P.stops || []).map((re) => {
+    try { return new RegExp(re, "i").test(text); }
+    catch (err) { return false; }
+  });
   return JSON.stringify({ captcha, sms, push, hardware_key, email_code,
-    password, user, code, sentinel: any(P.sentinel), steps });
+    password, user, code, sentinel: any(P.sentinel), steps, stops });
 })()
 """
 
@@ -886,16 +1043,24 @@ def detector_js(recipe: Recipe, sentinel: str) -> str:
         "one_page": ONE_PAGE_FORM,
         "otp": _OTP_FIELD,
         "steps": [{"when": s.when, "unless": s.unless} for s in recipe.steps],
+        "stops": [stop.text for stop in recipe.stops],
     }
     return DETECTOR_JS.replace("__PARAMS__", json.dumps(params))
 
 
-def parse_page(raw: object, n_steps: int) -> dict[str, Any] | None:
+def parse_page(raw: object, n_steps: int, n_stops: int = 0) -> dict[str, Any] | None:
     """The detector's answer, validated against its closed schema (None:
-    anything else — counted as an unreadable page, never trusted)."""
+    anything else — counted as an unreadable page, never trusted). A
+    missing ``stops`` list reads as none only for a recipe without site
+    stops (tp#1644)."""
     data = json_object(raw)
     steps = data.get("steps") if data else None
     if data is None or not isinstance(steps, list) or len(steps) != n_steps:
+        return None
+    stops = data.get("stops", [] if n_stops == 0 else None)
+    if not isinstance(stops, list) or len(stops) != n_stops:
+        return None
+    if not all(isinstance(hit, bool) for hit in stops):
         return None
     if not all(isinstance(data.get(key), bool) for key in PAGE_FLAGS):
         return None
@@ -906,6 +1071,7 @@ def parse_page(raw: object, n_steps: int) -> dict[str, Any] | None:
         return None
     out: dict[str, Any] = {key: data[key] for key in PAGE_FLAGS}
     out["steps"] = pairs
+    out["stops"] = list(stops)
     return out
 
 
@@ -1492,7 +1658,9 @@ class Machine:  # pylint: disable=too-many-instance-attributes
             reply = self.call(["--eval", path, *self._on(host)])
         if reply.rc != 0:
             return None
-        return parse_page(reply.data.get("result"), len(self.recipe.steps))
+        return parse_page(
+            reply.data.get("result"), len(self.recipe.steps), len(self.recipe.stops)
+        )
 
     # -- the run -------------------------------------------------------------
 
@@ -1554,6 +1722,9 @@ class Machine:  # pylint: disable=too-many-instance-attributes
             for flag in ALBERT_STOPS:
                 if page[flag]:
                     return self._end(NEEDS_ALBERT_RC, f"needs_albert_{flag}")
+            site_stop = self._site_stop(page)
+            if site_stop:
+                return self._end(stop_rc(site_stop), site_stop)
             index = self._next_step(host, page)
             if index is not None and self.proof_only:
                 return self._end(2, "safari_logged_out")
@@ -1598,9 +1769,23 @@ class Machine:  # pylint: disable=too-many-instance-attributes
             return False
         return bool(page["code"] or page["email_code"])
 
+    def _ran(self, kind: str) -> bool:
+        """A step of `kind` ran already ('' = always true)."""
+        return not kind or any(self.recipe.steps[i].kind == kind for i in self.done)
+
+    def _site_stop(self, page: dict[str, Any]) -> str:
+        """The first of the recipe's own Albert stops this page shows ('' =
+        none): its text matched, its `after` step ran, its page shape."""
+        fieldless = not (page["password"] or page["user"] or page["code"])
+        shape = {"fieldless": fieldless, "code": page["code"], "any": True}
+        for stop, hit in zip(self.recipe.stops, page.get("stops", ())):
+            if hit and self._ran(stop.after) and shape.get(stop.page, False):
+                return stop.code
+        return ""
+
     def _next_step(self, host: str, page: dict[str, Any]) -> int | None:
         for i, step in enumerate(self.recipe.steps):
-            if i in self.done or step.host != host:
+            if i in self.done or step.host != host or not self._ran(step.after):
                 continue
             when, unless = page["steps"][i]
             if when and not unless:
@@ -1679,7 +1864,10 @@ class Machine:  # pylint: disable=too-many-instance-attributes
         if self.baseline is None:
             return self._end(2, "email_code")
         if step.email_field:
-            params = {"field": step.email_field, "email": self.plan.expected_email}
+            params: dict[str, Any] = {
+                "field": step.email_field,
+                "email": self.plan.expected_email,
+            }
             if not self._eval_ok(
                 EMAIL_FILL_JS.replace("__PARAMS__", json.dumps(params)), step.host
             ):

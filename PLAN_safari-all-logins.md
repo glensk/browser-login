@@ -328,7 +328,7 @@ Execution order from here: B8-B9 first, then B6-B7 (overseer decision).
   `logged_out`, never forced. Slack's e-mail code: one attempt per code mail, respect
   the 15-min cooldown, no retry. Exit 4 (Google push / passkey) → Albert approves in
   that window, no retry.
-- [ ] B10 batch BP self-hosted (`*.dom42.space`, welib, the DSM account per B11
+- [x] B10 batch BP self-hosted (`*.dom42.space`, welib, the DSM account per B11
   step 0): `broker_recipe()` + `BROKER_SAFARI_LABELS` entries from a read-only probe
   of each login page in Albert's Safari (labels, one-page vs two-step, TOTP page). The
   probe runs ONLY with Albert present: it is a step of B11, and B10's code lands with

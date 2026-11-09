@@ -1064,7 +1064,45 @@ SAFARI_ROUTES: dict[str, SafariRoute] = {
     # steps (slack: else the e-mail code, `MAIL_CODE_ENV["slack"]`)
     "slack": SafariRoute("https://swiss-data-science.slack.com/", "builtin"),
     "openai": SafariRoute("https://chatgpt.com/", "builtin"),
+    # tp#1644 B10: the self-hosted broker logins, proven in Safari; their
+    # recipe = the listing row + `alsafari.BROKER_SAFARI_LABELS` (empty until
+    # B11's read-only label probe: ❌ until then). The landing = check_url.
+    **{
+        site: SafariRoute(landing, "in_safari")
+        for site, landing in (
+            ("abs-albert", "https://audiobookshelf.dom42.space/audiobookshelf/"),
+            ("aurral", "https://aurral.dom42.space/"),
+            ("calibre", "https://calibre.dom42.space/me"),
+            ("homeassistant", "https://ha.dom42.space/"),
+            ("immich", "https://immich.dom42.space/photos"),
+            ("jellyfin", "https://jellyfin.dom42.space/web/#/home"),
+            ("kavita-admin", "https://kavita.dom42.space/home"),
+            ("komga", "https://komga.dom42.space/dashboard"),
+            ("navidrome-albert", "https://music.dom42.space/app/"),
+            ("npm-nixos", "https://nginx-nix.dom42.space/"),
+            ("npm-raspi", "https://nginx.dom42.space/"),
+            ("portainer-ds218", "https://portainer.dom42.space/#!/home"),
+            ("qbittorrent", "https://qbittorrent.dom42.space"),
+            ("stirling", "https://stirling.dom42.space/"),
+            ("syncthing-nixos", "https://syncthing.dom42.space/"),
+            # the DSM account Safari holds (SAFARI_HELD); never dsm-albert (admin)
+            ("dsm-readonly", "https://synology.dom42.space/"),
+            ("welib", "https://welib.org/account"),
+        )
+    },
 }
+# tp#1644 B10: sites whose accounts share one Safari cookie scope — Safari
+# holds at most ONE of them. `SAFARI_HELD[group]`: the member Safari holds
+# ('' = none: every member ⛔ not_held); a group without an entry is not
+# decided yet (B11 step 0's identity read decides) and adds no reason.
+SAFARI_ACCOUNT_GROUPS: dict[str, tuple[str, ...]] = {
+    "dsm": ("dsm-readonly", "dsm-albert"),
+}
+SAFARI_HELD: dict[str, str] = {}
+# tp#1644 B10: the in-Safari identity read runs broker/identity.py's
+# RECIPE_JS in the page's MAIN world; until it runs isolated (Albert's
+# option A) no broker route with a listing `identity` is built.
+SAFARI_IDENTITY_READ_SAFE = False
 # tp#1644: sites that can NOT have a Safari route (⛔), with a fixed reason
 # code. Admin accounts (listing `privilege` admin) are derived, not listed:
 # `safari_why` → `admin_account` unless the site has a route.
@@ -1096,6 +1134,9 @@ SAFARI_CODE_TEXT: dict[str, str] = {
     "needs_albert_access": (
         "needs Albert: a Cloudflare Access login in Safari (his own, never an agent's)"
     ),
+    "email_code_unwired": (
+        "the site asks for an e-mail code this route does not read (no code mail sent)"
+    ),
 }
 
 
@@ -1117,18 +1158,55 @@ def _listing_row(site: str) -> dict:
 def safari_why(site: str, row: dict | None = None) -> str:
     """The ⛔ reason code of `site` ('' = it has a route, or none is built
     yet): `SAFARI_INFEASIBLE`, else `admin_account` for a row whose
-    `privilege` is admin (`row`, else the listing snapshot)."""
-    if site in SAFARI_ROUTES:
+    `privilege` is admin (`row`, else the listing snapshot); a member of an
+    account group Safari holds another / no account of (tp#1644 B10:
+    `second_account` / `not_held`; the admin rule wins)."""
+    group = _group_why(site)
+    if site in SAFARI_ROUTES and not group:
         return ""
     if site in SAFARI_INFEASIBLE:
         return SAFARI_INFEASIBLE[site]
     privilege = (row if row is not None else _listing_row(site)).get("privilege")
-    return "admin_account" if privilege == "admin" else ""
+    return "admin_account" if privilege == "admin" else group
+
+
+def _group_why(site: str) -> str:
+    """`second_account` / `not_held` for a member of a decided account group
+    that Safari does not hold this member of ('' = held, undecided, or no
+    group)."""
+    for group, members in SAFARI_ACCOUNT_GROUPS.items():
+        if site in members and group in SAFARI_HELD:
+            held = SAFARI_HELD[group]
+            return "" if held == site else ("second_account" if held else "not_held")
+    return ""
+
+
+def safari_recipe(site: str, row: dict | None = None) -> alsafari.Recipe | None:
+    """`site`'s Safari recipe: `alsafari.RECIPES`, else (tp#1644 B10) the
+    broker recipe of its listing row (`row` over the snapshot's) and its
+    `BROKER_SAFARI_LABELS` entry — None without labels, and for a row with
+    an `identity` while the in-Safari identity read is not isolated."""
+    recipe = alsafari.RECIPES.get(site)
+    if recipe is not None:
+        return recipe
+    labels = alsafari.BROKER_SAFARI_LABELS.get(site)
+    if labels is None:
+        return None
+    entry = {**_listing_row(site), **(row or {})}
+    if entry.get("identity") and not SAFARI_IDENTITY_READ_SAFE:
+        return None
+    stops = alsafari.BROKER_SAFARI_STOPS.get(site, ())
+    return alsafari.broker_recipe({**entry, "site": site}, labels, stops)
 
 
 def safari_routed(site: str) -> bool:
-    """`site` has a Safari route: a `SAFARI_ROUTES` entry and its recipe."""
-    return site in SAFARI_ROUTES and site in alsafari.RECIPES
+    """`site` has a Safari route: a `SAFARI_ROUTES` entry and its recipe
+    (and Safari does not hold another account of its group)."""
+    return (
+        site in SAFARI_ROUTES
+        and safari_recipe(site) is not None
+        and not _group_why(site)
+    )
 
 
 def _routed_sites() -> list[str]:
@@ -4118,6 +4196,39 @@ def _mail_detail(out: alsafari.Outcome) -> dict:
     )
 
 
+# tp#1644 B10: the failed Safari runs of broker-built routes (one record per
+# site; fixed fields only), apart from checks.json's Chromium rows.
+SAFARI_FAILS_FILE = "safari-checks.json"
+
+
+def broker_built_route(site: str) -> bool:
+    """`site`'s Safari recipe is built from its broker listing row (not a
+    hand-written `alsafari.RECIPES` one)."""
+    return site not in alsafari.RECIPES and site in alsafari.BROKER_SAFARI_LABELS
+
+
+def record_safari_fail(
+    site: str, ok: bool | None, how: str, result: dict | None = None
+) -> None:
+    """Remember a broker-built Safari route's failed run in
+    `SAFARI_FAILS_FILE` (never checks.json: that row is the site's
+    Chromium check)."""
+    r = result or {}
+    rec = {
+        "state": "unknown" if ok is None else "failed",
+        "how": how,
+        "at": time.strftime("%Y-%m-%d %H:%M"),
+        **{k: str(r.get(k) or "") for k in ("phase", "code", "route", "detail")},
+        "run_id": RUN_ID,
+    }
+
+    def put(data: dict) -> None:
+        data.setdefault("sites", {})[site] = rec
+
+    with contextlib.suppress(als.StateError, OSError):
+        als.update(SAFARI_FAILS_FILE, put)
+
+
 def _safari_fail(
     site: str,
     out: alsafari.Outcome,
@@ -4132,7 +4243,10 @@ def _safari_fail(
     when the quarantine was written (N8). `quarantined` True: the run's own
     `-R` result says it quarantined already — never a second quarantine
     (tp#1633), just the report. A `recipe_stuck` names its reason (fixed
-    vocabulary) and the tab host it ended on (tp#1643)."""
+    vocabulary) and the tab host it ended on (tp#1643). A broker-built
+    Safari route (tp#1644 B10) keeps the quarantine but records its failure
+    apart (`record_safari_fail`): its checks.json row is the Chromium
+    check's."""
     detail = detail or out.stuck
     if out.credential and not quarantined:
         try:
@@ -4140,7 +4254,8 @@ def _safari_fail(
             quarantined = True
         except (als.StateError, OSError):
             quarantined = False
-    record_check(
+    record = record_safari_fail if broker_built_route(site) else record_check
+    record(
         site,
         None if out.rc in (BUSY_RC, 3) else False,
         how,
@@ -4581,7 +4696,7 @@ def safari_target_url(site: str, given: str) -> str | None:
     whitespace anywhere, a host of the site's recipe (exact)."""
     route = SAFARI_ROUTES.get(site)
     raw = given or (route.landing if route else "")
-    recipe = alsafari.RECIPES.get(site)
+    recipe = safari_recipe(site)
     if not raw or recipe is None or "\\" in raw or any(c <= " " for c in raw):
         return None
     try:
@@ -4750,7 +4865,9 @@ def safari_target_action(  # pylint: disable=too-many-return-statements
     if route.proof not in SAFARI_PROOFS:
         print(f"❌ {site}: no_safari_route — unknown proof kind {route.proof!r}")
         return 2
-    recipe = alsafari.RECIPES[site]
+    recipe = safari_recipe(site)
+    if recipe is None:  # the listing changed since safari_routed
+        return _no_route(site)
     target = safari_target_url(site, url)
     if target is None:
         print(
@@ -5724,7 +5841,7 @@ def build_parser() -> argparse.ArgumentParser:
         "have one); 3 = the Mac is locked or idle; 4 = needs Albert (CAPTCHA, "
         "SMS, push / passkey, a Cloudflare Access login). For Albert's 'log "
         "me into SITE' / 'open this page in my Safari'. Sites (the route "
-        "table SAFARI_ROUTES): " + ", ".join(sorted(SAFARI_ROUTES)),
+        "table SAFARI_ROUTES, with a recipe): " + ", ".join(_routed_sites()),
     )
     ap.add_argument(
         "-O",

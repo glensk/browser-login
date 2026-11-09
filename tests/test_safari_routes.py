@@ -1191,3 +1191,313 @@ def test_page_js_can_forge_the_identity_answer(mode: str, tmp_path: Path) -> Non
     assert got["seen"]["nonce"] == nonce  # the page sees the nonce
     assert got["read"]["state"] == "found"
     assert got["read"]["digest"] == identity.challenge_digest(nonce, forged)
+
+
+# ---------------------------------------------------------------------------
+# tp#1644 B10: broker-built Safari routes (listing row + probe labels)
+# ---------------------------------------------------------------------------
+
+BSITE = "selfhost-tp1644"
+BLANDING = "https://app.example.org/home"
+BROW: dict[str, Any] = {
+    "site": BSITE,
+    "name": "Selfhost",
+    "safari_fill": True,
+    "refused": False,
+    "fill_only": False,
+    "fill_origins": ["https://id.example.org"],
+    "check_url": BLANDING,
+    "login_url": "https://app.example.org/login",
+    "logged_in_selector": "#me",
+    "privilege": None,
+    "identity": None,
+}
+TWO_LABELS = alsafari.BrokerLabels(
+    "two_step", pass_submit="Sign in", user_submit="Next", otp_submit="Verify"
+)
+
+
+def test_a_listing_row_and_labels_build_the_recipe() -> None:
+    recipe = alsafari.broker_recipe(BROW, TWO_LABELS)
+    assert recipe is not None
+    assert recipe.hosts == ("id.example.org", "app.example.org")
+    assert recipe.start_url == BLANDING
+    assert recipe.sentinel_host == "app.example.org"
+    assert recipe.broker and not recipe.import_after and not recipe.identity
+    assert recipe.sentinel == ""  # the listing's logged_in_selector (_safari_plan)
+    assert [(s.kind, s.host, s.submit, s.after) for s in recipe.steps] == [
+        ("user", "id.example.org", "Next", ""),
+        ("login", "id.example.org", "Sign in", "user"),
+        ("otp", "id.example.org", "Verify", "login"),
+    ]
+    one = alsafari.broker_recipe(
+        {**BROW, "identity": "gitlab"},
+        alsafari.BrokerLabels("one_page", pass_submit="Log in"),
+    )
+    assert one is not None and one.identity == BSITE
+    assert [(s.kind, s.when) for s in one.steps] == [("login", alsafari.ONE_PAGE_FORM)]
+
+
+@pytest.mark.parametrize(
+    "change",
+    [
+        {"safari_fill": False},
+        {"refused": True},
+        {"fill_only": True},
+        {"check_url": "http://app.example.org/"},
+        {"fill_origins": ["not a url"]},
+        {"pre_click": "#show-login"},  # no label for it: never a guess
+    ],
+)
+def test_a_row_the_labels_do_not_fit_builds_no_recipe(change: dict) -> None:
+    assert alsafari.broker_recipe({**BROW, **change}, TWO_LABELS) is None
+
+
+def test_labels_naming_a_foreign_idp_build_no_recipe() -> None:
+    labels = alsafari.BrokerLabels("one_page", pass_submit="x", idp="evil.example")
+    assert alsafari.broker_recipe(BROW, labels) is None
+    assert alsafari.broker_recipe(BROW, alsafari.BrokerLabels("x", "y")) is None
+
+
+def test_pre_click_is_a_click_step_before_the_form() -> None:
+    labels = alsafari.BrokerLabels(
+        "one_page", pass_submit="Sign in", pre_click_label="Manual login"
+    )
+    recipe = alsafari.broker_recipe({**BROW, "pre_click": "#manual"}, labels)
+    assert recipe is not None
+    click = recipe.steps[0]
+    assert (click.kind, click.trigger, click.when) == (
+        "click",
+        "Manual login",
+        "#manual",
+    )
+    assert click.unless == 'input[type="password"]' and click.optional
+    assert [s.kind for s in recipe.steps] == ["click", "login"]
+
+
+def test_b10_ships_no_labels_no_stops_and_no_identity_route() -> None:
+    assert not alsafari.BROKER_SAFARI_LABELS
+    assert not alsafari.BROKER_SAFARI_STOPS
+    assert al.SAFARI_IDENTITY_READ_SAFE is False
+    for site in ("aurral", "jellyfin", "dsm-readonly", "welib", "abs-albert"):
+        assert site in al.SAFARI_ROUTES
+        assert al.safari_recipe(site) is None and not al.safari_routed(site)
+    assert "dsm-albert" not in al.SAFARI_ROUTES
+
+
+@pytest.fixture
+def broker_run(run: dict[str, Any], monkeypatch: pytest.MonkeyPatch) -> dict[str, Any]:
+    """`run` for a broker-built route: labels, listing row, route entry."""
+    monkeypatch.setitem(alsafari.BROKER_SAFARI_LABELS, BSITE, TWO_LABELS)
+    monkeypatch.setitem(al.SAFARI_ROUTES, BSITE, al.SafariRoute(BLANDING, "in_safari"))
+    _snapshot(monkeypatch, [BROW])
+    monkeypatch.setattr(al, "broker_state", lambda **_k: ("ok", [BROW]))
+    monkeypatch.setattr(
+        al, "record_safari_fail", lambda *a: run["safari_fails"].append(a)
+    )
+    every = w.ALL_FEATURES | frozenset(alsafari.STEP_FEATURES.values())
+    monkeypatch.setattr(alsafari, "features", lambda _c: every)
+    run["safari_fails"] = []
+    return run
+
+
+def _go_broker(st: dict[str, Any], script: list, **kw: Any) -> int:
+    recipe = al.safari_recipe(BSITE)
+    assert recipe is not None
+    st["safari"] = Safari(recipe, script)
+    rc: int = al.safari_target_action(BSITE, "", **kw)
+    return rc
+
+
+B_LOGIN = "https://id.example.org/login"
+B_SENTINEL = (BLANDING, w._page(sentinel=True))
+
+
+def test_no_labels_is_no_route(
+    broker_run: dict[str, Any],
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    assert al.safari_routed(BSITE) and al.login_columns(BSITE, BROW).safari
+    monkeypatch.delitem(alsafari.BROKER_SAFARI_LABELS, BSITE)
+    assert not al.safari_routed(BSITE)
+    cols = al.login_columns(BSITE, BROW)
+    assert not cols.safari and not cols.safari_why  # ❌, not ⛔
+    assert al.safari_target_action(BSITE, "") == 2
+    assert "no_safari_route" in capsys.readouterr().out
+
+
+def test_a_broker_route_with_a_live_session_opens_with_zero_fills(
+    broker_run: dict[str, Any],
+) -> None:
+    assert _go_broker(broker_run, [B_SENTINEL]) == 0
+    fake = broker_run["safari"]
+    assert not fake.ops(*FILLS) and not broker_run["imports"]
+    assert fake.landing_opens() == [["--open", BLANDING, "--wait", "20"]]
+
+
+def test_totp_runs_only_after_the_password_step(broker_run: dict[str, Any]) -> None:
+    # a code field before the password step: the otp step never runs
+    early = [
+        (
+            B_LOGIN,
+            w._page(code=True, steps=[[False, False], [False, False], [True, False]]),
+        )
+    ]
+    assert _go_broker(broker_run, early) == 2
+    assert not broker_run["safari"].ops(*FILLS)
+    flow = [
+        (
+            B_LOGIN,
+            w._page(user=True, steps=[[True, False], [False, False], [True, False]]),
+        ),
+        (
+            B_LOGIN,
+            w._page(password=True, steps=[[False, True], [True, False], [True, False]]),
+        ),
+        (
+            B_LOGIN,
+            w._page(code=True, steps=[[False, False], [False, False], [True, False]]),
+        ),
+        B_SENTINEL,
+    ]
+    assert _go_broker(broker_run, flow) == 0
+    fills = broker_run["safari"].ops(*FILLS)
+    assert [c[0] for c in fills] == ["--login", "--login", "--otp"]
+    assert "--user-only" in fills[0] and "--no-user" in fills[1]
+    assert fills[2][:2] == ["--otp", "Selfhost"]
+
+
+def test_an_access_interstitial_is_alberts_and_not_a_chromium_failure(
+    broker_run: dict[str, Any],
+) -> None:
+    url = "https://x.cloudflareaccess.com/cdn-cgi/access/login"
+    assert _go_broker(broker_run, [(url, w._page(user=True))]) == 4
+    assert not broker_run["safari"].ops(*FILLS)
+    assert not broker_run["records"]  # checks.json (the Chromium row) untouched
+    assert broker_run["safari_fails"][-1][3]["code"] == "needs_albert_access"
+
+
+def test_a_failed_broker_login_quarantines_but_keeps_the_chromium_row(
+    broker_run: dict[str, Any], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    quarantined: list[str] = []
+    monkeypatch.setattr(al.als, "quarantine", lambda s, *_a: quarantined.append(s))
+    stuck = [
+        (
+            B_LOGIN,
+            w._page(user=True, steps=[[True, False], [False, False], [False, False]]),
+        )
+    ]
+    assert _go_broker(broker_run, stuck) == 2  # the user step, then stuck
+    assert quarantined == [BSITE]
+    assert not broker_run["records"]
+    assert broker_run["safari_fails"][-1][1] is False
+
+
+def test_record_safari_fail_writes_its_own_file() -> None:
+    al.record_safari_fail(BSITE, False, "stopped", {"phase": "fill", "code": "x"})
+    data = al.als.read(al.SAFARI_FAILS_FILE)
+    assert data["sites"][BSITE]["code"] == "x"
+    assert data["sites"][BSITE]["state"] == "failed"
+    assert BSITE not in al.als.checks()
+
+
+def test_a_listing_identity_row_is_no_route_until_the_read_is_isolated(
+    broker_run: dict[str, Any], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    row = {**BROW, "identity": "gitlab", "privilege": "user"}
+    _snapshot(monkeypatch, [row])
+    assert al.safari_recipe(BSITE) is None and not al.safari_routed(BSITE)
+    monkeypatch.setattr(al, "SAFARI_IDENTITY_READ_SAFE", True)
+    recipe = al.safari_recipe(BSITE)
+    assert recipe is not None and recipe.identity == BSITE
+
+
+def test_a_multi_account_broker_route_mismatch_is_wrong_account(
+    broker_run: dict[str, Any],
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    row = {**BROW, "identity": "gitlab", "privilege": "user"}
+    _snapshot(monkeypatch, [row])
+    monkeypatch.setattr(al, "broker_state", lambda **_k: ("ok", [row]))
+    monkeypatch.setattr(al, "SAFARI_IDENTITY_READ_SAFE", True)
+    monkeypatch.setattr(
+        al.identity, "item_recipe", lambda *_a, **_k: identity.IDENTITIES["gitlab"]
+    )
+    broker_run["nonce"] = secrets.token_hex(32)
+    broker_run["verdict"] = "mismatch"
+    recipe = al.safari_recipe(BSITE)
+    assert recipe is not None
+    broker_run["safari"] = Safari(recipe, [B_SENTINEL])
+    broker_run["safari"].answer = {
+        "state": "found",
+        "digest": secrets.token_hex(32),
+        "admin": False,
+    }
+    assert al.safari_target_action(BSITE, "") == 2
+    assert "wrong_account" in capsys.readouterr().out
+    assert not broker_run["safari"].ops(*FILLS)
+    assert not broker_run["safari"].landing_opens()
+
+
+def test_the_dsm_pair_routes_only_the_held_account(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    ro, adm = "dsm-readonly", "dsm-albert"
+    admin_row = {"privilege": "admin"}
+    # undecided (B11 step 0 pending): no group reason, the admin rule only
+    assert al.safari_why(ro, {}) == "" and not al.safari_routed(ro)
+    assert al.safari_why(adm, admin_row) == "admin_account"
+    labels = alsafari.BrokerLabels("one_page", pass_submit="Sign in")
+    monkeypatch.setitem(alsafari.BROKER_SAFARI_LABELS, ro, labels)
+    dsm = {
+        **BROW,
+        "site": ro,
+        "fill_origins": ["https://synology.dom42.space"],
+        "check_url": "https://synology.dom42.space/",
+        "login_url": "https://synology.dom42.space/",
+    }
+    _snapshot(monkeypatch, [dsm])
+    monkeypatch.setitem(al.SAFARI_HELD, "dsm", ro)
+    assert al.safari_routed(ro) and al.safari_why(ro, {}) == ""
+    assert not al.safari_routed(adm)
+    assert al.safari_why(adm, {}) == "second_account"
+    assert al.safari_why(adm, admin_row) == "admin_account"  # the admin rule wins
+    monkeypatch.setitem(al.SAFARI_HELD, "dsm", adm)
+    assert not al.safari_routed(ro) and al.safari_why(ro, {}) == "second_account"
+    monkeypatch.setitem(al.SAFARI_HELD, "dsm", "")
+    assert not al.safari_routed(ro)
+    assert al.safari_why(ro, {}) == "not_held" == al.safari_why(adm, {})
+    assert al.login_columns(ro, dsm).safari_why == "not_held"
+
+
+def test_a_site_stop_ends_the_run_only_after_its_step() -> None:
+    stop = alsafari.SiteStop("needs_albert_push", r"OneAuth", after="login")
+    recipe = alsafari.Recipe(**{**w.SHOP.__dict__, "stops": (stop,)})
+    hit = [True]
+    before = w._page(steps=[[False, False], [False, False]], stops=hit)
+    fake = w.FakeSafari(recipe, [("https://id.example.org/login", before)])
+    out = w._machine(fake).run()
+    assert out.code == "recipe_stuck"  # not before the password step
+    pages = [
+        (
+            "https://id.example.org/pw",
+            w._page(password=True, steps=[[False, True], [True, False]], stops=[False]),
+        ),
+        (
+            "https://id.example.org/push",
+            w._page(steps=[[False, False], [False, False]], stops=hit),
+        ),
+    ]
+    fake = w.FakeSafari(recipe, pages)
+    out = w._machine(fake).run()
+    assert (out.code, out.rc) == ("needs_albert_push", alsafari.NEEDS_ALBERT_RC)
+    assert alsafari.parse_page(json.dumps({**before, "steps": []}), 0, 1) is not None
+    no_stops = {k: v for k, v in before.items() if k != "stops"}
+    assert alsafari.parse_page(json.dumps({**no_stops, "steps": []}), 0, 1) is None
+    assert alsafari.parse_page(json.dumps({**no_stops, "steps": []}), 0) is not None
+    js = alsafari.detector_js(recipe, "#account")
+    params = json.loads(js.split("const P = ", 1)[1].split(";\n", 1)[0])
+    assert params["stops"] == ["OneAuth"]
