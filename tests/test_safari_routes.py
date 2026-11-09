@@ -197,6 +197,7 @@ EXPECTED: dict[str, str] = {
             "smartsheet",
             "stirling",
             "switch",
+            "switch-engines",
             "syncthing-nixos",
             "welib",
         ),
