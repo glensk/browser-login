@@ -170,6 +170,11 @@ STUCK_REASONS = frozenset(
 FAILED_OPS = frozenset(
     {"open", "tabs", "user", "login", "otp", "click", "account", "eval", "close"}
 )
+# tp#1928 Outcome.failed_flag: the safari.py flag the failed call ran with
+# (its argv's first word; a `user` step runs `--login … --user-only`)
+SAFARI_FLAGS = frozenset(
+    {"--open", "--tabs", "--login", "--otp", "--click", "--eval", "--close"}
+)
 MAIL_WAIT_S = 180.0
 MAIL_POLL_S = 5.0
 # The himalaya environment of the headless Notion path: a dead EPFL grant
@@ -883,6 +888,9 @@ class Outcome:  # pylint: disable=too-many-instance-attributes
     # message text
     failed_op: str = ""
     safari_rc: int | None = None
+    # tp#1928: the safari.py flag that call ran with (SAFARI_FLAGS, "" =
+    # none or not known)
+    failed_flag: str = ""
 
     @property
     def ok(self) -> bool:
@@ -1906,17 +1914,20 @@ class Machine:  # pylint: disable=too-many-instance-attributes
 
     # -- safari.py calls ---------------------------------------------------
 
-    def _fail(self, reply: Reply, op: str) -> Outcome:
+    def _fail(self, reply: Reply, op: str, args: list[str]) -> Outcome:
         """End with the fixed code of a failed safari.py call, naming the
-        operation (FAILED_OPS) and its exit code."""
-        self._failed(reply, op)
+        operation (FAILED_OPS), the flag it ran with and its exit code."""
+        self._failed(reply, op, args)
         code = error_code(reply)
         return self._end(stop_rc(code), code)
 
-    def _failed(self, reply: Reply, op: str) -> None:
-        """tp#1644: remember which safari.py operation failed (a fixed word)
-        and its exit code — never its message."""
+    def _failed(self, reply: Reply, op: str, args: list[str]) -> None:
+        """tp#1644: remember which safari.py operation failed (a fixed word),
+        the flag of its argv `args` (tp#1928, SAFARI_FLAGS) and its exit
+        code — never its message."""
         self.out.failed_op = op if op in FAILED_OPS else ""
+        flag = args[0] if args else ""
+        self.out.failed_flag = flag if flag in SAFARI_FLAGS else ""
         self.out.safari_rc = reply.rc
 
     def _end(self, rc: int, code: str) -> Outcome:
@@ -1937,7 +1948,7 @@ class Machine:  # pylint: disable=too-many-instance-attributes
         """(host of the login window's only tab, '' or a stop code)."""
         reply = self.call(["--tabs"])
         if reply.rc != 0:
-            self._failed(reply, "tabs")  # its stop ends the run
+            self._failed(reply, "tabs", ["--tabs"])  # its stop ends the run
             return "", error_code(reply)
         tabs = reply.data.get("tabs")
         if not isinstance(tabs, list):
@@ -1977,15 +1988,14 @@ class Machine:  # pylint: disable=too-many-instance-attributes
         if mail_steps and self.plan.mail is not None and not self._lazy_baseline():
             # BEFORE anything can trigger a code mail
             self.baseline = mail_baseline(self.plan.mail, mail_steps[0])
-        reply = self.call(
-            ["--open", self.plan.start_url, "--new-window", "--wait", str(WAIT_S)]
-        )
+        args = ["--open", self.plan.start_url, "--new-window", "--wait", str(WAIT_S)]
+        reply = self.call(args)
         wid = reply.data.get("window_id")
         valid = isinstance(wid, int) and not isinstance(wid, bool) and wid > 0
         if valid:
             self.handle = str(wid)
         if reply.rc != 0:
-            out = self._fail(reply, "open")
+            out = self._fail(reply, "open", args)
             if valid:
                 self.call(["--close", "--handle", self.handle])
             return out
@@ -2197,7 +2207,7 @@ class Machine:  # pylint: disable=too-many-instance-attributes
         if reply.rc == 2 and step.optional and not interrupted(reply):
             return None  # refused before anything was copied: not offered here
         if reply.rc != 0:
-            return self._fail(reply, step.kind)
+            return self._fail(reply, step.kind, args)
         if step.prompt:
             self.notify(
                 f"▶ {self.recipe.site}: clicked {step.trigger} on {step.prompt}"
@@ -2236,7 +2246,7 @@ class Machine:  # pylint: disable=too-many-instance-attributes
         with private_js(body) as path:
             reply = self.call(["--eval", path, *self._on(host)])
         if reply.rc != 0:
-            self._failed(reply, "eval")  # its caller ends the run
+            self._failed(reply, "eval", ["--eval"])  # its caller ends the run
             return False
         res = json_object(reply.data.get("result"))
         return res is not None and res.get("ok") is True
@@ -2273,11 +2283,10 @@ class Machine:  # pylint: disable=too-many-instance-attributes
             if stop:
                 return self._end(2, stop)
         if step.trigger:
-            reply = self.call(
-                ["--click", step.trigger, "--row", step.trigger, *self._on(step.host)]
-            )
+            args = ["--click", step.trigger, "--row", step.trigger]
+            reply = self.call([*args, *self._on(step.host)])
             if reply.rc != 0:
-                return self._fail(reply, "click")
+                return self._fail(reply, "click", args)
         code = self._wait_code(reader, step)
         if code is None:
             return self._end(2, "email_code")

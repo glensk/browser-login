@@ -308,7 +308,7 @@ def test_the_overview_shows_the_blocked_cell_and_its_legend(
     monkeypatch.setattr(al, "row_state", lambda _r, _c: ("ok", "WHY"))
     al.print_overview({"rows": _rows(), "broker_ok": True, "broker": "running"})
     lines = capsys.readouterr().out.splitlines()
-    head = next(i for i, x in enumerate(lines) if "agent_fill_origins" in x)
+    head = next(i for i, x in enumerate(lines) if f"{al.FILL_COL}  status" in x)
     assert lines[head + 1].strip() == al.LOGIN_COLUMNS_LEGEND
     assert "⛔ = Albert's (reason: -L SITE -s -n, -j login_columns.safari_why)" in (
         al.LOGIN_COLUMNS_LEGEND
@@ -2280,14 +2280,15 @@ def test_a_refused_user_step_names_op_user_and_its_exit_code(
     fake = w.FakeSafari(recipe, [ZOHO_USER], fail=fail)
     out = _timed(fake, _zoho_plan()).run()
     assert (out.rc, out.code) == (2, "recipe_stuck") and not out.stuck
-    assert (out.failed_op, out.safari_rc) == ("user", 2)
+    assert (out.failed_op, out.failed_flag, out.safari_rc) == ("user", "--login", 2)
     fails: list[tuple] = []
     monkeypatch.setattr(al, "record_safari_fail", lambda *a: fails.append(a))
     monkeypatch.setattr(al.als, "quarantine", lambda *_a: None)
     assert al._safari_fail("zoho-desk", out, "stopped") == 2
     assert fails[-1][3]["detail"] == "op: user, safari_rc: 2"
     got = capsys.readouterr()
-    assert got.err.splitlines() == ["   safari.py --user exited 2"]
+    # tp#1928: the real safari.py flag, the recipe step after it
+    assert got.err.splitlines() == ["   safari.py --login (user step) exited 2"]
     assert LEAK not in got.out + got.err + json.dumps(fails)
 
 
@@ -2296,7 +2297,7 @@ def test_a_failed_tabs_read_names_op_tabs(monkeypatch: pytest.MonkeyPatch) -> No
     fail = {"--tabs": alsafari.Reply(1, {"ok": False, "error": LEAK}, LEAK)}
     out = _timed(w.FakeSafari(recipe, [ZOHO_USER], fail=fail), _zoho_plan()).run()
     assert (out.rc, out.code) == (2, "recipe_stuck")
-    assert (out.failed_op, out.safari_rc) == ("tabs", 1)
+    assert (out.failed_op, out.failed_flag, out.safari_rc) == ("tabs", "--tabs", 1)
 
 
 def test_a_failed_open_names_op_open(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -2304,6 +2305,18 @@ def test_a_failed_open_names_op_open(monkeypatch: pytest.MonkeyPatch) -> None:
     fail = {"--open": alsafari.Reply(1, {"ok": False}, LEAK)}
     out = _timed(w.FakeSafari(recipe, [ZOHO_USER], fail=fail), _zoho_plan()).run()
     assert (out.code, out.failed_op, out.safari_rc) == ("recipe_stuck", "open", 1)
+    assert out.failed_flag == "--open" and al._safari_call(out) == "--open"
+
+
+def test_the_stderr_call_names_the_real_safari_flag() -> None:
+    """tp#1928: the stderr line names the flag safari.py ran with; the recipe
+    step only when it differs; `--<op>` when the flag is not known."""
+    out = alsafari.Outcome(2, "recipe_stuck", failed_op="account", safari_rc=2)
+    assert al._safari_call(out) == "--account"
+    out.failed_flag = "--click"
+    assert al._safari_call(out) == "--click (account step)"
+    out.failed_op, out.failed_flag = "otp", "--otp"
+    assert al._safari_call(out) == "--otp"
 
 
 def test_max_polls_is_its_own_stuck_reason(monkeypatch: pytest.MonkeyPatch) -> None:

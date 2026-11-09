@@ -1008,9 +1008,10 @@ def test_overview_columns_align_with_a_legend(
     data = {"rows": _rows(), "broker_ok": True, "broker": "running"}
     al.print_overview(data)
     lines = capsys.readouterr().out.splitlines()
-    head = next(i for i, x in enumerate(lines) if "agent_fill_origins" in x)
+    head = next(i for i, x in enumerate(lines) if "BW fill  status" in x)
     header = lines[head]
-    assert "  Safari  Chromium  agent_fill_origins  status" in header
+    # tp#1928: a short header for the agent_fill_origins column
+    assert "  Safari  Chromium  BW fill  status" in header
     assert lines[head + 1].strip() == al.LOGIN_COLUMNS_LEGEND
     body = lines[head + 2 : head + 2 + len(states)]
     # every column up to the status text ends at the same terminal column

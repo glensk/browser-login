@@ -1286,10 +1286,14 @@ def _broker_logs_in(row: dict | None) -> bool:
 # The overview's two capability columns (tp#1643) and their one-line legend.
 SAFARI_COL = "Safari"
 CHROMIUM_COL = "Chromium"
+# tp#1928: the item's agent_fill_origins field is set (JSON: in_bitwarden) —
+# a short header leaves the status column the width
+FILL_COL = "BW fill"
 LOGIN_COLUMNS_LEGEND = (
     "Safari = -L SITE -s logs Albert's Safari in and opens the page · "
     "Chromium = an agent gets the shared Chromium logged in itself · "
-    "⛔ = Albert's (reason: -L SITE -s -n, -j login_columns.safari_why)"
+    "⛔ = Albert's (reason: -L SITE -s -n, -j login_columns.safari_why) · "
+    "BW fill = the Bitwarden item has agent_fill_origins"
 )
 
 
@@ -2068,7 +2072,7 @@ def print_overview(data: dict, width: int | None = None) -> None:
     }
     judged.sort(key=lambda x: (order.get(x[1], 3), x[0]["name"].lower()))
     width_name = max(len(r["name"]) for r in rows)
-    col = "agent_fill_origins"
+    col = FILL_COL
     icons = {
         "ok": "✅",
         "on-demand": "⏯ ",
@@ -2088,7 +2092,7 @@ def print_overview(data: dict, width: int | None = None) -> None:
     legend = LOGIN_COLUMNS_LEGEND if width is None else LOGIN_COLUMNS_LEGEND_SHORT
     print(_c("2", "     " + fit(legend, None if width is None else width - 5)))
     # the columns before the status: indent, icon (2), name, the two
-    # capability cells, agent_fill_origins, each with its two-space gap
+    # capability cells, BW fill (agent_fill_origins), each with its two-space gap
     lead = 5 + width_name + 2 + len(SAFARI_COL) + 2 + len(CHROMIUM_COL) + 2
     room = None if width is None else width - (lead + len(col) + 2)
     for r, state, why in judged:
@@ -4300,6 +4304,14 @@ def _safari_detail(base: str, out: alsafari.Outcome) -> str:
     return f"{base}; {failed}" if base else failed
 
 
+def _safari_call(out: alsafari.Outcome) -> str:
+    """tp#1928: the failed safari.py call as it ran — its real flag, the
+    recipe step after it when the two differ (``--login (user step)``,
+    ``--click (account step)``); ``--<op>`` when the flag is not known."""
+    flag = out.failed_flag or f"--{out.failed_op}"
+    return flag if flag == f"--{out.failed_op}" else f"{flag} ({out.failed_op} step)"
+
+
 def _safari_fail(
     site: str,
     out: alsafari.Outcome,
@@ -4348,7 +4360,7 @@ def _safari_fail(
     print(f"❌ {site}: {who} — {code_text(out.phase, out.code)}{why}")
     if out.failed_op:
         print(
-            f"   safari.py --{out.failed_op} exited {out.safari_rc}",
+            f"   safari.py {_safari_call(out)} exited {out.safari_rc}",
             file=sys.stderr,
             flush=True,
         )
