@@ -552,7 +552,7 @@ framework. It is a **provider**: other repos depend on it, not the reverse. See
   items EXIST (`dump-keychain` without `-a`, ~30 ms) and drops deleted ones,
   counting new ones (tp#1059); those raw names are compared, never printed.
 - **What agents can use** = `agent-login.py -A` (the file
-  `~/.local/state/agent-login/agents.md`, refreshed by `-S` every 10 min and by
+  `~/.local/state/agent-login/agents.md`, refreshed by `-S` every 30 min and by
   every `agent-login.py` run; a SessionStart hook in mydotfiles' Claude
   settings prints it into each session).
 - **No Cloudflare Access team session in the shared browser (tp#1466)**: a

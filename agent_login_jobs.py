@@ -46,7 +46,7 @@ LAUNCH_HOUR, LAUNCH_MINUTE = 9, 15
 
 
 SNAPSHOT_LABEL = "com.albert.agent-login-snapshot"
-SNAPSHOT_INTERVAL_S = 600
+SNAPSHOT_INTERVAL_S = 1800  # tp#1963: was 10 min
 # WS1b: the refresh-only pass (`-R`): renews refreshable tokens (NPM's 1-day
 # JWT) between daily checks; never logs in, never submits a password.
 REFRESH_LABEL = "com.albert.agent-login-refresh"
@@ -59,7 +59,7 @@ TAB_REAPER_INTERVAL_S = 2 * 3600
 # tp#1421: the Claude Console balance reader (`console-balance.py -q`): writes
 # each account's credit balance + spend limit for ccc's `balance_json` source.
 CONSOLE_BALANCE_LABEL = "com.albert.console-balance"
-CONSOLE_BALANCE_INTERVAL_S = 3600
+CONSOLE_BALANCE_INTERVAL_S = 4 * 3600  # tp#1963: was hourly
 CONSOLE_BALANCE_PY = Path(__file__).resolve().parent / "console-balance.py"
 # tp#1468: the Access team-cookie sweep (`browser.py sweep-access -A -q -S`) of
 # every running shared-browser instance: drops a Cloudflare Access team-domain
@@ -188,7 +188,7 @@ def tab_reaper_plist() -> str:
 
 
 def console_balance_plist() -> str:
-    """The hourly Claude Console balance LaunchAgent (tp#1421), as text. Pure."""
+    """The 4-hourly Claude Console balance LaunchAgent (tp#1421), as text. Pure."""
     return launchagent_plist(
         label=CONSOLE_BALANCE_LABEL,
         args=("-q",),
@@ -243,7 +243,7 @@ def agent_plists() -> list[tuple[str, str, str]]:
         (
             CONSOLE_BALANCE_LABEL,
             console_balance_plist(),
-            f"every {CONSOLE_BALANCE_INTERVAL_S // 60} min, console-balance.py -q",
+            f"every {CONSOLE_BALANCE_INTERVAL_S // 3600} h, console-balance.py -q",
         ),
         (
             ACCESS_SWEEP_LABEL,

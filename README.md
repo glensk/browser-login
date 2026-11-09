@@ -403,7 +403,7 @@ cleared normally. Belt and braces: a PAUSED wrapper also resumes itself within
 when the owner merely died (the watchdog needs the gate first), except after
 60 s of a dead record (watchdog presumed dead) — and the relay ends itself
 (`-M`) when the record or its owner disappears. Backstop for a watchdog that
-died too: `agent-login.py -S` (LaunchAgent, every 10 min) first reads the
+died too: `agent-login.py -S` (LaunchAgent, every 30 min) first reads the
 record and, when it is not live AND its `watchdog_pid` is certainly gone (pid
 not running, or no pid recorded and a heartbeat older than 120 s; a live pid
 or a malformed value = do nothing), runs the same recovery once
@@ -1536,7 +1536,7 @@ stopped again. Each account's result is written atomically (0600) to
 the schema ccc reads as `balance_json:<path>`. A failed run keeps the last good
 figures and their `measured_at` and sets a typed `status` (`logged_out`,
 `wrong_account`, `browser_down`, `busy`, `timeout`, `page_error`); a logged-out
-account is not retried for 6 h (`-f` retries now), so the hourly run does not
+account is not retried for 6 h (`-f` retries now), so the 4-hourly run does not
 start the private browser for a session only you can restore. Exit 0 all read,
 2 logged out / wrong account, 1 other failure.
 
@@ -1558,7 +1558,7 @@ reading: the last good `cloud_credit` stays with its old `measured_at` and
 ```
 
 Schedule: LaunchAgent `com.albert.console-balance` (installed by
-`./agent-login.py -I` with the others) runs `console-balance.py -q` every hour and at
+`./agent-login.py -I` with the others) runs `console-balance.py -q` every 4 hours and at
 load; log `~/Library/Logs/com.albert.console-balance.log`.
 
 ## How other tools consume it
@@ -1809,10 +1809,10 @@ Fill-only items (`agent_fill_only = true`, tp#1082): the broker never logs in wi
 | `-c`, `--check-all` | every usable site: logged in? if not, `browser.py login`; one line per site; exit 0 when every failure is a site on record in last-check.json, 1 when the broker, a browser or the check failed |
 | `-m`, `-M`, `--mail` | with -c: mail `albert.glensk@gmail.com` (gog) when a site stays logged out |
 | `-r`, `--refresh` | ask the broker now (re-reads Bitwarden, ~40 s) instead of the snapshot |
-| `-S`, `--snapshot` | recover a stale guided login whose watchdog died (one line), refresh the site-list and secret-run snapshots and the agents file (which also lists the secrets agents can inject), print nothing else (LaunchAgent, every 10 min) |
+| `-S`, `--snapshot` | recover a stale guided login whose watchdog died (one line), refresh the site-list and secret-run snapshots and the agents file (which also lists the secrets agents can inject), print nothing else (LaunchAgent, every 30 min) |
 | `-K`, `--keychain` | rescan the login keychain (~15 s) and list every item (names only) with whether agents can read it |
 | `-A`, `--agents` | print the summary agent sessions get at start (the agents file) |
-| `-I`, `--install-daily` | install + load the LaunchAgents com.albert.agent-login-check (`-c` daily 09:15), com.albert.agent-login-snapshot (`-S` every 10 min), com.albert.agent-login-refresh (`-R` every 6 h), com.albert.browser-tab-reaper (`browser.py reap` every 2 h), com.albert.console-balance (`console-balance.py` every 60 min) and com.albert.browser-access-sweep (`browser.py sweep-access` every 60 s) as one transaction (any failure restores the previous set) |
+| `-I`, `--install-daily` | install + load the LaunchAgents com.albert.agent-login-check (`-c` daily 09:15), com.albert.agent-login-snapshot (`-S` every 30 min), com.albert.agent-login-refresh (`-R` every 6 h), com.albert.browser-tab-reaper (`browser.py reap` every 2 h), com.albert.console-balance (`console-balance.py` every 4 h) and com.albert.browser-access-sweep (`browser.py sweep-access` every 60 s) as one transaction (any failure restores the previous set) |
 | `-U`, `--uninstall-daily` | unload + remove all 6 LaunchAgents of -I |
 | `-P`, `--print-plist` | print all 6 LaunchAgent plists of -I (writes nothing) |
 | `-j`, `--json` | print the overview (with -x: the matrix) as JSON |

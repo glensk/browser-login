@@ -233,14 +233,15 @@ def test_browser_registers_the_console_site() -> None:
     assert browser.GUIDED_START_URLS["console"] == "https://platform.claude.com/login"
 
 
-def test_the_hourly_launchagent_runs_the_reader_quietly() -> None:
+def test_the_4_hourly_launchagent_runs_the_reader_quietly() -> None:
     import agent_login_jobs as jobs
 
     plists = {label: text for label, text, _what in jobs.agent_plists()}
     text = plists[jobs.CONSOLE_BALANCE_LABEL]
     assert str(jobs.CONSOLE_BALANCE_PY) in text and "<string>-q</string>" in text
     assert (
-        "<integer>3600</integer>" in text and f"<key>{jobs.SCHEDULED_ENV}</key>" in text
+        "<integer>14400</integer>" in text
+        and f"<key>{jobs.SCHEDULED_ENV}</key>" in text
     )
 
 

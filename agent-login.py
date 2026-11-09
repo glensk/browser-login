@@ -399,7 +399,7 @@ def broker_request(op: str, timeout: float = 120.0, **kw: str) -> dict:
 
 
 STATE_DIR = Path.home() / ".local/state/agent-login"
-SITES_SNAPSHOT_MAX_AGE_S = 30 * 60  # the snapshot job refreshes every 10 min
+SITES_SNAPSHOT_MAX_AGE_S = 60 * 60  # the snapshot job refreshes every 30 min
 
 
 def _state_path(name: str) -> Path:
@@ -419,7 +419,7 @@ def broker_state(*, fresh: bool = False) -> tuple[str, list[dict]]:
     """(health message, broker site list) — from the snapshot when it is recent.
 
     The broker's `sites` answer costs a Bitwarden unlock (~30-40 s when its own
-    cache is cold), so the overview reads the snapshot that `-S` (every 10 min,
+    cache is cold), so the overview reads the snapshot that `-S` (every 30 min,
     LaunchAgent) writes; `fresh` asks the broker and re-reads Bitwarden.
     """
     snap = _state_path("sites.json")
@@ -5759,7 +5759,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="recover a stale guided login whose watchdog died (one line), "
         "refresh the site-list and secret-run snapshots and the agents file "
         "(which also lists the secrets agents can inject), print nothing else "
-        "(LaunchAgent, every 10 min)",
+        "(LaunchAgent, every 30 min)",
     )
     ap.add_argument(
         "-K",

@@ -26,7 +26,7 @@ file (0600, written atomically) that ccc reads as ``balance_json:<path>``
 
 A logged-out (or wrong-account) account is not re-tried for
 BACKOFF_S unless -f is given, so a scheduled run does not start the private
-browser every hour for a session only Albert can restore
+browser every 4 hours for a session only Albert can restore
 (``./agent-login.py -g console-private``).
 
 Exit: 0 every account read, 2 some account logged out / wrong account,

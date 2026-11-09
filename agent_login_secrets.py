@@ -19,7 +19,7 @@ from typing import Any
 from broker.vault import safe_name
 
 SNAPSHOT_NAME = "secrets.json"
-SNAPSHOT_MAX_AGE_S = 30 * 60
+SNAPSHOT_MAX_AGE_S = 60 * 60  # the snapshot job writes it every 30 min (tp#1963)
 
 Request = Callable[..., dict]
 
