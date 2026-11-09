@@ -505,7 +505,8 @@ class BrokerLabels:  # pylint: disable=too-many-instance-attributes
     overrides replace the generic field selectors of a step; the `*_field`
     selectors name the field safari.py fills (tp#1644 B12, '' = its
     default). `post_clicks`: (label, when-selector) pairs of optional
-    prompts after the password step ("Trust this browser?" → "Not now"),
+    prompts after the password step ("Trust this browser?" → "Not now";
+    zoho-desk alone answers "Trust", Albert's exception of 2026-11-09),
     each a click step on `idp` that runs only where its selector shows."""
 
     shape: str  # "one_page" | "two_step"
@@ -526,19 +527,58 @@ class BrokerLabels:  # pylint: disable=too-many-instance-attributes
 
 
 BROKER_SHAPES = frozenset({"one_page", "two_step"})
-# site → its labels from B11 / B13's read-only probe. EMPTY until then: no
-# labels entry → no route (❌), never a guessed label.
-BROKER_SAFARI_LABELS: dict[str, BrokerLabels] = {}
+# tp#1644 B13, Zoho (accounts.zoho.eu, read 2026-11-09 from the logged-out
+# sign-in page's markup and its signinnew.js; Albert's Safari and the shared
+# Chromium both held a live session, so no rendered identifier page): the
+# step-2 password field sits pre-rendered in `#password_container.zeroheight`
+# (height 0, overflow hidden — the detector's vis() counts it visible). Zoho
+# drops `zeroheight` when the password step shows and adds it back for the
+# TOTP / push pages, so this selector is the password step only; a
+# passkey-first lookup hides the field's `.textbox_div` instead (no fill).
+ZOHO_PASSWORD = '#password_container:not(.zeroheight) input[type="password"]'
+# site → its labels from B11 / B13's read-only probe. No labels entry → no
+# route (❌), never a guessed label.
+BROKER_SAFARI_LABELS: dict[str, BrokerLabels] = {
+    # `#login_id` (autocomplete "webauthn username email", type text):
+    # safari.py's default user field misses it. One `#nextbtn` reads "Next"
+    # on the e-mail page and "Sign in" on the password page. No TOTP step:
+    # Zoho's `#mfa_totp` is a split-digit widget, unproven with safari.py -O
+    # (a TOTP page ends `step_conditions_unmet`, nothing typed). The post-login
+    # prompt "Trust this browser?" (`.trustbrowser_ui`, display:none until
+    # shown) is answered "Trust" — Albert's decision 2026-11-09 (tp#1644), the
+    # one exception to the never-trust-a-device rule (docs/AGENTS_REFERENCE.md).
+    # "Review your account details" → "Remind me later" is NOT clicked: that
+    # page was not readable (its control is a span/link per the broker's
+    # page_state.py, which safari.py --click may not match).
+    "zoho-desk": BrokerLabels(
+        "two_step",
+        pass_submit="Sign in",
+        user_submit="Next",
+        user_when="#login_id",
+        user_unless=ZOHO_PASSWORD,
+        pass_when=ZOHO_PASSWORD,
+        user_field="#login_id",
+        pass_field="#password",
+        post_clicks=(("Trust", ".trustbrowser_ui .trustbtn"),),
+    ),
+}
 
 # tp#1644 B12: the sites' own Albert stops. Each regex names the challenge
 # page's own wording (a request SENT / a wait for the device), never a login
 # page's offer ("Sign in with a passkey", "Use GitHub Mobile"); the `after`
 # step and the page shape keep it off the login form itself.
-# Zoho: the OneAuth push after the password (fieldless) ...
+# Zoho: the OneAuth push after the password. `any` page (B13): Zoho re-adds
+# the concealed `#password_container.zeroheight` on its MFA pages, so the
+# detector may count a password field there; the wait wording decides. The
+# B13 alternatives are Zoho's own strings (signin page i18n, 2026-11-09):
+# "Accept the push notification in OneAuth to sign in", "… you received on
+# OneAuth to verify", "Use Touch ID / Face ID in OneAuth to sign in".
 ZOHO_PUSH_RE = (
     r"sent[^\n]{0,60}(push )?notification[^\n]{0,60}OneAuth"
     r"|OneAuth[^\n]{0,60}(approve|push notification)"
     r"|approve[^\n]{0,60}(push|notification|request)[^\n]{0,60}OneAuth"
+    r"|accept the push notification[^\n]{0,60}OneAuth"
+    r"|(touch|face) id in OneAuth"
 )
 # ... and the passkey it asks for right after the e-mail lookup. `any` page:
 # Zoho keeps the concealed password field in the DOM (the detector may count
@@ -586,7 +626,7 @@ SMARTSHEET_MAIL_RE = (
 # site → its own Albert stops (push / passkey / SMS pages, B12).
 BROKER_SAFARI_STOPS: dict[str, tuple[SiteStop, ...]] = {
     "zoho-desk": (
-        SiteStop("needs_albert_push", ZOHO_PUSH_RE, after="login"),
+        SiteStop("needs_albert_push", ZOHO_PUSH_RE, "login", "any"),
         SiteStop("needs_albert_hardware_key", ZOHO_PASSKEY_RE, "user", "any"),
     ),
     "github": (

@@ -355,7 +355,7 @@ Execution order from here: B8-B9 first, then B6-B7 (overseer decision).
   push, a Smartsheet e-mail code page → stop `email_code_unwired`, exit 2: no code
   mail is sent by a route that does not know the sender). Tests as B10, plus the
   identity `mismatch` → exit 2 `wrong_account`.
-- [ ] B13 **[Albert]** label read + LIVE CANARY BP SaaS (as B11). A TOTP code is used
+- [x] B13 **[Albert]** label read + LIVE CANARY BP SaaS (as B11). A TOTP code is used
   once (`safari.py -O` waits for a fresh window); a push / passkey prompt → exit 4,
   Albert approves in that window, no retry.
 - [ ] B14 batch SSO: eduid (BP + TOTP on login.eduid.ch), switch (`then` chain

@@ -292,7 +292,11 @@ framework. It is a **provider**: other repos depend on it, not the reverse. See
   identity — and no service worker of a fill origin ran; the OTP step runs
   under it too, and a self-submitting OTP page is marked, never re-pressed)
   and ticks a SESSION "remember me" (never a trusted
-  device / browser / choice) before typing. A new recipe that submits a form
+  device / browser / choice) before typing. One exception, Albert's decision
+  of 2026-11-09 (tp#1644 B13): the zoho-desk Safari route
+  (`agent_login_safari.BROKER_SAFARI_LABELS["zoho-desk"]`) answers Zoho's
+  post-login "Trust this browser?" with "Trust" in Albert's own Safari; every
+  other Safari route answers such a prompt "Not now" or leaves it alone. A new recipe that submits a form
   uses the same helpers. A Cloudflare Access page (`origins.access_gated`:
   `*.cloudflareaccess.com` or `/cdn-cgi/access/`) is `precheck` ·
   `access_gated` on both sides, before any reservation — agent-login shows it

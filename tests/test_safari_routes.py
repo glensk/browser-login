@@ -52,8 +52,25 @@ al = load_script("agent_login_tp1644_test", "agent-login.py")
 # reads; no names, URLs or usernames). A new broker item fails
 # `test_every_listed_login_is_classified_exactly_once` until it is added
 # here AND to `EXPECTED`. `cloudflare` is listed twice (one refused).
+# A labelled broker route (tp#1644 B13) also needs the fill fields its
+# recipe reads (`broker_recipe`).
+LISTED_FILL: dict[str, dict[str, Any]] = {
+    "zoho-desk": {
+        "safari_fill": True,
+        "fill_only": False,
+        "fill_origins": ["https://accounts.zoho.eu"],
+        "check_url": "https://desk.zoho.eu/agent",
+        "login_url": "https://desk.zoho.eu/agent",
+    },
+}
 LISTING: list[dict[str, Any]] = [
-    {"site": s, "privilege": p, "identity": i, "refused": False}
+    {
+        "site": s,
+        "privilege": p,
+        "identity": i,
+        "refused": False,
+        **LISTED_FILL.get(s, {}),
+    }
     for s, p, i in (
         ("google-kindle", None, None),
         ("anibis", None, None),
@@ -126,6 +143,8 @@ EXPECTED: dict[str, str] = {
             # tp#1644 B6: the built-in sites
             "openai",
             "slack",
+            # tp#1644 B13: the broker SaaS route with probe labels
+            "zoho-desk",
         ),
         ROUTE,
     ),
@@ -180,7 +199,6 @@ EXPECTED: dict[str, str] = {
             "switch",
             "syncthing-nixos",
             "welib",
-            "zoho-desk",
         ),
         NOT_BUILT,
     ),
@@ -201,6 +219,8 @@ def listed(monkeypatch: pytest.MonkeyPatch) -> list[dict[str, Any]]:
         al, "broker_state", lambda **_k: ("running, Bitwarden readable", LISTING)
     )
     monkeypatch.setattr(al, "safari_state", lambda _s: {})
+    # a labelled broker route reads its row from the `sites` snapshot (B13)
+    _snapshot(monkeypatch, LISTING)
     rows: list[dict[str, Any]] = al.overview()["rows"]
     return rows
 
@@ -1277,7 +1297,8 @@ def test_pre_click_is_a_click_step_before_the_form() -> None:
 
 
 def test_b10_ships_no_labels_no_stops_and_no_identity_route() -> None:
-    assert not alsafari.BROKER_SAFARI_LABELS
+    # tp#1644 B13: zoho-desk's probe labels are the only ones so far
+    assert set(alsafari.BROKER_SAFARI_LABELS) == B13_LABELLED
     # tp#1644 B12: the SaaS sites' own stops only, none for B10's sites
     assert set(alsafari.BROKER_SAFARI_STOPS) == set(B12_STOPS)
     assert al.SAFARI_IDENTITY_READ_SAFE is False
@@ -1527,7 +1548,7 @@ B12_IDP = {
 # site → its stops as (code, after, page)
 B12_STOPS = {
     "zoho-desk": [
-        ("needs_albert_push", "login", "fieldless"),
+        ("needs_albert_push", "login", "any"),
         ("needs_albert_hardware_key", "user", "any"),
     ],
     "github": [
@@ -1552,6 +1573,16 @@ LOGIN_TEXT = {
         "Trust this browser?\nIf you trust this browser, you will not be asked "
         "for a verification code again.\nTrust\nNot now",
         "Review your account details\nRemind me later\nConfirm",
+        # B13: Zoho's own strings (sign-in page, 2026-11-09)
+        "Sign in\nto access Zoho Desk\nEmail address or mobile number\nNext\n"
+        "Use passkey to sign in\nSign in another way",
+        "Verify your identity\nVerify via Passkey\nTry another way",
+        "Sign in another way\nOffline TOTP verification\nOpen OneAuth, tap Sign "
+        "in another way, and enter it here to verify your sign-in.\nScan QR "
+        "verification\nOpen OneAuth and tap Sign in another way. Tap Scan QR "
+        "instead to open code scanner. Scan the below code to verify sign-in.",
+        "Trust this browser?\nDon't trust browsers on public or shared "
+        "devices.\nTrust\nNot now",
     ],
     "github": [
         "Sign in to GitHub\nUsername or email address\nPassword\n"
@@ -1583,6 +1614,18 @@ CHALLENGE_TEXT = {
             "OneAuth app on iPhone. Approve it to sign in.",
         ),
         (0, "Open OneAuth and approve the sign-in request"),
+        # B13: Zoho's own push / OneAuth-biometric wait strings
+        (
+            0,
+            "Verify push notification\nAccept the push notification in OneAuth to sign in",
+        ),
+        (0, "Accept the push notification you received on OneAuth to verify."),
+        (
+            0,
+            "A push notification has been sent to your OneAuth devices. "
+            "Approve it to verify",
+        ),
+        (0, "Verify Touch ID\nUse Touch ID in OneAuth to sign in to your account"),
         (1, "Sign in with passkey\nWaiting for your passkey ..."),
         (1, "Use your passkey to sign in. Follow the browser instructions."),
     ],
@@ -1624,6 +1667,8 @@ def _hits(site: str, text: str) -> list[bool]:
 def test_b12_routes_are_listed_and_unbuilt_without_labels() -> None:
     for site, landing in B12_LANDINGS.items():
         assert al.SAFARI_ROUTES[site] == al.SafariRoute(landing, "in_safari")
+        if site in B13_LABELLED:
+            continue
         assert al.safari_recipe(site) is None and not al.safari_routed(site)
         assert site not in alsafari.BROKER_SAFARI_LABELS
         assert EXPECTED[site] == NOT_BUILT
@@ -1809,6 +1854,7 @@ def test_b12_labels_route_a_saas_site_with_its_stops(
         "login_url": B12_LANDINGS[site],
     }
     _snapshot(monkeypatch, [row])
+    monkeypatch.delitem(alsafari.BROKER_SAFARI_LABELS, site)
     assert not al.safari_routed(site)  # no labels: no route
     monkeypatch.setitem(alsafari.BROKER_SAFARI_LABELS, site, B12_LABELS)
     recipe = al.safari_recipe(site)
@@ -1884,3 +1930,97 @@ def test_b12_the_fills_pass_their_field_selectors_to_safari_py() -> None:
     assert calls[1][-1] == "--pass-field=#password" and "--no-user" in calls[1]
     assert calls[2][-1] == "--otp-field=#mfa_totp"
     assert calls[3][:2] == ["--click", "Not now"]
+
+
+# ---------------------------------------------------------------------------
+# tp#1644 B13: zoho-desk's labels (sign-in page markup, 2026-11-09)
+# ---------------------------------------------------------------------------
+
+B13_LABELLED = {"zoho-desk"}
+ZOHO_ROW: dict[str, Any] = {
+    **BROW,
+    "site": "zoho-desk",
+    "name": "Zoho",
+    **LISTED_FILL["zoho-desk"],
+    "logged_in_selector": '[data-selector-id="avatarStatus"]',
+}
+ZOHO_ID = "https://accounts.zoho.eu/signin"
+NO_HIT = [False, False]  # neither Zoho stop's text
+_TRUST_PAGE = [[False, False], [False, False], [True, False]]
+
+
+def _zoho_recipe(monkeypatch: pytest.MonkeyPatch) -> alsafari.Recipe:
+    _snapshot(monkeypatch, [ZOHO_ROW])
+    recipe: alsafari.Recipe | None = al.safari_recipe("zoho-desk")
+    assert recipe is not None and al.safari_routed("zoho-desk")
+    return recipe
+
+
+def test_b13_zoho_fills_the_password_only_on_the_password_step(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    recipe = _zoho_recipe(monkeypatch)
+    zp = alsafari.ZOHO_PASSWORD
+    got = [(s.kind, s.when, s.unless, s.after, s.fields) for s in recipe.steps]
+    assert got == [
+        ("user", "#login_id", zp, "", (("--user-field", "#login_id"),)),
+        ("login", zp, "", "user", (("--pass-field", "#password"),)),
+        ("click", ".trustbrowser_ui .trustbtn", "", "login", ()),
+    ]
+    assert [s.submit for s in recipe.steps[:2]] == ["Next", "Sign in"]
+    assert recipe.steps[2].trigger == "Trust" and recipe.steps[2].optional
+    assert ".zeroheight" in zp and 'input[type="password"]' in zp
+    assert recipe.stops == alsafari.BROKER_SAFARI_STOPS["zoho-desk"]
+    assert recipe.hosts == ("accounts.zoho.eu", "desk.zoho.eu")
+    assert recipe.sentinel_host == "desk.zoho.eu" and not recipe.import_after
+
+
+def test_b13_zoho_login_runs_user_password_trust_then_lands(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    recipe = _zoho_recipe(monkeypatch)
+    # (user, login, trust) step conditions; the identifier page shows the
+    # concealed password field (the detector's `password` flag is true)
+    pages = [
+        (ZOHO_ID, w._page(user=True, password=True, steps=_USER_PAGE, stops=NO_HIT)),
+        (ZOHO_ID, w._page(password=True, steps=_PASS_PAGE, stops=NO_HIT)),
+        (ZOHO_ID, w._page(steps=_TRUST_PAGE, stops=NO_HIT)),
+        ("https://desk.zoho.eu/agent", w._page(sentinel=True, stops=NO_HIT)),
+    ]
+    fake = w.FakeSafari(recipe, pages)
+    out = w._machine(fake, w._plan(start_url=ZOHO_ROW["check_url"], item="Zoho")).run()
+    assert out.ok, out.code
+    calls = [c for c in fake.calls if c[0] in FILLS]
+    assert [c[0] for c in calls] == ["--login", "--login", "--click"]
+    assert "--user-only" in calls[0] and calls[0][-1] == "--user-field=#login_id"
+    assert "--no-user" in calls[1] and calls[1][-1] == "--pass-field=#password"
+    assert calls[2][:4] == ["--click", "Trust", "--row", "Trust"]
+
+
+def test_b13_zoho_passkey_first_never_fills_the_concealed_password(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    recipe = _zoho_recipe(monkeypatch)
+    # after the e-mail: Safari's own passkey sheet, the page keeps the
+    # concealed field and offers no step → stuck, nothing but the e-mail typed
+    pages = [
+        (ZOHO_ID, w._page(user=True, password=True, steps=_USER_PAGE, stops=NO_HIT)),
+        (ZOHO_ID, w._page(password=True, steps=_NO_STEP, stops=NO_HIT)),
+    ]
+    fake = w.FakeSafari(recipe, pages)
+    out = w._machine(fake, w._plan(start_url=ZOHO_ROW["check_url"], item="Zoho")).run()
+    assert out.rc == 2 and out.code == "recipe_stuck"
+    calls = [c for c in fake.calls if c[0] in FILLS]
+    assert len(calls) == 1 and "--user-only" in calls[0]
+
+
+def test_b13_only_zoho_desk_answers_a_trust_prompt_with_trust() -> None:
+    # the never-trust-a-device rule (docs/AGENTS_REFERENCE.md) and its one
+    # exception, Albert's decision of 2026-11-09
+    trusting = {
+        site
+        for site, labels in alsafari.BROKER_SAFARI_LABELS.items()
+        for label, _when in labels.post_clicks
+        if label.strip().lower() in {"trust", "trust browser", "trust this browser"}
+    }
+    assert trusting == {"zoho-desk"}
