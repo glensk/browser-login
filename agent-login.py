@@ -1090,6 +1090,26 @@ SAFARI_ROUTES: dict[str, SafariRoute] = {
             ("welib", "https://welib.org/account"),
         )
     },
+    # tp#1644 B12: the SaaS broker logins (TOTP expected), same mechanism; the
+    # sites' own push / passkey / SMS / mail-code stops are
+    # `alsafari.BROKER_SAFARI_STOPS`; labels come from B13's probe (❌ until
+    # then). gitlab-sdsc-glensk carries a listing identity: no recipe while
+    # SAFARI_IDENTITY_READ_SAFE is False.
+    **{
+        site: SafariRoute(landing, "in_safari")
+        for site, landing in (
+            ("github", "https://github.com/settings/profile"),
+            ("gitlab-com", "https://gitlab.com/-/user_settings/profile"),
+            ("gitlab-ethz", "https://gitlab.ethz.ch/-/user_settings/profile"),
+            (
+                "gitlab-sdsc-glensk",
+                "https://gitlab.datascience.ch/-/user_settings/profile",
+            ),
+            ("infomaniak", "https://manager.infomaniak.com"),
+            ("zoho-desk", "https://desk.zoho.eu/agent"),
+            ("smartsheet", "https://app.smartsheet.com/b/home"),
+        )
+    },
 }
 # tp#1644 B10: sites whose accounts share one Safari cookie scope — Safari
 # holds at most ONE of them. `SAFARI_HELD[group]`: the member Safari holds

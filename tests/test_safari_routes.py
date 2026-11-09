@@ -17,6 +17,7 @@ from __future__ import annotations
 import contextlib
 import json
 import os
+import re
 import secrets
 import shutil
 import stat
@@ -1277,7 +1278,8 @@ def test_pre_click_is_a_click_step_before_the_form() -> None:
 
 def test_b10_ships_no_labels_no_stops_and_no_identity_route() -> None:
     assert not alsafari.BROKER_SAFARI_LABELS
-    assert not alsafari.BROKER_SAFARI_STOPS
+    # tp#1644 B12: the SaaS sites' own stops only, none for B10's sites
+    assert set(alsafari.BROKER_SAFARI_STOPS) == set(B12_STOPS)
     assert al.SAFARI_IDENTITY_READ_SAFE is False
     for site in ("aurral", "jellyfin", "dsm-readonly", "welib", "abs-albert"):
         assert site in al.SAFARI_ROUTES
@@ -1501,3 +1503,384 @@ def test_a_site_stop_ends_the_run_only_after_its_step() -> None:
     js = alsafari.detector_js(recipe, "#account")
     params = json.loads(js.split("const P = ", 1)[1].split(";\n", 1)[0])
     assert params["stops"] == ["OneAuth"]
+
+
+# ---------------------------------------------------------------------------
+# tp#1644 B12: the SaaS broker routes and their own Albert stops
+# ---------------------------------------------------------------------------
+
+B12_LANDINGS = {
+    "github": "https://github.com/settings/profile",
+    "gitlab-com": "https://gitlab.com/-/user_settings/profile",
+    "gitlab-ethz": "https://gitlab.ethz.ch/-/user_settings/profile",
+    "gitlab-sdsc-glensk": "https://gitlab.datascience.ch/-/user_settings/profile",
+    "infomaniak": "https://manager.infomaniak.com",
+    "zoho-desk": "https://desk.zoho.eu/agent",
+    "smartsheet": "https://app.smartsheet.com/b/home",
+}
+B12_IDP = {
+    "github": "github.com",
+    "infomaniak": "login.infomaniak.com",
+    "zoho-desk": "accounts.zoho.eu",
+    "smartsheet": "app.smartsheet.com",
+}
+# site → its stops as (code, after, page)
+B12_STOPS = {
+    "zoho-desk": [
+        ("needs_albert_push", "login", "fieldless"),
+        ("needs_albert_hardware_key", "user", "any"),
+    ],
+    "github": [
+        ("needs_albert_push", "login", "fieldless"),
+        ("needs_albert_hardware_key", "login", "fieldless"),
+    ],
+    "infomaniak": [
+        ("needs_albert_sms", "login", "code"),
+        ("needs_albert_push", "login", "fieldless"),
+    ],
+    "smartsheet": [("email_code_unwired", "", "code")],
+}
+
+# The normal login pages' text (synthetic, after the live wording): no stop
+# regex of the site matches any of them.
+LOGIN_TEXT = {
+    "zoho-desk": [
+        "Sign in\nto access Desk\nEmail address or mobile number\nNext\n"
+        "Sign in using passkey\nSign in using\nGoogle",
+        "Enter password\nForgot password?\nSign in\nSign in using OneAuth",
+        "TOTP\nEnter the TOTP from your authenticator app\nVerify\nSign in another way",
+        "Trust this browser?\nIf you trust this browser, you will not be asked "
+        "for a verification code again.\nTrust\nNot now",
+        "Review your account details\nRemind me later\nConfirm",
+    ],
+    "github": [
+        "Sign in to GitHub\nUsername or email address\nPassword\n"
+        "Forgot password?\nSign in\nSign in with a passkey\nNew to GitHub?",
+        "Two-factor authentication\nAuthentication code\nVerify\nOpen your "
+        "two-factor authenticator (TOTP) app or browser extension to view your "
+        "authentication code.\nHaving problems?\nUse GitHub Mobile\n"
+        "Use your passkey\nUse a recovery code",
+        "Sign in faster with passkeys\nAdd a passkey\nAsk me later",
+    ],
+    "infomaniak": [
+        "Log in\nEmail address\nPassword\nForgot your password?\nLog in\n"
+        "Create an account",
+        "Two-step verification\nEnter the 6-digit code from your "
+        "authentication app\nReceive a code by SMS instead\nValidate",
+        "Welcome to the Manager\nDownload the Infomaniak app for iOS and Android",
+    ],
+    "smartsheet": [
+        "Log in\nEmail\nContinue\nOr\nLog in with Google\nLog in with Microsoft",
+        "Enter your password\nForgot password?\nLog in\nEmail me a login link",
+    ],
+}
+# site → (stop index, the challenge page's text) — each matches its stop only
+CHALLENGE_TEXT = {
+    "zoho-desk": [
+        (
+            0,
+            "Sign in to access Desk\nWe have sent a push notification to your "
+            "OneAuth app on iPhone. Approve it to sign in.",
+        ),
+        (0, "Open OneAuth and approve the sign-in request"),
+        (1, "Sign in with passkey\nWaiting for your passkey ..."),
+        (1, "Use your passkey to sign in. Follow the browser instructions."),
+    ],
+    "github": [
+        (
+            0,
+            "GitHub Mobile\nWe sent you a sign-in request on your GitHub Mobile "
+            "app. Enter the digits shown below to verify your identity.\n42",
+        ),
+        (1, "Passkey\nWhen you are ready to authenticate, press the button below."),
+        (1, "Security key\nWaiting for input from browser interaction..."),
+    ],
+    "infomaniak": [
+        (0, "Two-step verification\nA code has been sent by SMS to +41 79 *** ** 12"),
+        (0, "Un code vous a été envoyé par SMS\nCode\nValider"),
+        (
+            1,
+            "Confirm the connection on the Infomaniak app\nA notification has "
+            "been sent to your device",
+        ),
+        (1, "Validez la connexion depuis l'application Infomaniak"),
+    ],
+    "smartsheet": [
+        (0, "Check your email\nWe sent a 6-digit code to albert@example.org"),
+        (0, "Enter the code we emailed to you\nContinue"),
+    ],
+}
+
+
+def _hits(site: str, text: str) -> list[bool]:
+    """The detector's `stops` answer for `text` (Python's `re` stands in for
+    the page's JS RegExp, case-insensitive)."""
+    return [
+        re.search(stop.text, text, re.IGNORECASE) is not None
+        for stop in alsafari.BROKER_SAFARI_STOPS[site]
+    ]
+
+
+def test_b12_routes_are_listed_and_unbuilt_without_labels() -> None:
+    for site, landing in B12_LANDINGS.items():
+        assert al.SAFARI_ROUTES[site] == al.SafariRoute(landing, "in_safari")
+        assert al.safari_recipe(site) is None and not al.safari_routed(site)
+        assert site not in alsafari.BROKER_SAFARI_LABELS
+        assert EXPECTED[site] == NOT_BUILT
+
+
+def test_b12_stops_name_their_code_step_and_page() -> None:
+    got = {
+        site: [(s.code, s.after, s.page) for s in stops]
+        for site, stops in alsafari.BROKER_SAFARI_STOPS.items()
+    }
+    assert got == B12_STOPS
+    for stops in alsafari.BROKER_SAFARI_STOPS.values():
+        for stop in stops:
+            want = 2 if stop.code == "email_code_unwired" else alsafari.NEEDS_ALBERT_RC
+            assert alsafari.stop_rc(stop.code) == want
+            assert stop.code in al.phases.CODE_TEXT or stop.code in al.SAFARI_CODE_TEXT
+
+
+@pytest.mark.parametrize("site", sorted(LOGIN_TEXT))
+def test_b12_no_stop_matches_a_normal_login_page(site: str) -> None:
+    for text in LOGIN_TEXT[site]:
+        assert not any(_hits(site, text)), text
+
+
+@pytest.mark.parametrize("site", sorted(CHALLENGE_TEXT))
+def test_b12_each_challenge_page_matches_its_own_stop_only(site: str) -> None:
+    n = len(alsafari.BROKER_SAFARI_STOPS[site])
+    for index, text in CHALLENGE_TEXT[site]:
+        assert _hits(site, text) == [i == index for i in range(n)], text
+
+
+_JS_TEST = r"""const fs = require("fs");
+const cases = JSON.parse(fs.readFileSync(0, "utf8"));
+process.stdout.write(JSON.stringify(cases.map(
+  ([re, text]) => new RegExp(re, "i").test(text))));
+"""
+
+
+@pytest.mark.skipif(_NODE is None, reason="node not installed")
+def test_b12_the_page_js_regexp_agrees_with_python(tmp_path: Path) -> None:
+    cases: list[tuple[str, str]] = []
+    want: list[bool] = []
+    for site, stops in alsafari.BROKER_SAFARI_STOPS.items():
+        texts = LOGIN_TEXT[site] + [t for _i, t in CHALLENGE_TEXT[site]]
+        for text in texts:
+            for stop, hit in zip(stops, _hits(site, text)):
+                cases.append((stop.text, text))
+                want.append(hit)
+    script = tmp_path / "re.js"
+    script.write_text(_JS_TEST, encoding="utf-8")
+    assert _NODE is not None
+    done = subprocess.run(
+        [_NODE, str(script)],
+        input=json.dumps(cases),
+        capture_output=True,
+        text=True,
+        check=True,
+        timeout=30,
+    )
+    assert json.loads(done.stdout) == want
+    assert any(want) and not all(want)
+
+
+B12_LABELS = alsafari.BrokerLabels(
+    "two_step", pass_submit="Sign in", user_submit="Next", otp_submit="Verify"
+)
+
+
+def _b12_recipe(site: str) -> alsafari.Recipe:
+    row = {
+        **BROW,
+        "site": site,
+        "fill_origins": [f"https://{B12_IDP[site]}"],
+        "check_url": B12_LANDINGS[site],
+        "login_url": B12_LANDINGS[site],
+    }
+    recipe = alsafari.broker_recipe(row, B12_LABELS, alsafari.BROKER_SAFARI_STOPS[site])
+    assert recipe is not None
+    return recipe
+
+
+# (user, login, otp) step conditions per page
+_USER_PAGE = [[True, False], [False, False], [False, False]]
+_PASS_PAGE = [[False, True], [True, False], [False, False]]
+_CODE_PAGE = [[False, False], [False, False], [True, False]]
+_NO_STEP = [[False, False], [False, False], [False, False]]
+
+
+def _shape(page: str) -> dict[str, Any]:
+    """Page flags of a challenge page of shape `page`."""
+    if page == "code":
+        return {"code": True, "steps": _CODE_PAGE}
+    if page == "any":  # Zoho: the concealed password field counts visible
+        return {"password": True, "steps": _NO_STEP}
+    return {"steps": _NO_STEP}
+
+
+def _challenges() -> list[tuple[str, int, str]]:
+    return [
+        (site, index, text)
+        for site, items in CHALLENGE_TEXT.items()
+        for index, text in items
+    ]
+
+
+def _run_b12(site: str, pages: list[tuple[str, str, dict[str, Any]]]) -> Any:
+    """Run `site`'s recipe over (path, page text, flags) pages."""
+    idp = B12_IDP[site]
+    script = [
+        (f"https://{idp}{path}", w._page(**flags, stops=_hits(site, text)))
+        for path, text, flags in pages
+    ]
+    fake = w.FakeSafari(_b12_recipe(site), script)
+    return fake, w._machine(fake).run()
+
+
+def _before(after: str) -> list[tuple[str, str, dict[str, Any]]]:
+    """The pages that run the steps up to and including `after`."""
+    user = ("/login", "Sign in", {"user": True, "steps": _USER_PAGE})
+    password = ("/pw", "Password", {"password": True, "steps": _PASS_PAGE})
+    return {"": [], "user": [user], "login": [user, password]}[after]
+
+
+@pytest.mark.parametrize(("site", "index", "text"), _challenges())
+def test_b12_a_stop_fires_on_its_page_after_its_step(
+    site: str, index: int, text: str
+) -> None:
+    stop = alsafari.BROKER_SAFARI_STOPS[site][index]
+    pages = [*_before(stop.after), ("/challenge", text, _shape(stop.page))]
+    fake, out = _run_b12(site, pages)
+    assert (out.code, out.rc) == (stop.code, alsafari.stop_rc(stop.code))
+    kinds = [c[0] for c in fake.calls if c[0] in FILLS]
+    assert kinds == ["--login"] * len(_before(stop.after))  # never the TOTP
+
+
+@pytest.mark.parametrize(("site", "index", "text"), _challenges())
+def test_b12_a_stop_never_fires_before_its_step_or_on_another_page(
+    site: str, index: int, text: str
+) -> None:
+    stop = alsafari.BROKER_SAFARI_STOPS[site][index]
+    if stop.after:  # the challenge text before its step ran
+        _fake, out = _run_b12(site, [("/challenge", text, _shape(stop.page))])
+        assert out.code != stop.code
+    if stop.page != "any":  # the text on a page of the other shape
+        other = _shape("fieldless" if stop.page == "code" else "code")
+        pages = [*_before(stop.after), ("/challenge", text, other)]
+        _fake, out = _run_b12(site, pages)
+        assert out.code != stop.code
+
+
+def test_b12_the_identity_row_stays_unrouted(monkeypatch: pytest.MonkeyPatch) -> None:
+    site = "gitlab-sdsc-glensk"
+    row = {
+        **BROW,
+        "site": site,
+        "identity": "gitlab",
+        "privilege": "user",
+        "fill_origins": ["https://gitlab.datascience.ch"],
+        "check_url": B12_LANDINGS[site],
+        "login_url": "https://gitlab.datascience.ch/users/sign_in",
+    }
+    _snapshot(monkeypatch, [row])
+    labels = alsafari.BrokerLabels(
+        "one_page", pass_submit="Sign in", otp_submit="Verify"
+    )
+    monkeypatch.setitem(alsafari.BROKER_SAFARI_LABELS, site, labels)
+    assert al.safari_recipe(site) is None and not al.safari_routed(site)
+    assert al.safari_why(site, row) == ""  # ❌ not built, never ⛔
+    monkeypatch.setattr(al, "SAFARI_IDENTITY_READ_SAFE", True)
+    recipe = al.safari_recipe(site)
+    assert recipe is not None and recipe.identity == site and al.safari_routed(site)
+
+
+def test_b12_labels_route_a_saas_site_with_its_stops(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    site = "zoho-desk"
+    row = {
+        **BROW,
+        "site": site,
+        "fill_origins": ["https://accounts.zoho.eu"],
+        "check_url": B12_LANDINGS[site],
+        "login_url": B12_LANDINGS[site],
+    }
+    _snapshot(monkeypatch, [row])
+    assert not al.safari_routed(site)  # no labels: no route
+    monkeypatch.setitem(alsafari.BROKER_SAFARI_LABELS, site, B12_LABELS)
+    recipe = al.safari_recipe(site)
+    assert recipe is not None and al.safari_routed(site)
+    assert recipe.stops == alsafari.BROKER_SAFARI_STOPS[site]
+    assert recipe.hosts == ("accounts.zoho.eu", "desk.zoho.eu")
+    assert recipe.start_url == B12_LANDINGS[site] and not recipe.import_after
+
+
+FIELD_LABELS = alsafari.BrokerLabels(
+    "two_step",
+    pass_submit="Sign in",
+    user_submit="Next",
+    otp_submit="Verify",
+    user_field="#login_id",
+    pass_field="#password",
+    otp_field="#mfa_totp",
+    post_clicks=(("Not now", "#trust-browser"), ("Remind me later", "#review")),
+)
+
+
+def test_b12_field_selectors_and_post_login_clicks_build_steps() -> None:
+    recipe = alsafari.broker_recipe(BROW, FIELD_LABELS)
+    assert recipe is not None
+    got = [(s.kind, s.fields, s.trigger, s.when, s.after) for s in recipe.steps]
+    assert got == [
+        ("user", (("--user-field", "#login_id"),), "", alsafari._USER_FIELD, ""),
+        ("login", (("--pass-field", "#password"),), "", alsafari._PASSWORD, "user"),
+        ("otp", (("--otp-field", "#mfa_totp"),), "", alsafari._OTP_FIELD, "login"),
+        ("click", (), "Not now", "#trust-browser", "login"),
+        ("click", (), "Remind me later", "#review", "login"),
+    ]
+    assert all(s.optional for s in recipe.steps[3:])
+    one = alsafari.broker_recipe(
+        BROW,
+        alsafari.BrokerLabels(
+            "one_page", pass_submit="Log in", user_field="#u", pass_field="#p"
+        ),
+    )
+    assert one is not None
+    assert one.steps[0].fields == (("--user-field", "#u"), ("--pass-field", "#p"))
+    for bad in (("", "#x"), ("Not now", "")):
+        labels = alsafari.BrokerLabels("one_page", "Log in", post_clicks=(bad,))
+        assert alsafari.broker_recipe(BROW, labels) is None
+
+
+def test_b12_the_fills_pass_their_field_selectors_to_safari_py() -> None:
+    recipe = alsafari.broker_recipe(BROW, FIELD_LABELS)
+    assert recipe is not None
+    five = [[False, False]] * 5
+    pages = [
+        (
+            "https://id.example.org/login",
+            w._page(user=True, steps=_USER_PAGE + five[:2]),
+        ),
+        (
+            "https://id.example.org/pw",
+            w._page(password=True, steps=_PASS_PAGE + five[:2]),
+        ),
+        ("https://id.example.org/mfa", w._page(code=True, steps=_CODE_PAGE + five[:2])),
+        (
+            "https://id.example.org/trust",
+            w._page(steps=[*five[:3], [True, False], [False, False]]),
+        ),
+        ("https://app.example.org/home", w._page(sentinel=True)),
+    ]
+    fake = w.FakeSafari(recipe, pages)
+    out = w._machine(fake, w._plan(start_url=BLANDING, item="Selfhost")).run()
+    assert out.ok, out.code
+    calls = [c for c in fake.calls if c[0] in FILLS]
+    assert [c[0] for c in calls] == ["--login", "--login", "--otp", "--click"]
+    assert calls[0][-1] == "--user-field=#login_id" and "--user-only" in calls[0]
+    assert calls[1][-1] == "--pass-field=#password" and "--no-user" in calls[1]
+    assert calls[2][-1] == "--otp-field=#mfa_totp"
+    assert calls[3][:2] == ["--click", "Not now"]

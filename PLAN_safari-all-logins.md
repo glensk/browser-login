@@ -348,7 +348,7 @@ Execution order from here: B8-B9 first, then B6-B7 (overseer decision).
   `-L SITE -s`. Most are logged in in Safari already → proof-first ok. A real login
   only where `-O` said `safari_logged_out`; one attempt each; the broker rate limit
   and cooldowns are respected (a `rate_limited` → stop, no retry).
-- [ ] B12 batch BP SaaS with TOTP: github, gitlab-com, gitlab-ethz,
+- [x] B12 batch BP SaaS with TOTP: github, gitlab-com, gitlab-ethz,
   gitlab-sdsc-glensk, infomaniak, zoho-desk, smartsheet. Same mechanism as B10, plus
   the identity read for the multi-account gitlab-sdsc-glensk and per-site Albert
   stops (GitHub passkey / "GitHub Mobile" push, Infomaniak SMS / app, Zoho OneAuth

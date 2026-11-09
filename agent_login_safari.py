@@ -130,6 +130,8 @@ STEP_FEATURES = {
     "account": "account_pick",
     "mail_code": "click",
 }
+# tp#1644 B12: the safari.py options that name a fill step's fields (`Step.fields`).
+FIELD_OPTS = frozenset({"--user-field", "--pass-field", "--otp-field"})
 # Steps that send a credential, an SSO choice or a code: at most once per run;
 # a failure after one quarantines the site.
 CREDENTIAL_KINDS = frozenset({"user", "login", "otp", "account", "mail_code"})
@@ -223,6 +225,9 @@ class Step:  # pylint: disable=too-many-instance-attributes
     # tp#1644: a step kind that must have run first (a TOTP step only after
     # the password step, never before).
     after: str = ""
+    # tp#1644 B12: the fields this step fills, as (safari.py option, CSS
+    # selector) pairs (`FIELD_OPTS`; none = safari.py's default fields).
+    fields: tuple[tuple[str, str], ...] = ()
 
 
 @dataclass(frozen=True)
@@ -497,7 +502,11 @@ class BrokerLabels:  # pylint: disable=too-many-instance-attributes
     page's submit ('' = no TOTP page), the IdP host ('' = the first fill
     origin's host), the label of the listing `pre_click` element, and a
     sentinel for a listing row without one. The `*_when` / `*_unless`
-    overrides replace the generic field selectors of a step."""
+    overrides replace the generic field selectors of a step; the `*_field`
+    selectors name the field safari.py fills (tp#1644 B12, '' = its
+    default). `post_clicks`: (label, when-selector) pairs of optional
+    prompts after the password step ("Trust this browser?" → "Not now"),
+    each a click step on `idp` that runs only where its selector shows."""
 
     shape: str  # "one_page" | "two_step"
     pass_submit: str
@@ -510,21 +519,100 @@ class BrokerLabels:  # pylint: disable=too-many-instance-attributes
     user_unless: str = ""
     pass_when: str = ""
     otp_when: str = ""
+    user_field: str = ""
+    pass_field: str = ""
+    otp_field: str = ""
+    post_clicks: tuple[tuple[str, str], ...] = ()
 
 
 BROKER_SHAPES = frozenset({"one_page", "two_step"})
 # site → its labels from B11 / B13's read-only probe. EMPTY until then: no
 # labels entry → no route (❌), never a guessed label.
 BROKER_SAFARI_LABELS: dict[str, BrokerLabels] = {}
-# site → its own Albert stops (push / passkey / SMS pages, B12). Empty.
-BROKER_SAFARI_STOPS: dict[str, tuple[SiteStop, ...]] = {}
+
+# tp#1644 B12: the sites' own Albert stops. Each regex names the challenge
+# page's own wording (a request SENT / a wait for the device), never a login
+# page's offer ("Sign in with a passkey", "Use GitHub Mobile"); the `after`
+# step and the page shape keep it off the login form itself.
+# Zoho: the OneAuth push after the password (fieldless) ...
+ZOHO_PUSH_RE = (
+    r"sent[^\n]{0,60}(push )?notification[^\n]{0,60}OneAuth"
+    r"|OneAuth[^\n]{0,60}(approve|push notification)"
+    r"|approve[^\n]{0,60}(push|notification|request)[^\n]{0,60}OneAuth"
+)
+# ... and the passkey it asks for right after the e-mail lookup. `any` page:
+# Zoho keeps the concealed password field in the DOM (the detector may count
+# it visible), so the wait wording itself is the condition.
+ZOHO_PASSKEY_RE = (
+    r"(waiting for|verifying|authenticating with) (your |the )?passkey\b"
+    r"|passkey\b[^\n]{0,80}(touch id|face id|follow the (browser|on-?screen)"
+    r"|your browser.s (prompt|instructions))"
+)
+# GitHub: the GitHub Mobile sign-in request; the webauthn passkey page.
+GITHUB_MOBILE_RE = (
+    r"sent[^\n]{0,60}(sign-?in request|notification)[^\n]{0,60}GitHub Mobile"
+    r"|GitHub Mobile[^\n]{0,80}(sign-?in request|enter the (digits|number))"
+)
+# never "Sign in with a passkey" (the login page) / "Use your passkey" (the
+# TOTP page's other options): the webauthn page's own wait wording only
+GITHUB_PASSKEY_RE = (
+    r"waiting for input from browser interaction"
+    r"|when you are ready to authenticate"
+    r"|authenticate with (a |your )?passkey\b"
+)
+# Infomaniak: an SMS code SENT (a code page; "receive a code by SMS instead"
+# is an offer, no stop) and the Infomaniak app's push (fieldless).
+INFOMANIAK_SMS_RE = (
+    r"(sent|envoy(é|e)|gesendet)[^\n]{0,60}\bSMS\b"
+    r"|\bSMS\b[^\n]{0,40}(sent|envoy(é|e)|gesendet)"
+    r"|code[^\n]{0,40}(sent|envoy(é|e)|gesendet)[^\n]{0,30}\+\d[\d *•x]{5,}"
+)
+INFOMANIAK_PUSH_RE = (
+    r"(notification|request|demande)[^\n]{0,80}(sent|envoy(é|e)|gesendet)"
+    r"[^\n]{0,80}(app|application|appareil|device|Gerät)"
+    r"|(confirm|validate|approve|confirmez|validez|approuvez|bestätige)[^\n]{0,60}"
+    r"(on|from|in|sur|depuis|dans|in der) (the |your |votre |l.|deiner )?"
+    r"(Infomaniak )?(app|application|appareil|device)\b"
+)
+# Smartsheet: a code page that names the code mail (no code mail sender is
+# known to this route: never sent, never read).
+SMARTSHEET_MAIL_RE = (
+    r"(sent|emailed)[^\n]{0,60}code[^\n]{0,60}(e-?mail|inbox)"
+    r"|(sent|emailed)[^\n]{0,30}(a |the )?([0-9]-digit |one-time |verification "
+    r"|login |security )*code\b"
+    r"|check your (e-?mail|inbox)"
+    r"|enter the code (we|that was) (sent|emailed)"
+)
+# site → its own Albert stops (push / passkey / SMS pages, B12).
+BROKER_SAFARI_STOPS: dict[str, tuple[SiteStop, ...]] = {
+    "zoho-desk": (
+        SiteStop("needs_albert_push", ZOHO_PUSH_RE, after="login"),
+        SiteStop("needs_albert_hardware_key", ZOHO_PASSKEY_RE, "user", "any"),
+    ),
+    "github": (
+        SiteStop("needs_albert_push", GITHUB_MOBILE_RE, after="login"),
+        SiteStop("needs_albert_hardware_key", GITHUB_PASSKEY_RE, after="login"),
+    ),
+    "infomaniak": (
+        SiteStop("needs_albert_sms", INFOMANIAK_SMS_RE, "login", "code"),
+        SiteStop("needs_albert_push", INFOMANIAK_PUSH_RE, after="login"),
+    ),
+    "smartsheet": (SiteStop("email_code_unwired", SMARTSHEET_MAIL_RE, page="code"),),
+}
+
+
+def _fields(*pairs: tuple[str, str]) -> tuple[tuple[str, str], ...]:
+    """The (option, selector) pairs whose selector the labels set."""
+    return tuple((opt, sel) for opt, sel in pairs if sel)
 
 
 def _broker_steps(labels: BrokerLabels, idp: str, pre_click: str) -> tuple[Step, ...]:
     """The login steps of `labels` on `idp`: the pre-click (a click step on
     its label, only where the listing's element shows and no password
     field), the one-page or two-step form, then the TOTP page — only after
-    the password step."""
+    the password step —, then the optional post-login prompt clicks."""
+    user = ("--user-field", labels.user_field)
+    password = ("--pass-field", labels.pass_field)
     steps: list[Step] = []
     if pre_click:
         steps.append(
@@ -544,6 +632,7 @@ def _broker_steps(labels: BrokerLabels, idp: str, pre_click: str) -> tuple[Step,
                 idp,
                 submit=labels.pass_submit,
                 when=labels.pass_when or ONE_PAGE_FORM,
+                fields=_fields(user, password),
             )
         )
     else:
@@ -554,6 +643,7 @@ def _broker_steps(labels: BrokerLabels, idp: str, pre_click: str) -> tuple[Step,
                 submit=labels.user_submit,
                 when=labels.user_when or _USER_FIELD,
                 unless=labels.user_unless or _PASSWORD,
+                fields=_fields(user),
             ),
             Step(
                 "login",
@@ -562,6 +652,7 @@ def _broker_steps(labels: BrokerLabels, idp: str, pre_click: str) -> tuple[Step,
                 when=labels.pass_when or _PASSWORD,
                 no_user=True,
                 after="user",
+                fields=_fields(password),
             ),
         ]
     if labels.otp_submit:
@@ -572,8 +663,13 @@ def _broker_steps(labels: BrokerLabels, idp: str, pre_click: str) -> tuple[Step,
                 submit=labels.otp_submit,
                 when=labels.otp_when or _OTP_FIELD,
                 after="login",
+                fields=_fields(("--otp-field", labels.otp_field)),
             )
         )
+    steps += [
+        Step("click", idp, trigger=label, when=when, after="login", optional=True)
+        for label, when in labels.post_clicks
+    ]
     return tuple(steps)
 
 
@@ -595,8 +691,12 @@ def broker_recipe(
     origins = [safe_host(o) for o in row.get("fill_origins") or ()]
     if not check or "" in origins or labels.shape not in BROKER_SHAPES:
         return None
-    if not labels.pass_submit or (
-        labels.shape == "two_step" and not labels.user_submit
+    # a prompt click names its label AND where it shows
+    clicks_ok = all(label and when for label, when in labels.post_clicks)
+    if (
+        not clicks_ok
+        or not labels.pass_submit
+        or (labels.shape == "two_step" and not labels.user_submit)
     ):
         return None
     named = [*origins, check, safe_host(row.get("login_url"))]
@@ -1822,8 +1922,10 @@ class Machine:  # pylint: disable=too-many-instance-attributes
             if not self.plan.account:
                 return None
             return ["--click", self.plan.account, "--row", self.plan.account, *on]
+        # `--opt=SEL`: a selector is never read as an option of its own
+        fields = [f"{opt}={sel}" for opt, sel in step.fields if opt in FIELD_OPTS]
         if step.kind == "otp":
-            return ["--otp", self.plan.item, *on, "--submit", step.submit]
+            return ["--otp", self.plan.item, *on, "--submit", step.submit, *fields]
         if step.kind == "user":
             return [
                 "--login",
@@ -1832,11 +1934,12 @@ class Machine:  # pylint: disable=too-many-instance-attributes
                 "--user-only",
                 "--submit",
                 step.submit,
+                *fields,
             ]
         args = ["--login", self.plan.item, *on, "--submit", step.submit]  # login
         if step.no_user:
             args.append("--no-user")
-        return args
+        return [*args, *fields]
 
     def _eval_ok(self, body: str, host: str) -> bool:
         """Run `body` in the login tab; True when it answered ``{"ok": true}``."""
