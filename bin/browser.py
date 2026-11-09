@@ -157,6 +157,8 @@ import fnmatch
 import functools
 import glob
 import hashlib
+import importlib.util
+import io
 import json
 import os
 import queue
@@ -217,7 +219,13 @@ from broker.useragent import engine_user_agent as _engine_user_agent  # noqa: E4
 # `instance` puts it there, so ONE instance never holds two accounts of one
 # site (admin accounts live only in "admin", started on demand).
 INSTANCE_PORTS = {"": 9222, "private": 9223, **_identity.ROLE_INSTANCE_PORTS}
-INSTANCE = os.environ.get("CLAUDE_BROWSER_INSTANCE", "").strip().lower()
+# `_INSTANCE_PIN`: set (before this module runs) only in the per-instance copy
+# `sweep-access -A` loads in-process (`_instance_module`, tp#1963).
+INSTANCE = (
+    str(globals().get("_INSTANCE_PIN", os.environ.get("CLAUDE_BROWSER_INSTANCE", "")))
+    .strip()
+    .lower()
+)
 if INSTANCE not in INSTANCE_PORTS:
     sys.exit(
         f"❌ CLAUDE_BROWSER_INSTANCE={INSTANCE!r} is unknown "
@@ -1338,6 +1346,25 @@ def ensure_deps():  # literal "def ensure_deps():" required by pre-commit hook
         subprocess.run([sys.executable, "-m", "venv", str(venv_dir)], check=True)
         _pip_install()
     os.execv(str(venv_python), [str(venv_python), *sys.argv])
+
+
+#: Raw-CDP-only subcommands (tp#1963): they never import Playwright — only
+#: `websockets` (`_cdp_ws_call`) — so `ensure_deps`' Playwright import probe
+#: is skipped while websockets imports.
+_RAW_CDP_CMDS = frozenset({"sweep-access"})
+
+
+def _ensure_cmd_deps(cmd: str | None) -> None:
+    """`ensure_deps`, except for a raw-CDP command whose `websockets` imports
+    already (the every-minute `sweep-access` pays no Playwright import)."""
+    if cmd in _RAW_CDP_CMDS:
+        try:
+            import websockets  # noqa: F401  # pylint: disable=unused-import
+
+            return
+        except ImportError:
+            pass
+    ensure_deps()
 
 
 def _chromium_binary() -> str:
@@ -15089,28 +15116,130 @@ class _SweepChild(NamedTuple):
     timed_out: bool = False
 
 
+#: tp#1963: `sweep-access -A` sweeps every instance in THIS process (was one
+#: child interpreter per instance). Another instance's pass runs in its own
+#: copy of this module — its INSTANCE, CACHE_DIR, registry, maintenance
+#: record, journal and state file — loaded once (`_instance_module`).
+_INSTANCE_MODULES: dict[str, Any] = {}
+_INSTANCE_MODULES_LOCK = threading.Lock()
+
+
+def _instance_module(inst: str) -> Any:
+    """This module as instance `inst` sees it: itself when it IS that
+    unpinned instance, else a copy executed with ``_INSTANCE_PIN = inst``
+    (cached; no environment change, so concurrent passes stay safe)."""
+    if inst == INSTANCE and DEFAULT_CDP_PORT == INSTANCE_PORTS[inst]:
+        return sys.modules[__name__]
+    with _INSTANCE_MODULES_LOCK:
+        mod = _INSTANCE_MODULES.get(inst)
+        if mod is not None:
+            return mod
+        name = f"_browser_instance_{inst or 'default'}"
+        spec = importlib.util.spec_from_file_location(name, os.path.realpath(__file__))
+        if spec is None or spec.loader is None:
+            raise ImportError(f"cannot load {__file__} for instance {inst!r}")
+        mod = importlib.util.module_from_spec(spec)
+        mod.__dict__["_INSTANCE_PIN"] = inst
+        sys.modules[name] = mod  # dataclasses look their module up while it runs
+        try:
+            spec.loader.exec_module(mod)
+        except BaseException:
+            sys.modules.pop(name, None)
+            raise
+        _INSTANCE_MODULES[inst] = mod
+        return mod
+
+
+class _ThreadStreams(io.TextIOBase):
+    """``sys.stdout``/``sys.stderr`` while `sweep-access -A` runs its passes
+    as threads: a thread that `route`d itself writes into its own buffer
+    (the old child's captured output), every other thread to `real`."""
+
+    def __init__(self, real: Any) -> None:
+        super().__init__()
+        self.real = real
+        self.local = threading.local()
+
+    def route(self, buf: io.StringIO | None) -> None:
+        self.local.buf = buf
+
+    def writable(self) -> bool:
+        return True
+
+    def write(self, s: str) -> int:
+        buf = getattr(self.local, "buf", None)
+        return int((buf if buf is not None else self.real).write(s) or 0)
+
+    def flush(self) -> None:
+        if getattr(self.local, "buf", None) is None:
+            with contextlib.suppress(Exception):
+                self.real.flush()
+
+
+@contextlib.contextmanager
+def _thread_streams() -> Iterator[None]:
+    """Install `_ThreadStreams` on stdout/stderr (kept when already there)."""
+    if isinstance(sys.stdout, _ThreadStreams) and isinstance(
+        sys.stderr, _ThreadStreams
+    ):
+        yield
+        return
+    saved = sys.stdout, sys.stderr
+    sys.stdout, sys.stderr = _ThreadStreams(saved[0]), _ThreadStreams(saved[1])
+    try:
+        yield
+    finally:
+        sys.stdout, sys.stderr = saved
+
+
+def _sweep_access_in(inst: str, *, quiet: bool, dry_run: bool) -> int:
+    """`_sweep_access_one` of instance `inst`, on its own port."""
+    mod = _instance_module(inst)
+    return int(
+        mod._sweep_access_one(mod.DEFAULT_CDP_PORT, quiet=quiet, dry_run=dry_run)
+    )
+
+
 def _sweep_access_child(
     inst: str, argv: Sequence[str], timeout_s: float
 ) -> _SweepChild:
-    """Run ``browser.py ARGV`` pinned to `inst`, bounded by `timeout_s`."""
-    env = {**os.environ, "CLAUDE_BROWSER_INSTANCE": inst}
-    env.pop("CLAUDE_BROWSER_CDP_PORT", None)
-    try:
-        r = subprocess.run(
-            [sys.executable, os.path.realpath(__file__), *argv],
-            env=env,
-            capture_output=True,
-            text=True,
-            timeout=timeout_s,
-            check=False,
-        )
-    except subprocess.TimeoutExpired:
+    """Run ``sweep-access ARGV`` for `inst` in a thread of THIS process
+    (tp#1963), its output captured, bounded by `timeout_s`: a pass that has
+    not finished by then is a timed-out failure (its daemon thread is left
+    behind; the process exits right after the fan-out)."""
+    quiet, dry_run = "-q" in argv, "-n" in argv
+    box: list[_SweepChild] = []
+
+    def _work() -> None:
+        out, err = io.StringIO(), io.StringIO()
+        streams = [s for s in (sys.stdout, sys.stderr) if isinstance(s, _ThreadStreams)]
+        if len(streams) == 2:
+            streams[0].route(out)
+            streams[1].route(err)
+        rc = 1
+        try:
+            rc = _sweep_access_in(inst, quiet=quiet, dry_run=dry_run)
+        except SystemExit as exc:
+            rc = exc.code if isinstance(exc.code, int) else 1
+            if isinstance(exc.code, str):
+                print(exc.code, file=sys.stderr)
+        except Exception as exc:  # pylint: disable=broad-exception-caught
+            print(f"❌ sweep-access: {_exc_line(exc)}", file=sys.stderr)
+        finally:
+            for s in streams:
+                s.route(None)
+        box.append(_SweepChild(rc, out.getvalue(), err.getvalue()))
+
+    worker = threading.Thread(
+        target=_work, name=f"sweep-pass-{inst or 'default'}", daemon=True
+    )
+    worker.start()
+    worker.join(max(0.0, timeout_s))
+    if not box:
         return _SweepChild(
             1, "", f"❌ sweep-access timed out after {timeout_s:g}s\n", True
         )
-    except OSError as exc:
-        return _SweepChild(1, "", f"❌ sweep-access did not start: {exc}\n", True)
-    return _SweepChild(r.returncode, r.stdout, r.stderr)
+    return box[0]
 
 
 def _sweep_access_fanout(
@@ -15119,7 +15248,8 @@ def _sweep_access_fanout(
     child_timeout_s: float = ACCESS_SWEEP_CHILD_TIMEOUT_S,
     deadline_s: float = ACCESS_SWEEP_FANOUT_DEADLINE_S,
 ) -> int:
-    """`sweep-access -A`: one child per instance whose CDP port answers, ALL
+    """`sweep-access -A`: one pass per instance whose CDP port answers (a
+    thread of this process, tp#1963: `_sweep_access_child`), ALL
     AT ONCE (a stalled instance costs its own `child_timeout_s`, capped at
     ACCESS_SWEEP_CHILD_TIMEOUT_S, never the others' time), bounded overall
     by `deadline_s`; output tagged per instance, exit `_worst_rc`. A child
@@ -15148,10 +15278,11 @@ def _sweep_access_fanout(
         for inst, iport in INSTANCE_PORTS.items()
     ]
     end = time.monotonic() + deadline_s
-    for t in threads:
-        t.start()
-    for t in threads:
-        t.join(max(0.0, end - time.monotonic()))
+    with _thread_streams():
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(max(0.0, end - time.monotonic()))
     codes: list[int] = []
     dry_run = "-n" in argv  # a dry run journals and records nothing
     now = time.time()
@@ -21253,7 +21384,7 @@ def _reexec_in_instance(inst: str) -> None:
 def main() -> int:
     """Parse, bootstrap, and dispatch; a timed-out Playwright attach is a ❌ line."""
     args = parse_args()
-    ensure_deps()
+    _ensure_cmd_deps(args.cmd)
     # WS5: `login`/`logged-in` of a broker item that lives in a role instance
     # (admin/alt) run there — before any registration, gate or journal entry
     # of THIS instance. A pinned run is refused by the gate instead.
@@ -21524,5 +21655,5 @@ def _dispatch(args: argparse.Namespace, port: int) -> int:  # pylint: disable=to
 
 if __name__ == "__main__":
     args_ns = parse_args()  # parse first so -h is instant (no venv/import cost)
-    ensure_deps()
+    _ensure_cmd_deps(args_ns.cmd)
     sys.exit(main())

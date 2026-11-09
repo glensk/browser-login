@@ -1665,7 +1665,11 @@ the `himalaya` helpers. The CDP endpoint is always `http://127.0.0.1:<port>` (ne
   `browser.py sweep-access -A -q -S`, every 60 s from the LaunchAgent
   `com.albert.browser-access-sweep`, runs the same raw-CDP sweep on every
   running instance concurrently (each bounded, never starting a browser,
-  never attaching Playwright). It stands down (exit 75; 0 under `-S`) while
+  never attaching Playwright). Since tp#1963 the LaunchAgent calls
+  `bin/access_sweep.py -A -q -S`: it exits at once when no instance's CDP
+  port listens, else runs `sweep-access` in one process (each instance's
+  pass a thread in its own copy of the module; no Playwright import, no
+  child interpreter). It stands down (exit 75; 0 under `-S`) while
   a guided login owns the browser — that login sweeps at its own end, and
   its watchdog sweeps in recovery before resuming clients. Each pass writes
   `<cache>/access-sweep.json` (status ok/dropped/failed/busy/down, host +

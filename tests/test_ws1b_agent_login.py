@@ -665,8 +665,9 @@ def test_access_sweep_plist_runs_sweep_access_every_minute_in_background() -> No
     plists = {label: text for label, text, _what in jobs.agent_plists()}
     text = plists[jobs.ACCESS_SWEEP_LABEL]
     assert "<string>com.albert.browser-access-sweep</string>" in text
-    assert str(jobs.BROWSER_PY) in text
-    args = "".join(f"<string>{a}</string>" for a in ("sweep-access", "-A", "-q", "-S"))
+    assert str(jobs.ACCESS_SWEEP_PY) in text  # tp#1963: the cheap entry
+    assert jobs.ACCESS_SWEEP_PY.exists()
+    args = "".join(f"<string>{a}</string>" for a in ("-A", "-q", "-S"))
     assert args in text.replace("\n", "").replace(" ", "")
     assert "<key>StartInterval</key>\n    <integer>60</integer>" in text
     assert "<key>RunAtLoad</key>\n    <false/>" in text
@@ -686,8 +687,7 @@ def test_access_sweep_plist_is_valid_plist() -> None:
     doc = plistlib.loads(jobs.access_sweep_plist().encode())
     assert doc["Label"] == jobs.ACCESS_SWEEP_LABEL
     assert doc["ProgramArguments"][1:] == [
-        str(jobs.BROWSER_PY),
-        "sweep-access",
+        str(jobs.ACCESS_SWEEP_PY),
         "-A",
         "-q",
         "-S",

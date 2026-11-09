@@ -1108,32 +1108,156 @@ def test_sweep_access_all_child_timeout_is_a_journaled_failure(
     tmp_path: Path,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    import subprocess  # pylint: disable=import-outside-toplevel
+    import threading  # pylint: disable=import-outside-toplevel
 
     ports = browser.INSTANCE_PORTS
     _fanout_env(monkeypatch, down={ports["admin"], ports["alt"]})
-    budgets: list[float] = []
+    # tp#1963: the passes are threads of this process, no child interpreter
+    monkeypatch.setattr(
+        browser.subprocess, "run", lambda *_a, **_k: pytest.fail("subprocess")
+    )
+    monkeypatch.setattr(browser, "ACCESS_SWEEP_CHILD_TIMEOUT_S", 0.3)
+    hold = threading.Event()
 
-    def _run(argv: Any, **kw: Any) -> Any:
-        budgets.append(kw["timeout"])
-        if kw["env"]["CLAUDE_BROWSER_INSTANCE"] == "private":
-            raise subprocess.TimeoutExpired(argv, kw["timeout"])
-        assert "CLAUDE_BROWSER_CDP_PORT" not in kw["env"]
-        return subprocess.CompletedProcess(argv, 0, "", "")
+    def _pass(inst: str, *, quiet: bool, dry_run: bool) -> int:
+        assert quiet and dry_run in (False, True)
+        if inst == "private":
+            hold.wait(timeout=5)  # never finishes inside its budget
+        return 0
 
-    monkeypatch.setattr(browser.subprocess, "run", _run)
-    rc = browser._sweep_access_fanout(["sweep-access", "-q"], child_timeout_s=60.0)
-    assert rc == 1
-    assert budgets == [20.0, 20.0]  # a caller's 60 s is capped at 20 s
-    err = capsys.readouterr().err
-    assert "[private] ❌ sweep-access timed out" in err
-    events = [e for e in _journal_events(tmp_path) if e["event"] == "access_sweep"]
-    assert [(e["sweep_instance"], e["status"]) for e in events] == [
-        ("private", "failed")
-    ]
-    budgets.clear()  # a dry run's timeout is reported, never journaled
-    assert browser._sweep_access_fanout(["sweep-access", "-q", "-n"]) == 1
-    assert len(_journal_events(tmp_path)) == len(events)
+    monkeypatch.setattr(browser, "_sweep_access_in", _pass)
+    try:
+        rc = browser._sweep_access_fanout(["sweep-access", "-q"], child_timeout_s=60.0)
+        assert rc == 1
+        err = capsys.readouterr().err
+        assert "[private] ❌ sweep-access timed out after 0.3s" in err  # 60 s capped
+        events = [e for e in _journal_events(tmp_path) if e["event"] == "access_sweep"]
+        assert [(e["sweep_instance"], e["status"]) for e in events] == [
+            ("private", "failed")
+        ]
+        # a dry run's timeout is reported, never journaled
+        assert browser._sweep_access_fanout(["sweep-access", "-q", "-n"]) == 1
+        assert len(_journal_events(tmp_path)) == len(events)
+    finally:
+        hold.set()
+
+
+def test_sweep_access_all_runs_passes_in_process_with_tagged_output(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """tp#1963: each instance's pass prints into its own buffer (tagged
+    after), a pass's SystemExit/exception is that instance's failure."""
+    ports = browser.INSTANCE_PORTS
+    _fanout_env(monkeypatch, down={ports["alt"]})
+    monkeypatch.setattr(
+        browser.subprocess, "run", lambda *_a, **_k: pytest.fail("subprocess")
+    )
+
+    def _pass(inst: str, *, quiet: bool, dry_run: bool) -> int:
+        assert not quiet and not dry_run
+        if inst == "private":
+            raise SystemExit("❌ Cannot register")
+        if inst == "admin":
+            raise RuntimeError("boom")
+        print(f"swept {inst or 'default'}")
+        print(f"note {inst or 'default'}", file=sys.stderr)
+        return 0
+
+    monkeypatch.setattr(browser, "_sweep_access_in", _pass)
+    assert browser._sweep_access_fanout(["sweep-access"]) == 1
+    out = capsys.readouterr()
+    assert out.out.splitlines() == ["[default] swept default"]
+    err = out.err.splitlines()
+    assert "[default] note default" in err
+    assert "[private] ❌ Cannot register" in err
+    assert any(
+        line.startswith("[admin] ❌ sweep-access:") and "boom" in line for line in err
+    )
+    assert not isinstance(sys.stdout, browser._ThreadStreams)  # restored
+
+
+def test_instance_module_is_a_pinned_copy_for_another_instance(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """tp#1963: another instance's pass runs in a copy of browser.py whose
+    INSTANCE, port and files are that instance's — no env change."""
+    import os  # pylint: disable=import-outside-toplevel
+
+    monkeypatch.delenv("CLAUDE_BROWSER_CDP_PORT", raising=False)
+    monkeypatch.delenv("CLAUDE_BROWSER_INSTANCE", raising=False)
+    monkeypatch.setattr(browser, "_INSTANCE_MODULES", {})
+    try:
+        mod = browser._instance_module("private")
+        assert mod is not browser and mod is browser._instance_module("private")
+        assert mod.INSTANCE == "private" and mod.DEFAULT_CDP_PORT == 9223
+        assert "CLAUDE_BROWSER_INSTANCE" not in os.environ
+    finally:
+        sys.modules.pop("_browser_instance_private", None)
+
+
+def test_sweep_access_needs_no_playwright(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(browser, "ensure_deps", lambda: pytest.fail("playwright"))
+    browser._ensure_cmd_deps("sweep-access")  # websockets is enough
+    seen: list[str] = []
+    monkeypatch.setattr(browser, "ensure_deps", lambda: seen.append("deps"))
+    browser._ensure_cmd_deps("login")
+    assert seen == ["deps"]
+
+
+def _load_access_sweep() -> Any:
+    path = REPO / "bin" / "access_sweep.py"
+    spec = importlib.util.spec_from_file_location("access_sweep_test", path)
+    assert spec and spec.loader
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def test_access_sweep_entry_ports_and_argv() -> None:
+    entry = _load_access_sweep()
+    assert entry.INSTANCE_PORTS == browser.INSTANCE_PORTS
+    args = entry.parse_args(["-A", "-q", "-S"])
+    assert entry.forward_argv(args) == ["sweep-access", "-A", "-q", "-S"]
+    assert entry.forward_argv(entry.parse_args(["-n"])) == ["sweep-access", "-n"]
+
+
+def test_access_sweep_entry_exits_early_only_when_nothing_listens(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import socket  # pylint: disable=import-outside-toplevel
+
+    entry = _load_access_sweep()
+    with socket.socket() as s:  # a port nobody listens on
+        s.bind(("127.0.0.1", 0))
+        free = s.getsockname()[1]
+    assert entry.port_down(free)
+    with socket.socket() as srv:
+        srv.bind(("127.0.0.1", 0))
+        srv.listen(1)
+        assert not entry.port_down(srv.getsockname()[1])
+    monkeypatch.setattr(entry, "port_down", lambda _p, *_a: True)
+    assert entry.nothing_runs({})
+    for pin in entry.PIN_ENVS:  # a pinned run always goes to browser.py
+        assert not entry.nothing_runs({pin: "x"})
+    monkeypatch.setattr(entry, "port_down", lambda p, *_a: p != 9224)
+    assert not entry.nothing_runs({})
+    monkeypatch.setattr(entry, "nothing_runs", lambda _e: True)
+    assert entry.main(["-A", "-q", "-S"]) == 0  # never imports browser.py
+
+
+def test_access_sweep_entry_help_exits_zero() -> None:
+    import subprocess  # pylint: disable=import-outside-toplevel
+
+    r = subprocess.run(
+        [sys.executable, str(REPO / "bin" / "access_sweep.py"), "-h"],
+        capture_output=True,
+        text=True,
+        timeout=60,
+        check=False,
+    )
+    assert r.returncode == 0, r.stderr
+    for flag in ("--all-instances", "--quiet", "--dry-run", "--scheduled"):
+        assert flag in r.stdout
 
 
 def test_sweep_access_all_has_an_overall_deadline(

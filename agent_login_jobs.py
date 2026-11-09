@@ -67,6 +67,10 @@ CONSOLE_BALANCE_PY = Path(__file__).resolve().parent / "console-balance.py"
 # (guided login, gate held) exits 0 instead of 75. Background priority.
 ACCESS_SWEEP_LABEL = "com.albert.browser-access-sweep"
 ACCESS_SWEEP_INTERVAL_S = 60
+# tp#1963: its entry runs `browser.py sweep-access` in-process and exits at
+# once when no instance listens (no per-run compile of browser.py, no
+# Playwright import, no child interpreter per instance).
+ACCESS_SWEEP_PY = BROWSER_PY.parent / "access_sweep.py"
 ACCESS_SWEEP_LOG = Path.home() / "Library" / "Logs" / f"{ACCESS_SWEEP_LABEL}.log"
 # Set in every agent-login LaunchAgent: a scheduled run. `-L` (the Safari
 # login, which drives Albert's real Safari) refuses to run with it.
@@ -206,13 +210,13 @@ def access_sweep_plist() -> str:
     text, at background priority. Pure."""
     return launchagent_plist(
         label=ACCESS_SWEEP_LABEL,
-        args=("sweep-access", "-A", "-q", "-S"),
+        args=("-A", "-q", "-S"),
         schedule=(
             "<key>StartInterval</key>\n    "
             f"<integer>{ACCESS_SWEEP_INTERVAL_S}</integer>"
         ),
         run_at_load=False,
-        script=BROWSER_PY,
+        script=ACCESS_SWEEP_PY,
         background=True,
     )
 
@@ -248,7 +252,8 @@ def agent_plists() -> list[tuple[str, str, str]]:
         (
             ACCESS_SWEEP_LABEL,
             access_sweep_plist(),
-            f"every {ACCESS_SWEEP_INTERVAL_S} s, browser.py sweep-access -A -q -S; "
+            f"every {ACCESS_SWEEP_INTERVAL_S} s, access_sweep.py -A -q -S "
+            "(browser.py sweep-access); "
             f"log {ACCESS_SWEEP_LOG}",
         ),
     ]

@@ -570,7 +570,8 @@ framework. It is a **provider**: other repos depend on it, not the reverse. See
   Never add an exemption; per-app Access cookies on the app's own host are
   fine. Agent navigation (Playwright MCP, `open`, `eval`, any CDP client)
   is covered by the periodic sweep (tp#1468): `browser.py sweep-access -A -q
-  -S` every 60 s (LaunchAgent `com.albert.browser-access-sweep`), raw CDP
+  -S` every 60 s (LaunchAgent `com.albert.browser-access-sweep`, via
+  `bin/access_sweep.py`: one process, Playwright never imported, tp#1963), raw CDP
   only, state in `<cache>/access-sweep.json`, read by `doctor`. Keep it
   attach-free (no Playwright, no `Target.*`/`Page.*`), journal-quiet on a
   clean pass and value-free on every sink; an injection never falls back
