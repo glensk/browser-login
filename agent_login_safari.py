@@ -30,6 +30,11 @@ Safety rules (each one tested):
   features nothing is driven (``safari_py_outdated``).
 * Every credential / SSO / code step runs at most once per run; a failure
   after one may have submitted something and quarantines the site.
+* Albert's turn (tp#1644, `AlbertWait` / `SiteStop.wait_s`): a recipe may
+  wait for his Touch ID / push approval in the same window — read-only
+  polls, nothing typed, no submit retried. Past the wait the run ends with
+  its needs-Albert code and leaves the window open; the e-mail step alone
+  quarantines nothing.
 * A safari.py run that overstays its budget gets SIGTERM (safari.py clears
   the clipboard on it, feature ``sigterm_clear``), then SIGKILL; after a
   killed credential step this process clears the clipboard itself.
@@ -67,6 +72,7 @@ import secrets
 import shutil
 import signal
 import subprocess
+import sys
 import tempfile
 import time
 from collections.abc import Callable, Iterator
@@ -135,6 +141,9 @@ FIELD_OPTS = frozenset({"--user-field", "--pass-field", "--otp-field"})
 # Steps that send a credential, an SSO choice or a code: at most once per run;
 # a failure after one quarantines the site.
 CREDENTIAL_KINDS = frozenset({"user", "login", "otp", "account", "mail_code"})
+# tp#1644: of those, the steps that send more than the e-mail address — an
+# Albert wait that runs out after the e-mail step alone quarantines nothing.
+SECRET_KINDS = CREDENTIAL_KINDS - {"user"}
 # Steps whose secret travels through the clipboard (safari.py -L / -O).
 CLIPBOARD_KINDS = frozenset({"user", "login", "otp"})
 
@@ -237,12 +246,37 @@ class SiteStop:
     on the page text, only after a step of kind `after` ran ('' = any time),
     on a page of shape `page` (``fieldless`` = no password / user / code
     field, ``code`` = a code field, ``any``); the run ends with `code`
-    (its `stop_rc`)."""
+    (its `stop_rc`). `wait_s` > 0 (tp#1644): the run first waits that long
+    in the same window for Albert to approve (read-only polls, nothing
+    typed) and goes on when the page moves on; past it, `code`."""
 
     code: str
     text: str
     after: str = ""
     page: str = "fieldless"  # fieldless | code | any
+    wait_s: float = 0.0
+
+
+@dataclass(frozen=True)
+class AlbertWait:
+    """tp#1644: after a step of kind `after` ran, a page where no step runs
+    (and no stop shows) is Albert's turn — a passkey / Touch ID sheet over
+    a loader, a push to approve. The run waits up to `seconds` (read-only
+    polls, nothing typed, the window kept open) and goes on when the page
+    moves on; past it, `code` (its `stop_rc`) with the window left open.
+    `what` names his action in the one line the wait prints."""
+
+    after: str
+    seconds: float
+    code: str
+    what: str
+
+
+# The action a site stop's wait names (`SiteStop.wait_s`), by its code.
+WAIT_WHAT = {
+    "needs_albert_push": "push approval",
+    "needs_albert_hardware_key": "passkey / Touch ID",
+}
 
 
 @dataclass(frozen=True)
@@ -261,6 +295,7 @@ class Recipe:  # pylint: disable=too-many-instance-attributes
     import_after: bool = True  # False: Safari-only use (Ricardo)
     identity: str = ""  # built-in import's account proof (browser.py)
     stops: tuple[SiteStop, ...] = ()  # tp#1644: the site's own Albert stops
+    albert_wait: AlbertWait | None = None  # tp#1644: None = stuck as before
 
     def features(self) -> frozenset[str]:
         """safari.py features this recipe needs."""
@@ -507,7 +542,10 @@ class BrokerLabels:  # pylint: disable=too-many-instance-attributes
     default). `post_clicks`: (label, when-selector) pairs of optional
     prompts after the password step ("Trust this browser?" → "Not now";
     zoho-desk alone answers "Trust", Albert's exception of 2026-11-09),
-    each a click step on `idp` that runs only where its selector shows."""
+    each a click step on `idp` that runs only where its selector shows,
+    after a step of kind `post_after` ("login"; "user" where a passkey can
+    stand in for the password). `albert_wait`: the recipe's wait for Albert
+    (`AlbertWait`, None = none)."""
 
     shape: str  # "one_page" | "two_step"
     pass_submit: str
@@ -524,6 +562,8 @@ class BrokerLabels:  # pylint: disable=too-many-instance-attributes
     pass_field: str = ""
     otp_field: str = ""
     post_clicks: tuple[tuple[str, str], ...] = ()
+    post_after: str = "login"
+    albert_wait: AlbertWait | None = None
 
 
 BROKER_SHAPES = frozenset({"one_page", "two_step"})
@@ -536,6 +576,7 @@ BROKER_SHAPES = frozenset({"one_page", "two_step"})
 # TOTP / push pages, so this selector is the password step only; a
 # passkey-first lookup hides the field's `.textbox_div` instead (no fill).
 ZOHO_PASSWORD = '#password_container:not(.zeroheight) input[type="password"]'
+ZOHO_WAIT_S = 90.0  # Albert's Touch ID / OneAuth approval (tp#1644)
 # site → its labels from B11 / B13's read-only probe. No labels entry → no
 # route (❌), never a guessed label.
 BROKER_SAFARI_LABELS: dict[str, BrokerLabels] = {
@@ -560,6 +601,18 @@ BROKER_SAFARI_LABELS: dict[str, BrokerLabels] = {
         user_field="#login_id",
         pass_field="#password",
         post_clicks=(("Trust", ".trustbrowser_ui .trustbtn"),),
+        # tp#1644: Albert's account is passkey-first — after the e-mail Zoho
+        # shows a loader under Safari's own Touch ID sheet (no wording, no
+        # field): the run waits there for his touch (or a OneAuth approval),
+        # window open, then answers "Trust" and lands. The passkey path never
+        # runs the password step, so the prompt counts after the e-mail step.
+        post_after="user",
+        albert_wait=AlbertWait(
+            "user",
+            ZOHO_WAIT_S,
+            "needs_albert_hardware_key",
+            "Touch ID / OneAuth approval",
+        ),
     ),
 }
 
@@ -626,8 +679,11 @@ SMARTSHEET_MAIL_RE = (
 # site → its own Albert stops (push / passkey / SMS pages, B12).
 BROKER_SAFARI_STOPS: dict[str, tuple[SiteStop, ...]] = {
     "zoho-desk": (
-        SiteStop("needs_albert_push", ZOHO_PUSH_RE, "login", "any"),
-        SiteStop("needs_albert_hardware_key", ZOHO_PASSKEY_RE, "user", "any"),
+        # both wait for Albert's approval in the same window first (tp#1644)
+        SiteStop("needs_albert_push", ZOHO_PUSH_RE, "login", "any", ZOHO_WAIT_S),
+        SiteStop(
+            "needs_albert_hardware_key", ZOHO_PASSKEY_RE, "user", "any", ZOHO_WAIT_S
+        ),
     ),
     "github": (
         SiteStop("needs_albert_push", GITHUB_MOBILE_RE, after="login"),
@@ -707,7 +763,14 @@ def _broker_steps(labels: BrokerLabels, idp: str, pre_click: str) -> tuple[Step,
             )
         )
     steps += [
-        Step("click", idp, trigger=label, when=when, after="login", optional=True)
+        Step(
+            "click",
+            idp,
+            trigger=label,
+            when=when,
+            after=labels.post_after,
+            optional=True,
+        )
         for label, when in labels.post_clicks
     ]
     return tuple(steps)
@@ -756,6 +819,7 @@ def broker_recipe(
         import_after=False,
         identity=site if row.get("identity") else "",
         stops=stops,
+        albert_wait=labels.albert_wait,
     )
 
 
@@ -780,6 +844,9 @@ class Outcome:  # pylint: disable=too-many-instance-attributes
     phase: str = "safari-source"
     # a window this run opened may still be open (its id was not returned)
     window_left: bool = False
+    # tp#1644: an Albert wait ran out — the login window stays open on
+    # purpose (his Touch ID sheet / approval may still be pending there)
+    window_open: bool = False
     # the used login-code mail moved out of INBOX: ok / failed / skipped
     # ("" = no mail code was used); fixed vocabulary, never mail content
     mail_archived: str = ""
@@ -1712,6 +1779,10 @@ class Plan:
     mail: MailReader | None = None
 
 
+def _to_stderr(line: str) -> None:
+    print(line, file=sys.stderr, flush=True)
+
+
 @dataclass
 class Machine:  # pylint: disable=too-many-instance-attributes
     """One Safari login: open a new window, read the page, run steps."""
@@ -1746,6 +1817,13 @@ class Machine:  # pylint: disable=too-many-instance-attributes
     # in-Safari identity read): (safari.py runner, the `--handle …
     # --expect-host HOST` args) -> '' (go on, ok) or a stop code (its stop_rc).
     on_sentinel: Callable[[Runner, list[str]], str] | None = None
+    # tp#1644: Albert's turn (`AlbertWait` / a `SiteStop.wait_s`): the
+    # deadline on `clock` (0 = no wait running), the code it ends with, the
+    # waits started (each once per run), the one line it prints.
+    wait_until: float = 0.0
+    wait_code: str = ""
+    waited: set[str] = field(default_factory=set)
+    notify: Callable[[str], None] = _to_stderr
 
     # -- safari.py calls ---------------------------------------------------
 
@@ -1830,7 +1908,8 @@ class Machine:  # pylint: disable=too-many-instance-attributes
         try:
             return self._loop()
         finally:
-            self.call(["--close", "--handle", self.handle])
+            if not self.out.window_open:  # an Albert wait ran out: left open
+                self.call(["--close", "--handle", self.handle])
 
     def _lazy_baseline(self) -> bool:
         """tp#1643: with a trigger hook or in no-trigger mode the mailbox
@@ -1840,8 +1919,10 @@ class Machine:  # pylint: disable=too-many-instance-attributes
 
     # one return per stop; the branches are the page states in check order
     def _loop(self) -> Outcome:  # pylint: disable=too-many-return-statements,too-many-branches
-        idle = 0
-        for _ in range(MAX_POLLS):
+        idle = polls = 0
+        while polls < MAX_POLLS:
+            if not self.wait_until:  # an Albert wait is bounded by its clock
+                polls += 1
             host, stop = self.tab_host()
             if stop:
                 return self._end(stop_rc(stop), stop)
@@ -1850,6 +1931,11 @@ class Machine:  # pylint: disable=too-many-instance-attributes
                 if self.clock() >= self.submit_deadline:
                     return self._stuck("after_submit", host)
                 self.sleep(POLL_S)
+                continue
+            if page is None and self.wait_until:
+                waited = self._albert_turn()
+                if waited is not None:
+                    return waited
                 continue
             if page is None:
                 idle += 1
@@ -1862,15 +1948,23 @@ class Machine:  # pylint: disable=too-many-instance-attributes
             for flag in ALBERT_STOPS:
                 if page[flag]:
                     return self._end(NEEDS_ALBERT_RC, f"needs_albert_{flag}")
-            site_stop = self._site_stop(page)
-            if site_stop:
-                return self._end(stop_rc(site_stop), site_stop)
+            hit = self._site_stop(page)
+            if hit is not None:
+                waited = self._stop_wait(hit)
+                if waited is not None:
+                    return waited
+                continue
             index = self._next_step(host, page)
             if index is not None and self.proof_only:
                 return self._end(2, "safari_logged_out")
             if index is None:
                 if page["email_code"]:
                     return self._end(2, "email_code")
+                if self._albert_due():
+                    waited = self._albert_turn()
+                    if waited is not None:
+                        return waited
+                    continue
                 idle += 1
                 if idle >= IDLE_POLLS:
                     on_host = any(s.host == host for s in self.recipe.steps)
@@ -1879,6 +1973,7 @@ class Machine:  # pylint: disable=too-many-instance-attributes
                 self.sleep(POLL_S)
                 continue
             idle = 0
+            self.wait_until = 0.0  # the page moved on: Albert's turn is over
             stopped = self._run_step(index)
             if stopped is not None:
                 return stopped
@@ -1913,15 +2008,75 @@ class Machine:  # pylint: disable=too-many-instance-attributes
         """A step of `kind` ran already ('' = always true)."""
         return not kind or any(self.recipe.steps[i].kind == kind for i in self.done)
 
-    def _site_stop(self, page: dict[str, Any]) -> str:
-        """The first of the recipe's own Albert stops this page shows ('' =
+    def _site_stop(self, page: dict[str, Any]) -> SiteStop | None:
+        """The first of the recipe's own Albert stops this page shows (None =
         none): its text matched, its `after` step ran, its page shape."""
         fieldless = not (page["password"] or page["user"] or page["code"])
         shape = {"fieldless": fieldless, "code": page["code"], "any": True}
         for stop, hit in zip(self.recipe.stops, page.get("stops", ())):
             if hit and self._ran(stop.after) and shape.get(stop.page, False):
-                return stop.code
-        return ""
+                return stop
+        return None
+
+    # -- Albert's turn (tp#1644) ----------------------------------------------
+
+    def _stop_wait(self, stop: SiteStop) -> Outcome | None:
+        """A site stop's page: end with its code, or — a stop with `wait_s`,
+        not in prove-only mode, its wait not spent yet — wait for Albert
+        (None = poll on)."""
+        key = f"stop:{stop.code}"
+        if stop.wait_s <= 0 or self.proof_only:
+            return self._end(stop_rc(stop.code), stop.code)
+        if key in self.waited and not self.wait_until:
+            return self._end(stop_rc(stop.code), stop.code)  # its wait is spent
+        what = WAIT_WHAT.get(stop.code, "approval")
+        return self._albert_turn(key, stop.code, stop.wait_s, what)
+
+    def _albert_due(self) -> bool:
+        """No step runs on this page: Albert's turn — a wait already running,
+        or the recipe's `albert_wait` once its step ran (once per run, never
+        in prove-only mode)."""
+        if self.wait_until:
+            return True
+        wait = self.recipe.albert_wait
+        if wait is None or self.proof_only or "albert" in self.waited:
+            return False
+        return self._ran(wait.after)
+
+    def _albert_turn(
+        self, key: str = "albert", code: str = "", seconds: float = 0.0, what: str = ""
+    ) -> Outcome | None:
+        """Wait for Albert: the first call starts the wait (one line on
+        stderr), every call polls on (None, after one read-only pause) until
+        the deadline; past it the run ends with the wait's code, the window
+        left open, nothing typed meanwhile."""
+        if not self.wait_until:
+            wait = self.recipe.albert_wait
+            if not code and wait is not None:
+                code, seconds, what = wait.code, wait.seconds, wait.what
+            self.waited.add(key)
+            self.wait_until = self.clock() + seconds
+            self.notify(
+                f"   ⏳ {self.recipe.site}: waiting up to {seconds:.0f} s for "
+                f"Albert's {what} in Safari (nothing is typed meanwhile)"
+            )
+        if code:
+            self.waited.add(key)
+            self.wait_code = code  # the page's own stop names the timeout
+        if self.clock() >= self.wait_until:
+            return self._albert_timeout()
+        self.sleep(POLL_S)
+        return None
+
+    def _albert_timeout(self) -> Outcome:
+        """The wait ran out: its code, the window stays open (his sheet or
+        approval may still be pending). Only a step that sent a secret (not
+        the e-mail alone) keeps the run a credential run (→ quarantine)."""
+        self.out.window_open = True
+        self.out.credential = self.out.credential and any(
+            self.recipe.steps[i].kind in SECRET_KINDS for i in self.done
+        )
+        return self._end(stop_rc(self.wait_code), self.wait_code)
 
     def _next_step(self, host: str, page: dict[str, Any]) -> int | None:
         for i, step in enumerate(self.recipe.steps):

@@ -296,7 +296,11 @@ framework. It is a **provider**: other repos depend on it, not the reverse. See
   of 2026-11-09 (tp#1644 B13): the zoho-desk Safari route
   (`agent_login_safari.BROKER_SAFARI_LABELS["zoho-desk"]`) answers Zoho's
   post-login "Trust this browser?" with "Trust" in Albert's own Safari; every
-  other Safari route answers such a prompt "Not now" or leaves it alone. A new recipe that submits a form
+  other Safari route answers such a prompt "Not now" or leaves it alone. The
+  same route waits up to 90 s in its window for Albert's Touch ID / OneAuth
+  approval after the e-mail step (`agent_login_safari.AlbertWait`; read-only
+  polls, nothing typed), then trusts and lands; past the wait it exits 4
+  (`needs_albert_*`) with the window left open. A new recipe that submits a form
   uses the same helpers. A Cloudflare Access page (`origins.access_gated`:
   `*.cloudflareaccess.com` or `/cdn-cgi/access/`) is `precheck` ·
   `access_gated` on both sides, before any reservation — agent-login shows it

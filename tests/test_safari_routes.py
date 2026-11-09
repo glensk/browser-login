@@ -1737,6 +1737,30 @@ B12_LABELS = alsafari.BrokerLabels(
 )
 
 
+class _Clock:
+    """A fake monotonic clock: every sleep moves it on."""
+
+    def __init__(self) -> None:
+        self.now = 0.0
+
+    def __call__(self) -> float:
+        return self.now
+
+    def sleep(self, seconds: float) -> None:
+        self.now += seconds
+
+
+def _timed(
+    fake: w.FakeSafari, plan: alsafari.Plan | None = None, **kw: Any
+) -> alsafari.Machine:
+    """`w._machine` on a fake clock (an Albert wait runs out at once)."""
+    clock = _Clock()
+    kw.setdefault("notify", lambda _line: None)
+    return alsafari.Machine(
+        fake.recipe, plan or w._plan(), fake, sleep=clock.sleep, clock=clock, **kw
+    )
+
+
 def _b12_recipe(site: str) -> alsafari.Recipe:
     row = {
         **BROW,
@@ -1782,7 +1806,7 @@ def _run_b12(site: str, pages: list[tuple[str, str, dict[str, Any]]]) -> Any:
         for path, text, flags in pages
     ]
     fake = w.FakeSafari(_b12_recipe(site), script)
-    return fake, w._machine(fake).run()
+    return fake, _timed(fake).run()  # a waiting stop runs out on a fake clock
 
 
 def _before(after: str) -> list[tuple[str, str, dict[str, Any]]]:
@@ -1965,8 +1989,12 @@ def test_b13_zoho_fills_the_password_only_on_the_password_step(
     assert got == [
         ("user", "#login_id", zp, "", (("--user-field", "#login_id"),)),
         ("login", zp, "", "user", (("--pass-field", "#password"),)),
-        ("click", ".trustbrowser_ui .trustbtn", "", "login", ()),
+        ("click", ".trustbrowser_ui .trustbtn", "", "user", ()),
     ]
+    assert recipe.albert_wait == alsafari.AlbertWait(
+        "user", 90.0, "needs_albert_hardware_key", "Touch ID / OneAuth approval"
+    )
+    assert all(s.wait_s == 90.0 for s in recipe.stops)
     assert [s.submit for s in recipe.steps[:2]] == ["Next", "Sign in"]
     assert recipe.steps[2].trigger == "Trust" and recipe.steps[2].optional
     assert ".zeroheight" in zp and 'input[type="password"]' in zp
@@ -1997,21 +2025,131 @@ def test_b13_zoho_login_runs_user_password_trust_then_lands(
     assert calls[2][:4] == ["--click", "Trust", "--row", "Trust"]
 
 
-def test_b13_zoho_passkey_first_never_fills_the_concealed_password(
+class _Albert(w.FakeSafari):
+    """Albert acts in Safari: after `holds[i]` page reads of script entry i
+    the page moves on by itself (no step of the run)."""
+
+    def __init__(
+        self, recipe: alsafari.Recipe, script: list, holds: dict[int, int]
+    ) -> None:
+        super().__init__(recipe, script)
+        self.holds = holds
+        self.reads = 0
+
+    def __call__(self, args: list[str]) -> alsafari.Reply:
+        reply = super().__call__(args)
+        if args[0] == "--eval" and self.pos in self.holds:
+            self.reads += 1
+            if self.reads >= self.holds[self.pos]:
+                self.reads, self.pos = 0, self.pos + 1
+        return reply
+
+
+ZOHO_USER = (ZOHO_ID, w._page(user=True, password=True, steps=_USER_PAGE, stops=NO_HIT))
+# after the e-mail: a loader under Safari's own Touch ID sheet — the page
+# keeps the concealed field, no step, no wording
+ZOHO_LOADER = (ZOHO_ID, w._page(password=True, steps=_NO_STEP, stops=NO_HIT))
+ZOHO_TRUST = (ZOHO_ID, w._page(steps=_TRUST_PAGE, stops=NO_HIT))
+ZOHO_LANDED = ("https://desk.zoho.eu/agent", w._page(sentinel=True, stops=NO_HIT))
+
+
+def _zoho_plan() -> alsafari.Plan:
+    return w._plan(start_url=ZOHO_ROW["check_url"], item="Zoho")
+
+
+def test_b13_zoho_passkey_first_waits_for_albert_then_trusts_and_lands(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     recipe = _zoho_recipe(monkeypatch)
-    # after the e-mail: Safari's own passkey sheet, the page keeps the
-    # concealed field and offers no step → stuck, nothing but the e-mail typed
-    pages = [
-        (ZOHO_ID, w._page(user=True, password=True, steps=_USER_PAGE, stops=NO_HIT)),
-        (ZOHO_ID, w._page(password=True, steps=_NO_STEP, stops=NO_HIT)),
-    ]
-    fake = w.FakeSafari(recipe, pages)
-    out = w._machine(fake, w._plan(start_url=ZOHO_ROW["check_url"], item="Zoho")).run()
-    assert out.rc == 2 and out.code == "recipe_stuck"
+    pages = [ZOHO_USER, ZOHO_LOADER, ZOHO_TRUST, ZOHO_LANDED]
+    fake = _Albert(recipe, pages, {1: 8})  # Albert touches after 8 reads
+    lines: list[str] = []
+    m = _timed(fake, _zoho_plan(), notify=lines.append)
+    out = m.run()
+    assert out.ok, out.code
     calls = [c for c in fake.calls if c[0] in FILLS]
-    assert len(calls) == 1 and "--user-only" in calls[0]
+    assert [c[0] for c in calls] == ["--login", "--click"]  # never the password
+    assert "--user-only" in calls[0] and calls[1][:2] == ["--click", "Trust"]
+    assert len(lines) == 1 and "90 s" in lines[0] and "Touch ID" in lines[0]
+    assert m.clock() < 90 and fake.calls[-1][0] == "--close"
+
+
+def test_b13_zoho_wait_runs_out_needs_albert_with_the_window_open(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    recipe = _zoho_recipe(monkeypatch)
+    fake = w.FakeSafari(recipe, [ZOHO_USER, ZOHO_LOADER])
+    m = _timed(fake, _zoho_plan())
+    out = m.run()
+    assert (out.rc, out.code) == (4, "needs_albert_hardware_key")
+    assert out.window_open and not out.credential  # the e-mail alone: no quarantine
+    assert not [c for c in fake.calls if c[0] == "--close"]
+    calls = [c for c in fake.calls if c[0] in FILLS]
+    assert len(calls) == 1 and "--user-only" in calls[0]  # nothing typed meanwhile
+    assert 90 <= m.clock() < 90 + 2 * alsafari.POLL_S
+
+
+def test_b13_a_run_out_wait_records_without_quarantine(
+    run: dict[str, Any],
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    del run
+    quarantined: list[str] = []
+    fails: list[tuple] = []
+    monkeypatch.setattr(al.als, "quarantine", lambda s, *_a: quarantined.append(s))
+    monkeypatch.setattr(al, "record_safari_fail", lambda *a: fails.append(a))
+    out = alsafari.Outcome(4, "needs_albert_hardware_key", window_open=True)
+    out.steps = ["user"]
+    assert al._safari_fail("zoho-desk", out, "stopped") == 4
+    assert not quarantined and fails[-1][3]["code"] == "needs_albert_hardware_key"
+    assert "stays open" in capsys.readouterr().out
+
+
+def test_b13_zoho_push_waits_for_the_approval_then_trusts(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    recipe = _zoho_recipe(monkeypatch)
+    pw = (ZOHO_ID, w._page(password=True, steps=_PASS_PAGE, stops=NO_HIT))
+    push = (ZOHO_ID, w._page(password=True, steps=_NO_STEP, stops=[True, False]))
+    pages = [ZOHO_USER, pw, push, ZOHO_TRUST, ZOHO_LANDED]
+    fake = _Albert(recipe, pages, {2: 5})
+    lines: list[str] = []
+    out = _timed(fake, _zoho_plan(), notify=lines.append).run()
+    assert out.ok, out.code
+    calls = [c for c in fake.calls if c[0] in FILLS]
+    assert [c[0] for c in calls] == ["--login", "--login", "--click"]
+    assert len(lines) == 1 and "push approval" in lines[0]
+    # never approved: the push stop's code, a credential run (password sent)
+    fake = w.FakeSafari(recipe, [ZOHO_USER, pw, push])
+    out = _timed(fake, _zoho_plan()).run()
+    assert (out.rc, out.code) == (4, "needs_albert_push")
+    assert out.window_open and out.credential
+
+
+def test_a_recipe_without_albert_wait_stays_stuck(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    recipe = _zoho_recipe(monkeypatch)
+    plain = alsafari.Recipe(**{**recipe.__dict__, "albert_wait": None, "stops": ()})
+    fake = w.FakeSafari(plain, [ZOHO_USER, ZOHO_LOADER])
+    lines: list[str] = []
+    out = _timed(fake, _zoho_plan(), notify=lines.append).run()
+    assert (out.rc, out.code) == (2, "recipe_stuck") and not lines
+    assert not out.window_open and fake.calls[-1][0] == "--close"
+
+
+def test_prove_only_never_waits_for_albert(monkeypatch: pytest.MonkeyPatch) -> None:
+    recipe = _zoho_recipe(monkeypatch)
+    push = (ZOHO_ID, w._page(password=True, steps=_NO_STEP, stops=[True, True]))
+    fake = w.FakeSafari(recipe, [ZOHO_LOADER])
+    lines: list[str] = []
+    out = _timed(fake, _zoho_plan(), notify=lines.append, proof_only=True).run()
+    assert out.code == "recipe_stuck" and not lines
+    # a stop page whose step never ran stays no stop; none waits in prove-only
+    fake = w.FakeSafari(recipe, [push])
+    out = _timed(fake, _zoho_plan(), notify=lines.append, proof_only=True).run()
+    assert not lines and not out.window_open
 
 
 def test_b13_only_zoho_desk_answers_a_trust_prompt_with_trust() -> None:

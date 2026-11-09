@@ -4305,6 +4305,11 @@ def _safari_fail(
         )
     if out.window_left:
         print("   a Safari login window may be left open (its id never came back)")
+    if out.window_open:
+        print(
+            "   the Safari login window stays open: Albert can still approve there "
+            "(or close it)"
+        )
     return out.rc
 
 
