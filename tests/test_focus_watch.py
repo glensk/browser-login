@@ -601,16 +601,18 @@ class FakeQuartz:  # pylint: disable=invalid-name  # mirrors the pyobjc names
 
 
 class FakeApp:  # pylint: disable=invalid-name
-    """An NSRunningApplication; counts LaunchServices-backed property reads."""
+    """An NSRunningApplication; counts reads beyond the pid (LaunchServices trips)."""
+
+    name_reads = 0  # class-wide: every poll hands back a fresh object
 
     def __init__(self, pid, name):
-        self.pid, self.name, self.reads = pid, name, 0
+        self.pid, self.name = pid, name
 
     def processIdentifier(self):
-        self.reads += 1
         return self.pid
 
     def localizedName(self):
+        FakeApp.name_reads += 1
         return self.name
 
     def bundleIdentifier(self):
@@ -662,14 +664,14 @@ def test_z_order_change_alone_is_still_diffed(tmp_path):
     assert [r["window"] for r in raises] == [4]
 
 
-def test_same_frontmost_object_is_not_re_read(tmp_path):
+def test_unchanged_frontmost_pid_reads_nothing_else(tmp_path):
     front = [FakeApp(10, "iTerm2")]
     watcher = fake_watcher(tmp_path, FakeQuartz([info(1, "iTerm2")]), front)
-    watcher.tick()  # adopts the object (same pid as the start record: no event)
-    reads = front[0].reads
+    reads = FakeApp.name_reads
     for _ in range(5):
+        front[0] = FakeApp(10, "iTerm2")  # a fresh proxy per run-loop turn
         watcher.tick()
-    assert front[0].reads == reads
+    assert FakeApp.name_reads == reads
     front[0] = FakeApp(20, "Finder")
     watcher.tick()
     acts = [r for r in watcher.records if r["event"] == "activate"]

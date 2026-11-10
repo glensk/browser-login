@@ -999,10 +999,6 @@ class Watcher:  # pylint: disable=too-many-instance-attributes
         self.reporter = RateLimitedReporter()
         self.front_pid: int | None = None
         self.front_name: str | None = None
-        # The NSRunningApplication last seen frontmost: pyobjc hands back the
-        # same proxy for the same object, so an identical poll result is skipped
-        # without asking LaunchServices for pid / name / bundle again.
-        self.front_app: Any = None
         self.tracker = WindowTracker()
         # On-screen window numbers (front to back) of the last full on-screen
         # diff; a tick whose cheap id list matches it cannot produce an event.
@@ -1053,10 +1049,7 @@ class Watcher:  # pylint: disable=too-many-instance-attributes
     def on_activate(self, running_app: Any, source: str) -> None:
         """Record an activation unless that app is already the known frontmost."""
         info = app_info(running_app)
-        if info["pid"] is None:
-            return
-        self.front_app = running_app
-        if info["pid"] == self.front_pid:
+        if info["pid"] is None or info["pid"] == self.front_pid:
             return
         prev = self.front_name
         self.front_pid, self.front_name = info["pid"], info["app"]
@@ -1171,9 +1164,14 @@ class Watcher:  # pylint: disable=too-many-instance-attributes
         self.diff_on_screen()
 
     def poll_frontmost(self) -> None:
-        """Fallback activation poll; the same frontmost object as last time is a no-op."""
+        """Fallback activation poll; an unchanged frontmost pid costs one property read.
+
+        NSWorkspace hands back a fresh NSRunningApplication proxy on every run-loop
+        turn, and each property is a LaunchServices round trip, so the pid is
+        compared alone before `app_info` reads name, bundle and executable (tp#1968).
+        """
         app = self.workspace.frontmostApplication()
-        if app is not None and app is self.front_app:
+        if app is None or int(app.processIdentifier()) == self.front_pid:
             return
         self.on_activate(app, "poll")
 
