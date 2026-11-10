@@ -3176,6 +3176,15 @@ KEYCLOAK_REMEMBER_ME = "#rememberMe"
 # After the form wait: one last server check before "form not found" (a
 # silent SSO that landed on the portal late).
 CSCS_FINAL_CHECK_S = 8.0
+# The portal's own end of Keycloak's redirect: Waldur checks the OIDC `state`
+# there, trades the code and redirects on. It intermittently answers a JSON
+# 400 instead — {"detail": "keycloak error: Invalid auth state."} (tp#1977,
+# seen 2026-11-03 and 2026-11-09 23:08, right after a submit Keycloak had
+# accepted) — and the page then sits there for the whole settle wait.
+CSCS_RETURN_PATH = "/api-auth/keycloak/complete/"
+# The return endpoint rendered a document of its own (an API answer, not the
+# redirect on to the portal app): value-free, the content type only.
+_CSCS_RETURN_ERROR_JS = "() => document.contentType === 'application/json'"
 
 
 # Keycloak's re-authentication page (the IdP still remembers the account):
@@ -3475,6 +3484,62 @@ def _cscs_password_field(
     return _cscs_password_step(page, allowed, dev=dev)
 
 
+def cscs_on_return(url: str) -> bool:
+    """The page is the portal's Keycloak return endpoint
+    (``CSCS_RETURN_PATH`` on the exact portal host), whatever its query."""
+    try:
+        parts = urllib.parse.urlsplit(url)
+    except ValueError:
+        return False
+    return (
+        parts.scheme == "https"
+        and (parts.hostname or "") == "portal.cscs.ch"
+        and parts.port in (None, 443)
+        and parts.path.rstrip("/") == CSCS_RETURN_PATH.rstrip("/")
+    )
+
+
+def _cscs_return_failed(page: Any) -> bool:
+    """The portal's return endpoint answered with a document of its own (the
+    JSON error, e.g. "Invalid auth state") instead of redirecting on: the
+    login will not move from here by itself. False when unreadable."""
+    if not cscs_on_return(str(page.url or "")):
+        return False
+    try:
+        return page.evaluate(_CSCS_RETURN_ERROR_JS) is True
+    except Exception:  # pylint: disable=broad-exception-caught
+        return False
+
+
+def _cscs_rejoin(page: Any, item: SiteItem, *, dev: bool) -> None:
+    """ONE more trip to the portal after its return endpoint refused
+    Keycloak's answer (tp#1977): the start URL again, so the portal asks
+    Keycloak with a fresh `state` and Keycloak's own session — set by the
+    submit just made — answers without a form. Nothing is typed or clicked
+    here: the portal with a token the server accepts returns (the caller's
+    server proof decides); any Keycloak form (password asked again), no
+    portal, or a challenge ends the login (submitted) — a password is never
+    sent a second time."""
+    page.goto(cscs_start_url(item, dev=dev), wait_until="domcontentloaded")
+    try:
+        form = _cscs_form_or_portal(page, STEP_TIMEOUT_S)
+    except NeedsHuman as exc:
+        raise NeedsHuman(exc.detail, challenge=exc.challenge, submitted=True) from exc
+    except LoginFailed as exc:
+        raise LoginFailed(
+            "login did not reach the CSCS portal: its Keycloak return failed and "
+            "a fresh start found neither the portal nor a form — " + exc.detail,
+            submitted=True,
+        ) from exc
+    if form is not None:
+        raise LoginFailed(
+            "login did not reach the CSCS portal: its Keycloak return failed and "
+            "a fresh start asks for the password again (not typed twice)"
+            + _kc_page_hint(page),
+            submitted=True,
+        )
+
+
 def cscs_login(
     page: Any,
     item: SiteItem,
@@ -3519,6 +3584,8 @@ def cscs_login(
         page.wait_for_timeout(500)
         if cscs_on_portal(page.url):
             return
+        if _cscs_return_failed(page):
+            break  # the portal refused Keycloak's answer: waiting changes nothing
         if not watch.clear(page):
             continue
         if not otp_done:
@@ -3536,6 +3603,11 @@ def cscs_login(
                     generic=False,
                 )
     if cscs_on_portal(page.url):
+        return
+    if cscs_on_return(str(page.url or "")):
+        # Stuck on the portal's return endpoint (Keycloak already sent the
+        # browser back): one fresh start, nothing typed.
+        _cscs_rejoin(page, item, dev=dev)
         return
     watch.final(page)
     raise LoginFailed(
