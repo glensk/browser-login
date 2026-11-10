@@ -30,12 +30,14 @@ HOMEPROXY_PAC_HOSTS: tuple[str, ...] = (
     "booklore.dom42.space",
     "books.dom42.space",
     "calibre.dom42.space",
+    "homelab.dom42.space",
     "homepage.dom42.space",
     "jellyfin.dom42.space",
     "kavita.dom42.space",
     "kindle-history.dom42.space",
     "komga.dom42.space",
     "music.dom42.space",
+    "notes.dom42.space",
     "vaultwarden.dom42.space",
 )
 PAC_URL_PREFIX = "data:application/x-ns-proxy-autoconfig;base64,"

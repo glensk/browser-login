@@ -57,6 +57,8 @@ GATED = {
     "homepage.dom42.space",
     "kindle-history.dom42.space",
     "jellyfin.dom42.space",
+    "notes.dom42.space",
+    "homelab.dom42.space",
     "vaultwarden.dom42.space",
 }
 DIRECT_HOSTS = (

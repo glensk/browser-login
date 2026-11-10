@@ -53,12 +53,14 @@ DOM42 = {
         "booklore",
         "books",
         "calibre",
+        "homelab",
         "homepage",
         "jellyfin",
         "kavita",
         "kindle-history",
         "komga",
         "music",
+        "notes",
         "vaultwarden",
     )
 }

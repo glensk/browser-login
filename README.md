@@ -1410,8 +1410,9 @@ home split tunnel, Cisco EPFL and Mullvad, and it never toggles a VPN itself.
 `bin/pac_hosts.json` lists exactly the Access-gated hosts nixos' dnsmasq answers
 authoritatively (nixos `accessGatedNames`), each as an EXACT host on
 `SOCKS5 127.0.0.1:1082` — no `.dom42.space` suffix rule:
-`audiobookshelf`, `booklore`, `books`, `calibre`, `homepage`, `jellyfin`,
-`kavita`, `kindle-history`, `komga`, `music`, `vaultwarden` (`.dom42.space`).
+`audiobookshelf`, `booklore`, `books`, `calibre`, `homelab`, `homepage`,
+`jellyfin`, `kavita`, `kindle-history`, `komga`, `music`, `notes`,
+`vaultwarden` (`.dom42.space`).
 `homeassistant.dom42.space` is deliberately absent (Access stays mandatory
 there) and LAN-only names such as `navidrome.dom42.space` stay DIRECT. With
 homeproxy down, the `; DIRECT` fallback gives today's behaviour (Access).
