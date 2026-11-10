@@ -568,3 +568,111 @@ def test_summary_offscreen_window_is_informational_until_shown():
     assert summary.chrome_events == 2
     assert summary.chrome_shown == 1
     assert [r["window"] for r in summary.flagged] == [2, 2, 3]
+
+
+# -- Watcher fast paths (tp#1968), against fake pyobjc modules -----------------
+
+ON_SCREEN_OPTS = 1 | 16  # kCGWindowListOptionOnScreenOnly | ExcludeDesktopElements
+
+
+class FakeQuartz:  # pylint: disable=invalid-name  # mirrors the pyobjc names
+    """CGWindowList* over a mutable list of on-screen window infos."""
+
+    kCGWindowListOptionAll = 0
+    kCGWindowListOptionOnScreenOnly = 1
+    kCGWindowListExcludeDesktopElements = 16
+    kCGNullWindowID = 0
+
+    def __init__(self, on_screen):
+        self.on_screen = list(on_screen)
+        self.copies = 0
+
+    def CGWindowListCreate(self, opts, _rel):
+        assert opts in (self.kCGWindowListOptionAll, ON_SCREEN_OPTS)
+        return [i["kCGWindowNumber"] for i in self.on_screen]
+
+    def CGWindowListCopyWindowInfo(self, opts, _rel):
+        assert opts == ON_SCREEN_OPTS
+        self.copies += 1
+        return list(self.on_screen)
+
+    def CGWindowListCreateDescriptionFromArray(self, ids):
+        return [i for i in self.on_screen if i["kCGWindowNumber"] in ids]
+
+
+class FakeApp:  # pylint: disable=invalid-name
+    """An NSRunningApplication; counts LaunchServices-backed property reads."""
+
+    def __init__(self, pid, name):
+        self.pid, self.name, self.reads = pid, name, 0
+
+    def processIdentifier(self):
+        self.reads += 1
+        return self.pid
+
+    def localizedName(self):
+        return self.name
+
+    def bundleIdentifier(self):
+        return f"com.example.{self.name.lower()}"
+
+    def executableURL(self):
+        return None
+
+
+def fake_watcher(tmp_path, quartz, front):
+    workspace = type("WS", (), {"frontmostApplication": lambda _self: front[0]})()
+    appkit = type(
+        "AppKit",
+        (),
+        {
+            "NSWorkspace": type("NSW", (), {"sharedWorkspace": lambda: workspace}),
+            "NSScreen": type("NSS", (), {"screens": lambda: []}),
+        },
+    )
+    mods = fw.ObjC(appkit=appkit, quartz=quartz, apphelper=None, objc=None)
+    log = fw.JsonlLog(tmp_path / "f.jsonl", 1_000_000)
+    watcher = fw.Watcher(log, mods, fw.WatchOptions(keep_records=True))
+    watcher.start()
+    return watcher
+
+
+def test_unchanged_on_screen_ids_skip_the_window_description(tmp_path):
+    quartz = FakeQuartz([info(1, "iTerm2"), info(2, "Finder")])
+    watcher = fake_watcher(tmp_path, quartz, [FakeApp(10, "iTerm2")])
+    watcher.poll_windows()  # first diff after the baseline
+    copies = quartz.copies
+    for _ in range(5):
+        watcher.poll_windows()
+    assert quartz.copies == copies  # id list unchanged: no CopyWindowInfo
+    quartz.on_screen.insert(0, info(7, CFT))
+    watcher.poll_windows()
+    assert quartz.copies == copies + 1
+    new = [r for r in watcher.records if r["event"] == "window_new"]
+    assert [r["window"] for r in new] == [7]
+
+
+def test_z_order_change_alone_is_still_diffed(tmp_path):
+    quartz = FakeQuartz([info(1, "iTerm2"), info(4, CFT)])
+    watcher = fake_watcher(tmp_path, quartz, [FakeApp(10, "iTerm2")])
+    watcher.poll_windows()
+    quartz.on_screen.reverse()  # same ids, Chrome now in front
+    watcher.poll_windows()
+    raises = [r for r in watcher.records if r["event"] == "window_raise"]
+    assert [r["window"] for r in raises] == [4]
+
+
+def test_same_frontmost_object_is_not_re_read(tmp_path):
+    front = [FakeApp(10, "iTerm2")]
+    watcher = fake_watcher(tmp_path, FakeQuartz([info(1, "iTerm2")]), front)
+    watcher.tick()  # adopts the object (same pid as the start record: no event)
+    reads = front[0].reads
+    for _ in range(5):
+        watcher.tick()
+    assert front[0].reads == reads
+    front[0] = FakeApp(20, "Finder")
+    watcher.tick()
+    acts = [r for r in watcher.records if r["event"] == "activate"]
+    assert [(r["app"], r["source"], r["prev_app"]) for r in acts] == [
+        ("Finder", "poll", "iTerm2")
+    ]

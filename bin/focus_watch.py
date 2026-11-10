@@ -999,7 +999,14 @@ class Watcher:  # pylint: disable=too-many-instance-attributes
         self.reporter = RateLimitedReporter()
         self.front_pid: int | None = None
         self.front_name: str | None = None
+        # The NSRunningApplication last seen frontmost: pyobjc hands back the
+        # same proxy for the same object, so an identical poll result is skipped
+        # without asking LaunchServices for pid / name / bundle again.
+        self.front_app: Any = None
         self.tracker = WindowTracker()
+        # On-screen window numbers (front to back) of the last full on-screen
+        # diff; a tick whose cheap id list matches it cannot produce an event.
+        self.on_screen_ids: tuple[int, ...] | None = None
         self.all_ids: set[int] = set()
         self.last_all_scan = 0.0
         self.last_std_check = 0.0
@@ -1046,7 +1053,10 @@ class Watcher:  # pylint: disable=too-many-instance-attributes
     def on_activate(self, running_app: Any, source: str) -> None:
         """Record an activation unless that app is already the known frontmost."""
         info = app_info(running_app)
-        if info["pid"] is None or info["pid"] == self.front_pid:
+        if info["pid"] is None:
+            return
+        self.front_app = running_app
+        if info["pid"] == self.front_pid:
             return
         prev = self.front_name
         self.front_pid, self.front_name = info["pid"], info["app"]
@@ -1087,6 +1097,35 @@ class Watcher:  # pylint: disable=too-many-instance-attributes
             quartz.kCGNullWindowID,
         )
         return normalize_windows(infos or [], self._exe, self.display_rects)
+
+    def on_screen_window_ids(self) -> tuple[int, ...]:
+        """On-screen window numbers, front to back (no descriptions: cheap)."""
+        quartz = self.mods.quartz
+        ids = quartz.CGWindowListCreate(
+            quartz.kCGWindowListOptionOnScreenOnly
+            | quartz.kCGWindowListExcludeDesktopElements,
+            quartz.kCGNullWindowID,
+        )
+        return tuple(int(i) for i in ids or ())
+
+    def diff_on_screen(self) -> None:
+        """Describe the on-screen windows and diff them, unless nothing moved.
+
+        The diff's events depend only on which tracked windows are on screen
+        and on the layer-0 z-order (a window keeps its owner and layer), so an
+        id list (front to back) identical to the last diffed one cannot
+        produce an event and is skipped. That skips
+        CGWindowListCopyWindowInfo and the per-window normalisation, the bulk
+        of a tick's CPU (tp#1968).
+        """
+        if (
+            self.on_screen_ids is not None
+            and self.on_screen_window_ids() == self.on_screen_ids
+        ):
+            return
+        cur = self.on_screen_windows()
+        self._emit_window_events(self.tracker.on_screen(cur))
+        self.on_screen_ids = tuple(w.number for w in cur) if cur else None
 
     def scan_all(self, describe_all: bool = False) -> tuple[set[int], list[Win]]:
         """Ids of ALL windows (any Space, hidden, minimised) + the new ones described."""
@@ -1129,7 +1168,14 @@ class Watcher:  # pylint: disable=too-many-instance-attributes
             self.last_all_scan = now
             existing, new_wins = self.scan_all()
             self._emit_window_events(self.tracker.all_windows(existing, new_wins))
-        self._emit_window_events(self.tracker.on_screen(self.on_screen_windows()))
+        self.diff_on_screen()
+
+    def poll_frontmost(self) -> None:
+        """Fallback activation poll; the same frontmost object as last time is a no-op."""
+        app = self.workspace.frontmostApplication()
+        if app is not None and app is self.front_app:
+            return
+        self.on_activate(app, "poll")
 
     def tick(self) -> None:
         """The poll timer: main-thread jobs, frontmost poll, window poll, stop check."""
@@ -1143,7 +1189,7 @@ class Watcher:  # pylint: disable=too-many-instance-attributes
             except Exception as exc:  # pylint: disable=broad-exception-caught
                 self.reporter.report(f"main-thread job failed: {exc}")
         try:
-            self.on_activate(self.workspace.frontmostApplication(), "poll")
+            self.poll_frontmost()
         except Exception as exc:  # pylint: disable=broad-exception-caught
             self.reporter.report(f"frontmost poll failed: {exc}")
         try:
