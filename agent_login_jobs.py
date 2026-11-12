@@ -86,8 +86,15 @@ ACCESS_SWEEP_INTERVAL_S = 60
 # Playwright import, no child interpreter per instance).
 ACCESS_SWEEP_PY = BROWSER_PY.parent / "access_sweep.py"
 ACCESS_SWEEP_LOG = Path.home() / "Library" / "Logs" / f"{ACCESS_SWEEP_LABEL}.log"
+# tp#1644 B19: the Safari keep-alive (`agent-login.py -k`): proves Albert's
+# Safari session of each keep-alive site in a background tab and, only on a
+# definite logged-out while he is active, logs Safari in again (the one
+# exemption from "`-L` is agent-invoked only"; agent_login_keepalive.py).
+SAFARI_KEEPALIVE_LABEL = "com.albert.agent-login-safari-keepalive"
+SAFARI_KEEPALIVE_INTERVAL_S = 1800
 # Set in every agent-login LaunchAgent: a scheduled run. `-L` (the Safari
-# login, which drives Albert's real Safari) refuses to run with it.
+# login, which drives Albert's real Safari) refuses to run with it; only
+# `-k`'s keep-alive sites are exempt.
 SCHEDULED_ENV = "AGENT_LOGIN_SCHEDULED"
 
 
@@ -235,6 +242,20 @@ def access_sweep_plist() -> str:
     )
 
 
+def safari_keepalive_plist() -> str:
+    """The every-30-min Safari keep-alive LaunchAgent (`agent-login.py -k`,
+    tp#1644 B19), as text. Pure."""
+    return launchagent_plist(
+        label=SAFARI_KEEPALIVE_LABEL,
+        args=("-k",),
+        schedule=(
+            "<key>StartInterval</key>\n    "
+            f"<integer>{SAFARI_KEEPALIVE_INTERVAL_S}</integer>"
+        ),
+        run_at_load=False,
+    )
+
+
 def agent_plists() -> list[tuple[str, str, str]]:
     """(label, plist text, what) of every agent-login LaunchAgent. Pure."""
     return [
@@ -262,6 +283,12 @@ def agent_plists() -> list[tuple[str, str, str]]:
             CONSOLE_BALANCE_LABEL,
             console_balance_plist(),
             f"every {CONSOLE_BALANCE_INTERVAL_S // 3600} h, console-balance.py -q",
+        ),
+        (
+            SAFARI_KEEPALIVE_LABEL,
+            safari_keepalive_plist(),
+            f"every {SAFARI_KEEPALIVE_INTERVAL_S // 60} min, -k: Safari keep-alive "
+            "(cscs; a login only on a proven logged-out while Albert is active)",
         ),
         (
             ACCESS_SWEEP_LABEL,
@@ -302,7 +329,7 @@ def daily_loaded() -> bool:
 def install_daily() -> int:
     """Write + (re)load every LaunchAgent of `agent_plists()` (daily check,
     snapshot, refresh pass, tab reaper, Console balance, Access team-cookie
-    sweep) as ONE transaction: on any failure every label it touched
+    sweep, Safari keep-alive) as ONE transaction: on any failure every label it touched
     is booted out, the previous plist files are restored and the agents
     that were loaded before are loaded again — never a partial set."""
     jobs = agent_plists()

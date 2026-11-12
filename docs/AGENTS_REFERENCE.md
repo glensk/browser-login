@@ -403,6 +403,32 @@ framework. It is a **provider**: other repos depend on it, not the reverse. See
   - **Who runs it:** `agent-login.py -L SITE` is agent-invoked ONLY. Every
     LaunchAgent sets `AGENT_LOGIN_SCHEDULED=1` and `-L` refuses with it. Never
     call it from `-c`, `-S` or `-R`.
+  - **The one exemption: the Safari keep-alive (`-k`, tp#1644 B19, Albert's
+    decision of 2026-11-13).** The LaunchAgent
+    `com.albert.agent-login-safari-keepalive` (every 30 min, under log-ts.py)
+    runs `agent-login.py -k`; it may log Albert's Safari in by itself, within
+    these limits, all enforced in code (`keepalive_site`,
+    `agent_login_keepalive.py`) and tested (`tests/test_safari_keepalive.py`):
+    - only the sites of the one config key `kal.KEEPALIVE_SITES` (today
+      `cscs`; github only after Albert adds it);
+    - only while Albert is active: `alsafari.attended_gate` = the interactive
+      gate (unlocked, on the console, < 15 min idle) without its `scheduled`
+      refusal; safari.py `--status` first, so Safari is never launched;
+    - the logged-in case touches nothing: `safari.py --background` proves the
+      sentinel in a tab at the end of the front window (never the current
+      tab, no activation), which safari.py closes; a tab it reports as left is
+      closed with `--close-tab WID:TAB --expect-host` only when it is provably
+      the probe's (last tab, not current, a recipe host, other tabs remain);
+    - only when that probe did not see the session: not when quarantined,
+      not during a live guided login (exit 75 = skip), at most one attempt
+      per site per 6 h (`safari-keepalive.json`, stamped BEFORE the attempt,
+      failures count, unreadable = no attempt) → the `-O` proof under the
+      Safari lock → only on its `safari_logged_out` the `-L SITE -s` login
+      (`keepalive=True`: no page opened); never on an unknown or error;
+    - exit 4 (push, passkey, CAPTCHA, SMS) or ANY failed re-login → one
+      notification per site per 6 h: a macOS banner (osascript, the text as
+      argv), a gog mail to Albert only when the banner fails. A busy login
+      (exit 75) is a skip, no notification.
   - **The interactive gate** (`alsafari.interactive_gate`, exit 3): it also
     refuses on a locked console, when Albert is not on the console, and when
     nobody touched the Mac for 15 min. Locked = `CGSSessionScreenIsLocked` or

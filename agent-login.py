@@ -63,6 +63,8 @@ Examples:
                                   # workspace home (-s URL: that page)
   ./agent-login.py -L galaxus-de -n  # what -L would do (no import, no Safari login)
   ./agent-login.py -R           # refresh-only pass (NPM tokens; LaunchAgent every 6 h)
+  ./agent-login.py -k           # Safari keep-alive (LaunchAgent every 30 min): cscs —
+                                # a login only on a proven logged-out, Albert active
   ./agent-login.py -l           # items agents can fill into Albert's Safari (safari.py -L)
   ./agent-login.py -H runai-test3  # its identity proofs that did not say match (all: -H)
 
@@ -120,6 +122,7 @@ from typing import Any
 sys.path.insert(0, str(Path(__file__).resolve().parent))  # the repo's `broker` package
 # pylint: disable=wrong-import-position
 import agent_login_cred  # noqa: E402
+import agent_login_keepalive as kal  # noqa: E402
 import agent_login_keychain  # noqa: E402
 import agent_login_safari as alsafari  # noqa: E402
 import agent_login_secrets  # noqa: E402
@@ -152,6 +155,8 @@ from agent_login_jobs import (  # noqa: E402
     NETWORK_HOST,
     REFRESH_INTERVAL_S,
     REFRESH_LABEL,
+    SAFARI_KEEPALIVE_INTERVAL_S,
+    SAFARI_KEEPALIVE_LABEL,
     SNAPSHOT_INTERVAL_S,
     SNAPSHOT_LABEL,
     TAB_REAPER_INTERVAL_S,
@@ -4970,15 +4975,30 @@ def _no_route(site: str) -> int:
 
 # One return per stage of the -s pipeline (tp#1643 Design).
 def safari_target_action(  # pylint: disable=too-many-return-statements,too-many-branches
-    site: str, url: str, *, dry_run: bool = False, prove_only: bool = False
+    site: str,
+    url: str,
+    *,
+    dry_run: bool = False,
+    prove_only: bool = False,
+    keepalive: bool = False,
 ) -> int:
     """`-L SITE -s [URL]`: prove Safari's session (else log Safari in), import
     into the shared Chromium when that is logged out, open the page in
     Safari. Attended only; one run, no retries. `prove_only` (`-O`,
     tp#1644): never log in — a logged-out Safari ends exit 2
-    `safari_logged_out`."""
+    `safari_logged_out`. `keepalive` (tp#1644 B19, only from
+    `keepalive_site` after its `-O` proof said `safari_logged_out`): the
+    one exemption from "never from a LaunchAgent" — a keep-alive site's
+    in_safari route only, the attended gate without its `scheduled`
+    refusal, and no page opened afterwards."""
     site = resolve_site(site)
-    if alsafari.scheduled():
+    if keepalive and site not in kal.KEEPALIVE_SITES:
+        print(
+            f"❌ {site}: not a keep-alive site "
+            f"({', '.join(kal.KEEPALIVE_SITES)}) — nothing done"
+        )
+        return 2
+    if alsafari.scheduled() and not keepalive:
         print(
             f"❌ -L -s drives Albert's Safari: never from a LaunchAgent "
             f"({alsafari.SCHEDULED_ENV}=1)"
@@ -4989,6 +5009,12 @@ def safari_target_action(  # pylint: disable=too-many-return-statements,too-many
     route = SAFARI_ROUTES[site]
     if route.proof not in SAFARI_PROOFS:
         print(f"❌ {site}: no_safari_route — unknown proof kind {route.proof!r}")
+        return 2
+    if keepalive and (route.proof != "in_safari" or route.then or dry_run or url):
+        print(
+            f"❌ {site}: the keep-alive logs in only an in_safari route without a "
+            "chain, on its landing page — nothing done"
+        )
         return 2
     recipe = safari_recipe(site)
     if recipe is None:  # the listing changed since safari_routed
@@ -5004,7 +5030,7 @@ def safari_target_action(  # pylint: disable=too-many-return-statements,too-many
     print(f"▶ {site}: Safari target {_origin(target)} ({what})")
     if dry_run:
         return safari_target_dry_run(site, recipe, prove_only=prove_only)
-    gate = alsafari.interactive_gate()
+    gate = alsafari.attended_gate() if keepalive else alsafari.interactive_gate()
     if gate is not None:
         print(f"❌ {site}: {phases.CODE_TEXT.get(gate, gate)} ({gate})")
         return 3
@@ -5025,7 +5051,12 @@ def safari_target_action(  # pylint: disable=too-many-return-statements,too-many
                 return rc
         if route.proof == "in_safari":
             return _safari_target_in_safari(
-                site, recipe, call, (target, what), prove_only=prove_only
+                site,
+                recipe,
+                call,
+                (target, what),
+                prove_only=prove_only,
+                open_page=not keepalive,
             )
         return _safari_target_locked(
             site, recipe, call, target, what, prove_only=prove_only
@@ -5099,15 +5130,21 @@ def _safari_target_finish(
     call: alsafari.Runner,
     page: tuple[str, str],
     out: alsafari.Outcome | None,
+    *,
+    open_page: bool = True,
 ) -> int:
     """Steps 8-9: the import (only when `recipe.import_after`), then open
     `page` (target URL, its words) in Safari. Reached only after Safari's
     proof passed (`-s` and `-O`): a broker-built route's old failure entry
-    goes (tp#1644)."""
+    goes (tp#1644). `open_page` False (the keep-alive, tp#1644 B19): no
+    page is opened — nothing is left in Safari."""
     target, what = page
     clear_safari_fail(site)
     if recipe.import_after:
         _safari_target_import(site, out)
+    if not open_page:
+        print(f"✅ {site}: Albert's Safari is logged in (keep-alive: no page opened)")
+        return 0
     reply = call(["--open", target, "--wait", str(SAFARI_OPEN_WAIT_S)])
     if reply.rc != 0:
         print(
@@ -5128,12 +5165,14 @@ def _safari_target_in_safari(
     page: tuple[str, str],
     *,
     prove_only: bool = False,
+    open_page: bool = True,
 ) -> int:
     """`safari_target_action` under the lock for an `in_safari` proof: ONE
     Machine run (tp#1644) — the sentinel first (a live session: zero
     steps), then the identity read for a row with a listing `identity`,
     else the recipe's login (never with `prove_only`: the first login page
-    ends `safari_logged_out`)."""
+    ends `safari_logged_out`). `open_page` False: the keep-alive's run
+    (no page opened at the end)."""
     before = ""
     if recipe.import_after and _cookie_rule(site):
         cookies, why = _safari_jar(site)
@@ -5166,7 +5205,178 @@ def _safari_target_in_safari(
             print(f"⚠️ {site}: Safari did not write the new session yet")
     else:
         print(f"✅ {site}: Albert's Safari holds a working session — no login needed")
-    return _safari_target_finish(site, recipe, call, page, out if out.steps else None)
+    return _safari_target_finish(
+        site, recipe, call, page, out if out.steps else None, open_page=open_page
+    )
+
+
+# ---------------------------------------------------------------------------
+# tp#1644 B19: the Safari keep-alive (`-k`, LaunchAgent every 30 min).
+# Albert's exemption of 2026-11-13 from "`-L` is agent-invoked only", limited
+# as agent_login_keepalive.py's docstring says: its sites only, Albert
+# active, a login only after this run's `-O` proof said `safari_logged_out`,
+# never while quarantined / during a live guided login, one attempt per site
+# per 6 h (failures too), one notification per site per 6 h for Albert's own
+# step (exit 4) or any failed re-login (a banner; a gog mail when it fails).
+# A logged-in Safari is proven in a background tab: nothing opened or left.
+# ---------------------------------------------------------------------------
+
+
+def keepalive_action() -> int:
+    """`-k`: `keepalive_site` for every keep-alive site; 1 when a proof or
+    login failed, else 0 (a skip is 0)."""
+    rc = 0
+    for site in kal.KEEPALIVE_SITES:
+        rc = max(rc, keepalive_site(site))
+    return rc
+
+
+def _keepalive_ready(site: str) -> tuple[alsafari.Recipe, alsafari.Runner] | None:
+    """(recipe, safari.py runner) of a keep-alive site when its probe may
+    run now; else None after one line: no in_safari route, Albert not
+    active (the attended gate), safari.py not ready or Safari not running
+    (`--status`: never launched here)."""
+    route = SAFARI_ROUTES.get(site)
+    recipe = safari_recipe(site) if safari_routed(site) else None
+    if route is None or recipe is None or route.proof != "in_safari" or route.then:
+        print(f"❌ {site}: keep-alive needs an in_safari route without a chain")
+        return None
+    gate = alsafari.attended_gate()
+    if gate is not None:
+        print(f"⏸  {site}: keep-alive skipped — {phases.CODE_TEXT.get(gate, gate)}")
+        return None
+    call, stop = _safari_py_ready(recipe)
+    if call is not None and not kal.PROBE_FEATURES <= alsafari.features(call):
+        call, stop = None, "safari_py_outdated"
+    if call is None:
+        print(f"⏸  {site}: keep-alive skipped — {phases.CODE_TEXT.get(stop, stop)}")
+        return None
+    return recipe, call
+
+
+def _keepalive_tidy(
+    site: str, recipe: alsafari.Recipe, call: alsafari.Runner, seen: kal.Probe
+) -> None:
+    """After the probe: close the background tab safari.py could not close
+    (only when provably that tab), say when Safari's front tab changed."""
+    if seen.tab_left is not None:
+        if kal.close_left_tab(call, seen.tab_left, recipe.hosts):
+            print(f"✅ {site}: closed the probe tab safari.py had left open")
+        else:
+            print(f"❌ {site}: the probe tab may be left open in Safari")
+    if seen.focus_kept is False:
+        print(f"⚠️ {site}: Safari's front tab differs from before the probe")
+
+
+def _keepalive_stop(site: str, now: float) -> str:
+    """Why no `-O` proof + login may run for `site` now ('' = none):
+    quarantined, a live guided login (exit 75: skip), the per-site attempt
+    cooldown (unreadable = closed), or the stamp could not be written. The
+    stamp is written HERE, before the attempt: a failure counts too."""
+    if als.quarantined(site) is not None:
+        return f"quarantined — release first: ./agent-login.py -Q {site}"
+    busy = guided_busy()
+    if busy:
+        return f"{busy} (exit {BUSY_RC}: skip)"
+    left = kal.cooldown_left(site, "attempt_at", kal.ATTEMPT_COOLDOWN_S, now)
+    if left is None:
+        return f"its cooldown state ({kal.STATE_FILE}) is unreadable"
+    if left > 0:
+        hours = int(kal.ATTEMPT_COOLDOWN_S // 3600)
+        return f"one attempt per {hours} h — {int(left // 60)} min left"
+    if not kal.stamp(site, "attempt_at", now):
+        return f"its cooldown stamp ({kal.STATE_FILE}) could not be written"
+    return ""
+
+
+def _keepalive_prove(site: str, recipe: alsafari.Recipe) -> alsafari.Outcome:
+    """The `-O` proof (the Safari Machine with `proof_only`: the sentinel
+    or the first login page, nothing typed) under the Safari-login lock."""
+    with safari_login_lock() as got:
+        if not got:
+            return alsafari.Outcome(BUSY_RC, "busy", phase="precheck")
+        return _safari_drive(site, recipe, proof_only=True, status_checked=True)
+
+
+def _keepalive_notify(site: str, text: str) -> str:
+    """The one notification per site per `kal.NOTIFY_COOLDOWN_S`: a macOS
+    banner, a gog mail to Albert only when the banner failed."""
+    return kal.notify_once(
+        site,
+        text,
+        time.time(),
+        fallback=lambda body: send_mail(f"agent-login keep-alive: {site}", body),
+    )
+
+
+def _keepalive_stopped(site: str, rc: int, code: str, what: str) -> int:
+    """The line (and the one notification: exit 4, or any failed
+    re-login) of a keep-alive proof / login that did not end logged in; the
+    job's exit code. A busy skip (exit 75) of the login is no failure."""
+    if rc == alsafari.NEEDS_ALBERT_RC:
+        said = _keepalive_notify(
+            site,
+            f"{site}: Safari needs your own login (push, passkey, CAPTCHA or "
+            "SMS) — the keep-alive stopped",
+        )
+        print(
+            f"⏸  {site}: keep-alive {what} needs Albert ({code}) — notification {said}"
+        )
+        return 0
+    if rc == BUSY_RC or (rc == alsafari.ENV_RC and what != "login"):
+        print(f"⏸  {site}: keep-alive {what} skipped ({code}, exit {rc})")
+        return 0
+    print(f"❌ {site}: keep-alive {what} stopped ({code}, exit {rc})")
+    if what == "login":
+        said = _keepalive_notify(
+            site,
+            f"{site}: the keep-alive could not log Safari in again ({code}) — "
+            f"run ./agent-login.py -L {site} -s",
+        )
+        print(f"⏸  {site}: notification {said}")
+    return 1
+
+
+# One return per stop of the keep-alive, in the order they are decided.
+def keepalive_site(site: str) -> int:  # pylint: disable=too-many-return-statements
+    """One keep-alive pass of `site` (see the section comment): the
+    background probe; only when it did not see the session and no stop
+    applies, the `-O` proof, and only on its `safari_logged_out` the login
+    (`safari_target_action(..., keepalive=True)`). 0 = logged in or
+    skipped, 1 = a proof or login failed."""
+    if site not in kal.KEEPALIVE_SITES:
+        print(f"❌ {site}: not a keep-alive site — nothing done")
+        return 2
+    ready = _keepalive_ready(site)
+    if ready is None:
+        return 0
+    recipe, call = ready
+    seen = kal.probe(call, SAFARI_ROUTES[site].landing, recipe.sentinel)
+    _keepalive_tidy(site, recipe, call, seen)
+    if seen.state == "logged_in":
+        print(f"✅ {site}: Albert's Safari is logged in (background probe)")
+        return 0
+    if seen.state != "not_proven":
+        print(f"⏸  {site}: the background probe could not tell ({seen.why}) — no login")
+        return 0
+    stop = _keepalive_stop(site, time.time())
+    if stop:
+        print(f"⏸  {site}: not proven logged in ({seen.why}); no login — {stop}")
+        return 0
+    print(f"▶ {site}: not proven logged in ({seen.why}) — the -O proof in Safari")
+    out = _keepalive_prove(site, recipe)
+    if out.window_left or out.window_open:
+        print(f"⚠️ {site}: the -O proof's Safari window may be left open")
+    if out.ok:
+        print(f"✅ {site}: the -O proof found a working session — no login")
+        return 0
+    if out.code != "safari_logged_out":
+        return _keepalive_stopped(site, out.rc, out.code, "-O proof")
+    print(f"▶ {site}: safari_logged_out — logging Albert's Safari in (keep-alive)")
+    rc = safari_target_action(site, "", keepalive=True)
+    if rc == 0:
+        return 0
+    return _keepalive_stopped(site, rc, f"exit {rc}", "login")
 
 
 # Safari's identity read (tp#1644): polls of the parked recipe answer
@@ -5876,9 +6086,10 @@ def build_parser() -> argparse.ArgumentParser:
         f"(`-R` every {REFRESH_INTERVAL_S // 3600} h), {TAB_REAPER_LABEL} "
         f"(`browser.py reap` every {TAB_REAPER_INTERVAL_S // 3600} h), "
         f"{CONSOLE_BALANCE_LABEL} (`console-balance.py` every "
-        f"{CONSOLE_BALANCE_INTERVAL_S // 60} min) and {ACCESS_SWEEP_LABEL} "
-        f"(`browser.py sweep-access` every {ACCESS_SWEEP_INTERVAL_S} s) as one "
-        "transaction (any failure restores the previous set)",
+        f"{CONSOLE_BALANCE_INTERVAL_S // 60} min), {ACCESS_SWEEP_LABEL} "
+        f"(`browser.py sweep-access` every {ACCESS_SWEEP_INTERVAL_S} s) and "
+        f"{SAFARI_KEEPALIVE_LABEL} (`-k` every {SAFARI_KEEPALIVE_INTERVAL_S // 60} "
+        "min) as one transaction (any failure restores the previous set)",
     )
     ap.add_argument(
         "-U",
@@ -5976,8 +6187,8 @@ def build_parser() -> argparse.ArgumentParser:
         "claude.ai: the automated magic link; notion: after the import the "
         "headless e-mail code (`browser.py login notion -M`, also while "
         "Albert is away), the Safari login only as its fallback. One run, no "
-        "retries; never "
-        "from a LaunchAgent. Exit 4 = needs Albert (CAPTCHA, SMS, push / "
+        "retries; never from a LaunchAgent (the one exemption: -k's "
+        "keep-alive sites). Exit 4 = needs Albert (CAPTCHA, SMS, push / "
         "security key); a locked vault is the agent's: `vault-touchid "
         "unlock-safari -a main` (Albert touches once); exit 3 = the Mac is "
         "locked or idle (for notion only before its Safari fallback): retry "
@@ -6043,6 +6254,24 @@ def build_parser() -> argparse.ArgumentParser:
         "reason word, HTTP status, code, redacted detail (checks.json keeps "
         "the last 10 per site; the latest check overwrites its detail); "
         "-j: JSON",
+    )
+    ap.add_argument(
+        "-k",
+        "--keep-alive",
+        action="store_true",
+        help="Safari keep-alive (LaunchAgent "
+        f"{SAFARI_KEEPALIVE_LABEL}, every {SAFARI_KEEPALIVE_INTERVAL_S // 60} "
+        "min): for each keep-alive site ("
+        + ", ".join(kal.KEEPALIVE_SITES)
+        + ") prove Albert's Safari session in a background tab (closed again, "
+        "no focus change); only when that did not see it, Albert is active, "
+        "the site is not quarantined, no guided login runs and its "
+        f"{int(kal.ATTEMPT_COOLDOWN_S // 3600)}-h attempt cooldown is over: "
+        "the -O proof, and only on safari_logged_out the -L SITE -s login "
+        "(no page opened). Exit 4 (push, passkey, CAPTCHA, SMS) or a failed "
+        "re-login → one notification per site per "
+        f"{int(kal.NOTIFY_COOLDOWN_S // 3600)} h (a macOS banner; a gog mail "
+        "when it fails). The one exemption from '-L never from a LaunchAgent'",
     )
     ap.add_argument(
         "-R",
@@ -6145,16 +6374,19 @@ def main() -> int:  # pylint: disable=too-many-return-statements,too-many-branch
         args.release,
         args.remove,
         args.rearm,
+        args.keep_alive,
     )
     if args.safari_login and any(others):
         ap.error(
-            "-L/--safari-login runs alone (not with -c/-S/-R/-I/-U/-t/-g/-p/-Q/-D/-E)"
+            "-L/--safari-login runs alone (not with -c/-S/-R/-I/-U/-t/-g/-p/-Q/-D/-E/-k)"
         )
     rc = launch_action(args)
     if rc is None:
         rc = listing_action(args)
     if rc is not None:
         return rc
+    if args.keep_alive:  # tp#1644 B19: no overview, no agents file
+        return keepalive_action()
     if args.snapshot:
         # First, before anything else touches the browser: a guided login
         # whose owner and watchdog both died leaves its record behind.

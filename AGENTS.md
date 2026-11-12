@@ -74,6 +74,8 @@ framework. It is a **provider**: other repos depend on it, not the reverse. See
   length, hash or any comparison. Never duplicate a broker refusal rule in a review.
 - `agent-login.py -L` is agent-invoked ONLY (never from `-c`/`-S`/`-R`); it goes on only
   from a definite logged-out; Safari is driven only through `safari.py` by long options.
+  Sole exemption: `-k` keep-alive, `KEEPALIVE_SITES` only, attended, after `-O` said
+  `safari_logged_out` (tp#1644 B19; limits: docs/AGENTS_REFERENCE.md). Widen only by Albert.
 - `security` (keychain) calls go through `_security_run` only: new session, no timeout,
   never `kill`/`terminate` (tp#504); writes are delete-then-add, never
   `add-generic-password -U`.

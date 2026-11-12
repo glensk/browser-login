@@ -1388,6 +1388,14 @@ def interactive_gate(run: _Run = subprocess.run) -> str | None:
     return attended(os.getuid(), run)
 
 
+def attended_gate(run: _Run = subprocess.run) -> str | None:
+    """`interactive_gate` WITHOUT its ``scheduled`` refusal — ONLY for the
+    Safari keep-alive (`agent-login.py -k`, tp#1644 B19: Albert's exemption
+    of 2026-11-13, limited to `agent_login_keepalive.KEEPALIVE_SITES`). The
+    console must be unlocked and used within ``IDLE_MAX_S``; fail closed."""
+    return attended(os.getuid(), run)
+
+
 # ---------------------------------------------------------------------------
 # the page detector (booleans only)
 # ---------------------------------------------------------------------------
@@ -2520,6 +2528,7 @@ __all__ = [
     "Recipe",
     "Reply",
     "Step",
+    "attended_gate",
     "available_features",
     "console_state",
     "detector_js",
