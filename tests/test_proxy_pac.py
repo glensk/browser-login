@@ -44,6 +44,8 @@ PORT = unused_port()  # below the ephemeral range: tp#905
 EPFL = {
     "groups.epfl.ch": "SOCKS5 127.0.0.1:1081",
     "api.epfl.ch": "SOCKS5 127.0.0.1:1081",
+    "portal.rcp.epfl.ch": "SOCKS5 127.0.0.1:1081",
+    "superset.rcp.epfl.ch": "SOCKS5 127.0.0.1:1081",
 }
 # The Access-gated dom42 hosts (= nixos `accessGatedNames`) via `vpn.sh homeproxy`.
 DOM42 = {
@@ -236,7 +238,9 @@ def test_pac_url_is_inline_base64_data():
 def test_summary_line():
     assert browser._pac_summary({**EPFL, "a.test": "PROXY h:1"}) == (
         "a.test → PROXY h:1, api.epfl.ch → SOCKS5 127.0.0.1:1081, "
-        "groups.epfl.ch → SOCKS5 127.0.0.1:1081"
+        "groups.epfl.ch → SOCKS5 127.0.0.1:1081, "
+        "portal.rcp.epfl.ch → SOCKS5 127.0.0.1:1081, "
+        "superset.rcp.epfl.ch → SOCKS5 127.0.0.1:1081"
     )
 
 
