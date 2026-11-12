@@ -370,7 +370,7 @@ Execution order from here: B8-B9 first, then B6-B7 (overseer decision).
 - [ ] B15 (cscs part done 9c42bc0, 2026-11-12; edu-ID + switch open) **[Albert]** label read + LIVE CANARY SSO (as B11; the cscs sentinel is read
   here). edu-ID and the switch chain: `-O` only. A real `-L eduid -s` / `-L switch -s`
   runs only after `-O` said `safari_logged_out` AND Albert said go for that run.
-- [x] B19 [opus] keep-alive (Albert, 2026-11-12: "ensure I am always logged in in Safari
+- [ ] B19 [opus] (code landed b8a479d, job loaded 2026-11-13; live logged-in proof open) keep-alive (Albert, 2026-11-12: "ensure I am always logged in in Safari
   to cscs; once done then github"): a LaunchAgent (via `agent-login.py -P/-I`, same
   pattern as the existing jobs, wrapped in log-ts.py) that every ~30 min checks the
   Safari session of each keep-alive site (first `cscs`, then `github` once its B13-style
