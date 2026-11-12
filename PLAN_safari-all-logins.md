@@ -367,7 +367,7 @@ Execution order from here: B8-B9 first, then B6-B7 (overseer decision).
   needs a login; a live edu-ID session → zero fills on both; cscs: `_safari_plan`
   resolves a Plan (no `safari_no_recipe`) and `-s` never calls the broker's bundle /
   token path; identity `mismatch` on runai → exit 2.
-- [x] B15 **[Albert]** label read + LIVE CANARY SSO (as B11; the cscs sentinel is read
+- [ ] B15 (cscs part done 9c42bc0, 2026-11-12; edu-ID + switch open) **[Albert]** label read + LIVE CANARY SSO (as B11; the cscs sentinel is read
   here). edu-ID and the switch chain: `-O` only. A real `-L eduid -s` / `-L switch -s`
   runs only after `-O` said `safari_logged_out` AND Albert said go for that run.
 - [ ] B19 [opus] keep-alive (Albert, 2026-11-12: "ensure I am always logged in in Safari
