@@ -1298,8 +1298,8 @@ def test_pre_click_is_a_click_step_before_the_form() -> None:
 
 
 def test_b10_ships_no_labels_no_stops_and_no_identity_route() -> None:
-    # tp#1644 B13: zoho-desk's probe labels are the only ones so far
-    assert set(alsafari.BROKER_SAFARI_LABELS) == B13_LABELLED
+    # tp#1644 B13 / B15: zoho-desk's and cscs' probe labels are the only ones
+    assert set(alsafari.BROKER_SAFARI_LABELS) == B13_LABELLED | B15_LABELLED
     # tp#1644 B12: the SaaS sites' own stops only, none for B10's sites
     assert set(alsafari.BROKER_SAFARI_STOPS) == set(B12_STOPS)
     assert al.SAFARI_IDENTITY_READ_SAFE is False
@@ -2013,6 +2013,9 @@ def test_b12_the_fills_pass_their_field_selectors_to_safari_py() -> None:
 # ---------------------------------------------------------------------------
 
 B13_LABELLED = {"zoho-desk"}
+B15_LABELLED = {"cscs"}  # tp#1644 B15: the SSO batch's labels read so far
+# the real cscs labels, captured before any fixture swaps them
+CSCS_REAL = alsafari.BROKER_SAFARI_LABELS["cscs"]
 ZOHO_ROW: dict[str, Any] = {
     **BROW,
     "site": "zoho-desk",
@@ -2466,11 +2469,12 @@ def _host(call: list[str]) -> str:
 def test_b14_routes_are_listed_and_unbuilt_without_labels() -> None:
     for site in ("eduid", "cscs", "runai-test3", "switch", "switch-engines"):
         assert al.SAFARI_ROUTES[site].proof == "in_safari"
+    for site in ("eduid", "runai-test3", "switch", "switch-engines"):
         assert not al.safari_routed(site)  # ❌ until B15's label read
     assert al.SAFARI_ROUTES["switch"].then == "eduid"
     assert al.SAFARI_ROUTES["switch-engines"].then == "eduid"
     assert not al.SAFARI_ROUTES["eduid"].then
-    for site in ("eduid", "cscs", "runai-test3"):
+    for site in ("eduid", "runai-test3"):
         assert site not in alsafari.BROKER_SAFARI_LABELS
     assert not alsafari.SSO_SAFARI_LABELS
     assert "authentik-glensk" not in al.SAFARI_ROUTES  # admin → ⛔
@@ -2703,3 +2707,119 @@ def test_runai_identity_mismatch_is_exit_2(
     assert "wrong_account" in capsys.readouterr().out
     assert not sso["safari"].ops(*FILLS)
     assert not sso["safari"].landing_opens()
+
+
+# ---------------------------------------------------------------------------
+# tp#1644 B15: the real cscs labels (one-page login, six-box code page)
+# ---------------------------------------------------------------------------
+
+CSCS_LOGIN = "https://auth.cscs.ch/auth/realms/cscs/protocol/openid-connect/auth"
+CSCS_HOME = "https://portal.cscs.ch/profile/"
+
+
+@pytest.fixture
+def cscs(sso: dict[str, Any], monkeypatch: pytest.MonkeyPatch) -> dict[str, Any]:
+    """`sso` with the real cscs labels and a safari.py that splits codes."""
+    monkeypatch.setitem(alsafari.BROKER_SAFARI_LABELS, "cscs", CSCS_REAL)
+    every = (
+        w.ALL_FEATURES
+        | frozenset(alsafari.STEP_FEATURES.values())
+        | frozenset({"split_otp"})
+    )
+    monkeypatch.setattr(alsafari, "features", lambda _c: every)
+    sso["safari_fails"] = []
+    monkeypatch.setattr(
+        al, "record_safari_fail", lambda *a: sso["safari_fails"].append(a)
+    )
+    return sso
+
+
+def _go_cscs(st: dict[str, Any], script: list, **kw: Any) -> int:
+    recipe = al.safari_recipe("cscs")
+    assert recipe is not None
+    st["safari"] = Safari(recipe, script)
+    rc: int = al.safari_target_action("cscs", "", **kw)
+    return rc
+
+
+def test_cscs_labels_build_the_one_page_login_then_the_six_box_code(
+    cscs: dict[str, Any],
+) -> None:
+    recipe = al.safari_recipe("cscs")
+    assert recipe is not None and al.safari_routed("cscs")
+    login, otp = recipe.steps
+    assert (login.kind, login.host, login.submit) == (
+        "login",
+        "auth.cscs.ch",
+        "Sign in",
+    )
+    assert login.when == alsafari.ONE_PAGE_FORM and not login.no_user
+    assert (otp.kind, otp.host, otp.submit) == ("otp", "auth.cscs.ch", "Verify Code")
+    # the visible boxes, never the hidden #otp; only after the password
+    assert otp.when == alsafari.CSCS_CODE_BOXES and otp.after == "login"
+    assert "maxlength" in otp.when and "#otp" not in otp.when
+    assert not otp.fields  # safari.py's default code field → its one box group
+    assert otp.needs == "split_otp" and "split_otp" in recipe.features()
+    assert recipe.sentinel == alsafari.CSCS_SENTINEL
+    assert {"auth.cscs.ch", "portal.cscs.ch"} <= set(recipe.hosts)
+    assert recipe.sentinel_host == "portal.cscs.ch" and not recipe.import_after
+    assert recipe.start_url == CSCS_HOME and not recipe.stops
+
+
+def test_cscs_live_session_opens_the_profile_with_zero_fills(
+    cscs: dict[str, Any],
+) -> None:
+    assert _go_cscs(cscs, [(CSCS_HOME, w._page(sentinel=True))]) == 0
+    fake = cscs["safari"]
+    assert not fake.ops(*FILLS) and not cscs["imports"] and not cscs["broker"]
+    assert fake.landing_opens() == [["--open", CSCS_HOME, "--wait", "20"]]
+
+
+def test_cscs_prove_only_on_the_login_form_types_nothing(
+    cscs: dict[str, Any], capsys: pytest.CaptureFixture[str]
+) -> None:
+    form = (
+        CSCS_LOGIN,
+        w._page(user=True, password=True, steps=[[True, False], [False, False]]),
+    )
+    assert _go_cscs(cscs, [form], prove_only=True) == 2
+    assert "safari_logged_out" in capsys.readouterr().out
+    assert not cscs["safari"].ops(*FILLS)
+
+
+def test_cscs_login_then_the_code_boxes_then_the_portal(cscs: dict[str, Any]) -> None:
+    flow = [
+        (
+            CSCS_LOGIN,
+            w._page(user=True, password=True, steps=[[True, False], [False, False]]),
+        ),
+        (CSCS_LOGIN, w._page(code=True, steps=[[False, False], [True, False]])),
+        (CSCS_HOME, w._page(sentinel=True)),
+    ]
+    assert _go_cscs(cscs, flow) == 0
+    fills = cscs["safari"].ops(*FILLS)
+    assert [c[0] for c in fills] == ["--login", "--otp"]
+    login, otp = fills
+    assert login[login.index("--submit") + 1] == "Sign in" and "--no-user" not in login
+    assert otp[:2] == ["--otp", "Cscs Item"]
+    assert otp[otp.index("--submit") + 1] == "Verify Code"
+    assert not any(a.startswith("--otp-field") for a in otp)
+    assert _host(login) == _host(otp) == "auth.cscs.ch"
+    assert cscs["safari"].landing_opens() == [["--open", CSCS_HOME, "--wait", "20"]]
+
+
+def test_cscs_needs_a_safari_py_that_splits_codes(
+    cscs: dict[str, Any],
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    older = w.ALL_FEATURES | frozenset(alsafari.STEP_FEATURES.values())
+    monkeypatch.setattr(alsafari, "features", lambda _c: older - {"split_otp"})
+    form = (
+        CSCS_LOGIN,
+        w._page(user=True, password=True, steps=[[True, False], [False, False]]),
+    )
+    assert _go_cscs(cscs, [form]) == 3
+    out = capsys.readouterr().out
+    assert "safari_py_outdated" in out and "split_otp" in out
+    assert not cscs["safari"].ops(*FILLS)

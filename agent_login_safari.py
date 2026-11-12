@@ -253,6 +253,11 @@ class Step:  # pylint: disable=too-many-instance-attributes
     # that ran says one ▶ line naming it ('' = silent; a prompt that did not
     # show says nothing).
     prompt: str = ""
+    # tp#1644 B15: a safari.py feature this step needs beyond its kind's
+    # (`STEP_FEATURES`): CSCS's code split into one-digit boxes needs
+    # `split_otp` — an older safari.py would fill one box after the password
+    # was sent ('' = none).
+    needs: str = ""
 
 
 @dataclass(frozen=True)
@@ -318,7 +323,8 @@ class Recipe:  # pylint: disable=too-many-instance-attributes
 
     def features(self) -> frozenset[str]:
         """safari.py features this recipe needs."""
-        return BASE_FEATURES | {STEP_FEATURES[s.kind] for s in self.steps}
+        kinds = {STEP_FEATURES[s.kind] for s in self.steps}
+        return BASE_FEATURES | kinds | {s.needs for s in self.steps if s.needs}
 
     def proves_on(self, host: str) -> bool:
         """The sentinel counts on `host`: the sentinel host or a proof host."""
@@ -587,6 +593,9 @@ class BrokerLabels:  # pylint: disable=too-many-instance-attributes
     post_clicks: tuple[tuple[str, str], ...] = ()
     post_after: str = "login"
     albert_wait: AlbertWait | None = None
+    # tp#1644 B15: the TOTP page splits the code into one-digit boxes (the
+    # code step needs safari.py's `split_otp`)
+    otp_split: bool = False
 
 
 BROKER_SHAPES = frozenset({"one_page", "two_step"})
@@ -605,9 +614,42 @@ POST_CLICK_PROMPTS: dict[str, str] = {
 # passkey-first lookup hides the field's `.textbox_div` instead (no fill).
 ZOHO_PASSWORD = '#password_container:not(.zeroheight) input[type="password"]'
 ZOHO_WAIT_S = 90.0  # Albert's Touch ID / OneAuth approval (tp#1644)
+# tp#1644 B15, CSCS (auth.cscs.ch, Keycloak theme `cscs-v2`; the login page
+# read live in Albert's Safari 2026-11-12, the code page from the theme's
+# public bundle KcPage-*.js, component for login-otp.ftl): the code page
+# shows six visible `input[type=text][inputmode=numeric][maxlength=1]` boxes
+# plus a hidden `#otp` its script keeps in sync; "Verify Code" (a <button>,
+# type submit) stays disabled until all six hold a digit; nothing submits on
+# the sixth digit. The `when` names the boxes, never the hidden field.
+CSCS_CODE_BOXES = 'input[inputmode="numeric"][maxlength="1"]'
+# The portal (Waldur, portal.cscs.ch): the header's user-menu toggle holds
+# the user's avatar (`.symbol-label`: initials or picture) when logged in, an
+# `.image-placeholder` for a guest (Layout-*.js `UserMenuToggle`, Avatar-*.js,
+# Image-*.js: both user avatars are `.symbol-circle > .symbol-label`). The
+# second alternative holds when the toggle's aria-label is translated. A
+# logged-out /profile/ never renders the header (straight to Keycloak).
+# Confirmed live in Albert's Safari on /profile/ after the 2026-11-12 login:
+# both alternatives match once, the guest placeholder is absent.
+CSCS_SENTINEL = (
+    'button[aria-label="User menu"] .symbol-label,button .symbol-circle > .symbol-label'
+)
 # site → its labels from B11 / B13's read-only probe. No labels entry → no
 # route (❌), never a guessed label.
 BROKER_SAFARI_LABELS: dict[str, BrokerLabels] = {
+    # One page: `#username` (type text, name username, no autocomplete) and
+    # `#password`, button "Sign in"; then the six-box code page (above). The
+    # anonymous /profile/ falls through to /api-auth/default/init/ →
+    # auth.cscs.ch (a Kerberos 401 page that posts itself on). No SMS / push /
+    # passkey / CAPTCHA up to the code page. The listing has no sentinel.
+    "cscs": BrokerLabels(
+        "one_page",
+        pass_submit="Sign in",
+        otp_submit="Verify Code",
+        idp="auth.cscs.ch",
+        sentinel=CSCS_SENTINEL,
+        otp_when=CSCS_CODE_BOXES,
+        otp_split=True,
+    ),
     # `#login_id` (autocomplete "webauthn username email", type text):
     # safari.py's default user field misses it. One `#nextbtn` reads "Next"
     # on the e-mail page and "Sign in" on the password page. No TOTP step:
@@ -795,6 +837,7 @@ def _broker_steps(labels: BrokerLabels, idp: str, pre_click: str) -> tuple[Step,
                 when=labels.otp_when or _OTP_FIELD,
                 after="login",
                 fields=_fields(("--otp-field", labels.otp_field)),
+                needs="split_otp" if labels.otp_split else "",
             )
         )
     steps += [
