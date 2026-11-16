@@ -143,6 +143,8 @@ EXPECTED: dict[str, str] = {
             # tp#1644 B6: the built-in sites
             "openai",
             "slack",
+            # tp#2144: EPFL Microsoft 365 (no step; Entra SSO)
+            "m365",
             # tp#1644 B13: the broker SaaS route with probe labels
             "zoho-desk",
         ),

@@ -145,6 +145,16 @@ SAFARI_BUILTIN: dict[str, SafariSite] = {
         session_cookies=("__Secure-next-auth.session-token*",),
         import_unattended=False,
     ),
+    # EPFL Microsoft 365 / Teams (tp#2144): only the IdP's cookies travel —
+    # Entra ID's persistent SSO cookie (Keep me signed in) on
+    # login.microsoftonline.com; Teams / SharePoint mint their own session
+    # (MSAL tokens, their own cookies) through that SSO, so none of theirs is
+    # copied.
+    "m365": SafariSite(
+        ("microsoftonline.com",),
+        session_cookies=("ESTSAUTHPERSISTENT",),
+        import_unattended=False,
+    ),
 }
 
 

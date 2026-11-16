@@ -493,12 +493,13 @@ framework. It is a **provider**: other repos depend on it, not the reverse. See
     a PATH lookup are honoured only inside pytest (`in_test_mode`).
   - **Credentials:** a credential step runs once. A failure after one
     quarantines (`-Q` releases it).
-  - **A built-in import** (`SAFARI_BUILTIN`: notion, slack, openai) is one
+  - **A built-in import** (`SAFARI_BUILTIN`: notion, slack, openai, m365) is one
     interaction-lease transaction:
     1. the site's own check must say a definite logged-out;
     2. Safari's cookies are proven in a THROWAWAY browser context, server-side
        (Slack `auth.test` team + user id, OpenAI account ids, Notion's user
-       record);
+       record; m365: Teams after Entra's SSO, then the MSAL cache's account
+       key — key names only);
     3. only on `match` does the shared jar change.
 
     A failed post-copy check is undone, and a failed undo is recorded

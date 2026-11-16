@@ -104,6 +104,7 @@ OVERRIDE_STR_KEYS = frozenset(
         "account",
         "expected_email",
         "expected_team_id",
+        "expected_tenant_id",
         "expected_user_id",
         "expected_workspace_id",
         "mailbox",
@@ -374,6 +375,26 @@ def _google(host: str, trigger: str, *, optional: bool = False) -> tuple[Step, .
     )
 
 
+# tp#2144, Microsoft Entra ID (login.microsoftonline.com). UNVERIFIED (no L2
+# read in Albert's Safari: it holds a live session): the Authenticator
+# approval page (number matching or a plain approve) and the sign-in pages
+# (e-mail, account picker, password, "Stay signed in?"), English / German /
+# French. The sign-in stop's page heading stands on its own line.
+M365_PUSH_RE = (
+    r"Approve sign.?in request|Enter the number shown|Open your Authenticator app"
+    r"|Anmeldeanforderung genehmigen|angezeigte Zahl ein"
+    r"|Approuver la demande de connexion|Entrez le nombre affich"
+)
+M365_SIGNIN_RE = (
+    r"Pick an account|Enter password|Stay signed in\?"
+    r"|Konto ausw(ä|ae)hlen|Kennwort eingeben|Angemeldet bleiben\?"
+    r"|Choisir un compte|Entrer le mot de passe|Rester connect(é|e)"
+    r"|(^|\n)\s*(Sign in|Anmelden|Connexion)\s*(\n|$)"
+)
+# Albert's sign-in + MFA in the same window (one wait for both stops).
+M365_WAIT_S = 180.0
+
+
 # Labels are UNVERIFIED unless a comment says L2 read them in Albert's
 # Safari; a wrong one only stops the run (`recipe_stuck`) — safari.py clicks
 # exactly one visible match or nothing.
@@ -544,6 +565,30 @@ RECIPES: dict[str, Recipe] = {
         sentinel=".notion-sidebar, .notion-sidebar-switcher",
         broker=False,
         identity="notion",
+    ),
+    # EPFL Microsoft 365 / Teams (tp#2144). No step: nothing is typed — the
+    # EPFL password is not in the vault and the MFA is Albert's. A Safari
+    # holding Entra's "Stay signed in" session lands on Teams by SSO (the
+    # sentinel ends the run, then the import); a sign-in page or the
+    # Authenticator page waits for Albert in the same window, then ends
+    # needs-Albert (exit 4).
+    "m365": Recipe(
+        "m365",
+        ("teams.cloud.microsoft", "teams.microsoft.com", "login.microsoftonline.com"),
+        "teams.cloud.microsoft",
+        (),
+        start_url="https://teams.cloud.microsoft/",
+        # L2 (2026-11-16): the account avatar in Teams' title bar, read in
+        # the logged-in shared Chromium (not yet in Albert's Safari)
+        sentinel='[data-tid="me-control-avatar-trigger"]',
+        broker=False,
+        identity="m365",
+        stops=(
+            SiteStop("needs_albert_push", M365_PUSH_RE, page="any", wait_s=M365_WAIT_S),
+            SiteStop(
+                "needs_albert_login", M365_SIGNIN_RE, page="any", wait_s=M365_WAIT_S
+            ),
+        ),
     ),
 }
 # claude.ai: no Safari — its login is the automated magic link in the shared

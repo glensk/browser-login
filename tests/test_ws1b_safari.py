@@ -419,7 +419,7 @@ def test_available_features_are_kept_on_disk_per_safari_py_file(
 
     def ask() -> frozenset[str]:
         s._FEATURE_CACHE.clear()  # pylint: disable=protected-access
-        return s.available_features()
+        return frozenset(s.available_features())
 
     def n_calls() -> int:
         return len(calls.read_text().splitlines()) if calls.exists() else 0

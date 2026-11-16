@@ -1286,7 +1286,7 @@ def test_notion_identity_hands_the_jar_user_to_the_probe(
 
 
 def test_tristate_sites_cover_every_builtin_import() -> None:
-    assert al.TRISTATE_SITES == frozenset({"notion", "slack", "openai"})
+    assert al.TRISTATE_SITES == frozenset({"notion", "slack", "openai", "m365"})
     assert set(sc.SAFARI_BUILTIN) <= al.TRISTATE_SITES
 
 

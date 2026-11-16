@@ -493,6 +493,14 @@ STATIC_SITE_NAMES = frozenset(
         "engines",
         "engines.admin.switch.ch",
         "switchengines",
+        # EPFL Microsoft 365 / Teams (tp#2144)
+        "epfl-m365",
+        "m365",
+        "microsoft",
+        "office365",
+        "sharepoint",
+        "teams",
+        "teams.cloud.microsoft",
     }
 )
 

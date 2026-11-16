@@ -69,7 +69,8 @@ Every Playwright attach gives up after $CLAUDE_BROWSER_CONNECT_TIMEOUT_S (defaul
 
 Generic multi-site login (a SITE is one of the entries in the SITES registry —
 currently ``cscs``, ``anthropic``/``claude``, ``openai``/``chatgpt``, ``slack``,
-``notion``, ``biopolwifi`` and ``switch``; add more by registering a Site):
+``notion``, ``m365``/``teams``, ``biopolwifi`` and ``switch``; add more by
+registering a Site):
   login SITE        Ensure SITE is logged in in the shared browser. Automated for
                     sites with stored credentials (CSCS Keycloak). For claude.ai:
                     FULLY automatic when $ANTHROPIC_LOGIN_EMAIL is set and himalaya
@@ -105,7 +106,7 @@ the socket). Exit codes: 0 ok, 2 not logged in, 3 broker unavailable, 4 needs a
 human.
   broker-sites      List the broker's sites (id, fill origins, status).
   logout SITE       Drop the broker profile for SITE + delete its cookies here.
-                    Built-in notion/slack/openai: shared browser only, session
+                    Built-in notion/slack/openai/m365: shared browser only, session
                     cookies only, Safari untouched.
   import-safari SITE [-n]
                     Copy SITE's session cookies from Safari (sites in
@@ -197,6 +198,7 @@ from broker.origins import access_gated as _access_gated  # noqa: E402
 from broker.origins import access_gated_via as _access_gated_via  # noqa: E402
 from broker.page_state import await_sentinel as _broker_await_sentinel  # noqa: E402
 from broker.page_state import page_blank as _broker_page_blank  # noqa: E402
+from broker.page_state import sentinel_shown as _sentinel_shown  # noqa: E402
 from broker.recipes import CSCS_EXPIRES_KEY as BROKER_CSCS_EXPIRES_KEY  # noqa: E402
 from broker.recipes import CSCS_TOKEN_KEY as BROKER_CSCS_TOKEN_KEY  # noqa: E402
 from broker.recipes import REFRESH_MIN_LEFT_S as BROKER_REFRESH_MIN_LEFT_S  # noqa: E402
@@ -892,7 +894,7 @@ def _add_login_parsers(sub: Any) -> None:
     pl.add_argument(
         "site",
         help="Site to log into (e.g. cscs, anthropic/claude, openai/chatgpt, "
-        "slack, notion, biopolwifi, switch).",
+        "slack, notion, m365/teams, biopolwifi, switch).",
     )
     pl.add_argument(
         "-e",
@@ -10193,6 +10195,189 @@ def cmd_slack_session(port: int) -> int:
     return 0
 
 
+# ---------------------------------------------------------------------------
+# EPFL Microsoft 365 / Teams (teams.cloud.microsoft) — tp#2144. EPFL's SSO is
+# Entra ID (login.microsoftonline.com); with "Stay signed in" it holds a
+# persistent SSO cookie (ESTSAUTHPERSISTENT) that silently signs Teams in, so a
+# check that loads Teams keeps the session rolling. A cold session is
+# ASSISTED (Albert's EPFL password + MFA; nothing here types a password). No
+# token is extracted: the account proof reads only the MSAL cache's KEY names.
+# ---------------------------------------------------------------------------
+M365_TEAMS_URL = "https://teams.cloud.microsoft/"
+M365_TEAMS_HOST = "teams.cloud.microsoft"
+M365_LOGIN_HOST = "login.microsoftonline.com"
+# The account avatar in Teams' title bar (L2-verified 2026-11-16 in the
+# logged-in shared Chromium); the sign-in pages never render it.
+M365_SENTINEL = '[data-tid="me-control-avatar-trigger"]'
+# Teams boots slowly, and the SSO round trip through Entra comes first.
+M365_BOOT_WAIT_S = 45.0
+# A settled Entra sign-in page: the e-mail / password field or the account
+# picker ("Pick an account"). Booleans only leave the page.
+M365_SIGNIN_JS = r"""() => {
+  const vis = (e) => !!e && e.getClientRects().length > 0 &&
+    getComputedStyle(e).visibility !== "hidden";
+  const sel = 'input[type="password"],input[type="email"],input[name="loginfmt"],' +
+    '#tilesHolder,[data-test-id="accountList"],div.table[role="button"]';
+  try { return [...document.querySelectorAll(sel)].some(vis); }
+  catch (err) { return false; }
+}"""
+# The account proof: an MSAL cache key `msal.2|<oid>.<tid>|<env>|…` whose
+# second segment is the expected `<user id>.<tenant id>`. Key names only —
+# never a value or a token; only the enum leaves the page.
+M365_IDENTITY_JS = r"""(want) => {
+  try {
+    if (location.hostname === "login.microsoftonline.com") return "logged_out";
+    const mine = (String(want.user) + "." + String(want.tenant)).toLowerCase();
+    let seen = false;
+    for (let i = 0; i < localStorage.length; i++) {
+      const parts = String(localStorage.key(i) || "").split("|");
+      if (parts.length < 3 || !/^msal\./.test(parts[0])) continue;
+      if (!/^[0-9a-f-]+\.[0-9a-f-]+$/i.test(parts[1])) continue;
+      if (parts[1].toLowerCase() === mine) return "match";
+      seen = true;
+    }
+    return seen ? "mismatch" : "indeterminate";
+  } catch (err) { return "indeterminate"; }
+}"""
+
+
+def _m365_host(page) -> str:
+    """The host of `page`'s URL ('' when unreadable)."""
+    try:
+        return (urllib.parse.urlsplit(str(page.url)).hostname or "").lower()
+    except Exception:  # pylint: disable=broad-exception-caught
+        return ""
+
+
+def _m365_on_signin(page) -> bool:
+    """True on a settled Entra sign-in page (form, password or account picker)."""
+    if _m365_host(page) != M365_LOGIN_HOST:
+        return False
+    try:
+        return page.evaluate(M365_SIGNIN_JS) is True
+    except Exception:  # pylint: disable=broad-exception-caught
+        return False
+
+
+def _m365_await(page) -> str:
+    """Poll the (already loaded) page up to ``M365_BOOT_WAIT_S``: valid (the
+    sentinel on Teams), invalid (a settled Entra sign-in page), else
+    indeterminate."""
+    shown = _broker_await_sentinel(
+        page,
+        M365_SENTINEL,
+        M365_BOOT_WAIT_S,
+        where=lambda p: _m365_host(p) == M365_TEAMS_HOST,
+        give_up=_m365_on_signin,
+    )
+    if shown:
+        return "valid"
+    return "invalid" if _m365_on_signin(page) else "indeterminate"
+
+
+def _m365_state(page) -> str:
+    """valid / invalid / indeterminate for EPFL Teams: loads Teams (the SSO
+    round trip keeps the Entra session rolling) and waits for the avatar.
+    invalid ONLY on a settled sign-in page; a navigation error or a Teams
+    that did not boot in time cannot tell."""
+    from playwright.sync_api import Error as PlaywrightError
+
+    try:
+        page.goto(M365_TEAMS_URL, wait_until="domcontentloaded")
+    except PlaywrightError:
+        return "indeterminate"
+    return _m365_await(page)
+
+
+def _m365_logged_in(page) -> bool:
+    """True when `_m365_state` says valid."""
+    return _m365_state(page) == "valid"
+
+
+def _m365_wait_for_login(page, timeout_s: int = 600) -> bool:
+    """PASSIVE poll: watch the login tab WITHOUT navigating it (a reload would
+    wipe what Albert types). True once the Teams avatar shows on Teams."""
+    start = time.monotonic()
+    last_beat = 0.0
+    while time.monotonic() - start < timeout_s:
+        if _m365_host(page) == M365_TEAMS_HOST and _sentinel_shown(page, M365_SENTINEL):
+            return True
+        elapsed = time.monotonic() - start
+        if elapsed - last_beat >= 30:
+            print(
+                f"  …waiting for you to finish the Microsoft sign-in in the shared "
+                f"browser window ({int(elapsed)}s elapsed, timeout {timeout_s}s)…",
+                file=sys.stderr,
+            )
+            last_beat = elapsed
+        try:
+            page.wait_for_timeout(3000)
+        except Exception:  # pylint: disable=broad-exception-caught
+            time.sleep(3)
+    return False
+
+
+def cmd_m365_login(port: int) -> int:
+    """Ensure EPFL Microsoft 365 (Teams) is logged in. Idempotent: a warm
+    session (or a silent Entra SSO) returns 0. A cold session is ASSISTED —
+    Albert's EPFL password + MFA, never typed by this tool — and runs only
+    inside a guided login (exit 4 elsewhere). In a fresh background tab this
+    process owns, closed again (tp#845)."""
+    try:
+        with _owned_background_page(port) as page:
+            return _m365_login_owned(port, page)
+    except OwnedTabError as exc:
+        return _fail(f"login m365: {exc}")
+
+
+def _m365_login_owned(port: int, page) -> int:
+    """`cmd_m365_login` in its owned tab."""
+    # Warm probe + guided-login gate FIRST, outside the lease (read-only).
+    if _m365_logged_in(page):
+        print("✓ Already logged into EPFL Microsoft 365 (Teams).")
+        return 0
+    # A cold session needs Albert — only inside a guided login (exit 4).
+    if not _guided_login_allowed(port, "m365", M365_LOGIN_HOST):
+        return NEEDS_ALBERT_RC
+    with _interaction_lease("login m365"):
+        from playwright.sync_api import Error as PlaywrightError
+
+        try:
+            if _m365_host(page) not in (M365_TEAMS_HOST, M365_LOGIN_HOST):
+                page.goto(M365_TEAMS_URL, wait_until="domcontentloaded")
+            _bring_to_front(page, "login m365", port)
+        except PlaywrightError:
+            pass
+        print(
+            "\n🔐 EPFL Microsoft 365 (Teams) needs a login.\n"
+            "   In the shared Chrome window (now in front):\n"
+            "     1. Sign in with your EPFL account.\n"
+            '     2. Tick "Stay signed in" (keeps the SSO alive for months).\n'
+            "     3. Approve the MFA request on your phone.\n"
+            "     4. Land in Teams — success is auto-detected (your avatar).\n"
+            "   Take your time — the page is NOT reloaded while you type.\n",
+            file=sys.stderr,
+        )
+        if not _m365_wait_for_login(page, timeout_s=600):
+            return _fail(
+                "Microsoft 365 login not detected within 10 min. Finish it in the "
+                "shared browser, then re-run: browser.py login m365"
+            )
+        print("✓ Logged into EPFL Microsoft 365 (Teams).")
+        _record_login_event("m365", "assisted")
+        return 0
+
+
+def cmd_m365_logged_in(port: int) -> int:
+    """Exit 0 if EPFL Teams is logged in (the avatar shows), else 2 — the
+    result record says ``logged_out`` (a settled Entra sign-in page) or
+    ``indeterminate``."""
+    return _tristate_report(
+        "EPFL Microsoft 365 (teams.cloud.microsoft)",
+        _logged_in_page_state(port, _m365_state),
+    )
+
+
 def _biopolwifi_logged_in(page) -> bool:
     """True on the settled, logged-in Cloudpath portal (the properties surface).
 
@@ -16397,7 +16582,7 @@ def cmd_broker_logout(port: int, site_name: str) -> int:  # pylint: disable=too-
     and its declared localStorage keys (`_logout_storage_plan`, read back;
     exit 2 when that cannot be confirmed) from the shared browser (the session
     ends here; server-side sessions live on until the site expires them).
-    A ``SAFARI_BUILTIN`` site (notion, slack, openai) goes to
+    A ``SAFARI_BUILTIN`` site (notion, slack, openai, m365) goes to
     `cmd_builtin_logout` BEFORE the broker lookup: the broker's fill-only
     item of the same name would refuse, and its op is never called."""
     site = site_name.strip().lower()
@@ -16855,7 +17040,7 @@ def cmd_import_safari(
     `result_file` (`-R`): the phase record. `agent` (`-a`): an agent just
     logged Safari in (`agent-login.py -L`) — the login event is
     ``safari-agent``, else ``safari-import`` (a copy, not a login).
-    A built-in site (``SAFARI_BUILTIN``: notion, slack, openai) takes
+    A built-in site (``SAFARI_BUILTIN``: notion, slack, openai, m365) takes
     `_import_builtin`: one transaction with an account proof (WS1b).
     A real import ends with the Access team-cookie sweep on every exit
     (tp#1466); a failed sweep turns 0 into 1 (``access_team_sweep_failed``).
@@ -16961,7 +17146,7 @@ def _safari_try_import(port: int, site: str, entry: dict) -> bool:
 
 
 # ---------------------------------------------------------------------------
-# WS1b: Safari import of a BUILT-IN site (notion, slack, openai) — one
+# WS1b: Safari import of a BUILT-IN site (notion, slack, openai, m365) — one
 # transaction under ONE interaction lease:
 #   1. the site's own check in the shared browser must say a DEFINITE
 #      "logged out" (S7; Notion: or another account) — a working or
@@ -16970,7 +17155,8 @@ def _safari_try_import(port: int, site: str, entry: dict) -> bool:
 #      Playwright's new_context = Target.createBrowserContext, disposed on
 #      close and on detach): the session AND its account, server-side
 #      (Slack auth.test team + user, OpenAI's account ids, Notion's user
-#      record), only an enum leaves the page;
+#      record; m365: the MSAL cache's account key after Entra's SSO), only
+#      an enum leaves the page;
 #   3. only on `match` the cookies go into the shared jar (Slack's token store
 #      cleared first), then the shared browser's own check; if that fails the
 #      import is undone — a failed undo is recorded (`undo: failed`).
@@ -16987,6 +17173,7 @@ BUILTIN_EXPECTED_KEYS = {
     "notion": ("expected_email",),
     "slack": ("expected_team_id", "expected_user_id"),
     "openai": ("expected_workspace_id",),
+    "m365": ("expected_tenant_id", "expected_user_id"),
 }
 OVERRIDES_HINT = "~/.config/agent-login/safari-logins.json"
 
@@ -17121,6 +17308,21 @@ def _openai_identity(page: Any, expected: dict[str, str]) -> str:
     return _eval_enum(page, OPENAI_IDENTITY_JS, want)
 
 
+def _m365_identity(page: Any, expected: dict[str, str]) -> str:
+    """match / mismatch / logged_out / indeterminate: Teams after Entra's
+    SSO (bounded by ``M365_BOOT_WAIT_S``), then the MSAL cache's account key
+    (``M365_IDENTITY_JS``, key names only) against the expected user AND
+    tenant id."""
+    state = _m365_state(page)
+    if state != "valid":
+        return "logged_out" if state == "invalid" else "indeterminate"
+    want = {
+        "user": expected["expected_user_id"],
+        "tenant": expected["expected_tenant_id"],
+    }
+    return _eval_enum(page, M365_IDENTITY_JS, want)
+
+
 def _notion_identity(page: Any, expected: dict[str, str]) -> str:
     """match / mismatch / logged_out / indeterminate: Notion's server alone
     (``NOTION_SERVER_JS``: the user record of the session) — no sidebar wait,
@@ -17152,6 +17354,7 @@ BUILTIN_PROVERS: dict[str, Callable[[Any, dict[str, str]], str]] = {
     "notion": _notion_identity,
     "slack": _slack_identity,
     "openai": _openai_identity,
+    "m365": _m365_identity,
 }
 
 
@@ -17190,7 +17393,7 @@ def _builtin_state(port: int, site: str, expected: dict[str, str]) -> str:
         if res["verdict"] == "valid" and res["identity"] == "mismatch":
             return "wrong_account"
         return str(res["verdict"])
-    check = _slack_state if site == "slack" else _chatgpt_state
+    check = {"slack": _slack_state, "m365": _m365_state}.get(site, _chatgpt_state)
     return _logged_in_page_state(port, check)
 
 
@@ -18526,10 +18729,11 @@ GUIDED_START_URLS = {
     "notion": NOTION_LOGIN_URL,
     "switch": SWITCH_ORIGIN + SWITCH_LOGIN_PATH,
     "switch-engines": SWITCH_ENGINES_ORIGIN + SWITCH_LOGIN_PATH,
+    "m365": M365_TEAMS_URL,
 }
 # Built-in sites whose own `login SITE` flow is the window flow of path A.
 GUIDED_BUILTIN_WINDOW = frozenset(
-    {"anthropic", "openai", "slack", "notion", "switch", "switch-engines"}
+    {"anthropic", "openai", "slack", "notion", "switch", "switch-engines", "m365"}
 )
 # Test hooks, honoured ONLY with CLAUDE_BROWSER_CACHE_DIR set (a disposable
 # browser): extra sites from a JSON file, and the viewer URL written to a file
@@ -19825,6 +20029,21 @@ def _sites() -> list[Site]:
             blurb="app.notion.com (assisted e-mail-code / SSO login; no token)",
             login=cmd_notion_login,
             logged_in=cmd_notion_logged_in,
+        ),
+        Site(
+            name="m365",
+            aliases=(
+                "teams",
+                "microsoft",
+                "epfl-m365",
+                "sharepoint",
+                "teams.cloud.microsoft",
+                "office365",
+            ),
+            blurb="EPFL Microsoft 365 / Teams (Entra ID SSO; assisted login, "
+            "Safari import; no token)",
+            login=cmd_m365_login,
+            logged_in=cmd_m365_logged_in,
         ),
         Site(
             name="biopolwifi",

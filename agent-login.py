@@ -338,6 +338,14 @@ TARGETS = (
         "Notion (SDSC/Renku workspace)",
     ),
     Target(
+        "m365",
+        "EPFL Microsoft 365",
+        "https://login.microsoftonline.com",
+        ASSISTED_FLOW,
+        "EPFL Teams + SharePoint (Entra ID SSO, stay signed in); renewed from "
+        "Albert's Safari session; consumer: sdsc/epfl-sharepoint-api",
+    ),
+    Target(
         "switch",
         "SWITCH Cloud",
         "https://cloud.switch.ch",
@@ -1081,6 +1089,9 @@ SAFARI_ROUTES: dict[str, SafariRoute] = {
     # steps (slack: else the e-mail code, `MAIL_CODE_ENV["slack"]`)
     "slack": SafariRoute("https://swiss-data-science.slack.com/", "builtin"),
     "openai": SafariRoute("https://chatgpt.com/", "builtin"),
+    # tp#2144: only Entra's SSO cookie travels (login.microsoftonline.com);
+    # the proof loads Teams, which signs in by SSO. Nothing is typed in Safari.
+    "m365": SafariRoute("https://teams.cloud.microsoft/", "builtin"),
     # tp#1644 B10: the self-hosted broker logins, proven in Safari; their
     # recipe = the listing row + `alsafari.BROKER_SAFARI_LABELS` (empty until
     # B11's read-only label probe: ❌ until then). The landing = check_url.
@@ -1188,6 +1199,11 @@ SAFARI_CODE_TEXT: dict[str, str] = {
     ),
     "email_code_unwired": (
         "the site asks for an e-mail code this route does not read (no code mail sent)"
+    ),
+    # tp#2144: Microsoft's sign-in page — the EPFL password is not in the vault
+    "needs_albert_login": (
+        "needs Albert: he signs in to Microsoft in Safari once (EPFL account, "
+        "Stay signed in, MFA on his phone)"
     ),
 }
 
@@ -2590,7 +2606,7 @@ def assisted_verdict(site: str) -> tuple[bool | None, str, dict | None]:
 
 # WS1b D8: built-in sites whose `logged-in` is tri-state (its result record
 # says `indeterminate` when it cannot tell — never "logged out").
-TRISTATE_SITES = frozenset({"notion", "slack", "openai"})
+TRISTATE_SITES = frozenset({"notion", "slack", "openai", "m365"})
 
 
 def _login_hint(site: str) -> str:
@@ -4055,6 +4071,7 @@ MATRIX_META = {
     "console": ("console-balance.py (billing, read-only)", "admin"),
     "console-private": ("console-balance.py (billing, read-only)", "admin"),
     "openai": ("ChatGPT Business admin", "admin"),
+    "m365": ("sdsc/epfl-sharepoint-api (EPFL Teams / SharePoint)", "user"),
     "switch": ("Switch Cloud Portal", "user"),
     "switch-engines": ("SWITCHengines AdminUI (cost-center admin)", "admin"),
 }
