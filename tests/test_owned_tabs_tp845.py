@@ -265,7 +265,9 @@ def _stub_checks(monkeypatch) -> None:
     monkeypatch.setattr(
         browser, "_broker_cscs_token_proof", lambda page, wait_s: "valid"
     )
-    monkeypatch.setattr(browser, "_switch_page_verdict", lambda page: "logged-in")
+    monkeypatch.setattr(
+        browser, "_switch_page_verdict", lambda page, portal=None: "logged-in"
+    )
 
 
 CHECKS = {
@@ -307,7 +309,7 @@ def test_checks_run_only_in_the_owned_helper_with_the_probe_viewport(
 def _login_stubs(monkeypatch, lease: Lease) -> None:
     monkeypatch.setattr(browser, "_interaction_lease", lease)
     monkeypatch.setattr(browser, "_capture_and_cache_token", lambda ctx, page: 0)
-    monkeypatch.setattr(browser, "_switch_warm_or_via_broker", lambda port: False)
+    monkeypatch.setattr(browser, "_switch_warm_or_via_broker", lambda *a: False)
     monkeypatch.setattr(browser, "_notion_probe", lambda port: False)
     monkeypatch.setattr(browser, "_guided_login_allowed", lambda *a: True)
     monkeypatch.setattr(browser, "_switch_wait_for_login", lambda *a, **k: True)
@@ -833,7 +835,7 @@ def test_switch_probe_runs_in_a_ledgered_owned_tab(
 ):
     ledgered: list[list[Path]] = []
 
-    def judge(page) -> str:
+    def judge(page, portal=None) -> str:  # tp#1957 added `portal`
         ledgered.append(_ledgers(cache))  # the tab is on the ledger meanwhile
         return str(verdict)
 
