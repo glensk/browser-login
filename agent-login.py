@@ -5234,8 +5234,11 @@ def _safari_target_in_safari(
 # active, a login only after this run's `-O` proof said `safari_logged_out`,
 # never while quarantined / during a live guided login, one attempt per site
 # per 6 h (failures too), one notification per site per 6 h for Albert's own
-# step (exit 4) or any failed re-login (a banner; a gog mail when it fails).
+# step (exit 4), any failed re-login or `kal.UNPROVEN_NOTIFY_AFTER` runs in a
+# row without a proven session (a banner; a gog mail when it fails).
 # A logged-in Safari is proven in a background tab: nothing opened or left.
+# That probe is never proof either way: whatever it did not see (incl. "could
+# not tell") goes on to the `-O` proof (tp#1644).
 # ---------------------------------------------------------------------------
 
 
@@ -5285,25 +5288,26 @@ def _keepalive_tidy(
         print(f"⚠️ {site}: Safari's front tab differs from before the probe")
 
 
-def _keepalive_stop(site: str, now: float) -> str:
+def _keepalive_stop(site: str, now: float) -> tuple[str, bool]:
     """Why no `-O` proof + login may run for `site` now ('' = none):
-    quarantined, a live guided login (exit 75: skip), the per-site attempt
-    cooldown (unreadable = closed), or the stamp could not be written. The
-    stamp is written HERE, before the attempt: a failure counts too."""
+    quarantined, a live guided login (exit 75: skip — the bool is True,
+    the run counts neither way), the per-site attempt cooldown (unreadable
+    = closed), or the stamp could not be written. The stamp is written
+    HERE, before the attempt: a failure counts too."""
     if als.quarantined(site) is not None:
-        return f"quarantined — release first: ./agent-login.py -Q {site}"
+        return f"quarantined — release first: ./agent-login.py -Q {site}", False
     busy = guided_busy()
     if busy:
-        return f"{busy} (exit {BUSY_RC}: skip)"
+        return f"{busy} (exit {BUSY_RC}: skip)", True
     left = kal.cooldown_left(site, "attempt_at", kal.ATTEMPT_COOLDOWN_S, now)
     if left is None:
-        return f"its cooldown state ({kal.STATE_FILE}) is unreadable"
+        return f"its cooldown state ({kal.STATE_FILE}) is unreadable", False
     if left > 0:
         hours = int(kal.ATTEMPT_COOLDOWN_S // 3600)
-        return f"one attempt per {hours} h — {int(left // 60)} min left"
+        return f"one attempt per {hours} h — {int(left // 60)} min left", False
     if not kal.stamp(site, "attempt_at", now):
-        return f"its cooldown stamp ({kal.STATE_FILE}) could not be written"
-    return ""
+        return f"its cooldown stamp ({kal.STATE_FILE}) could not be written", False
+    return "", False
 
 
 def _keepalive_prove(site: str, recipe: alsafari.Recipe) -> alsafari.Outcome:
@@ -5354,13 +5358,12 @@ def _keepalive_stopped(site: str, rc: int, code: str, what: str) -> int:
     return 1
 
 
-# One return per stop of the keep-alive, in the order they are decided.
-def keepalive_site(site: str) -> int:  # pylint: disable=too-many-return-statements
+def keepalive_site(site: str) -> int:
     """One keep-alive pass of `site` (see the section comment): the
-    background probe; only when it did not see the session and no stop
-    applies, the `-O` proof, and only on its `safari_logged_out` the login
-    (`safari_target_action(..., keepalive=True)`). 0 = logged in or
-    skipped, 1 = a proof or login failed."""
+    background probe; whenever it did not see the session, `_keepalive_decide`
+    (the `-O` proof and, only on its `safari_logged_out`, the login); then the
+    run counts towards `kal.UNPROVEN_NOTIFY_AFTER`. 0 = logged in or skipped,
+    1 = a proof or login failed."""
     if site not in kal.KEEPALIVE_SITES:
         print(f"❌ {site}: not a keep-alive site — nothing done")
         return 2
@@ -5372,28 +5375,64 @@ def keepalive_site(site: str) -> int:  # pylint: disable=too-many-return-stateme
     _keepalive_tidy(site, recipe, call, seen)
     if seen.state == "logged_in":
         print(f"✅ {site}: Albert's Safari is logged in (background probe)")
+        kal.unproven_runs(site, proven=True)
         return 0
-    if seen.state != "not_proven":
-        print(f"⏸  {site}: the background probe could not tell ({seen.why}) — no login")
+    if seen.why == "safari_unavailable":
+        print(f"⏸  {site}: keep-alive skipped — Safari did not answer the probe")
         return 0
-    stop = _keepalive_stop(site, time.time())
+    rc, proven = _keepalive_decide(site, recipe, seen)
+    if proven is not None:
+        _keepalive_count(site, proven, seen.why)
+    return rc
+
+
+def _keepalive_count(site: str, proven: bool, why: str) -> None:
+    """Count the run (`kal.unproven_runs`); at `kal.UNPROVEN_NOTIFY_AFTER`
+    runs in a row without a proven session: the one notification."""
+    runs = kal.unproven_runs(site, proven=proven)
+    if proven or runs is None or runs < kal.UNPROVEN_NOTIFY_AFTER:
+        return
+    said = _keepalive_notify(
+        site,
+        f"{site}: the keep-alive proved no Safari session in {runs} runs in a "
+        f"row (last probe: {why}) — check ./agent-login.py -L {site} -s -O",
+    )
+    print(
+        f"⚠️ {site}: {runs} runs in a row without a proven session — notification {said}"
+    )
+
+
+# One return per stop of the keep-alive, in the order they are decided.
+def _keepalive_decide(  # pylint: disable=too-many-return-statements
+    site: str, recipe: alsafari.Recipe, seen: kal.Probe
+) -> tuple[int, bool | None]:
+    """The probe did not see the session (not seen or could not tell): no
+    stop → the `-O` proof → only on `safari_logged_out` the login
+    (`safari_target_action(..., keepalive=True)`). (exit code, proven: True =
+    a session was proven, False = none, None = a busy skip that counts
+    neither way)."""
+    stop, busy = _keepalive_stop(site, time.time())
     if stop:
         print(f"⏸  {site}: not proven logged in ({seen.why}); no login — {stop}")
-        return 0
+        return 0, None if busy else False
     print(f"▶ {site}: not proven logged in ({seen.why}) — the -O proof in Safari")
     out = _keepalive_prove(site, recipe)
     if out.window_left or out.window_open:
         print(f"⚠️ {site}: the -O proof's Safari window may be left open")
     if out.ok:
         print(f"✅ {site}: the -O proof found a working session — no login")
-        return 0
+        return 0, True
     if out.code != "safari_logged_out":
-        return _keepalive_stopped(site, out.rc, out.code, "-O proof")
+        rc = _keepalive_stopped(site, out.rc, out.code, "-O proof")
+        return rc, None if out.rc == BUSY_RC else False
     print(f"▶ {site}: safari_logged_out — logging Albert's Safari in (keep-alive)")
     rc = safari_target_action(site, "", keepalive=True)
     if rc == 0:
-        return 0
-    return _keepalive_stopped(site, rc, f"exit {rc}", "login")
+        print(f"✅ {site}: Albert's Safari is logged in again (keep-alive)")
+        return 0, True
+    return _keepalive_stopped(site, rc, f"exit {rc}", "login"), (
+        None if rc == BUSY_RC else False
+    )
 
 
 # Safari's identity read (tp#1644): polls of the parked recipe answer
@@ -6281,12 +6320,14 @@ def build_parser() -> argparse.ArgumentParser:
         "min): for each keep-alive site ("
         + ", ".join(kal.KEEPALIVE_SITES)
         + ") prove Albert's Safari session in a background tab (closed again, "
-        "no focus change); only when that did not see it, Albert is active, "
-        "the site is not quarantined, no guided login runs and its "
+        "no focus change); only when that did not see it (not seen or could "
+        "not tell), Albert is active, the site is not quarantined, no guided "
+        "login runs and its "
         f"{int(kal.ATTEMPT_COOLDOWN_S // 3600)}-h attempt cooldown is over: "
         "the -O proof, and only on safari_logged_out the -L SITE -s login "
-        "(no page opened). Exit 4 (push, passkey, CAPTCHA, SMS) or a failed "
-        "re-login → one notification per site per "
+        "(no page opened). Exit 4 (push, passkey, CAPTCHA, SMS), a failed "
+        f"re-login or {kal.UNPROVEN_NOTIFY_AFTER} runs in a row without a "
+        "proven session → one notification per site per "
         f"{int(kal.NOTIFY_COOLDOWN_S // 3600)} h (a macOS banner; a gog mail "
         "when it fails). The one exemption from '-L never from a LaunchAgent'",
     )

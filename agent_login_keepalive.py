@@ -7,15 +7,20 @@ only within these limits (agent-login.py `keepalive_site` enforces them):
 * only the sites of `KEEPALIVE_SITES` (one config key);
 * only while Albert is active (`agent_login_safari.attended_gate`, the
   < 15 min idle gate, without the `scheduled` refusal);
-* only after the `-O` proof of the same run (the Safari Machine, never a
-  login) said `safari_logged_out` — never on an unknown answer or an error;
+* the background probe alone is never proof either way: whenever it did
+  not see the session (not seen, or it could not tell — e.g. the logged-out
+  portal redirected the tab to its login host, which safari.py reports as
+  `bg-lost`), the `-O` proof of the same run decides (the Safari Machine,
+  never a login), and only its `safari_logged_out` leads to the login —
+  never an unknown answer or an error of that proof;
 * never while quarantined or during a live guided-login maintenance record;
 * at most one proof + login attempt per site per `ATTEMPT_COOLDOWN_S`
   (stamped BEFORE the attempt: failures count too), at most one desktop
   notification per site per `NOTIFY_COOLDOWN_S` (exit 4 of the proof or the
-  login: push, passkey, CAPTCHA, SMS — Albert's step; and ANY failed
-  re-login), a macOS banner with a gog mail to Albert as the fallback when
-  the banner fails;
+  login: push, passkey, CAPTCHA, SMS — Albert's step; ANY failed
+  re-login; and `UNPROVEN_NOTIFY_AFTER` runs in a row that proved no
+  session — never silent), a macOS banner with a gog mail to Albert as the
+  fallback when the banner fails;
 * a logged-in Safari is proven by `safari.py --background` (a tab at the end
   of the front window, never the current tab, no activation, closed by
   safari.py itself): no window, no focus change, nothing left open. A tab
@@ -45,6 +50,9 @@ KEEPALIVE_SITES: tuple[str, ...] = ("cscs",)
 ATTEMPT_COOLDOWN_S = 6 * 3600.0
 # At most one notification per site in this window.
 NOTIFY_COOLDOWN_S = 6 * 3600.0
+# Notify (within NOTIFY_COOLDOWN_S) once this many probing runs in a row
+# proved no session (neither the probe nor the -O proof nor a login).
+UNPROVEN_NOTIFY_AFTER = 3
 STATE_FILE = "safari-keepalive.json"
 # safari.py --background --wait (seconds): the page load on the site's origin.
 PROBE_WAIT_S = 20
@@ -56,7 +64,8 @@ NOTIFY_TITLE = "agent-login keep-alive"
 # The probe's states: the sentinel was seen (`logged_in`); safari.py ran
 # normally and the sentinel was NOT seen (`not_proven`: the page left the
 # site's origin — a logged-out portal goes straight to its login host — or it
-# rendered without the sentinel); anything else (`error`: no decision).
+# rendered without the sentinel); anything else (`error`: it could not tell).
+# Only `logged_in` ends the run; the other two go on to the `-O` proof.
 PROBE_STATES = frozenset({"logged_in", "not_proven", "error"})
 
 
@@ -121,6 +130,11 @@ def classify(  # pylint: disable=too-many-return-statements
         return Probe("error", "bad_answer", left, focus)
     if reply.rc == 2 and data.get("reason") == "origin":
         return Probe("not_proven", "left_origin", left, focus)
+    if reply.rc == 2 and data.get("reason") == "bg-lost":
+        # safari.py finds its tab by the origin it opened: a tab redirected
+        # to the login host (a logged-out portal) and a tab that is gone
+        # answer alike — it cannot tell which (tp#1644).
+        return Probe("error", "tab_lost_or_left_origin", left, focus)
     if reply.rc == alsafari.ENV_RC:
         return Probe("error", "safari_unavailable", left, focus)
     return Probe("error", "probe_failed", left, focus)
@@ -207,6 +221,30 @@ def stamp(site: str, key: str, now: float) -> bool:
     return True
 
 
+def unproven_runs(site: str, *, proven: bool) -> int | None:
+    """Count `site`'s probing runs in a row that proved no session
+    (`proven` False: +1; True: back to 0). The new count; None when the
+    state cannot be updated (no notification then)."""
+    got: list[int] = []
+
+    def put(data: dict[str, Any]) -> None:
+        sites = data.setdefault("sites", {})
+        if not isinstance(sites, dict):
+            raise als.StateError("sites is not an object")
+        entry = sites.setdefault(site, {})
+        if not isinstance(entry, dict):
+            raise als.StateError("site entry is not an object")
+        old = _int(entry.get("unproven_runs")) or 0
+        entry["unproven_runs"] = 0 if proven else max(0, old) + 1
+        got.append(entry["unproven_runs"])
+
+    try:
+        als.update(STATE_FILE, put, strict=True)
+    except (als.StateError, OSError):
+        return None
+    return got[0] if got else None
+
+
 # ---------------------------------------------------------------------------
 # the notification (one per site per NOTIFY_COOLDOWN_S)
 # ---------------------------------------------------------------------------
@@ -266,6 +304,7 @@ __all__ = [
     "PROBE_FEATURES",
     "PROBE_STATES",
     "Probe",
+    "UNPROVEN_NOTIFY_AFTER",
     "classify",
     "close_left_tab",
     "cooldown_left",
@@ -274,4 +313,5 @@ __all__ = [
     "probe",
     "probe_js",
     "stamp",
+    "unproven_runs",
 ]

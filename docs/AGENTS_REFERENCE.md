@@ -419,16 +419,22 @@ framework. It is a **provider**: other repos depend on it, not the reverse. See
       tab, no activation), which safari.py closes; a tab it reports as left is
       closed with `--close-tab WID:TAB --expect-host` only when it is provably
       the probe's (last tab, not current, a recipe host, other tabs remain);
-    - only when that probe did not see the session: not when quarantined,
-      not during a live guided login (exit 75 = skip), at most one attempt
-      per site per 6 h (`safari-keepalive.json`, stamped BEFORE the attempt,
-      failures count, unreadable = no attempt) → the `-O` proof under the
-      Safari lock → only on its `safari_logged_out` the `-L SITE -s` login
-      (`keepalive=True`: no page opened); never on an unknown or error;
-    - exit 4 (push, passkey, CAPTCHA, SMS) or ANY failed re-login → one
-      notification per site per 6 h: a macOS banner (osascript, the text as
-      argv), a gog mail to Albert only when the banner fails. A busy login
-      (exit 75) is a skip, no notification.
+    - the probe is never proof either way: whenever it did not see the
+      session — not seen, or it could not tell (a logged-out portal sends the
+      tab to its login host, which safari.py reports as `bg-lost`:
+      `tab_lost_or_left_origin`) — and Safari answered it: not when
+      quarantined, not during a live guided login (exit 75 = skip), at most
+      one attempt per site per 6 h (`safari-keepalive.json`, stamped BEFORE
+      the attempt, failures count, unreadable = no attempt) → the `-O` proof
+      under the Safari lock → only on its `safari_logged_out` the
+      `-L SITE -s` login (`keepalive=True`: no page opened); never on an
+      unknown answer or an error of the `-O` proof;
+    - exit 4 (push, passkey, CAPTCHA, SMS), ANY failed re-login, or
+      `kal.UNPROVEN_NOTIFY_AFTER` (3) runs in a row that proved no session
+      (`unproven_runs`; reset by any proven session; a busy skip counts
+      neither way) → one notification per site per 6 h: a macOS banner
+      (osascript, the text as argv), a gog mail to Albert only when the
+      banner fails. A busy login (exit 75) is a skip, no notification.
   - **The interactive gate** (`alsafari.interactive_gate`, exit 3): it also
     refuses on a locked console, when Albert is not on the console, and when
     nobody touched the Mac for 15 min. Locked = `CGSSessionScreenIsLocked` or

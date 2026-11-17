@@ -71,6 +71,18 @@ REDIRECTED = _bg(
     reason="origin",
     background={"window_id": 3, "tab": 9, "closed": True},
 )
+# What the live logged-out portal gives (tp#1644, 2026-11-17): the tab went
+# to auth.cscs.ch, safari.py no longer finds it on its origin (`bg-lost`),
+# cannot close it either.
+LOST = _bg(
+    2,
+    reason="bg-lost",
+    background={"window_id": 3, "tab": 9, "closed": False},
+)
+LOST_ROWS = [
+    {"window_id": 3, "tab": 1, "current": True, "url": "https://x.example/"},
+    {"window_id": 3, "tab": 9, "current": False, "url": LOGIN},
+]
 
 
 class Keep(r.Safari):
@@ -84,6 +96,7 @@ class Keep(r.Safari):
         self.probe = probe
         self.probe_files: list[tuple[int, str]] = []
         self.tab_rows: list[dict[str, Any]] = []
+        self.rows_once = False  # the rows answer only the first --tabs
 
     def __call__(self, args: list[str]) -> alsafari.Reply:
         if args[0] == "--background":
@@ -94,7 +107,10 @@ class Keep(r.Safari):
             return self.probe
         if args[0] == "--tabs" and self.tab_rows:
             self.calls.append(list(args))
-            return alsafari.Reply(0, {"ok": True, "tabs": self.tab_rows})
+            rows = self.tab_rows
+            if self.rows_once:
+                self.tab_rows = []
+            return alsafari.Reply(0, {"ok": True, "tabs": rows})
         if args[0] == "--close-tab":
             self.calls.append(list(args))
             return alsafari.Reply(0, {"ok": True})
@@ -283,19 +299,127 @@ def test_the_proof_finding_a_session_logs_nothing_in(keep: dict[str, Any]) -> No
     "probe",
     [
         _bg(1, error="x"),  # osascript / JS error
-        _bg(3, error="Safari is not running"),
         _bg(2, reason="disabled"),
+        _bg(2, reason="bg-lost"),
         _bg(0, result="not json"),
         alsafari.Reply(1, {}, "timeout", killed=True),
     ],
 )
-def test_an_unknown_probe_never_proves_or_logs_in(
-    keep: dict[str, Any], probe: alsafari.Reply
+def test_a_probe_that_cannot_tell_goes_on_to_the_proof(
+    keep: dict[str, Any], probe: alsafari.Reply, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    assert _k(keep, [FORM], probe) == 0
+    """The background probe is never proof either way (tp#1644): "could not
+    tell" runs the -O proof, and its safari_logged_out the login."""
+    assert _k(keep, [FORM, CODE, LIVE], probe) == 0
+    fake = keep["safari"]
+    assert len(fake.windows()) == 2  # the -O proof, then the login
+    assert [c[0] for c in fake.ops(*r.FILLS)] == ["--login", "--otp"]
+    assert isinstance(_attempt_at(), float)
+    out = capsys.readouterr().out
+    assert "could not tell" not in out and "safari_logged_out" in out
+
+
+def test_the_live_bg_lost_probe_closes_its_tab_and_logs_in(
+    keep: dict[str, Any], capsys: pytest.CaptureFixture[str]
+) -> None:
+    fake = Keep([FORM, CODE, LIVE], LOST)
+    fake.tab_rows, fake.rows_once = LOST_ROWS, True
+    keep["safari"] = fake
+    assert al.keepalive_action() == 0
+    assert fake.ops("--close-tab") == [
+        ["--close-tab", "3:9", "--expect-host", "auth.cscs.ch"]
+    ]
+    assert len(fake.windows()) == 2
+    out = capsys.readouterr().out
+    assert "tab_lost_or_left_origin" in out and "logged in again" in out
+    assert not keep["notes"]
+
+
+def test_a_probe_that_cannot_tell_and_a_live_proof_logs_nothing_in(
+    keep: dict[str, Any],
+) -> None:
+    assert _k(keep, [LIVE], _bg(1, error="x")) == 0
+    fake = keep["safari"]
+    assert len(fake.windows()) == 1 and not fake.ops(*r.FILLS)
+
+
+def test_safari_not_answering_the_probe_is_a_skip(keep: dict[str, Any]) -> None:
+    assert _k(keep, [FORM], _bg(3, error="Safari is not running")) == 0
     fake = keep["safari"]
     assert not fake.windows() and not fake.ops(*r.FILLS)
     assert _attempt_at() is None
+
+
+def test_the_cooldown_still_holds_after_a_probe_that_cannot_tell(
+    keep: dict[str, Any],
+) -> None:
+    assert kal.stamp("cscs", "attempt_at", time.time())
+    assert _k(keep, [FORM], _bg(1, error="x")) == 0
+    fake = keep["safari"]
+    assert not fake.windows() and not fake.ops(*r.FILLS)
+
+
+def _unproven() -> Any:
+    sites = als.read(kal.STATE_FILE).get("sites", {})
+    return sites.get("cscs", {}).get("unproven_runs")
+
+
+def test_runs_without_a_proven_session_notify_once(
+    keep: dict[str, Any], capsys: pytest.CaptureFixture[str]
+) -> None:
+    """N runs in a row without a proven session (here: the probe cannot
+    tell, the attempt cooldown holds) → one notification, then its 6 h
+    cooldown; never silent."""
+    assert kal.stamp("cscs", "attempt_at", time.time())
+    for n in range(1, kal.UNPROVEN_NOTIFY_AFTER):
+        assert _k(keep, [FORM], LOST) == 0
+        assert _unproven() == n and not keep["notes"]
+    assert _k(keep, [FORM], LOST) == 0
+    assert _unproven() == kal.UNPROVEN_NOTIFY_AFTER
+    assert len(keep["notes"]) == 1
+    assert "-L cscs -s -O" in keep["notes"][0]
+    assert "tab_lost_or_left_origin" in keep["notes"][0]
+    assert _k(keep, [FORM], LOST) == 0
+    assert len(keep["notes"]) == 1  # the notification cooldown
+    assert "without a proven session — notification suppressed" in (
+        capsys.readouterr().out
+    )
+
+
+def test_a_proven_session_resets_the_count(keep: dict[str, Any]) -> None:
+    assert kal.stamp("cscs", "attempt_at", time.time())
+    assert _k(keep, [FORM], LOST) == 0
+    assert _k(keep, [FORM], LOST) == 0
+    assert _unproven() == 2
+    assert _k(keep, [LIVE], SEEN) == 0
+    assert _unproven() == 0
+    assert _k(keep, [FORM], LOST) == 0
+    assert _unproven() == 1 and not keep["notes"]
+
+
+def test_a_working_proof_or_login_resets_the_count(keep: dict[str, Any]) -> None:
+    assert kal.unproven_runs("cscs", proven=False) == 1
+    assert _k(keep, [LIVE], LOST) == 0  # the -O proof finds the session
+    assert _unproven() == 0
+    assert kal.unproven_runs("cscs", proven=False) == 1
+    # the next attempt only after the 6 h cooldown
+    assert kal.stamp("cscs", "attempt_at", time.time() - kal.ATTEMPT_COOLDOWN_S - 1)
+    assert _k(keep, [FORM, CODE, LIVE], LOST) == 0  # proof → login
+    assert _unproven() == 0
+
+
+def test_a_busy_guided_login_counts_neither_way(
+    keep: dict[str, Any], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(al, "guided_busy", lambda: "busy: guided login for x")
+    for _ in range(kal.UNPROVEN_NOTIFY_AFTER + 1):
+        assert _k(keep, [FORM], LOST) == 0
+    assert _unproven() is None and not keep["notes"]
+
+
+def test_unproven_runs_fails_closed() -> None:
+    (als.state_dir() / kal.STATE_FILE).write_text("[]", encoding="utf-8")
+    assert kal.unproven_runs("cscs", proven=False) is None
 
 
 @pytest.mark.parametrize("code", ["recipe_stuck", "safari_window_unknown"])
@@ -492,6 +616,9 @@ def test_classify() -> None:
     assert kal.classify(_seen(False)).state == "not_proven"
     assert kal.classify(REDIRECTED) == kal.Probe("not_proven", "left_origin")
     assert kal.classify(_bg(2, reason="lost")).state == "error"
+    assert kal.classify(LOST) == kal.Probe(
+        "error", "tab_lost_or_left_origin", (3, 9), None
+    )
     assert kal.classify(_bg(0, result=json.dumps({"x": 1}))).state == "error"
     left = kal.classify(
         _seen(True, background={"window_id": 3, "tab": 9, "closed": False})

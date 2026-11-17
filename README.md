@@ -1328,11 +1328,14 @@ login as `safari-agent`; a guided login as `guided`.
   the keep-alive sites (today only `cscs`), every 30 min. It is the one
   exemption from "`-L` never from a LaunchAgent" (Albert, 2026-11-13). While
   Safari is logged in it only reads the sentinel in a background tab that is
-  closed again: no window, no focus change. Only when Albert is active, the
-  site is not quarantined, no guided login runs and its 6-h attempt cooldown
-  is over, it runs the `-O` proof, and only on `safari_logged_out` the
-  `-L SITE -s` login. Exit 4 or a failed re-login → one notification per site
-  per 6 h (macOS banner; a gog mail when the banner fails). Log:
+  closed again: no window, no focus change. That probe is never proof either
+  way: whenever it did not see the session (not seen, or it could not tell —
+  a logged-out portal redirects the tab to its login host), and Albert is
+  active, the site is not quarantined, no guided login runs and its 6-h
+  attempt cooldown is over, it runs the `-O` proof, and only on
+  `safari_logged_out` the `-L SITE -s` login. Exit 4, a failed re-login or 3
+  runs in a row without a proven session → one notification per site per 6 h
+  (macOS banner; a gog mail when the banner fails). Log:
   `~/Library/Logs/com.albert.agent-login-safari-keepalive.log`.
 - **Notion's check is tri-state.** Its server (`loadUserContent`, 10 s) decides
   and the sidebar only corroborates; "cannot tell" is never "logged out".
@@ -1828,7 +1831,7 @@ Fill-only items (`agent_fill_only = true`, tp#1082): the broker never logs in wi
 | `-m`, `-M`, `--mail` | with -c: mail `albert.glensk@gmail.com` (gog) when a site stays logged out |
 | `-r`, `--refresh` | ask the broker now (re-reads Bitwarden, ~40 s) instead of the snapshot |
 | `-S`, `--snapshot` | recover a stale guided login whose watchdog died (one line), refresh the site-list and secret-run snapshots and the agents file (which also lists the secrets agents can inject), print nothing else (LaunchAgent, every 30 min) |
-| `-k`, `--keep-alive` | Safari keep-alive (LaunchAgent com.albert.agent-login-safari-keepalive, every 30 min): for each keep-alive site (cscs) prove Albert's Safari session in a background tab (closed again, no focus change); only when that did not see it, Albert is active, the site is not quarantined, no guided login runs and its 6-h attempt cooldown is over: the -O proof, and only on safari_logged_out the -L SITE -s login (no page opened). Exit 4 or a failed re-login → one notification per site per 6 h (macOS banner; gog mail when it fails) |
+| `-k`, `--keep-alive` | Safari keep-alive (LaunchAgent com.albert.agent-login-safari-keepalive, every 30 min): for each keep-alive site (cscs) prove Albert's Safari session in a background tab (closed again, no focus change); only when that did not see it (not seen or could not tell), Albert is active, the site is not quarantined, no guided login runs and its 6-h attempt cooldown is over: the -O proof, and only on safari_logged_out the -L SITE -s login (no page opened). Exit 4, a failed re-login or 3 runs in a row without a proven session → one notification per site per 6 h (macOS banner; gog mail when it fails) |
 | `-K`, `--keychain` | rescan the login keychain (~15 s) and list every item (names only) with whether agents can read it |
 | `-A`, `--agents` | print the summary agent sessions get at start (the agents file) |
 | `-I`, `--install-daily` | install + load the LaunchAgents com.albert.agent-login-check (`-c` daily 09:15), com.albert.agent-login-snapshot (`-S` every 30 min), com.albert.agent-login-refresh (`-R` every 6 h), com.albert.browser-tab-reaper (`browser.py reap` every 2 h), com.albert.console-balance (`console-balance.py` every 4 h), com.albert.agent-login-safari-keepalive (`-k` every 30 min) and com.albert.browser-access-sweep (`browser.py sweep-access` every 60 s) as one transaction (any failure restores the previous set); each job runs under mydotfiles `log-ts.py --` (started by the venv python3), which keeps per-run CPU in `~/.local/state/job-cpu/<label>.json` (tp#1963) |
