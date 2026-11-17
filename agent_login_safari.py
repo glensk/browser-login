@@ -1077,6 +1077,10 @@ class Outcome:  # pylint: disable=too-many-instance-attributes
     # tp#1928: the safari.py flag that call ran with (SAFARI_FLAGS, "" =
     # none or not known)
     failed_flag: str = ""
+    # tp#1644: what a stuck page showed (`parse_shape`: its path, title,
+    # headings, button labels, form ids, field types/ids, alert texts — never
+    # a field value; "" = not read)
+    page: str = ""
 
     @property
     def ok(self) -> bool:
@@ -1534,6 +1538,57 @@ def detector_js(recipe: Recipe, sentinel: str) -> str:
         "stops": [stop.text for stop in recipe.stops],
     }
     return DETECTOR_JS.replace("__PARAMS__", json.dumps(params))
+
+
+# tp#1644: a stuck page's SHAPE for the report — the labels a recipe fix
+# needs, never a field value (inputs give type/id/name only; text comes from
+# headings, labels, buttons, alerts and the title, each trimmed).
+SHAPE_JS = r"""// agent-login:shape
+(() => {
+  const vis = (e) => !!e && e.getClientRects().length > 0 &&
+    getComputedStyle(e).visibility !== "hidden";
+  const t = (s) => String(s || "").replace(/\s+/g, " ").trim().slice(0, 60);
+  const all = (sel) => [...document.querySelectorAll(sel)].filter(vis);
+  const uniq = (xs) => [...new Set(xs.filter((x) => x))].slice(0, 8);
+  return JSON.stringify({
+    path: location.pathname.slice(0, 80),
+    title: t(document.title),
+    headings: uniq(all("h1,h2,h3,legend,label").map((e) => t(e.innerText))),
+    buttons: uniq(all('button,input[type="submit"],input[type="button"],a[role="button"],a[id]')
+      .map((e) => t(e.tagName === "INPUT" ? e.getAttribute("value") : e.innerText))),
+    forms: uniq(all("form").map((e) => t(e.id || e.getAttribute("name") || "(no id)"))),
+    fields: uniq(all("input,select,textarea").map((e) =>
+      t((e.getAttribute("type") || e.tagName.toLowerCase()) + (e.id ? "#" + e.id : "") +
+        (e.getAttribute("name") ? "[" + e.getAttribute("name") + "]" : "")))),
+    alerts: uniq(all('[role="alert"],.alert,.kc-feedback-text,[id^="input-error"],.pf-m-error')
+      .map((e) => t(e.innerText))),
+  });
+})()
+"""
+SHAPE_KEYS = ("path", "title", "headings", "buttons", "forms", "fields", "alerts")
+_SHAPE_DROP = re.compile(r"[^\w .,:;!?()'#\[\]/@+=*-]")
+
+
+def _shape_text(value: str) -> str:
+    """One shape string: no control or odd characters, at most 60 chars."""
+    return _SHAPE_DROP.sub("", value)[:60].strip()
+
+
+def parse_shape(raw: object) -> str:
+    """The shape JS's answer as ONE line (``key: a | b; …``); '' for an
+    answer that is not a JSON object."""
+    data = json_object(raw)
+    if data is None:
+        return ""
+    parts: list[str] = []
+    for key in SHAPE_KEYS:
+        value = data.get(key)
+        items = value if isinstance(value, list) else [value]
+        texts = [_shape_text(v) for v in items[:8] if isinstance(v, str)]
+        texts = [x for x in texts if x]
+        if texts:
+            parts.append(f"{key}: {' | '.join(texts)}")
+    return "; ".join(parts)
 
 
 def parse_page(raw: object, n_steps: int, n_stops: int = 0) -> dict[str, Any] | None:
@@ -2129,9 +2184,18 @@ class Machine:  # pylint: disable=too-many-instance-attributes
         return self.out
 
     def _stuck(self, why: str, host: str) -> Outcome:
-        """End `recipe_stuck`, naming why (STUCK_REASONS) and the tab host."""
+        """End `recipe_stuck`, naming why (STUCK_REASONS) and the tab host;
+        tp#1644: on a known host also the page's shape (labels, no values)."""
         self.out.stuck, self.out.stuck_host = why, host
+        if host:
+            self.out.page = self.read_shape(host)
         return self._end(2, "recipe_stuck")
+
+    def read_shape(self, host: str) -> str:
+        """tp#1644: the page's shape (`parse_shape`), '' when unreadable."""
+        with private_js(SHAPE_JS) as path:
+            reply = self.call(["--eval", path, *self._on(host)])
+        return parse_shape(reply.data.get("result")) if reply.rc == 0 else ""
 
     def _on(self, host: str) -> list[str]:
         """The window handle + the host safari.py must find the tab on."""

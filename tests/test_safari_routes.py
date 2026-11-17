@@ -2333,6 +2333,68 @@ def test_max_polls_is_its_own_stuck_reason(monkeypatch: pytest.MonkeyPatch) -> N
     assert "max_polls" in alsafari.STUCK_REASONS and not out.failed_op
 
 
+class _ShapeSafari(w.FakeSafari):
+    """The fake, answering the shape eval (tp#1644) with `shape`."""
+
+    def __init__(self, *args: Any, shape: object, **kw: Any) -> None:
+        super().__init__(*args, **kw)
+        self.shape = shape
+
+    def __call__(self, args: list[str]) -> alsafari.Reply:
+        if args[0] == "--eval" and "agent-login:shape" in Path(args[1]).read_text(
+            encoding="utf-8"
+        ):
+            self.calls.append(list(args))
+            return alsafari.Reply(0, {"ok": True, "result": json.dumps(self.shape)})
+        return super().__call__(args)
+
+
+SHAPE = {
+    "path": "/realms/cscs/login-actions/authenticate",
+    "title": "Sign in to CSCS",
+    "headings": ["Select login method\n", "x" * 90],
+    "buttons": ["Verify Code", 7, "\u0007bell"],
+    "forms": ["kc-otp-login-form"],
+    "fields": ["text#otp[otp]", "hidden#selectedCredentialId[selectedCredentialId]"],
+    "alerts": [],
+}
+
+
+def test_a_stuck_page_reports_its_shape_labels_only(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """tp#1644: a stall on a known host reads the page's labels once (no
+    field value: the JS never reads `.value`); trimmed, control characters
+    and non-strings dropped, empty keys left out."""
+    recipe = _zoho_recipe(monkeypatch)
+    fake = _ShapeSafari(recipe, [ZOHO_USER, ZOHO_LOADER], shape=SHAPE)
+    plain = alsafari.Recipe(**{**recipe.__dict__, "albert_wait": None, "stops": ()})
+    fake.recipe = plain
+    out = _timed(fake, _zoho_plan()).run()
+    assert out.code == "recipe_stuck" and out.stuck_host == "accounts.zoho.eu"
+    assert out.page == (
+        "path: /realms/cscs/login-actions/authenticate; title: Sign in to CSCS; "
+        f"headings: Select login method | {'x' * 60}; buttons: Verify Code | bell; "
+        "forms: kc-otp-login-form; fields: text#otp[otp] | "
+        "hidden#selectedCredentialId[selectedCredentialId]"
+    )
+    shape_calls = [
+        c for c in fake.calls if c[0] == "--eval" and c[-1] == "accounts.zoho.eu"
+    ]
+    assert shape_calls and fake.calls[-1][0] == "--close"
+    assert ".value" not in alsafari.SHAPE_JS
+    assert alsafari.parse_shape("not json") == alsafari.parse_shape(None) == ""
+
+
+def test_the_page_shape_goes_to_stderr(capsys: pytest.CaptureFixture[str]) -> None:
+    out = alsafari.Outcome(2, "recipe_stuck", stuck="step_conditions_unmet")
+    out.stuck_host, out.page = "auth.cscs.ch", "title: Sign in"
+    al._safari_fail("cscs", out, "Safari login stopped — recipe_stuck")
+    captured = capsys.readouterr()
+    assert "   the page showed — title: Sign in" in captured.err
+    assert "title: Sign in" not in captured.out
+
+
 def test_a_stuck_reason_and_a_failed_op_share_the_detail() -> None:
     out = alsafari.Outcome(2, "recipe_stuck", stuck="code_field")
     assert al._safari_detail("code_field", out) == "code_field"

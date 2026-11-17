@@ -4400,6 +4400,8 @@ def _safari_fail(
         where = f" on {out.stuck_host}" if out.stuck_host else ""
         why = f" ({out.stuck}{where})"
     print(f"❌ {site}: {who} — {code_text(out.phase, out.code)}{why}")
+    if out.page:
+        print(f"   the page showed — {out.page}", file=sys.stderr, flush=True)
     if out.failed_op:
         print(
             f"   safari.py {_safari_call(out)} exited {out.safari_rc}",
