@@ -92,6 +92,34 @@ its 60 s timeout in the incident is the stuck tab itself. `tabs` ownership for
 20496), also marker-free. An `open -N` tab is a caller handoff: never ledgered,
 never reaped by ledger (README §owned tabs).
 
+## Root cause (B1, 2026-11-19)
+
+**Not reproduced locally → B2 is verification-only (Design 2 and 3); the cold-LAN /
+first-contact stall (H3) goes to a follow-up ticket.**
+
+- Setup: `tests/repro_open_fragment.py` (5040df3) drives browser.py's own
+  `_open_create_target` + `_await_target_load` on Playwright Chromium 148 (`--headless=new`,
+  temp profile, temp `CLAUDE_BROWSER_CACHE_DIR`, free port) against a local `http.server`
+  whose `/pair` writes `location.hash` into the title. Each order (`/pair` first,
+  `/pair#code-123` first) got a fresh browser and server; each ended with an H2 probe
+  (navigate only after `/json/list` showed the marker committed). Two runs. Evidence:
+  `~/.claude/scratch/294aa102/tp1900-b1-evidence.json`.
+- Result: every answered `Page.navigate` had a `loaderId`, no `errorText`, and committed in
+  ~0.5–3.6 s; `location.hash` was `#code-123` for the fragment URL, `""` for `/pair`. No case
+  took the incident's path (navigate answered, tab left on its marker, `✓`).
+- H1 (Chromium will not leave the marker for a fragment URL): **refuted**. H2 (timing):
+  **not supported**. H3 (site/network): **leading, unconfirmed** — decide's `web/public/sw.js`
+  answers navigations network-first with no timeout, so a profile holding the service worker
+  sent to a cold or unreachable LAN hub stays uncommitted on its marker until TCP gives up;
+  a plain stalled connect does the same. H4: dropped (argv logged origin-only).
+- `/pair#<bogus>` is side-effect free (`PairView.svelte` posts `/api/pair` only on submit),
+  but `/pair` calls `history.replaceState(null, '', '/pair')` on mount, so `eval -T …
+  location.hash` reads `""` after load: B7 checks the fragment another way or uses `/#x`.
+- For B2: under load the listed URL briefly reads `""` right after a commit (3 of 5
+  committed cases) — the poll treats `""` as undecided, never as "still on marker".
+  `Target.createTarget` over its 5 s budget and the page websocket over its 1 s open timeout
+  already exit ❌; they are not the incident's silent `✓`.
+
 ## Options for carrying the owner marker (weighed)
 
 | # | Option | Lost-create-reply recovery (tp#1792) | Orphan reaping (tp#1759) | Fragment safety | Verdict |
