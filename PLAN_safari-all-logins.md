@@ -322,7 +322,7 @@ Execution order from here: B8-B9 first, then B6-B7 (overseer decision).
   push / passkey page → exit 4. **Check first:** slack's `d` cookie proof works with
   `import-safari slack -P` (the `localConfig_v2` storage part of
   `SAFARI_BUILTIN_STORAGE` is needed by the import, not by the proof?).
-- [ ] B7 **[Albert]** LIVE CANARY BI, then install (B4 path) before it. Per site:
+- [ ] B7 [opus] **[Albert]** LIVE CANARY BI, then install (B4 path) before it. Per site:
   `-L SITE -s -n`; `-L SITE -s -O` (expect `match`); `-L SITE -s` → exit 0, the
   landing page open, Albert confirms the account. A login run only when `-O` said
   `logged_out`, never forced. Slack's e-mail code: one attempt per code mail, respect
