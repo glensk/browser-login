@@ -1,6 +1,7 @@
 # PLAN: `browser.py open` with a URL that carries a #fragment (tp#1900)
 
-> **Resume here.** Status: planned (Opus), not debated, nothing built. Next box: B1.
+> **Resume here.** Status: planned (Opus), debated (Opus adversary, 2026-11-19, Codex
+> seat unavailable; see "Debate outcome"), nothing built. Next box: B1.
 > Planned against `HEAD` 05fd068 (2026-11-18). `bin/browser.py` is LIVE (consumers
 > exec it): every code box works in ONE worktree
 > (`git -C /Users/albert/obsidian/42-Git/home/browser-login worktree add
@@ -53,7 +54,22 @@ So the true root cause of (1) is unknown. Hypotheses B1 must decide between:
   navigation provisional (no commit) — macOS Local Network privacy (cf. tp#703) or
   the hub's `/pair` handling of the hash. Would NOT reproduce with a local server.
 - **H4** The URL was altered before `browser.py` saw it (caller quoting, `#` in the
-  shell). Ruled in/out by the journal's redacted argv for that run, if still kept.
+  shell). NOT checkable from the journal: `open` argv is logged origin-only
+  (`_journal_origin`, bin/browser.py:2245/2294); dropped as a B1 step.
+
+### Journal evidence (`~/.cache/claude-browser/journal.jsonl` lines 7193-7204)
+
+- 22:25:51 failing `open https://decide.dom42.space -N` (origin-only argv):
+  `held_ms` 16257 = ~1 s create+navigate + the full 15 s `_await_target_load`. So
+  `Page.navigate` answered quickly and the tab never committed.
+- 22:26:27 `eval -T 7BFB…` hits the 60 s watchdog (the stuck tab).
+- 22:27:49 and 22:28:01 two further `open` runs: `held_ms` 1127 / 979 — the
+  "same URL without fragment works" control ran ~2 min later, on a hub that had
+  meanwhile been reached (warm). The journal cannot tell which run carried a
+  fragment. Fragment vs. first-contact timing (H3: cold LAN hub, macOS Local Network
+  privacy, tp#703) is therefore NOT separated by the incident; H3 is at least as
+  likely as H1. Expected B1 outcome: **not reproduced locally** — then B2 is the
+  verification fix only and the root cause is a follow-up ticket.
 
 ### Every reader of the owner marker today (none of them needs it in the navigated URL)
 
@@ -107,14 +123,22 @@ websocket or moves to O5's attached session is B1's output, not a guess here.
    - H3/H4: no navigation change; B2 shrinks to the verification below plus a
      README note, and the site-specific cause is a follow-up ticket.
 2. **Navigation verification (B2, always)**: after `Page.navigate`, `open` waits
-   up to `OPEN_LOAD_BUDGET_S` (new constant, 15 s — today's `_await_target_load`
-   budget; override `-w/--wait SECONDS`, `-w` is free on `open`) for the tab's
-   `/json/list` URL to leave `about:blank` / its marker. Outcomes:
+   for the tab's `/json/list` URL to leave its marker (and `about:blank`, unless the
+   requested URL is itself `about:blank`). `OPEN_LOAD_BUDGET_S` (new constant, 15 s —
+   today's `_await_target_load` budget; override `-w/--wait SECONDS`, `-w` is free on
+   `open`) is the TOTAL deadline over `Page.navigate` (today's separate
+   `OPEN_NAVIGATE_BUDGET_S` 10 s, 6050, is capped by what remains of it) and the commit
+   poll, so `open -w N` never runs much longer than N s plus the create budget; `-w`
+   is clamped to 50 s so it stays under guided login's `_self_run(timeout=60.0)`
+   (18909) with margin. Outcomes:
    - committed on the target origin (scheme+host+port of the requested URL): `✓`
      as today, exit 0;
    - committed on another http(s) origin (a redirect, e.g. SSO login): `✓` plus
      one `⚠ open: redirected to <origin>` line on stderr, exit 0 (guided login's
      `open -N` of a login URL relies on redirects succeeding);
+   - requested `about:blank`: committed = the tab left its marker → `✓`, exit 0;
+   - committed on any non-marker URL that is not http(s) (`data:`, `file:`,
+     `chrome://…`, `about:srcdoc`): `✓`, exit 0 (no origin comparison);
    - still on `about:blank` / its marker at the deadline: close the tab (as a
      failed navigate does today), `❌ open: the new tab did not navigate to
      <origin> within <N>s (tab closed)`, no `target=` line, exit 1;
@@ -142,13 +166,17 @@ websocket or moves to O5's attached session is B1's output, not a guess here.
   `/pair` that writes `location.hash` into the title: run `browser.py`'s
   `_open_create_target` + `_await_target_load` for `/pair` and `/pair#code-123`,
   record the raw `Page.navigate` reply (`loaderId`, `errorText`), the listed URL
-  over time, and whether `Runtime.evaluate` answers. One run each, no loops. If it
-  reproduces → H1 or H2 (tell which by also sending `Page.navigate` after the
-  marker is listed as committed). If it does not → ask the overseer for one
-  attended run of the same script against `https://decide.dom42.space/pair#bogus`
-  on the disposable instance (H3), and check the journal for the 2026-11-08 22:26
-  run's argv (H4). Output: a `## Root cause` section handed back to the overseer
-  (plan edits are the overseer's), naming the chosen B2 variant.
+  over time, and whether `Runtime.evaluate` answers. One run per case, no loops,
+  in both orders on fresh tabs (`/pair` then `/pair#x`, and `/pair#x` then
+  `/pair`) so fragment and first-contact timing are told apart. If it reproduces →
+  H1 or H2 (tell which by also sending `Page.navigate` after the marker is listed
+  as committed). If it does not (the expected outcome, see "Journal evidence") →
+  ask the overseer for one attended run of the same script against a side-effect-free
+  decide URL with a fragment on the disposable instance (H3; `/pair#bogus` only
+  if B1 first confirmed from the hub's code that loading `/pair` with a hash sends
+  no pairing request). Output: a `## Root cause` section handed back to the
+  overseer (plan edits are the overseer's), naming the chosen B2 variant, or
+  "not reproduced → verification-only B2 + follow-up ticket".
 - [ ] B2 [opus] (after B1) `bin/browser.py` in the worktree: the B1 navigation fix
   (Design 1) + navigation verification and `-w/--wait` (Design 2) + the
   `open_navigate` journal event (Design 3); `open`'s help/description names the
@@ -156,15 +184,19 @@ websocket or moves to O5's attached session is B1's output, not a guess here.
   `_await_target_load`, `_open_new_raw`, `cmd_open`, `_add_open_eval_parsers`,
   the `open` dispatch (21761). Nothing else reads the marker differently.
 - [ ] B3 [sonnet/tests] `tests/fake_cdp.py` + `tests/test_connect_hang.py`
-  (no real browser): fake `_navigate` gains `navigate_noop` (answers like the
-  incident per B1 — ok, URL never changes) and `navigate_redirect_to` (commits
-  another origin). Tests, one run each: (a) URL with fragment → exit 0, the fake's
+  (no real browser): fake `_navigate` (fake_cdp.py:241) gains `navigate_noop`
+  (returns `{"frameId": <tid>}` with NO `loaderId` and NO `errorText`, leaves
+  `target.url` on the marker — the incident's shape per the journal) and
+  `navigate_redirect_to` (commits another origin). Tests, one run each: (a) URL with fragment → exit 0, the fake's
   `Page.navigate` param is byte-identical to the requested URL (fragment intact),
   the `createTarget` param is a marker URL and the marker substring appears in no
   `Page.navigate` param; (b) the same without fragment; (c) `navigate_noop` with
   `OPEN_LOAD_BUDGET_S` monkeypatched to 0.3 → exit 1, one ❌ line that is
   origin-only (no `code-123` in stderr/stdout), no `target=`, tab closed;
-  (d) redirect → exit 0 + one ⚠ line; (e) `-w` parses and reaches `cmd_open`.
+  (d) redirect → exit 0 + one ⚠ line; (e) `-w` parses and reaches `cmd_open`,
+  and `-w 90` is clamped to 50; (f) `open about:blank` → exit 0 once the tab left
+  its marker; (g) a commit to `data:text/html,x` → exit 0. (c) must fail on HEAD
+  (today it exits 0): the builder shows that once before B2's code is in.
 - [ ] B4 [sonnet/tests] `tests/test_open_fragment_chromium.py` (new,
   `@pytest.mark.launches_chrome`, skipped when Playwright's Chromium is missing;
   disposable Chromium + local `http.server` as in B1, never the shared browser):
@@ -176,7 +208,7 @@ websocket or moves to O5's attached session is B1's output, not a guess here.
   did not navigate within `-w` (default 15 s), the ⚠ redirect line, fragments are
   passed through untouched; one line in the owned-tabs section that the marker is
   only ever the initial `about:blank` of the tab.
-- [ ] B6 [sonnet/verify] Verify + install + land: `ruff format`, `ruff check`,
+- [ ] B6 [opus] Verify + install the LIVE `bin/browser.py` + land: `ruff format`, `ruff check`,
   `mypy`, `uv run pylint` on the touched files; targeted tests
   (`tests/test_connect_hang.py`, `tests/test_owned_tabs_tp845.py`,
   `tests/test_tab_reaper.py`, `tests/test_guided_login.py`, the B4 file); full
@@ -185,23 +217,36 @@ websocket or moves to O5's attached session is B1's output, not a guess here.
   live file still equals the worktree base, `cp` to a temp name in `bin/`, `mv`),
   then `ai.py push -W <worktree>` naming every changed file.
 - [ ] B7 [opus] **[Albert]** acceptance on the live browser (ticket's
-  `acceptance: needed yes`): `browser.py open 'https://decide.dom42.space/pair#<a
-  bogus code>'` → `✓` + `target=`; `browser.py eval -T <id> 'location.hash'`
+  `acceptance: needed yes`): `browser.py open 'https://decide.dom42.space/#x'` (a
+  fragment on a side-effect-free route; `/pair#<bogus>` only if B1 confirmed it
+  sends no pairing request) → `✓` + `target=`; `browser.py eval -T <id> 'location.hash'`
   returns the fragment; `browser.py close -i <id>`. Then one URL that cannot load
   in time (e.g. a blackholed LAN address with `-w 3`) → `❌`, exit 1, no tab left.
 
 ## Verification
 
 ```bash
-cd /Users/albert/obsidian/42-Git/home/browser-login/.worktrees.noindex/open-fragment && uv run pytest -q tests/test_connect_hang.py tests/test_owned_tabs_tp845.py tests/test_tab_reaper.py tests/test_guided_login.py tests/test_open_fragment_chromium.py
-cd /Users/albert/obsidian/42-Git/home/browser-login/.worktrees.noindex/open-fragment && uv run ruff check bin/browser.py tests/fake_cdp.py tests/test_connect_hang.py tests/test_open_fragment_chromium.py
-cd /Users/albert/obsidian/42-Git/home/browser-login/.worktrees.noindex/open-fragment && bin/browser.py open -h
+cd /Users/albert/obsidian/42-Git/home/browser-login && uv run pytest -q tests/test_connect_hang.py tests/test_owned_tabs_tp845.py tests/test_tab_reaper.py tests/test_guided_login.py tests/test_open_fragment_chromium.py
+cd /Users/albert/obsidian/42-Git/home/browser-login && uv run ruff check bin/browser.py tests/fake_cdp.py tests/test_connect_hang.py tests/test_open_fragment_chromium.py
+cd /Users/albert/obsidian/42-Git/home/browser-login && grep -c OPEN_LOAD_BUDGET_S bin/browser.py
+cd /Users/albert/obsidian/42-Git/home/browser-login && bin/browser.py open -h
 ```
+
+The block runs against the repo root on `main` (the landed, installed code), never
+the worktree, which is gone or stale after `ai.py push -W`; the `grep -c` proves
+the live `bin/browser.py` carries the change (it exits 1 on HEAD 05fd068). The
+block is not strict-eligible on purpose: the change is only proven by the targeted
+tests and the installed script's own `-h`, which run in the reviewer session.
 
 Definition of done:
 
-- B3 (a)-(e) and B4 pass; the existing tp#1792 tests in `test_connect_hang.py` and
+- B3 (a)-(g) and B4 pass; the existing tp#1792 tests in `test_connect_hang.py` and
   `test_owned_tabs_tp845.py` pass unchanged (lost reply, late tab, navigate failure).
+- Only defect (2) is guaranteed a test that fails on HEAD (B3 c). Defect (1) is
+  closed as fixed only if B1 reproduced it and B4 was shown failing on HEAD before
+  B2; otherwise it is recorded as "not reproduced locally" with a follow-up ticket
+  for the cold-LAN / first-contact hang (B4 and B7 then prove fragments pass
+  through, not that the incident's cause is gone).
 - No ❌/⚠ line of `open` contains a path, query or fragment.
 - Live acceptance B7 done with Albert.
 
@@ -209,19 +254,53 @@ Definition of done:
 
 - A legitimately slow first commit (> 15 s, e.g. a cold SSO hop) now fails `open`
   where it used to "succeed" on a blank tab. Mitigation: `-w`; guided login's
-  `_self_run(... timeout=60.0)` already allows passing `-w 45` if B7 shows need.
+  `_self_run(... timeout=60.0)` allows passing `-w 45` if B7 shows need (`-w` is
+  the total deadline and clamped to 50 s, so it stays under that 60 s kill).
 - Closing a tab that commits right after the deadline: the close is by target id,
   so a commit in between still closes our own tab — never another client's.
 - If B1 cannot reproduce anywhere (H3 not confirmable without Albert), B2 still
   lands the verification, which turns the silent failure into a ❌ — the ticket's
   second demand — and the root cause becomes a follow-up ticket.
 
-## Questions for Albert
+## Scope calls (settled by the overseer, 2026-11-19)
 
-- Should a Chrome error page (`errorText` / `chrome-error://`, e.g. DNS failure)
-  also make `open` exit 1? Recommendation: not in this ticket — it is documented
-  tp#1792 behaviour and some callers may inspect the error page; a separate ticket
-  if wanted.
-- Should `open`'s `✓ Opened:` line stop printing the full URL (a fragment can be a
-  pairing code / token)? Recommendation: yes, origin-only, as a separate small
-  ticket (it changes output other tools may scrape).
+- Chrome error pages (`errorText` / `chrome-error://`, e.g. DNS failure) keep
+  exiting 0 — documented tp#1792 behaviour; OUT of this ticket.
+- `open`'s `✓ Opened:` line printing only the origin (a fragment can be a pairing
+  code / token) — a separate small ticket; OUT of this ticket.
+
+## Debate outcome (Opus adversary)
+
+Critic: fresh Opus subagent, 2026-11-19, 1 round (Codex round 0 refused:
+`debate_seat_unknown`, the seat probe timed out). Verdict: sound-with-fixes.
+
+1. [major] H4 journal-argv check impossible (argv is origin-only); journal timing
+   points to first-contact/H3 — accepted: H4 dropped as a step, "Journal evidence"
+   added to Findings, B1 runs both orders, "not reproduced" stated as the expected
+   outcome.
+2. [major] B6 `[sonnet/verify]`: no such class, and it swaps the LIVE script —
+   accepted: B6 retagged `[opus]`.
+3. [major] Verification block `cd`s into the worktree that is gone/stale after
+   landing — accepted: block runs at the repo root on main, plus a `grep -c
+   OPEN_LOAD_BUDGET_S` proof of install.
+4. [major] "still on about:blank → exit 1" breaks `open about:blank`; non-http(s)
+   commits undefined — accepted: Design 2 outcomes for both, B3 (f)/(g).
+5. [major] No test fails on HEAD for defect (1) — accepted: Definition of done says
+   only defect (2) is guaranteed a HEAD-failing test (B3 c, shown failing first);
+   defect (1) closes as fixed only if B1 reproduces it.
+6. [minor] B3 `[sonnet/tests]` underspecified (`navigate_noop` "per B1") —
+   accepted: reply shape fixed now (`{"frameId"}`, no `loaderId`/`errorText`, URL
+   stays on the marker).
+7. [minor] Navigate budget + poll + `-w` can exceed guided login's 60 s kill —
+   accepted: `-w` is the total deadline, clamped to 50 s; B3 (e) checks the clamp.
+8. [minor] B7 on `/pair#bogus` may fire a pairing attempt on the live hub —
+   accepted: B7 uses `https://decide.dom42.space/#x` unless B1 shows `/pair` is
+   side-effect free.
+
+Requirement challenges (relayed to Albert):
+
+- R1 (moderate): the ticket's framing ("fragment collision") may chase an effect
+  that does not exist — the only no-fragment control ran 2 min later on a warm hub.
+  Alternative: retitle tp#1900 to "open reports success for a tab that never
+  committed" and file the cold-LAN / first-contact hang separately if B1 does not
+  reproduce. The plan keeps the ticket's framing until Albert decides.
