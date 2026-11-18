@@ -5376,22 +5376,32 @@ def _keepalive_tidy(
 def _keepalive_stop(site: str, now: float) -> tuple[str, bool]:
     """Why no `-O` proof + login may run for `site` now ('' = none):
     quarantined, a live guided login (exit 75: skip — the bool is True,
-    the run counts neither way), the per-site attempt cooldown (unreadable
-    = closed), or the stamp could not be written. The stamp is written
-    HERE, before the attempt: a failure counts too."""
+    the run counts neither way), the per-site attempt cooldown
+    (`kal.attempt_left`: 6 h, 1 h after a `-O` proof that typed nothing,
+    less 2 min slack; unreadable = closed), or the stamp could not be
+    written. The stamp is written HERE, before the attempt, as `typed`: a
+    failure counts too."""
     if als.quarantined(site) is not None:
         return f"quarantined — release first: ./agent-login.py -Q {site}", False
     busy = guided_busy()
     if busy:
         return f"{busy} (exit {BUSY_RC}: skip)", True
-    left = kal.cooldown_left(site, "attempt_at", kal.ATTEMPT_COOLDOWN_S, now)
+    left, kind = kal.attempt_left(site, now)
     if left is None:
         return f"its cooldown state ({kal.STATE_FILE}) is unreadable", False
     if left > 0:
-        hours = int(kal.ATTEMPT_COOLDOWN_S // 3600)
+        hours = int(kal.attempt_span(kind) // 3600)
+        why = (
+            " after a -O proof that typed nothing"
+            if kind == kal.ATTEMPT_UNTYPED
+            else ""
+        )
         # rounded up: "0 min left" read as "over" (tp#1644, 14:30 run)
-        return f"one attempt per {hours} h — {math.ceil(left / 60)} min left", False
-    if not kal.stamp(site, "attempt_at", now):
+        return (
+            f"one attempt per {hours} h{why} — {math.ceil(left / 60)} min left",
+            False,
+        )
+    if not kal.stamp_attempt(site, now):
         return f"its cooldown stamp ({kal.STATE_FILE}) could not be written", False
     return "", False
 
@@ -5423,6 +5433,21 @@ def _keepalive_proof_detail(site: str, out: alsafari.Outcome) -> None:
         )
         if out.safari_said:  # its own words, redacted (B19)
             print(f"   safari.py said: {out.safari_said}", file=sys.stderr, flush=True)
+
+
+def _keepalive_untyped(site: str, out: alsafari.Outcome, at: float) -> None:
+    """Albert (2026-11-18): a `-O` proof that stopped with nothing typed (no
+    credential step: no broker fill, no submit, no code mail) re-marks the
+    attempt stamped at `at` `untyped` — the next attempt after 1 h, not 6 h.
+    A run with a credential step keeps the full window."""
+    if out.credential:
+        return
+    hours = int(kal.ATTEMPT_UNTYPED_COOLDOWN_S // 3600)
+    if kal.mark_untyped(site, at):
+        print(f"   {site}: the -O proof typed nothing — next attempt in {hours} h")
+    else:
+        full = int(kal.ATTEMPT_COOLDOWN_S // 3600)
+        print(f"   {site}: the attempt stamp was not re-marked — {full} h hold")
 
 
 def _keepalive_notify(site: str, text: str) -> str:
@@ -5517,7 +5542,8 @@ def _keepalive_decide(  # pylint: disable=too-many-return-statements
     (`safari_target_action(..., keepalive=True)`). (exit code, proven: True =
     a session was proven, False = none, None = a busy skip that counts
     neither way)."""
-    stop, busy = _keepalive_stop(site, time.time())
+    now = time.time()
+    stop, busy = _keepalive_stop(site, now)
     if stop:
         print(f"⏸  {site}: not proven logged in ({seen.why}); no login — {stop}")
         return 0, None if busy else False
@@ -5530,6 +5556,7 @@ def _keepalive_decide(  # pylint: disable=too-many-return-statements
         return 0, True
     if out.code != "safari_logged_out":
         _keepalive_proof_detail(site, out)
+        _keepalive_untyped(site, out, now)
         rc = _keepalive_stopped(site, out.rc, out.code, "-O proof")
         return rc, None if out.rc == BUSY_RC else False
     print(f"▶ {site}: safari_logged_out — logging Albert's Safari in (keep-alive)")
@@ -6506,7 +6533,9 @@ def build_parser() -> argparse.ArgumentParser:
         "no focus change); only when that did not see it (not seen or could "
         "not tell), Albert is active, the site is not quarantined, no guided "
         "login runs and its "
-        f"{int(kal.ATTEMPT_COOLDOWN_S // 3600)}-h attempt cooldown is over: "
+        f"{int(kal.ATTEMPT_COOLDOWN_S // 3600)}-h attempt cooldown "
+        f"({int(kal.ATTEMPT_UNTYPED_COOLDOWN_S // 3600)} h after a -O proof that "
+        f"typed nothing; {int(kal.ATTEMPT_SLACK_S // 60)} min slack) is over: "
         "the -O proof, and only on safari_logged_out the -L SITE -s login "
         "(no page opened). Exit 4 (push, passkey, CAPTCHA, SMS), a failed "
         f"re-login or {kal.UNPROVEN_NOTIFY_AFTER} runs in a row without a "

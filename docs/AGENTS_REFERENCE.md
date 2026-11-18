@@ -430,7 +430,12 @@ framework. It is a **provider**: other repos depend on it, not the reverse. See
       it: not when
       quarantined, not during a live guided login (exit 75 = skip), at most
       one attempt per site per 6 h (`safari-keepalive.json`, stamped BEFORE
-      the attempt, failures count, unreadable = no attempt) → the `-O` proof
+      the attempt as `typed`, failures count, unreadable = no attempt; a
+      `-O` proof that stopped with nothing typed — no broker fill, no
+      submit, no code mail — re-marks it `untyped`: 1 h then; an attempt is
+      allowed 2 min before its window ends, so the 30-min launchd cadence
+      landing a few seconds early keeps its cycle; a stamp without a kind
+      counts as `typed`) → the `-O` proof
       under the Safari lock → only on its `safari_logged_out` the
       `-L SITE -s` login (`keepalive=True`: no page opened); never on an
       unknown answer or an error of the `-O` proof;

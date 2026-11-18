@@ -378,11 +378,117 @@ def test_a_stuck_proof_says_where_it_stopped(
 def test_the_cooldown_left_rounds_up(
     keep: dict[str, Any], capsys: pytest.CaptureFixture[str]
 ) -> None:
-    """tp#1644 (14:30 run): 18 s left read "0 min left" — now "1 min"."""
-    assert kal.stamp("cscs", "attempt_at", time.time() - kal.ATTEMPT_COOLDOWN_S + 18)
+    """tp#1644 (14:30 run): 18 s left read "0 min left" — now "1 min"
+    (left = the window less the slack)."""
+    at = time.time() - kal.ATTEMPT_COOLDOWN_S + kal.ATTEMPT_SLACK_S + 18
+    assert kal.stamp("cscs", "attempt_at", at)
     assert _k(keep, [FORM], REDIRECTED) == 0
     assert "one attempt per 6 h — 1 min left" in capsys.readouterr().out
     assert not keep["safari"].windows()
+
+
+def _kind() -> Any:
+    sites = als.read(kal.STATE_FILE).get("sites", {})
+    return sites.get("cscs", {}).get("attempt_kind")
+
+
+def test_an_untyped_proof_stop_waits_1_h(
+    keep: dict[str, Any],
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Albert (2026-11-18): a -O proof that stopped with nothing typed
+    (recipe_stuck, no credential step) → the next attempt after 1 h."""
+    stuck = alsafari.Outcome(2, "recipe_stuck")
+    proofs: list[str] = []
+
+    def prove(_s: str, _r: Any) -> alsafari.Outcome:
+        proofs.append("proof")
+        return stuck
+
+    monkeypatch.setattr(al, "_keepalive_prove", prove)
+    t0 = 1_800_000_000.0
+    monkeypatch.setattr(al.time, "time", lambda: t0)
+    assert _k(keep, [FORM], REDIRECTED) == 1
+    assert _attempt_at() == t0 and _kind() == kal.ATTEMPT_UNTYPED
+    assert "typed nothing — next attempt in 1 h" in capsys.readouterr().out
+    # 30 min later: held, the log says why (1 h, not 6 h)
+    monkeypatch.setattr(al.time, "time", lambda: t0 + 1800)
+    assert _k(keep, [FORM], REDIRECTED) == 0
+    out = capsys.readouterr().out
+    assert "one attempt per 1 h after a -O proof that typed nothing" in out
+    assert proofs == ["proof"]
+    # the next launchd run, a few seconds before the full hour: allowed
+    monkeypatch.setattr(al.time, "time", lambda: t0 + 3600 - 5)
+    assert _k(keep, [FORM], REDIRECTED) == 1
+    assert proofs == ["proof", "proof"] and _attempt_at() == t0 + 3600 - 5
+
+
+@pytest.mark.parametrize("how", ["credential_proof", "failed_login"])
+def test_a_typed_run_keeps_6_h(
+    keep: dict[str, Any],
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    how: str,
+) -> None:
+    """A run in which a credential step ran keeps the full 6 h: a proof
+    whose Outcome says credential, or the login after safari_logged_out."""
+    if how == "credential_proof":
+        typed = alsafari.Outcome(2, "recipe_stuck", credential=True)
+        monkeypatch.setattr(al, "_keepalive_prove", lambda _s, _r: typed)
+    else:
+        monkeypatch.setattr(al, "safari_target_action", lambda *_a, **_k: 2)
+    t0 = 1_800_000_000.0
+    monkeypatch.setattr(al.time, "time", lambda: t0)
+    assert _k(keep, [FORM], REDIRECTED) == 1
+    assert _attempt_at() == t0 and _kind() == kal.ATTEMPT_TYPED
+    assert "typed nothing" not in capsys.readouterr().out
+    for later in (3600.0, 6 * 3600.0 - 121):
+        monkeypatch.setattr(al.time, "time", lambda later=later: t0 + later)
+        assert _k(keep, [FORM], REDIRECTED) == 0
+        assert "one attempt per 6 h — " in capsys.readouterr().out
+    assert _attempt_at() == t0
+
+
+@pytest.mark.parametrize(
+    ("untyped", "span"),
+    [(False, kal.ATTEMPT_COOLDOWN_S), (True, kal.ATTEMPT_UNTYPED_COOLDOWN_S)],
+)
+def test_the_attempt_slack_on_both_sides(untyped: bool, span: float) -> None:
+    """An attempt is allowed once span − 120 s have passed, not before."""
+    t0 = 1_800_000_000.0
+    assert kal.stamp_attempt("cscs", t0)
+    if untyped:
+        assert kal.mark_untyped("cscs", t0)
+    kind = kal.ATTEMPT_UNTYPED if untyped else kal.ATTEMPT_TYPED
+    assert kal.attempt_left("cscs", t0 + span - 121) == (1.0, kind)
+    assert kal.attempt_left("cscs", t0 + span - 120) == (0.0, kind)
+    assert kal.attempt_left("cscs", t0 + span - 119) == (0.0, kind)
+    # a newer stamp is never re-marked by an older attempt
+    assert kal.stamp_attempt("cscs", t0 + 10)
+    assert not kal.mark_untyped("cscs", t0)
+    assert kal.attempt_kind("cscs") == kal.ATTEMPT_TYPED
+
+
+def test_an_old_format_stamp_counts_as_typed() -> None:
+    """A stamp written before the kind existed (`attempt_at` only) = 6 h."""
+    t0 = 1_800_000_000.0
+    path = als.state_dir() / kal.STATE_FILE
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps({"sites": {"cscs": {"attempt_at": t0}}}))
+    path.chmod(0o600)
+    assert kal.attempt_kind("cscs") == kal.ATTEMPT_TYPED
+    left, kind = kal.attempt_left("cscs", t0 + 3600)
+    assert kind == kal.ATTEMPT_TYPED and left == 5 * 3600 - 120
+    assert kal.attempt_left("cscs", t0 + 6 * 3600 - 120) == (0.0, kal.ATTEMPT_TYPED)
+    # an unknown kind word counts as the longer window too
+    path.write_text(
+        json.dumps({"sites": {"cscs": {"attempt_at": t0, "attempt_kind": "x"}}})
+    )
+    assert kal.attempt_left("cscs", t0 + 3600)[1] == kal.ATTEMPT_TYPED
+    # unreadable: fail closed
+    path.write_text("[]")
+    assert kal.attempt_left("cscs", t0) == (None, kal.ATTEMPT_TYPED)
 
 
 def test_a_probe_that_cannot_tell_and_a_live_proof_logs_nothing_in(

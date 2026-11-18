@@ -15,7 +15,12 @@ only within these limits (agent-login.py `keepalive_site` enforces them):
   never an unknown answer or an error of that proof;
 * never while quarantined or during a live guided-login maintenance record;
 * at most one proof + login attempt per site per `ATTEMPT_COOLDOWN_S`
-  (stamped BEFORE the attempt: failures count too), at most one desktop
+  (stamped BEFORE the attempt as `typed`: failures count too); a `-O`
+  proof that stopped with nothing typed (no broker fill, no submit, no
+  code mail: `Outcome.credential` False) re-marks it `untyped` —
+  `ATTEMPT_UNTYPED_COOLDOWN_S` then; both less `ATTEMPT_SLACK_S`, so the
+  30-min launchd cadence landing a few seconds early keeps its cycle
+  (Albert, 2026-11-18); at most one desktop
   notification per site per `NOTIFY_COOLDOWN_S` (exit 4 of the proof or the
   login: push, passkey, CAPTCHA, SMS — Albert's step; ANY failed
   re-login; and `UNPROVEN_NOTIFY_AFTER` runs in a row that proved no
@@ -49,6 +54,15 @@ import agent_login_state as als
 KEEPALIVE_SITES: tuple[str, ...] = ("cscs",)
 # At most one proof + login attempt per site in this window (failures too).
 ATTEMPT_COOLDOWN_S = 6 * 3600.0
+# ... but only this one after a -O proof that stopped with nothing typed
+# (Albert, 2026-11-18, tp#1644 B19 follow-up).
+ATTEMPT_UNTYPED_COOLDOWN_S = 1 * 3600.0
+# An attempt is allowed once its window less this slack has passed: the
+# 30-min launchd cadence may land a few seconds early.
+ATTEMPT_SLACK_S = 120.0
+# The attempt stamp's kinds; a stamp without one (older format) is `typed`.
+ATTEMPT_TYPED = "typed"
+ATTEMPT_UNTYPED = "untyped"
 # At most one notification per site in this window.
 NOTIFY_COOLDOWN_S = 6 * 3600.0
 # Notify (within NOTIFY_COOLDOWN_S) once this many probing runs in a row
@@ -264,23 +278,98 @@ def cooldown_left(site: str, key: str, span: float, now: float) -> float | None:
     return max(0.0, span - (now - at))
 
 
+def _entry(data: dict[str, Any], site: str) -> dict[str, Any]:
+    """`site`'s entry of the state (created when absent)."""
+    sites = data.setdefault("sites", {})
+    if not isinstance(sites, dict):
+        raise als.StateError("sites is not an object")
+    entry = sites.setdefault(site, {})
+    if not isinstance(entry, dict):
+        raise als.StateError("site entry is not an object")
+    return entry
+
+
 def stamp(site: str, key: str, now: float) -> bool:
     """Write `site`'s `key` stamp (locked, atomic, 0600); False on failure."""
 
     def put(data: dict[str, Any]) -> None:
-        sites = data.setdefault("sites", {})
-        if not isinstance(sites, dict):
-            raise als.StateError("sites is not an object")
-        entry = sites.setdefault(site, {})
-        if not isinstance(entry, dict):
-            raise als.StateError("site entry is not an object")
-        entry[key] = now
+        _entry(data, site)[key] = now
 
     try:
         als.update(STATE_FILE, put, strict=True)
     except (als.StateError, OSError):
         return False
     return True
+
+
+def attempt_kind(site: str) -> str | None:
+    """The kind of `site`'s attempt stamp: `untyped` only when recorded so,
+    else `typed` (no kind = an older stamp; an unknown word counts as the
+    longer window); None when the state cannot be read (fail closed)."""
+    try:
+        data = als.read(STATE_FILE, strict=True)
+    except als.StateError:
+        return None
+    sites = data.get("sites", {})
+    entry = sites.get(site, {}) if isinstance(sites, dict) else None
+    if not isinstance(entry, dict):
+        return None
+    if entry.get("attempt_kind") == ATTEMPT_UNTYPED:
+        return ATTEMPT_UNTYPED
+    return ATTEMPT_TYPED
+
+
+def attempt_span(kind: str) -> float:
+    """The attempt window of a stamp of `kind` (without the slack)."""
+    if kind == ATTEMPT_UNTYPED:
+        return ATTEMPT_UNTYPED_COOLDOWN_S
+    return ATTEMPT_COOLDOWN_S
+
+
+def attempt_left(site: str, now: float) -> tuple[float | None, str]:
+    """(seconds left of `site`'s attempt window, the stamp's kind): the
+    window of its kind less `ATTEMPT_SLACK_S`; None seconds when the state
+    cannot be read (fail closed)."""
+    kind = attempt_kind(site)
+    if kind is None:
+        return None, ATTEMPT_TYPED
+    span = attempt_span(kind) - ATTEMPT_SLACK_S
+    return cooldown_left(site, "attempt_at", span, now), kind
+
+
+def stamp_attempt(site: str, now: float) -> bool:
+    """Stamp `site`'s attempt BEFORE it runs, as `typed` (the full window
+    unless `mark_untyped` shortens it); False on failure."""
+
+    def put(data: dict[str, Any]) -> None:
+        entry = _entry(data, site)
+        entry["attempt_at"] = now
+        entry["attempt_kind"] = ATTEMPT_TYPED
+
+    try:
+        als.update(STATE_FILE, put, strict=True)
+    except (als.StateError, OSError):
+        return False
+    return True
+
+
+def mark_untyped(site: str, at: float) -> bool:
+    """Re-mark the attempt stamped at `at` as `untyped` (its `-O` proof
+    stopped with nothing typed); only that stamp — a newer one stays as it
+    is. False when nothing was written."""
+    done: list[bool] = []
+
+    def put(data: dict[str, Any]) -> None:
+        entry = _entry(data, site)
+        if entry.get("attempt_at") == at:
+            entry["attempt_kind"] = ATTEMPT_UNTYPED
+            done.append(True)
+
+    try:
+        als.update(STATE_FILE, put, strict=True)
+    except (als.StateError, OSError):
+        return False
+    return bool(done)
 
 
 def unproven_runs(site: str, *, proven: bool) -> int | None:
@@ -290,12 +379,7 @@ def unproven_runs(site: str, *, proven: bool) -> int | None:
     got: list[int] = []
 
     def put(data: dict[str, Any]) -> None:
-        sites = data.setdefault("sites", {})
-        if not isinstance(sites, dict):
-            raise als.StateError("sites is not an object")
-        entry = sites.setdefault(site, {})
-        if not isinstance(entry, dict):
-            raise als.StateError("site entry is not an object")
+        entry = _entry(data, site)
         old = _int(entry.get("unproven_runs")) or 0
         entry["unproven_runs"] = 0 if proven else max(0, old) + 1
         got.append(entry["unproven_runs"])
@@ -361,21 +445,30 @@ def notify_once(
 
 __all__ = [
     "ATTEMPT_COOLDOWN_S",
+    "ATTEMPT_SLACK_S",
+    "ATTEMPT_TYPED",
+    "ATTEMPT_UNTYPED",
+    "ATTEMPT_UNTYPED_COOLDOWN_S",
     "KEEPALIVE_SITES",
     "NOTIFY_COOLDOWN_S",
     "PROBE_FEATURES",
     "PROBE_STATES",
     "Probe",
     "UNPROVEN_NOTIFY_AFTER",
+    "attempt_kind",
+    "attempt_left",
+    "attempt_span",
     "classify",
     "close_left_tab",
     "cooldown_left",
     "desktop_notify",
     "locate",
+    "mark_untyped",
     "notify_once",
     "probe",
     "probe_js",
     "stamp",
+    "stamp_attempt",
     "tab_hint",
     "tab_rows",
     "unproven_runs",
