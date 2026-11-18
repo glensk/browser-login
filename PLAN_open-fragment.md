@@ -159,7 +159,7 @@ websocket or moves to O5's attached session is B1's output, not a guess here.
 
 ## Boxes
 
-- [ ] B1 [opus] Root cause, no browser.py change (scratch script in the worktree's
+- [x] B1 [opus] Root cause, no browser.py change (scratch script in the worktree's
   `tests/` is fine, deleted or turned into B4 afterwards). On a disposable headless
   Chromium (the `test_ws5_client_s2_cdp.py` launch pattern: free port, temp
   profile, temp `CLAUDE_BROWSER_CACHE_DIR`) plus a local `http.server` serving
