@@ -4397,6 +4397,16 @@ def _safari_call(out: alsafari.Outcome) -> str:
     return flag if flag == f"--{out.failed_op}" else f"{flag} ({out.failed_op} step)"
 
 
+def _moved_why(out: alsafari.Outcome) -> str:
+    """tp#1644: `` (<reason> on <where>)`` for a `safari_tab_moved` — a
+    fixed reason and the tab's place (`alsafari.moved_hint`: host + plain
+    path words, or a scheme word), '' when the run did not move."""
+    if not out.moved:
+        return ""
+    where = f" on {out.moved_to}" if out.moved_to else ""
+    return f" ({out.moved}{where})"
+
+
 def _safari_fail(
     site: str,
     out: alsafari.Outcome,
@@ -4417,7 +4427,7 @@ def _safari_fail(
     check's. tp#1644: a failed safari.py call adds its operation and exit
     code to the detail (fixed words) and says them on stderr; its message
     goes to stderr only, redacted (`safari_said`, B19), never the record."""
-    detail = _safari_detail(detail or out.stuck, out)
+    detail = _safari_detail(detail or out.stuck or out.moved, out)
     if out.credential and not quarantined:
         try:
             als.quarantine(site, out.phase, out.code)
@@ -4442,6 +4452,8 @@ def _safari_fail(
     if out.stuck:
         where = f" on {out.stuck_host}" if out.stuck_host else ""
         why = f" ({out.stuck}{where})"
+    elif out.moved:
+        why = _moved_why(out)
     print(f"❌ {site}: {who} — {code_text(out.phase, out.code)}{why}")
     if out.page:
         print(f"   the page showed — {out.page}", file=sys.stderr, flush=True)
@@ -5423,6 +5435,8 @@ def _keepalive_proof_detail(site: str, out: alsafari.Outcome) -> None:
     if out.stuck:
         where = f" on {out.stuck_host}" if out.stuck_host else ""
         print(f"   {site}: the -O proof found no step ({out.stuck}{where})")
+    if out.moved:
+        print(f"   {site}: the -O proof's tab left the recipe{_moved_why(out)}")
     if out.page:
         print(f"   the page showed — {out.page}", file=sys.stderr, flush=True)
     if out.failed_op:

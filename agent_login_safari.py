@@ -177,6 +177,14 @@ STUCK_REASONS = frozenset(
         "code_not_filled",
     }
 )
+# tp#1644 Outcome.moved: why a run ended `safari_tab_moved` — the listing was
+# no list, the login window held another tab count than one, or its one tab
+# was on no https host of the recipe (Slack's /ssb/redirect desktop hand-off
+# left both 2026-11 runs there without saying where)
+MOVED_REASONS = frozenset({"no_listing", "tab_count", "off_recipe_host"})
+# tp#1644 Outcome.moved_to: a plain path word / a URL scheme word (moved_hint)
+_PLAIN_SEGMENT = re.compile(r"^[A-Za-z][A-Za-z_.-]{0,31}$")
+_SCHEME_WORD = re.compile(r"^[a-z][a-z0-9+.-]{0,15}$")
 # tp#1644 Outcome.failed_op: the safari.py operation whose failure ended a run
 # (`click` also covers a mail-code trigger click, `eval` a fill in the page)
 FAILED_OPS = frozenset(
@@ -1255,6 +1263,11 @@ class Outcome:  # pylint: disable=too-many-instance-attributes
     # and the tab host it ended on (a host from the recipe, never a URL)
     stuck: str = ""
     stuck_host: str = ""
+    # tp#1644: why a `safari_tab_moved` ended (MOVED_REASONS, "" = not
+    # moved) and where the tab was (`moved_hint`: https host + plain path
+    # words, `<scheme>:` for any other URL, `<n> tabs` for a tab count)
+    moved: str = ""
+    moved_to: str = ""
     # tp#1644: the safari.py operation whose failure ended the run
     # (FAILED_OPS, "" = none) and its exit code (None = none) — fixed words
     # and a number (its message: `safari_said` below, stderr only)
@@ -1856,6 +1869,22 @@ def safe_host(url: object) -> str:
     return host if parts.scheme == "https" and HOST_RE.match(host) else ""
 
 
+def moved_hint(url: object) -> str:
+    """tp#1644: where a tab that left the recipe is, for the report — an
+    https URL's host and path, a path segment that is not a plain word
+    (ids, tokens, digits) as `*`; any other URL only its scheme
+    (``slack:``), never the rest (a deep link carries a login token); ''
+    when not even the scheme is a plain word."""
+    text = str(url or "")
+    host = safe_host(text)
+    if host:
+        path = urlsplit(text).path
+        parts = [p if _PLAIN_SEGMENT.match(p) else "*" for p in path.split("/") if p]
+        return (host + "/" + "/".join(parts))[:120]
+    scheme = text.split(":", 1)[0].lower() if ":" in text else ""
+    return f"{scheme}:" if _SCHEME_WORD.match(scheme) else ""
+
+
 # ---------------------------------------------------------------------------
 # mail codes (himalaya, the pattern of browser.py's magic-link reader)
 # ---------------------------------------------------------------------------
@@ -2445,14 +2474,14 @@ class Machine:  # pylint: disable=too-many-instance-attributes
             return "", error_code(reply)
         tabs = reply.data.get("tabs")
         if not isinstance(tabs, list):
-            return "", "safari_tab_moved"
+            return "", self._moved("no_listing", "")
         mine = [
             t
             for t in tabs
             if isinstance(t, dict) and str(t.get("window_id")) == self.handle
         ]
         if len(mine) != 1:
-            return "", "safari_tab_moved"
+            return "", self._moved("tab_count", f"{len(mine)} tabs")
         url = str(mine[0].get("url") or "")
         if url in ("", "about:blank"):
             return "", ""  # still loading
@@ -2461,8 +2490,14 @@ class Machine:  # pylint: disable=too-many-instance-attributes
             # tp#1644: Cloudflare Access asks first — that login is Albert's
             return "", "needs_albert_access"
         if not host or host not in self.recipe.hosts:
-            return "", "safari_tab_moved"
+            return "", self._moved("off_recipe_host", moved_hint(url))
         return host, ""
+
+    def _moved(self, why: str, where: str) -> str:
+        """tp#1644: remember why (MOVED_REASONS) and where the login tab
+        went (`moved_hint`); the stop code `safari_tab_moved`."""
+        self.out.moved, self.out.moved_to = why, where
+        return "safari_tab_moved"
 
     def read_page(self, host: str) -> dict[str, Any] | None:
         with private_js(detector_js(self.recipe, self.plan.sentinel)) as path:

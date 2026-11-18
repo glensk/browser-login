@@ -169,13 +169,63 @@ def test_a_second_tab_in_the_login_window_stops_before_any_action() -> None:
     fake = FakeSafari(SHOP, TWO_STEP, tabs_in_window=2)
     out = _machine(fake).run()
     assert out.code == "safari_tab_moved" and out.rc == 2
+    assert (out.moved, out.moved_to) == ("tab_count", "2 tabs")
     assert not [c for c in fake.calls if c[0] in ("--login", "--eval")]
 
 
 def test_the_tab_leaving_the_recipe_hosts_stops() -> None:
-    script = [("https://evil.example.com/login", _page(user=True))]
+    script = [("https://evil.example.com/login/a1b2c3?code=s3cr3t", _page(user=True))]
     out = _machine(FakeSafari(SHOP, script)).run()
     assert out.code == "safari_tab_moved"
+    # tp#1644: where it went — host and plain path words, never the query
+    assert (out.moved, out.moved_to) == ("off_recipe_host", "evil.example.com/login/*")
+
+
+def test_a_deep_link_tab_names_only_its_scheme() -> None:
+    """tp#1644: Slack's /ssb/redirect hands off to the desktop app — a
+    `slack://` URL in the login tab is named by its scheme only (the rest
+    carries a login token)."""
+    script = [("slack://magic-login/T0TOKEN123456?x=y", _page(user=True))]
+    out = _machine(FakeSafari(SHOP, script)).run()
+    assert out.code == "safari_tab_moved"
+    assert (out.moved, out.moved_to) == ("off_recipe_host", "slack:")
+    assert "TOKEN" not in out.moved_to
+
+
+def test_a_listing_without_tabs_says_no_listing() -> None:
+    fake = FakeSafari(SHOP, TWO_STEP)
+    fake.fail["--tabs"] = s.Reply(0, {"ok": True, "tabs": None})
+    out = _machine(fake).run()
+    assert (out.code, out.moved, out.moved_to) == ("safari_tab_moved", "no_listing", "")
+
+
+@pytest.mark.parametrize(
+    ("url", "hint"),
+    [
+        (
+            "https://swiss-data-science.slack.com/ssb/redirect",
+            "swiss-data-science.slack.com/ssb/redirect",
+        ),
+        (
+            "https://accounts.google.de/accounts/SetSID?ssdc=1&sidt=x",
+            "accounts.google.de/accounts/SetSID",
+        ),
+        (
+            "https://login.microsoftonline.com/0f1e2d3c-aaaa/saml2",
+            "login.microsoftonline.com/*/*",  # a digit: not a plain word
+        ),
+        ("http://plain.example.org/x", "http:"),
+        ("slack://magic-login/abc", "slack:"),
+        ("javascript:alert(1)", "javascript:"),
+        ("weird scheme://x", ""),
+        ("", ""),
+        (None, ""),
+    ],
+)
+def test_moved_hint_names_host_and_plain_path_words_only(
+    url: object, hint: str
+) -> None:
+    assert s.moved_hint(url) == hint
 
 
 def test_a_page_with_nothing_to_do_is_stuck_not_retried() -> None:

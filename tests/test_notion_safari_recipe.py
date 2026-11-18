@@ -333,4 +333,27 @@ def test_the_window_vanishing_during_the_code_field_wait_is_tab_moved() -> None:
     script = [(*LOGIN, None), (GONE[0], GONE[1], None)]
     out, fake, _box = _run(script)
     assert out.code == "safari_tab_moved" and out.stuck == ""
+    assert out.moved == "tab_count" and out.moved_to == "0 tabs"
     assert not out.credential and "code" not in fake.order
+
+
+def test_a_moved_tab_is_named_in_the_report_and_the_record(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """tp#1644: a `safari_tab_moved` says why and where (Slack's 2026-11-18
+    run said neither); the record's detail is the reason word only."""
+    out = s.Outcome(2, "safari_tab_moved", credential=True)
+    out.moved, out.moved_to = "off_recipe_host", "slack:"
+    quarantined: list[tuple] = []
+    records: list[dict] = []
+    monkeypatch.setattr(al.als, "quarantine", lambda *a: quarantined.append(a))
+    monkeypatch.setattr(
+        al,
+        "record_check",
+        lambda site, ok, how, result=None, **_k: records.append(result),
+    )
+    assert al._safari_fail("slack", out, "Safari login stopped") == 2
+    assert quarantined and records[0]["detail"] == "off_recipe_host"
+    printed = capsys.readouterr().out
+    assert "(off_recipe_host on slack:)" in printed
+    assert "quarantined (a credential step ran)" in printed
