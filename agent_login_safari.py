@@ -62,6 +62,8 @@ from __future__ import annotations
 # One module for the whole Safari side (recipes, runner, gate, detector, mail
 # codes, step machine): they share one contract and are tested together.
 # pylint: disable=too-many-lines
+import base64
+import binascii
 import contextlib
 import hashlib
 import hmac
@@ -137,12 +139,18 @@ STEP_FEATURES = {
     "click": "click",
     "account": "account_pick",
     "mail_code": "click",
+    "magic_link": "click",  # tp#1644 B16: e-mail, trigger, then an eval
 }
 # tp#1644 B12: the safari.py options that name a fill step's fields (`Step.fields`).
 FIELD_OPTS = frozenset({"--user-field", "--pass-field", "--otp-field"})
 # Steps that send a credential, an SSO choice or a code: at most once per run;
 # a failure after one quarantines the site.
-CREDENTIAL_KINDS = frozenset({"user", "login", "otp", "account", "mail_code"})
+CREDENTIAL_KINDS = frozenset(
+    {"user", "login", "otp", "account", "mail_code", "magic_link"}
+)
+# tp#1644 B16: the steps that read Albert's mailbox (a code, or a magic link
+# opened in the login window) — the shared cooldown, the baseline, the mail env.
+MAIL_KINDS = frozenset({"mail_code", "magic_link"})
 # tp#1644: of those, the steps that send more than the e-mail address — an
 # Albert wait that runs out after the e-mail step alone quarantines nothing.
 SECRET_KINDS = CREDENTIAL_KINDS - {"user"}
@@ -231,7 +239,7 @@ class Step:  # pylint: disable=too-many-instance-attributes
     mail-code step's "send me a code"); `submit` the button that SENDS what
     was filled (password, TOTP, the mail code)."""
 
-    kind: str  # user | login | otp | click | account | mail_code
+    kind: str  # user | login | otp | click | account | mail_code | magic_link
     host: str
     trigger: str = ""
     submit: str = ""
@@ -240,6 +248,8 @@ class Step:  # pylint: disable=too-many-instance-attributes
     no_user: bool = False  # login: the page shows the password field only
     # mail_code: the e-mail field filled with the expected address (from the
     # override file) before the trigger; the mail's senders, subjects, code.
+    # magic_link (tp#1644 B16): the same, `code_re` matching the LINK — it is
+    # opened in the login window (never argv, never printed).
     email_field: str = ""
     senders: tuple[str, ...] = ()
     code_re: str = ""
@@ -607,6 +617,128 @@ RECIPES: dict[str, Recipe] = {
 MAGIC_LINK_SITES = frozenset(
     {"anthropic", "anthropic-private", "console", "console-private"}
 )
+
+# tp#1644 B16: claude.ai / the Claude Console in Albert's SAFARI (`-L SITE -s`;
+# `-L SITE` alone stays the shared browser's magic link above). The link is
+# requested IN the Safari login window (the e-mail field + "Continue with
+# email", browser.py's `_claude_fill_email_and_continue` labels) and opened in
+# THAT window by an `--eval` file (`location.assign`, 0600) — never on a
+# command line, never printed. So the route works whether or not the link is
+# bound to the browser that asked for it (B17's canary shows which). The link
+# carries its credential in the fragment, `#<token>:<base64 e-mail>`; the
+# mail's sender domain is DMARC p=reject (browser.py `_ANTHROPIC_LOGIN_MAIL_
+# SENDERS_DEFAULT`, its subjects `_CLAUDE_SUBJECT_HINTS`). One cookie scope
+# holds ONE account: the work and the private site share it (agent-login's
+# `SAFARI_ACCOUNT_GROUPS`); the identity read (`CLAUDE_IDENTITY_JS`) names
+# which one Safari holds. UNVERIFIED (B17 reads them in Albert's Safari): both
+# sentinels; the Console's e-mail page labels (the same Anthropic login SPA).
+CLAUDE_LINK_RE = r"https://claude\.ai/magic-link#[A-Za-z0-9:+/=_-]+"
+CONSOLE_LINK_RE = r"https://platform\.claude\.com/magic-link#[A-Za-z0-9:+/=_-]+"
+ANTHROPIC_MAIL_SENDERS = ("mail.anthropic.com",)
+_EMAIL_FIELD = 'input[type="email"]'
+
+
+def _magic_link_step(host: str, link_re: str, subjects: tuple[str, ...]) -> Step:
+    """The one step of an Anthropic magic-link recipe on `host`."""
+    return Step(
+        "magic_link",
+        host,
+        trigger="Continue with email",
+        when=_EMAIL_FIELD,
+        email_field=_EMAIL_FIELD,
+        senders=ANTHROPIC_MAIL_SENDERS,
+        code_re=link_re,
+        subjects=subjects,
+    )
+
+
+def _claude_recipe(site: str) -> Recipe:
+    return Recipe(
+        site,
+        ("claude.ai",),
+        "claude.ai",
+        (
+            _magic_link_step(
+                "claude.ai",
+                CLAUDE_LINK_RE,
+                ("secure link to Claude.ai", "log in to Claude.ai"),
+            ),
+        ),
+        start_url="https://claude.ai/new",
+        sentinel='[data-testid="user-menu-button"]',  # UNVERIFIED (B17)
+        broker=False,
+        import_after=False,  # the shared Chromium has its own magic link
+    )
+
+
+def _console_recipe(site: str) -> Recipe:
+    return Recipe(
+        site,
+        ("platform.claude.com", "console.anthropic.com"),
+        "platform.claude.com",
+        (
+            _magic_link_step(
+                "platform.claude.com",
+                CONSOLE_LINK_RE,
+                ("secure link to the Claude Console",),
+            ),
+        ),
+        start_url="https://platform.claude.com/settings/billing",
+        sentinel='a[href="/settings/billing"]',  # UNVERIFIED (B17)
+        broker=False,
+        import_after=False,
+    )
+
+
+MAGIC_LINK_RECIPES: dict[str, Recipe] = {
+    "anthropic": _claude_recipe("anthropic"),
+    "anthropic-private": _claude_recipe("anthropic-private"),
+    "console": _console_recipe("console"),
+    "console-private": _console_recipe("console-private"),
+}
+
+
+def magic_link_email(link: str, link_re: str) -> str:
+    """The account a magic link names (`#<token>:<base64 e-mail>`), lower
+    case; '' when the link is not a full `link_re` match or the part does not
+    decode to exactly one address (browser.py `_magic_link_email`)."""
+    if not link or not re.fullmatch(link_re, link):
+        return ""
+    frag = link.partition("#")[2]
+    if ":" not in frag:
+        return ""
+    b64 = frag.rsplit(":", 1)[1].rstrip("=").replace("-", "+").replace("_", "/")
+    if not b64:
+        return ""
+    try:
+        raw = base64.b64decode(b64 + "=" * (-len(b64) % 4), validate=True)
+        addr = raw.decode("utf-8").strip().lower()
+    except (binascii.Error, ValueError):
+        return ""
+    if addr.count("@") != 1 or not addr.isprintable() or " " in addr:
+        return ""
+    local, _, dom = addr.partition("@")
+    return addr if local and dom else ""
+
+
+# tp#1644 B16: the in-Safari account read of claude.ai / the Console — the
+# site's own `/api/account` (agent_login_claude's `_CLAUDE_ACCOUNT_JS`),
+# compared IN the page with the expected and the other known address; only
+# the verdict leaves the page (`match` / `other` = Albert's other account /
+# `mismatch` = a third one / `logged_out` / `unknown`), never an address.
+# Run through identity_start_js / identity_read_js (safari.py cannot await).
+CLAUDE_IDENTITY_JS = r"""(P) => fetch("/api/account", { credentials: "same-origin" })
+  .then((r) => {
+    if (r.status === 401 || r.status === 403) return { state: "logged_out" };
+    if (!r.ok) return { state: "unknown" };
+    return r.json().then((a) => {
+      const e = String((a && a.email_address) || "").trim().toLowerCase();
+      if (!e) return { state: "unknown" };
+      if (e === P.want) return { state: "match" };
+      return { state: P.others.includes(e) ? "other" : "mismatch" };
+    });
+  })
+  .catch(() => ({ state: "unknown" }))"""
 
 
 # ---------------------------------------------------------------------------
@@ -2127,6 +2259,16 @@ IDENTITY_READ_JS = r"""// agent-login:identity-read
 """
 
 
+# tp#1644 B16: open the magic link in the login tab (the fragment carries
+# its credential; the SPA reads it). The link travels in this file only.
+LINK_OPEN_JS = r"""// agent-login:link
+(() => {
+  location.assign(__LINK__);
+  return JSON.stringify({ ok: true });
+})()
+"""
+
+
 def identity_start_js(recipe_js: str, args: dict[str, Any], key: str) -> str:
     """The start eval of the identity read (`key`: the run's random slot)."""
     return (
@@ -2204,6 +2346,10 @@ class Machine:  # pylint: disable=too-many-instance-attributes
     # until `submit_deadline` (clock) a page still on the code waits
     submitted: bool = False
     submit_deadline: float = 0.0
+    # tp#1644 B16: the magic link was opened in the login window; until
+    # `submit_deadline` any page without the sentinel waits (the SPA reads
+    # the link's fragment, then moves on)
+    link_opened: bool = False
     # tp#1644: prove only — the sentinel ends ok, the first page where a
     # recipe step would run ends `safari_logged_out` (nothing typed, no
     # broker fill, no code mail); Albert stops stay exit 4.
@@ -2302,7 +2448,7 @@ class Machine:  # pylint: disable=too-many-instance-attributes
 
     def run(self) -> Outcome:
         """Open the login window, then read → stop / step / wait, bounded."""
-        mail_steps = [s for s in self.recipe.steps if s.kind == "mail_code"]
+        mail_steps = [s for s in self.recipe.steps if s.kind in MAIL_KINDS]
         if mail_steps and self.plan.mail is not None and not self._lazy_baseline():
             # BEFORE anything can trigger a code mail
             self.baseline = mail_baseline(self.plan.mail, mail_steps[0])
@@ -2421,7 +2567,7 @@ class Machine:  # pylint: disable=too-many-instance-attributes
             return False
         if any(page[flag] for flag in ALBERT_STOPS):
             return False
-        return bool(page["code"] or page["email_code"])
+        return self.link_opened or bool(page["code"] or page["email_code"])
 
     def _ran(self, kind: str) -> bool:
         """A step of `kind` ran already ('' = always true)."""
@@ -2513,7 +2659,7 @@ class Machine:  # pylint: disable=too-many-instance-attributes
         step = self.recipe.steps[index]
         self.done.add(index)
         self.out.steps.append(step.kind)
-        if step.kind == "mail_code":
+        if step.kind in MAIL_KINDS:
             return self._mail_code(step)
         args = self._step_args(step)
         if args is None:
@@ -2639,6 +2785,8 @@ class Machine:  # pylint: disable=too-many-instance-attributes
         code = self._wait_code(reader, step)
         if code is None:
             return self._end(2, "email_code")
+        if step.kind == "magic_link":
+            return self._open_link(step, reader, code)
         stopped = self._wait_code_field(step)
         if stopped is not None:
             if stopped.stuck == "code_field":
@@ -2666,6 +2814,30 @@ class Machine:  # pylint: disable=too-many-instance-attributes
         self.submitted = True
         self.submit_deadline = self.clock() + POST_SUBMIT_S
         self.out.mail_archived = reader.archive(code)
+        return None
+
+    def _open_link(self, step: Step, reader: MailReader, link: str) -> Outcome | None:
+        """tp#1644 B16: open the magic link in the login window — an
+        ``--eval`` 0600 file (``location.assign``), the tab pinned to the
+        recipe's host; never argv, never printed. A link naming another
+        account than the expected one is never opened (`email_code`). Opened:
+        the mail did its job (out of INBOX), the run waits for the sentinel."""
+        want = self.plan.expected_email.strip().lower()
+        if not want or magic_link_email(link, step.code_re) != want:
+            reader.sources = {}
+            return self._end(2, "email_code")
+        self.out.credential = True
+        body = LINK_OPEN_JS.replace("__LINK__", json.dumps(link))
+        try:
+            ok = self._eval_ok(body, step.host)  # the RECIPE's host
+        finally:
+            del body
+        if not ok:
+            reader.sources = {}
+            return self._end(2, "email_code")
+        self.submitted = self.link_opened = True
+        self.submit_deadline = self.clock() + POST_SUBMIT_S
+        self.out.mail_archived = reader.archive(link)
         return None
 
     def _wait_code_field(self, step: Step) -> Outcome | None:

@@ -1153,6 +1153,16 @@ SAFARI_ROUTES: dict[str, SafariRoute] = {
     "switch-engines": SafariRoute(
         "https://engines.admin.switch.ch/", "in_safari", then="eduid"
     ),
+    # tp#1644 B16: claude.ai / the Claude Console, proven in Safari with the
+    # account read (`alsafari.CLAUDE_IDENTITY_JS`); a login = the magic link
+    # requested and opened in the Safari login window. Each pair shares one
+    # cookie scope: routed only once `SAFARI_HELD` names the account Safari
+    # holds (`SAFARI_HELD_FIRST`); until then only `-s -O` runs, whose
+    # account read names it (B17).
+    "anthropic": SafariRoute("https://claude.ai/", "in_safari"),
+    "anthropic-private": SafariRoute("https://claude.ai/", "in_safari"),
+    "console": SafariRoute("https://platform.claude.com/", "in_safari"),
+    "console-private": SafariRoute("https://platform.claude.com/", "in_safari"),
 }
 # tp#1644 B10: sites whose accounts share one Safari cookie scope — Safari
 # holds at most ONE of them. `SAFARI_HELD[group]`: the member Safari holds
@@ -1160,8 +1170,19 @@ SAFARI_ROUTES: dict[str, SafariRoute] = {
 # decided yet (B11 step 0's identity read decides) and adds no reason.
 SAFARI_ACCOUNT_GROUPS: dict[str, tuple[str, ...]] = {
     "dsm": ("dsm-readonly", "dsm-albert"),
+    # tp#1644 B16: one claude.ai / one Console account per Safari
+    "claude": ("anthropic", "anthropic-private"),
+    "console": ("console", "console-private"),
 }
 SAFARI_HELD: dict[str, str] = {}
+# tp#1644 B16: groups whose members are routed only once `SAFARI_HELD`
+# decides them (Q1: which pair Safari holds is read, not asked): until then
+# no member is routed (❌) and `-L SITE -s -O` alone runs — its account read
+# says which member Safari holds.
+SAFARI_HELD_FIRST = frozenset({"claude", "console"})
+# tp#1644 B16: the account each magic-link site logs in (the shared
+# browser's, agent_login_claude).
+MAGIC_LINK_ACCOUNTS: dict[str, str] = {**CLAUDE_ACCOUNTS, **CONSOLE_ACCOUNTS}
 # tp#1644 B10: the in-Safari identity read runs broker/identity.py's
 # RECIPE_JS in the page's MAIN world; until it runs isolated (Albert's
 # option A) no broker route with a listing `identity` is built.
@@ -1254,7 +1275,11 @@ def safari_recipe(site: str, row: dict | None = None) -> alsafari.Recipe | None:
     broker recipe of its listing row (`row` over the snapshot's) and its
     `BROKER_SAFARI_LABELS` entry — None without labels, and for a row with
     an `identity` while the in-Safari identity read is not isolated."""
-    recipe = alsafari.RECIPES.get(site) or alsafari.sso_recipe(site)
+    recipe = (
+        alsafari.RECIPES.get(site)
+        or alsafari.MAGIC_LINK_RECIPES.get(site)
+        or alsafari.sso_recipe(site)
+    )
     if recipe is not None or site in alsafari.SSO_PORTALS:
         return recipe
     labels = alsafari.BROKER_SAFARI_LABELS.get(site)
@@ -1276,8 +1301,18 @@ def safari_routed(site: str) -> bool:
         route is not None
         and safari_recipe(site) is not None
         and not _group_why(site)
+        and not _held_undecided(site)
         and (not route.then or (route.then != site and safari_routed(route.then)))
     )
+
+
+def _held_undecided(site: str) -> str:
+    """tp#1644 B16: the `SAFARI_HELD_FIRST` group of `site` while
+    `SAFARI_HELD` does not decide it yet ('' = none / decided)."""
+    for group, members in SAFARI_ACCOUNT_GROUPS.items():
+        if site in members and group in SAFARI_HELD_FIRST and group not in SAFARI_HELD:
+            return group
+    return ""
 
 
 def _routed_sites() -> list[str]:
@@ -4223,6 +4258,9 @@ MAIL_CODE_SITES = frozenset({"notion"})
 MAIL_CODE_ENV: dict[str, dict[str, str]] = {
     "notion": dict(alsafari.NOTION_MAIL_ENV),
     "slack": dict(alsafari.NOTION_MAIL_ENV),
+    # tp#1644 B16: the magic-link mail of claude.ai / the Console, read the
+    # same way (its own per-site cooldown `<site>-mail-code.json`)
+    **{site: dict(alsafari.NOTION_MAIL_ENV) for site in alsafari.MAGIC_LINK_RECIPES},
 }
 # `-M` stops that sent nothing: only these may fall through to the Safari
 # login (and only with the interactive gate open). Every other stop ends -L.
@@ -4735,9 +4773,10 @@ SAFARI_OPEN_WAIT_S = 20
 
 def has_mail_code(recipe: alsafari.Recipe) -> bool:
     """tp#1644: the recipe logs in with an e-mail code (a `mail_code`
-    step) — it drives through `_mail_code_safari_drive`. `MAIL_CODE_SITES`
-    stays the headless `-M` set."""
-    return any(s.kind == "mail_code" for s in recipe.steps)
+    step) or a magic link (B16, a `magic_link` step) — it drives through
+    `_mail_code_safari_drive` (the shared cooldown, the mail env).
+    `MAIL_CODE_SITES` stays the headless `-M` set."""
+    return any(s.kind in alsafari.MAIL_KINDS for s in recipe.steps)
 
 
 def _safari_drive(
@@ -4933,7 +4972,10 @@ def safari_target_dry_run(
     )
     block = ""
     if has_mail_code(recipe):
-        _mail_code_dry_run(site)
+        if site in alsafari.MAGIC_LINK_RECIPES:
+            _magic_link_dry_run(site)
+        else:
+            _mail_code_dry_run(site)
         block = _mail_code_block(site)
     if route.then and not (gate or stop):
         first = "prove it (no login)" if prove_only else "prove it, else log Safari in"
@@ -4990,6 +5032,14 @@ def _no_route(site: str) -> int:
             "nothing done"
         )
         return 2
+    group = _held_undecided(site)
+    if group and site in SAFARI_ROUTES:
+        print(
+            f"❌ {site}: no_safari_route — which {group} account Albert's Safari "
+            f"holds is not decided yet; -L {site} -s -O reads it (no login), "
+            "nothing done"
+        )
+        return 2
     print(f"❌ {site}: no_safari_route — -s works for: " + ", ".join(_routed_sites()))
     return 2
 
@@ -5025,7 +5075,14 @@ def safari_target_action(  # pylint: disable=too-many-return-statements,too-many
             f"({alsafari.SCHEDULED_ENV}=1)"
         )
         return 2
-    if not safari_routed(site):
+    undecided = _held_undecided(site)
+    if undecided and prove_only and site in SAFARI_ROUTES and not keepalive:
+        # tp#1644 B16: the account read decides the group — proof only
+        print(
+            f"ℹ️ {site}: which {undecided} account Safari holds is not decided "
+            "yet — -O proves and reads it (no login)"
+        )
+    elif not safari_routed(site):
         return _no_route(site)
     route = SAFARI_ROUTES[site]
     if route.proof not in SAFARI_PROOFS:
@@ -5201,6 +5258,8 @@ def _safari_target_in_safari(
         cookies.clear()
     entry = _listing_row(site)
     read = _safari_identity_reader(site, entry) if entry.get("identity") else None
+    if site in alsafari.MAGIC_LINK_RECIPES:
+        read = _claude_identity_reader(site)
     out = _safari_drive(
         site, recipe, proof_only=prove_only, on_sentinel=read, status_checked=True
     )
@@ -5216,6 +5275,14 @@ def _safari_target_in_safari(
         print(
             f"❌ {site}: wrong_account — Albert's Safari is logged in as ANOTHER "
             "account; nothing done (never a second account)"
+        )
+        return 2
+    if out.code == "second_account":
+        other = _group_other(site)
+        print(
+            f"❌ {site}: second_account — Albert's Safari holds {other or 'another'}'s "
+            f"account; nothing done (never a second account). -L {other} -s works "
+            "for that one."
         )
         return 2
     if not out.ok:
@@ -5439,6 +5506,73 @@ def _keepalive_decide(  # pylint: disable=too-many-return-statements
     )
 
 
+def _group_other(site: str) -> str:
+    """The other member of `site`'s two-member account group ('' = none)."""
+    for members in SAFARI_ACCOUNT_GROUPS.values():
+        if site in members and len(members) == 2:
+            return members[1] if members[0] == site else members[0]
+    return ""
+
+
+def _claude_identity_reader(site: str) -> Callable[[alsafari.Runner, list[str]], str]:
+    """tp#1644 B16: the Machine's `on_sentinel` for claude.ai / the Console —
+    `alsafari.CLAUDE_IDENTITY_JS` in the login window (0600 files, never
+    argv); only the verdict leaves the page. '' = Safari holds `site`'s
+    account; `second_account` = Albert's other account (its group member);
+    `wrong_account` = a third; else `indeterminate`. No broker: both
+    addresses are this file's (`MAGIC_LINK_ACCOUNTS`), nothing is typed and
+    no verdict leads to a login — a page that lied could only stop the run
+    or open the landing page (README: the main-world read is forgeable)."""
+
+    def read(call: alsafari.Runner, on: list[str]) -> str:
+        want = MAGIC_LINK_ACCOUNTS.get(site, "").strip().lower()
+        other = _group_other(site)
+        others = [MAGIC_LINK_ACCOUNTS.get(other, "").strip().lower()] if other else []
+        state = _safari_page_read(
+            call, on, alsafari.CLAUDE_IDENTITY_JS, {"want": want, "others": others}
+        ).get("state")
+        group = next((g for g, m in SAFARI_ACCOUNT_GROUPS.items() if site in m), "")
+        if state == "match" and want:
+            print(
+                f"✅ {site}: Safari's {group} account is {site}'s (account read) — "
+                f"decides SAFARI_HELD[{group!r}] = {site!r}"
+            )
+            return ""
+        if state == "other" and other:
+            print(f"⏸  {site}: Safari's {group} account is {other}'s (account read)")
+            return "second_account"
+        if state == "mismatch":
+            return "wrong_account"
+        print(f"⏸  {site}: Safari's account could not be read ({state or 'none'})")
+        return "indeterminate"
+
+    return read
+
+
+def _safari_page_read(
+    call: alsafari.Runner, on: list[str], recipe_js: str, args: dict
+) -> dict:
+    """Start `recipe_js(args)` in the window (`on`: its handle + pinned
+    host), then read its parked answer until it settles ({} = none) — the
+    start / read pair of `_safari_identity_answer`, any recipe."""
+    key = f"__agentLoginIdentity_{secrets.token_hex(8)}"
+    start = alsafari.identity_start_js(recipe_js, args, key)
+    with alsafari.private_js(start) as path:
+        reply = call(["--eval", path, *on])
+    if reply.rc != 0:
+        return {}
+    for _ in range(IDENTITY_READ_POLLS):
+        time.sleep(IDENTITY_READ_POLL_S)
+        with alsafari.private_js(alsafari.identity_read_js(key)) as path:
+            reply = call(["--eval", path, *on])
+        res = alsafari.json_object(reply.data.get("result")) if reply.rc == 0 else None
+        if res is None:
+            return {}
+        if not res.get("pending"):
+            return res
+    return {}
+
+
 # Safari's identity read (tp#1644): polls of the parked recipe answer
 # (RECIPE_JS ends itself within identity.TOTAL_MS), the broker's timeout.
 IDENTITY_READ_POLLS = 30
@@ -5532,23 +5666,8 @@ def _safari_identity_answer(
 ) -> dict:
     """Start RECIPE_JS in the window (`on`: its handle + pinned host), then
     read its parked answer until it settles ({} = none)."""
-    key = f"__agentLoginIdentity_{secrets.token_hex(8)}"
     args = identity.recipe_args(recipe, check_url, nonce)
-    start = alsafari.identity_start_js(identity.RECIPE_JS, args, key)
-    with alsafari.private_js(start) as path:
-        reply = call(["--eval", path, *on])
-    if reply.rc != 0:
-        return {}
-    for _ in range(IDENTITY_READ_POLLS):
-        time.sleep(IDENTITY_READ_POLL_S)
-        with alsafari.private_js(alsafari.identity_read_js(key)) as path:
-            reply = call(["--eval", path, *on])
-        res = alsafari.json_object(reply.data.get("result")) if reply.rc == 0 else None
-        if res is None:
-            return {}
-        if not res.get("pending"):
-            return res
-    return {}
+    return _safari_page_read(call, on, identity.RECIPE_JS, args)
 
 
 def _safari_proof(site: str) -> tuple[str | int, str]:  # pylint: disable=too-many-return-statements
@@ -5794,6 +5913,24 @@ def _safari_fp(site: str, cookies: list) -> str:
     return hmac.new(key, fp, hashlib.sha256).hexdigest()[:8]
 
 
+def _magic_link_dry_run(site: str) -> None:
+    """tp#1644 B16 `-L SITE -s -n`: the magic link's mailbox and account
+    source and its cooldown — READ-ONLY (no mailbox read, no trigger)."""
+    mailbox = MAGIC_LINK_MAILBOX.get(site, ("", ""))[0] or "himalaya's default"
+    left = als.mail_code_cooldown_left(site, time.time())
+    print(
+        f"ℹ️ {site}: magic link requested in Safari's login window, read from "
+        f"{mailbox} (account {site}); cooldown "
+        + (
+            "unreadable (counts as closed)"
+            if left is None
+            else f"{int(left)} s left"
+            if left > 0
+            else "free"
+        )
+    )
+
+
 def _mail_code_dry_run(site: str) -> None:
     """`-L notion -n`: is the headless route ready? READ-ONLY — the expected
     e-mail, himalaya, a mailbox baseline (no trigger), the cooldown."""
@@ -5935,21 +6072,27 @@ def _safari_plan(
     if not start or not sentinel or (recipe.broker and not item):
         return None
     mail = None
-    if any(s.kind == "mail_code" for s in recipe.steps):
+    # tp#1644 B16: a magic-link site's account and mailbox default to the
+    # shared browser's (`MAGIC_LINK_ACCOUNTS`, `MAGIC_LINK_MAILBOX`)
+    magic = site in alsafari.MAGIC_LINK_RECIPES
+    mailbox = MAGIC_LINK_MAILBOX.get(site, ("", ""))[0] if magic else ""
+    if any(s.kind in alsafari.MAIL_KINDS for s in recipe.steps):
         himalaya = shutil.which("himalaya")
         if himalaya:
             mail = alsafari.MailReader(
                 himalaya,
                 str(over.get("mailbox") or "")
+                or mailbox
                 or os.environ.get("ANTHROPIC_LOGIN_HIMALAYA_ACCOUNT"),
                 env=env,
             )
+    expected = str(over.get("expected_email") or "")
     return alsafari.Plan(
         start_url=start,
         sentinel=sentinel,
         item=item,
         account=str(over.get("account") or ""),
-        expected_email=str(over.get("expected_email") or ""),
+        expected_email=expected or (MAGIC_LINK_ACCOUNTS.get(site, "") if magic else ""),
         mail=mail,
     )
 

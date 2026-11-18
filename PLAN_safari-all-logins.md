@@ -379,7 +379,7 @@ Execution order from here: B8-B9 first, then B6-B7 (overseer decision).
   nothing (no new tab, no focus change; a probe tab it opens it closes). A live
   maintenance record / exit 4 (push, passkey, CAPTCHA) → skip and one notification, no
   retry storm (per-site cooldown). Site list = one config key; tests without real Safari.
-- [ ] B16 [opus] batch ML (the claude.ai / console pair Albert names in Q1; the other pair ⛔
+- [x] B16 [opus] batch ML (the claude.ai / console pair Albert names in Q1; the other pair ⛔
   `second_account`). Until Q1 is answered, B16 builds the mechanism with neither pair
   routed. **Check first, read-only:** does the claude.ai / console magic link log in
   whichever browser opens it, or only the one that requested it (a code page
