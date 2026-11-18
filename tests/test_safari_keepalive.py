@@ -330,9 +330,59 @@ def test_the_live_bg_lost_probe_closes_its_tab_and_logs_in(
         ["--close-tab", "3:9", "--expect-host", "auth.cscs.ch"]
     ]
     assert len(fake.windows()) == 2
+    # one listing locates the tab AND checks it before the close
+    first_window = fake.calls.index(fake.windows()[0])
+    assert [c[0] for c in fake.calls[:first_window]].count("--tabs") == 1
     out = capsys.readouterr().out
-    assert "tab_lost_or_left_origin" in out and "logged in again" in out
+    # tp#1644: the tab sits on CSCS's Keycloak — named, redacted (no query)
+    assert "login_host" in out and "logged in again" in out
+    assert "the probe tab was on auth.cscs.ch/auth/realms/cscs/protocol" in out
     assert not keep["notes"]
+
+
+def test_a_lost_probe_tab_that_is_gone_still_goes_to_the_proof(
+    keep: dict[str, Any], capsys: pytest.CaptureFixture[str]
+) -> None:
+    """tp#1644: no tab at the probe's place — `tab_gone`, never a reason to
+    skip the renewal: the -O proof decides, its safari_logged_out logs in."""
+    fake = Keep([FORM, CODE, LIVE], LOST)
+    fake.tab_rows, fake.rows_once = LOST_ROWS[:1], True
+    keep["safari"] = fake
+    assert al.keepalive_action() == 0
+    assert not fake.ops("--close-tab")
+    assert len(fake.windows()) == 2
+    assert [c[0] for c in fake.ops(*r.FILLS)] == ["--login", "--otp"]
+    out = capsys.readouterr().out
+    assert "tab_gone" in out and "logged in again" in out
+
+
+def test_a_stuck_proof_says_where_it_stopped(
+    keep: dict[str, Any],
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """tp#1644 (2026-11-18 08:30): a `recipe_stuck` -O proof names its stuck
+    reason, host and the page's shape — no login, the cooldown is spent."""
+    stuck = alsafari.Outcome(2, "recipe_stuck")
+    stuck.stuck, stuck.stuck_host = "step_conditions_unmet", "auth.cscs.ch"
+    stuck.page = "path: /auth/realms/cscs/x; buttons: Go"
+    monkeypatch.setattr(al, "_keepalive_prove", lambda _s, _r: stuck)
+    assert _k(keep, [FORM], REDIRECTED) == 1
+    got = capsys.readouterr()
+    assert "found no step (step_conditions_unmet on auth.cscs.ch)" in got.out
+    assert "the page showed — path: /auth/realms/cscs/x; buttons: Go" in got.err
+    assert isinstance(_attempt_at(), float)
+    assert not keep["safari"].ops(*r.FILLS)
+
+
+def test_the_cooldown_left_rounds_up(
+    keep: dict[str, Any], capsys: pytest.CaptureFixture[str]
+) -> None:
+    """tp#1644 (14:30 run): 18 s left read "0 min left" — now "1 min"."""
+    assert kal.stamp("cscs", "attempt_at", time.time() - kal.ATTEMPT_COOLDOWN_S + 18)
+    assert _k(keep, [FORM], REDIRECTED) == 0
+    assert "one attempt per 6 h — 1 min left" in capsys.readouterr().out
+    assert not keep["safari"].windows()
 
 
 def test_a_probe_that_cannot_tell_and_a_live_proof_logs_nothing_in(
@@ -378,7 +428,8 @@ def test_runs_without_a_proven_session_notify_once(
     assert _unproven() == kal.UNPROVEN_NOTIFY_AFTER
     assert len(keep["notes"]) == 1
     assert "-L cscs -s -O" in keep["notes"][0]
-    assert "tab_lost_or_left_origin" in keep["notes"][0]
+    # the fake lists no tab at the probe's place: tp#1644 `kal.locate`
+    assert "tab_gone" in keep["notes"][0]
     assert _k(keep, [FORM], LOST) == 0
     assert len(keep["notes"]) == 1  # the notification cooldown
     assert "without a proven session — notification suppressed" in (
@@ -624,6 +675,38 @@ def test_classify() -> None:
         _seen(True, background={"window_id": 3, "tab": 9, "closed": False})
     )
     assert left.tab_left == (3, 9) and left.focus_kept is True
+    # no_sentinel names where the page rendered (host + path, redacted)
+    plain = kal.classify(_seen(False, url=HOME + "?next=x"))
+    assert plain.why == "no_sentinel" and plain.hint == "portal.cscs.ch/profile"
+
+
+def test_tab_hint_keeps_host_and_plain_path_words_only() -> None:
+    url = (
+        "https://auth.cscs.ch/auth/realms/cscs/login-actions/authenticate"
+        "?execution=9d89&client_data=secret#frag"
+    )
+    assert (
+        kal.tab_hint(url) == "auth.cscs.ch/auth/realms/cscs/login-actions/authenticate"
+    )
+    assert kal.tab_hint("https://x.example/reset/abc123def/9") == "x.example/reset/*/*"
+    assert kal.tab_hint("http://x.example/a") == ""
+    assert kal.tab_hint(None) == ""
+
+
+def test_locate() -> None:
+    hosts, home = ("portal.cscs.ch", "auth.cscs.ch"), "portal.cscs.ch"
+    lost = kal.classify(LOST)
+    got = kal.locate(lost, LOST_ROWS, hosts, home)
+    assert got.state == "not_proven" and got.why == "login_host"
+    assert got.hint == "auth.cscs.ch/auth/realms/cscs/protocol/openid-connect/auth"
+    assert kal.locate(lost, LOST_ROWS[:1], hosts, home).why == "tab_gone"
+    assert kal.locate(lost, None, hosts, home) == lost
+    other = [{"window_id": 3, "tab": 9, "url": "https://x.example/a"}]
+    moved = kal.locate(lost, other, hosts, home)
+    assert moved.why == "tab_lost_or_left_origin" and moved.hint == "x.example/a"
+    # only a bg-lost probe is located
+    seen = kal.classify(SEEN)
+    assert kal.locate(seen, LOST_ROWS, hosts, home) == seen
 
 
 def test_the_cooldown_fails_closed(tmp_path: Path) -> None:

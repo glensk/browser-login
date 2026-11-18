@@ -34,10 +34,11 @@ except through the `Runner` it is given.
 from __future__ import annotations
 
 import json
+import re
 import subprocess
 import urllib.parse
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any
 
 import agent_login_safari as alsafari
@@ -72,13 +73,15 @@ PROBE_STATES = frozenset({"logged_in", "not_proven", "error"})
 @dataclass(frozen=True)
 class Probe:
     """One background probe: its state, a fixed reason word, the background
-    tab safari.py could not close ((window id, tab index), else None) and
-    whether Safari's front tab stayed the same (None = not reported)."""
+    tab safari.py could not close ((window id, tab index), else None),
+    whether Safari's front tab stayed the same (None = not reported) and
+    where the tab ended (`tab_hint`: host + path, '' = unknown)."""
 
     state: str
     why: str
     tab_left: tuple[int, int] | None = None
     focus_kept: bool | None = None
+    hint: str = ""
 
 
 def probe_js(sentinel: str) -> str:
@@ -109,6 +112,22 @@ def _tab_left(data: dict[str, Any]) -> tuple[int, int] | None:
     return (wid, tab) if wid is not None and tab is not None else None
 
 
+# A path segment `tab_hint` keeps as is (anything else: `*`).
+_PLAIN_SEGMENT = re.compile(r"^[A-Za-z][A-Za-z_.-]{0,31}$")
+
+
+def tab_hint(url: object) -> str:
+    """A tab's place for the log (tp#1644): the https host and the path —
+    never the query or the fragment; a path segment that is not a plain
+    word (ids, tokens, digits) becomes `*`. '' for anything else."""
+    host = alsafari.safe_host(url)
+    if not host:
+        return ""
+    path = urllib.parse.urlsplit(str(url)).path
+    parts = [p if _PLAIN_SEGMENT.match(p) else "*" for p in path.split("/") if p]
+    return (host + "/" + "/".join(parts))[:120]
+
+
 # One return per probe state, in the order they are decided.
 def classify(  # pylint: disable=too-many-return-statements
     reply: alsafari.Reply,
@@ -126,7 +145,8 @@ def classify(  # pylint: disable=too-many-return-statements
         if seen is True:
             return Probe("logged_in", "sentinel", left, focus)
         if seen is False:
-            return Probe("not_proven", "no_sentinel", left, focus)
+            hint = tab_hint(data.get("url"))
+            return Probe("not_proven", "no_sentinel", left, focus, hint)
         return Probe("error", "bad_answer", left, focus)
     if reply.rc == 2 and data.get("reason") == "origin":
         return Probe("not_proven", "left_origin", left, focus)
@@ -148,19 +168,61 @@ def probe(call: alsafari.Runner, url: str, sentinel: str) -> Probe:
     return classify(reply)
 
 
+def tab_rows(call: alsafari.Runner) -> list[dict[str, Any]] | None:
+    """safari.py `--tabs` (None when it failed)."""
+    listing = call(["--tabs"])
+    rows = listing.data.get("tabs") if listing.rc == 0 else None
+    if not isinstance(rows, list):
+        return None
+    return [r for r in rows if isinstance(r, dict)]
+
+
+def locate(
+    seen: Probe,
+    rows: list[dict[str, Any]] | None,
+    hosts: tuple[str, ...],
+    sentinel_host: str,
+) -> Probe:
+    """tp#1644: where a `bg-lost` probe's tab went. safari.py finds its tab
+    by the origin it opened, so a tab redirected away and a tab that is gone
+    answer alike; the listing at the tab's place (window id, index) tells:
+    on one of the site's hosts other than the sentinel's (CSCS: the
+    logged-out portal sent it to its Keycloak, auth.cscs.ch) →
+    `not_proven` / `login_host`; no tab there → `tab_gone`; no listing →
+    unchanged; any other tab there → unchanged, with its hint. Only the
+    reason word and the hint change: the `-O` proof decides either way."""
+    if seen.why != "tab_lost_or_left_origin" or seen.tab_left is None:
+        return seen
+    if rows is None:
+        return seen
+    wid, index = seen.tab_left
+    here = [r for r in rows if r.get("window_id") == wid and r.get("tab") == index]
+    if not here:
+        return replace(seen, why="tab_gone")
+    url = here[0].get("url")
+    host = alsafari.safe_host(url)
+    if host and host in hosts and host != sentinel_host:
+        return replace(seen, state="not_proven", why="login_host", hint=tab_hint(url))
+    return replace(seen, hint=tab_hint(url))
+
+
 def close_left_tab(
-    call: alsafari.Runner, where: tuple[int, int], hosts: tuple[str, ...]
+    call: alsafari.Runner,
+    where: tuple[int, int],
+    hosts: tuple[str, ...],
+    rows: list[dict[str, Any]] | None = None,
 ) -> bool:
     """Close the background tab safari.py could not close — only when it is
     provably that tab: it exists at (window id, tab), is its window's LAST
     tab (safari.py opens it at the end), is not the current tab, its window
     holds other tabs, and its host is one of the site's `hosts`. safari.py's
     `--close-tab --expect-host` re-checks host, tab count and URL in the
-    call that closes. True = closed."""
+    call that closes. `rows`: a `tab_rows` listing already read (else it is
+    read here). True = closed."""
     wid, index = where
-    listing = call(["--tabs"])
-    rows = listing.data.get("tabs") if listing.rc == 0 else None
-    if not isinstance(rows, list):
+    if rows is None:
+        rows = tab_rows(call)
+    if rows is None:
         return False
     mine = [r for r in rows if isinstance(r, dict) and r.get("window_id") == wid]
     here = [r for r in mine if r.get("tab") == index]
@@ -309,9 +371,12 @@ __all__ = [
     "close_left_tab",
     "cooldown_left",
     "desktop_notify",
+    "locate",
     "notify_once",
     "probe",
     "probe_js",
     "stamp",
+    "tab_hint",
+    "tab_rows",
     "unproven_runs",
 ]

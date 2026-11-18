@@ -106,6 +106,7 @@ import fcntl
 import hashlib
 import hmac
 import json
+import math
 import os
 import secrets
 import shutil
@@ -5347,16 +5348,25 @@ def _keepalive_ready(site: str) -> tuple[alsafari.Recipe, alsafari.Runner] | Non
 
 def _keepalive_tidy(
     site: str, recipe: alsafari.Recipe, call: alsafari.Runner, seen: kal.Probe
-) -> None:
-    """After the probe: close the background tab safari.py could not close
-    (only when provably that tab), say when Safari's front tab changed."""
+) -> kal.Probe:
+    """After the probe: where its tab went when safari.py lost it
+    (`kal.locate`, one `--tabs` listing: CSCS's logged-out portal sends it
+    to auth.cscs.ch, tp#1644), close the background tab safari.py could not
+    close (only when provably that tab), say when Safari's front tab
+    changed. The probe, its reason refined by `kal.locate`."""
     if seen.tab_left is not None:
-        if kal.close_left_tab(call, seen.tab_left, recipe.hosts):
+        rows = kal.tab_rows(call)
+        where = seen.tab_left
+        seen = kal.locate(seen, rows, recipe.hosts, recipe.sentinel_host)
+        if kal.close_left_tab(call, where, recipe.hosts, rows):
             print(f"✅ {site}: closed the probe tab safari.py had left open")
         else:
             print(f"❌ {site}: the probe tab may be left open in Safari")
+    if seen.hint:
+        print(f"   {site}: the probe tab was on {seen.hint} ({seen.why})")
     if seen.focus_kept is False:
         print(f"⚠️ {site}: Safari's front tab differs from before the probe")
+    return seen
 
 
 def _keepalive_stop(site: str, now: float) -> tuple[str, bool]:
@@ -5375,7 +5385,8 @@ def _keepalive_stop(site: str, now: float) -> tuple[str, bool]:
         return f"its cooldown state ({kal.STATE_FILE}) is unreadable", False
     if left > 0:
         hours = int(kal.ATTEMPT_COOLDOWN_S // 3600)
-        return f"one attempt per {hours} h — {int(left // 60)} min left", False
+        # rounded up: "0 min left" read as "over" (tp#1644, 14:30 run)
+        return f"one attempt per {hours} h — {math.ceil(left / 60)} min left", False
     if not kal.stamp(site, "attempt_at", now):
         return f"its cooldown stamp ({kal.STATE_FILE}) could not be written", False
     return "", False
@@ -5388,6 +5399,26 @@ def _keepalive_prove(site: str, recipe: alsafari.Recipe) -> alsafari.Outcome:
         if not got:
             return alsafari.Outcome(BUSY_RC, "busy", phase="precheck")
         return _safari_drive(site, recipe, proof_only=True, status_checked=True)
+
+
+def _keepalive_proof_detail(site: str, out: alsafari.Outcome) -> None:
+    """tp#1644: why the `-O` proof stopped without an answer — the stuck
+    reason (fixed words) and its host, the page's shape (labels only, no
+    values) and a failed safari.py call (its redacted words), as `-L`
+    prints them; before that the keep-alive log only said `recipe_stuck`."""
+    if out.stuck:
+        where = f" on {out.stuck_host}" if out.stuck_host else ""
+        print(f"   {site}: the -O proof found no step ({out.stuck}{where})")
+    if out.page:
+        print(f"   the page showed — {out.page}", file=sys.stderr, flush=True)
+    if out.failed_op:
+        print(
+            f"   safari.py {_safari_call(out)} exited {out.safari_rc}",
+            file=sys.stderr,
+            flush=True,
+        )
+        if out.safari_said:  # its own words, redacted (B19)
+            print(f"   safari.py said: {out.safari_said}", file=sys.stderr, flush=True)
 
 
 def _keepalive_notify(site: str, text: str) -> str:
@@ -5443,7 +5474,7 @@ def keepalive_site(site: str) -> int:
         return 0
     recipe, call = ready
     seen = kal.probe(call, SAFARI_ROUTES[site].landing, recipe.sentinel)
-    _keepalive_tidy(site, recipe, call, seen)
+    seen = _keepalive_tidy(site, recipe, call, seen)
     if seen.state == "logged_in":
         print(f"✅ {site}: Albert's Safari is logged in (background probe)")
         kal.unproven_runs(site, proven=True)
@@ -5494,6 +5525,7 @@ def _keepalive_decide(  # pylint: disable=too-many-return-statements
         print(f"✅ {site}: the -O proof found a working session — no login")
         return 0, True
     if out.code != "safari_logged_out":
+        _keepalive_proof_detail(site, out)
         rc = _keepalive_stopped(site, out.rc, out.code, "-O proof")
         return rc, None if out.rc == BUSY_RC else False
     print(f"▶ {site}: safari_logged_out — logging Albert's Safari in (keep-alive)")

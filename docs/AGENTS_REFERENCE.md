@@ -422,7 +422,12 @@ framework. It is a **provider**: other repos depend on it, not the reverse. See
     - the probe is never proof either way: whenever it did not see the
       session — not seen, or it could not tell (a logged-out portal sends the
       tab to its login host, which safari.py reports as `bg-lost`:
-      `tab_lost_or_left_origin`) — and Safari answered it: not when
+      `tab_lost_or_left_origin`; one `--tabs` listing at the tab's place
+      refines it to `login_host` — a site host other than the sentinel's,
+      CSCS's Keycloak — or `tab_gone`; the log names the tab by host and
+      plain path words only, `kal.tab_hint`, and a stopped `-O` proof
+      prints its stuck reason, host and page shape) — and Safari answered
+      it: not when
       quarantined, not during a live guided login (exit 75 = skip), at most
       one attempt per site per 6 h (`safari-keepalive.json`, stamped BEFORE
       the attempt, failures count, unreadable = no attempt) → the `-O` proof
