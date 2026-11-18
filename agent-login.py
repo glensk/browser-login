@@ -4372,8 +4372,8 @@ def _safari_fail(
     Safari route (tp#1644 B10) keeps the quarantine but records its failure
     apart (`record_safari_fail`): its checks.json row is the Chromium
     check's. tp#1644: a failed safari.py call adds its operation and exit
-    code to the detail (fixed words) and says them on stderr — never its
-    message."""
+    code to the detail (fixed words) and says them on stderr; its message
+    goes to stderr only, redacted (`safari_said`, B19), never the record."""
     detail = _safari_detail(detail or out.stuck, out)
     if out.credential and not quarantined:
         try:
@@ -4408,6 +4408,8 @@ def _safari_fail(
             file=sys.stderr,
             flush=True,
         )
+        if out.safari_said:  # tp#1644 B19: its own words, redacted
+            print(f"   safari.py said: {out.safari_said}", file=sys.stderr, flush=True)
     if quarantined:
         print(
             f"   quarantined (a credential step ran) — the main session releases "

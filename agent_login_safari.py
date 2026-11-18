@@ -164,6 +164,9 @@ STUCK_REASONS = frozenset(
         "code_field",
         "after_submit",
         "max_polls",  # tp#1644: MAX_POLLS page reads, none ended the run
+        # tp#1644 B19: safari.py refused the self-submitting code page's
+        # fill (exit 2) BEFORE the code went in — nothing was typed there
+        "code_not_filled",
     }
 )
 # tp#1644 Outcome.failed_op: the safari.py operation whose failure ended a run
@@ -1092,13 +1095,16 @@ class Outcome:  # pylint: disable=too-many-instance-attributes
     stuck: str = ""
     stuck_host: str = ""
     # tp#1644: the safari.py operation whose failure ended the run
-    # (FAILED_OPS, "" = none) and its exit code (None = none) — never its
-    # message text
+    # (FAILED_OPS, "" = none) and its exit code (None = none) — fixed words
+    # and a number (its message: `safari_said` below, stderr only)
     failed_op: str = ""
     safari_rc: int | None = None
     # tp#1928: the safari.py flag that call ran with (SAFARI_FLAGS, "" =
     # none or not known)
     failed_flag: str = ""
+    # tp#1644 B19: that call's own words (`safari_said`: redacted, one line)
+    # — printed on stderr only, never recorded
+    safari_said: str = ""
     # tp#1644: what a stuck page showed (`parse_shape`: its path, title,
     # headings, button labels, form ids, field types/ids, alert texts — never
     # a field value; "" = not read)
@@ -1206,13 +1212,39 @@ def safari_py_bin() -> str | None:
 class Reply:
     """One safari.py call: its exit code and the parsed JSON object (`data`;
     {} when there was none). `error` is safari.py's message — classified by
-    `error_code`, NEVER stored or printed. `killed`: it overstayed its budget
-    and was terminated."""
+    `error_code`, never stored; a failed step prints it only through
+    `safari_said` (tp#1644 B19, redacted). `stderr`: what safari.py wrote
+    there (argparse refusals, warnings; tail only), same rule. `killed`: it
+    overstayed its budget and was terminated."""
 
     rc: int
     data: dict[str, Any]
     error: str = ""
     killed: bool = False
+    stderr: str = ""
+
+
+SAFARI_SAID_MAX = 400  # chars of a failed call's message on stderr
+# tp#1644 B19: a digit run that could be a code (TOTP / mail code: 4-10) or
+# any longer number — masked in `safari_said`
+_DIGIT_RUN = re.compile(r"\d{4,}")
+_CONTROL = re.compile(r"[\x00-\x1f\x7f]+")
+
+
+def safari_said(reply: Reply) -> str:
+    """tp#1644 B19: a failed safari.py call's own words for stderr — its
+    JSON `error` plus its stderr tail, one line, capped. Never a code: every
+    run of 4+ digits is masked; never a password: safari.py takes every
+    filled value out of its messages itself (`redacted`), and nothing here
+    is stored (`_failed` keeps fixed words only)."""
+    parts = [reply.error.strip(), reply.stderr.strip()]
+    text = " | ".join(p for p in parts if p)
+    text = _CONTROL.sub(" ", text)
+    text = _DIGIT_RUN.sub("«digits»", text)
+    text = re.sub(r"\s+", " ", text).strip()
+    if len(text) > SAFARI_SAID_MAX:
+        text = text[: SAFARI_SAID_MAX - 1] + "…"
+    return text
 
 
 Runner = Callable[[list[str]], Reply]
@@ -1249,19 +1281,24 @@ def run_safari_py(binary: str) -> Runner:
             proc = subprocess.Popen(  # pylint: disable=consider-using-with
                 [binary, *args, "--json"],
                 stdout=subprocess.PIPE,
-                stderr=subprocess.DEVNULL,
+                stderr=subprocess.PIPE,
                 text=True,
                 start_new_session=True,
             )
         except OSError:
             return Reply(ENV_RC, {}, "safari.py could not be run")
         try:
-            out, _err = proc.communicate(timeout=call_timeout(args))
+            out, err = proc.communicate(timeout=call_timeout(args))
         except subprocess.TimeoutExpired:
             _terminate(proc)
             return Reply(1, {}, "timeout", killed=True)
         data = json_object(out or "{}") or {}
-        return Reply(proc.returncode, data, str(data.get("error") or ""))
+        return Reply(
+            proc.returncode,
+            data,
+            str(data.get("error") or ""),
+            stderr=(err or "")[-2000:],
+        )
 
     return call
 
@@ -2195,11 +2232,12 @@ class Machine:  # pylint: disable=too-many-instance-attributes
     def _failed(self, reply: Reply, op: str, args: list[str]) -> None:
         """tp#1644: remember which safari.py operation failed (a fixed word),
         the flag of its argv `args` (tp#1928, SAFARI_FLAGS) and its exit
-        code — never its message."""
+        code; its message only redacted, for stderr (B19, `safari_said`)."""
         self.out.failed_op = op if op in FAILED_OPS else ""
         flag = args[0] if args else ""
         self.out.failed_flag = flag if flag in SAFARI_FLAGS else ""
         self.out.safari_rc = reply.rc
+        self.out.safari_said = safari_said(reply)
 
     def _end(self, rc: int, code: str) -> Outcome:
         self.out.rc, self.out.code = rc, code
@@ -2468,7 +2506,9 @@ class Machine:  # pylint: disable=too-many-instance-attributes
                 return i
         return None
 
-    def _run_step(self, index: int) -> Outcome | None:
+    def _run_step(  # pylint: disable=too-many-return-statements
+        self, index: int
+    ) -> Outcome | None:
         """Run step `index` once; an Outcome when the run must stop."""
         step = self.recipe.steps[index]
         self.done.add(index)
@@ -2486,6 +2526,16 @@ class Machine:  # pylint: disable=too-many-instance-attributes
             self.out.credential = True
         if reply.rc == 2 and step.optional and not interrupted(reply):
             return None  # refused before anything was copied: not offered here
+        if (
+            step.self_submits
+            and reply.rc == 2
+            and not interrupted(reply)
+            and reply.data.get("filled") is not True
+        ):
+            # tp#1644 B19: refused BEFORE the code went in — say so, never
+            # read the page on as if the code had been sent
+            self._failed(reply, step.kind, args)
+            return self._stuck("code_not_filled", step.host)
         if step.self_submits and self._self_submitted(reply):
             # the page sends the code itself: wait for the sentinel, never
             # type or click again (the step is done)

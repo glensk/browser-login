@@ -2293,8 +2293,12 @@ def test_a_refused_user_step_names_op_user_and_its_exit_code(
     assert fails[-1][3]["detail"] == "op: user, safari_rc: 2"
     got = capsys.readouterr()
     # tp#1928: the real safari.py flag, the recipe step after it
-    assert got.err.splitlines() == ["   safari.py --login (user step) exited 2"]
-    assert LEAK not in got.out + got.err + json.dumps(fails)
+    # tp#1644 B19: its own words on stderr only (redacted), never the record
+    assert got.err.splitlines() == [
+        "   safari.py --login (user step) exited 2",
+        f"   safari.py said: {LEAK}",
+    ]
+    assert LEAK not in got.out + json.dumps(fails)
 
 
 def test_a_failed_tabs_read_names_op_tabs(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -2946,14 +2950,54 @@ def test_cscs_code_page_that_stays_types_the_code_once_and_quarantines(
 
 
 def test_cscs_code_fill_refused_before_the_fill_is_a_failure(
-    cscs: dict[str, Any],
+    cscs: dict[str, Any], capsys: pytest.CaptureFixture[str]
 ) -> None:
-    refused = alsafari.Reply(2, {"ok": False, "exit": 2}, "no visible field")
+    refused = alsafari.Reply(
+        2, {"ok": False, "exit": 2}, "no visible field for code (input.x)"
+    )
     flow = [CSCS_FORM, CSCS_BOXES]
     assert _go_cscs_self(cscs, flow, refused) == 2
     fake = cscs["safari"]
     assert [c[0] for c in fake.ops(*FILLS)] == ["--login", "--otp"]
     assert al.als.quarantined("cscs") is not None  # the password went out
+    # tp#1644 B19: named as a refusal BEFORE the code went in, with
+    # safari.py's own (redacted) words on stderr
+    cap = capsys.readouterr()
+    assert "code_not_filled on auth.cscs.ch" in cap.out
+    assert "safari.py --otp exited 2" in cap.err
+    assert "safari.py said: no visible field for code (input.x)" in cap.err
+
+
+def test_safari_said_masks_codes_and_keeps_one_line() -> None:
+    reply = alsafari.Reply(
+        2,
+        {},
+        "the code 493817 does not fit\n(6 boxes)",
+        stderr="usage: safari.py ...\nsafari.py: error: -T needs 12345678\x1b[0m",
+    )
+    said = alsafari.safari_said(reply)
+    assert "493817" not in said and "12345678" not in said
+    assert said.count("«digits»") == 2
+    assert "\n" not in said and "\x1b" not in said
+    assert said.startswith("the code «digits» does not fit (6 boxes) | usage:")
+    long = alsafari.Reply(1, {}, "x" * 1000)
+    assert len(alsafari.safari_said(long)) == alsafari.SAFARI_SAID_MAX
+    assert alsafari.safari_said(alsafari.Reply(2, {})) == ""
+
+
+def test_run_safari_py_keeps_its_stderr(tmp_path: Path) -> None:
+    fake = tmp_path / "safari.py"
+    fake.write_text(
+        "#!/bin/sh\n"
+        'echo \'{"ok": false, "error": "refused"}\'\n'
+        "echo 'safari.py: error: bad flag' >&2\n"
+        "exit 2\n",
+        encoding="utf-8",
+    )
+    fake.chmod(0o700)
+    reply = alsafari.run_safari_py(str(fake))(["--tabs"])
+    assert (reply.rc, reply.error) == (2, "refused")
+    assert reply.stderr.strip() == "safari.py: error: bad flag"
 
 
 def test_cscs_code_fill_killed_is_never_read_as_self_submitted() -> None:
