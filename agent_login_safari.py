@@ -828,8 +828,16 @@ CSCS_CODE_BOXES = 'input[inputmode="numeric"][aria-label^="Digit "]'
 # logged-out /profile/ never renders the header (straight to Keycloak).
 # Confirmed live in Albert's Safari on /profile/ after the 2026-11-12 login:
 # both alternatives match once, the guest placeholder is absent.
+# tp#1644, 2026-11-18: the portal's new (Tailwind) header no longer has
+# `.symbol-label`: the logged-in User menu toggle holds a `span.avatar`
+# (initials fallback inside). Read live in Albert's logged-in Safari on
+# /profile/: the third alternative matches once, the first two none, no
+# `.image-placeholder` in the toggle (excluded all the same: a guest's).
+# The old two stay for the old header.
 CSCS_SENTINEL = (
-    'button[aria-label="User menu"] .symbol-label,button .symbol-circle > .symbol-label'
+    'button[aria-label="User menu"] .symbol-label,'
+    "button .symbol-circle > .symbol-label,"
+    'button[aria-label="User menu"]:not(:has(.image-placeholder)) .avatar'
 )
 # site → its labels from B11 / B13's read-only probe. No labels entry → no
 # route (❌), never a guessed label.

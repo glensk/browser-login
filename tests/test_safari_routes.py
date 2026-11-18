@@ -2833,6 +2833,13 @@ def test_cscs_labels_build_the_one_page_login_then_the_six_box_code(
     assert not otp.fields  # safari.py's default code field → its one box group
     assert otp.needs == "split_otp" and "split_otp" in recipe.features()
     assert recipe.sentinel == alsafari.CSCS_SENTINEL
+    # tp#1644 2026-11-18: the new header's avatar (old and new header both),
+    # never a guest's placeholder
+    alts = recipe.sentinel.split(",")
+    assert 'button[aria-label="User menu"] .symbol-label' in alts
+    assert (
+        'button[aria-label="User menu"]:not(:has(.image-placeholder)) .avatar' in alts
+    )
     assert {"auth.cscs.ch", "portal.cscs.ch"} <= set(recipe.hosts)
     assert recipe.sentinel_host == "portal.cscs.ch" and not recipe.import_after
     assert recipe.start_url == CSCS_HOME and not recipe.stops
