@@ -339,7 +339,7 @@ Execution order from here: B8-B9 first, then B6-B7 (overseer decision).
   password step, never before; multi-account rows (abs-albert, navidrome-albert, DSM)
   → identity `mismatch` → exit 2 `wrong_account`; the DSM pair: exactly one routed,
   the other ⛔ `second_account` (or both ⛔ `not_held`).
-- [ ] B11 **[Albert]** label read + LIVE CANARY BP self-hosted: (0) DSM: one
+- [x] B11 **[Albert]** label read + LIVE CANARY BP self-hosted: (0) DSM: one
   `-L dsm-readonly -s -O` style identity read of Safari's DSM session (no login),
   which decides which DSM item is routed (the other ⛔ `second_account`; no session →
   both ⛔ `not_held`, no DSM login; Safari holds dsm-albert → stop and ask Albert, see

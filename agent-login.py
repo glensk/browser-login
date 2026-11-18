@@ -1094,8 +1094,9 @@ SAFARI_ROUTES: dict[str, SafariRoute] = {
     # the proof loads Teams, which signs in by SSO. Nothing is typed in Safari.
     "m365": SafariRoute("https://teams.cloud.microsoft/", "builtin"),
     # tp#1644 B10: the self-hosted broker logins, proven in Safari; their
-    # recipe = the listing row + `alsafari.BROKER_SAFARI_LABELS` (empty until
-    # B11's read-only label probe: ❌ until then). The landing = check_url.
+    # recipe = the listing row + `alsafari.BROKER_SAFARI_LABELS` (B11's
+    # read-only label probe; a site without labels stays ❌). The landing =
+    # check_url.
     **{
         site: SafariRoute(landing, "in_safari")
         for site, landing in (
@@ -1175,7 +1176,10 @@ SAFARI_ACCOUNT_GROUPS: dict[str, tuple[str, ...]] = {
     "claude": ("anthropic", "anthropic-private"),
     "console": ("console", "console-private"),
 }
-SAFARI_HELD: dict[str, str] = {}
+# tp#1644 B11 step 0 (2026-11-18): Safari's DSM tab showed the sign-in page
+# (username field, empty session user) — Safari holds no DSM account, so both
+# DSM rows are ⛔ not_held and no DSM login is routed.
+SAFARI_HELD: dict[str, str] = {"dsm": ""}
 # tp#1644 B16: groups whose members are routed only once `SAFARI_HELD`
 # decides them (Q1: which pair Safari holds is read, not asked): until then
 # no member is routed (❌) and `-L SITE -s -O` alone runs — its account read

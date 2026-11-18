@@ -893,6 +893,27 @@ BROKER_SAFARI_LABELS: dict[str, BrokerLabels] = {
             "Touch ID / OneAuth approval",
         ),
     ),
+    # tp#1644 B11: the self-hosted logins, read live (read-only, background
+    # tabs) in Albert's logged-out Safari 2026-11-18. Each is ONE visible
+    # form with the user field (name / autocomplete username, NPM type
+    # email) and the password; the label is the submit's rendered text
+    # (komga's Vuetify button renders upper-case). No CAPTCHA, no Access
+    # interstitial on these hosts. An unlabelled extra button inside a form
+    # (calibre, portainer, stirling: the eye toggle) never matches a label.
+    "aurral": BrokerLabels("one_page", pass_submit="Sign in"),
+    "calibre": BrokerLabels("one_page", pass_submit="Login"),
+    "kavita-admin": BrokerLabels("one_page", pass_submit="Sign in"),
+    "komga": BrokerLabels("one_page", pass_submit="SIGN IN"),
+    # Nginx Proxy Manager: "Sign in"; its two-factor page (the Login chunk of
+    # both installs' frontend, read 2026-11-18: input name "code",
+    # autocomplete one-time-code, buttons "Cancel" type=button and "Verify"
+    # type=submit) shows only for an account with 2FA on — the code step
+    # runs only after the password and only where that field shows.
+    "npm-nixos": BrokerLabels("one_page", pass_submit="Sign in", otp_submit="Verify"),
+    "npm-raspi": BrokerLabels("one_page", pass_submit="Sign in", otp_submit="Verify"),
+    "portainer-ds218": BrokerLabels("one_page", pass_submit="Login"),
+    "qbittorrent": BrokerLabels("one_page", pass_submit="Login"),
+    "stirling": BrokerLabels("one_page", pass_submit="Login"),
 }
 
 # tp#1644 B12: the sites' own Albert stops. Each regex names the challenge

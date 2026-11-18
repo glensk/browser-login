@@ -48,12 +48,24 @@ al = load_script("agent_login_tp1644_test", "agent-login.py")
 # Every listed login is classified exactly once
 # ---------------------------------------------------------------------------
 
+
 # The broker `sites` listing as of 2026-11-04 (fields the classification
 # reads; no names, URLs or usernames). A new broker item fails
 # `test_every_listed_login_is_classified_exactly_once` until it is added
 # here AND to `EXPECTED`. `cloudflare` is listed twice (one refused).
 # A labelled broker route (tp#1644 B13) also needs the fill fields its
 # recipe reads (`broker_recipe`).
+def _self_hosted(host: str, check: str, login: str) -> dict[str, Any]:
+    """The fill fields of a self-hosted listing row (one origin)."""
+    return {
+        "safari_fill": True,
+        "fill_only": False,
+        "fill_origins": [f"https://{host}"],
+        "check_url": f"https://{host}{check}",
+        "login_url": f"https://{host}{login}",
+    }
+
+
 LISTED_FILL: dict[str, dict[str, Any]] = {
     "zoho-desk": {
         "safari_fill": True,
@@ -62,6 +74,18 @@ LISTED_FILL: dict[str, dict[str, Any]] = {
         "check_url": "https://desk.zoho.eu/agent",
         "login_url": "https://desk.zoho.eu/agent",
     },
+    # tp#1644 B11: the self-hosted broker routes with probe labels
+    "aurral": _self_hosted("aurral.dom42.space", "/", "/"),
+    "calibre": _self_hosted("calibre.dom42.space", "/me", "/login"),
+    "kavita-admin": _self_hosted(
+        "kavita.dom42.space", "/home", "/login?skipAutoLogin=true"
+    ),
+    "komga": _self_hosted("komga.dom42.space", "/dashboard", "/login"),
+    "npm-nixos": _self_hosted("nginx-nix.dom42.space", "/", "/"),
+    "npm-raspi": _self_hosted("nginx.dom42.space", "/", "/"),
+    "portainer-ds218": _self_hosted("portainer.dom42.space", "/#!/home", "/#!/auth"),
+    "qbittorrent": _self_hosted("qbittorrent.dom42.space", "", ""),
+    "stirling": _self_hosted("stirling.dom42.space", "/", "/login"),
 }
 LISTING: list[dict[str, Any]] = [
     {
@@ -147,6 +171,16 @@ EXPECTED: dict[str, str] = {
             "m365",
             # tp#1644 B13: the broker SaaS route with probe labels
             "zoho-desk",
+            # tp#1644 B11: the self-hosted broker routes with probe labels
+            "aurral",
+            "calibre",
+            "kavita-admin",
+            "komga",
+            "npm-nixos",
+            "npm-raspi",
+            "portainer-ds218",
+            "qbittorrent",
+            "stirling",
         ),
         ROUTE,
     ),
@@ -155,6 +189,8 @@ EXPECTED: dict[str, str] = {
     "mullvad": "⛔ not_opted_in",
     "cloudflare": "⛔ refused",
     "myfritz": "⛔ on_demand",
+    # tp#1644 B11 step 0: Safari holds no DSM account (dsm-albert: admin wins)
+    "dsm-readonly": "⛔ not_held",
     **dict.fromkeys(
         (
             "abs-root",
@@ -173,12 +209,9 @@ EXPECTED: dict[str, str] = {
             "abs-albert",
             "anthropic",
             "anthropic-private",
-            "aurral",
-            "calibre",
             "console",
             "console-private",
             "cscs",
-            "dsm-readonly",
             "eduid",
             "github",
             "gitlab-com",
@@ -188,16 +221,9 @@ EXPECTED: dict[str, str] = {
             "immich",
             "infomaniak",
             "jellyfin",
-            "kavita-admin",
-            "komga",
             "navidrome-albert",
-            "npm-nixos",
-            "npm-raspi",
-            "portainer-ds218",
-            "qbittorrent",
             "runai-test3",
             "smartsheet",
-            "stirling",
             "switch",
             "switch-engines",
             "syncthing-nixos",
@@ -1301,7 +1327,9 @@ def test_pre_click_is_a_click_step_before_the_form() -> None:
 
 def test_b10_ships_no_labels_no_stops_and_no_identity_route() -> None:
     # tp#1644 B13 / B15: zoho-desk's and cscs' probe labels are the only ones
-    assert set(alsafari.BROKER_SAFARI_LABELS) == B13_LABELLED | B15_LABELLED
+    assert (
+        set(alsafari.BROKER_SAFARI_LABELS) == B11_LABELLED | B13_LABELLED | B15_LABELLED
+    )
     # tp#1644 B12: the SaaS sites' own stops only, none for B10's sites
     assert set(alsafari.BROKER_SAFARI_STOPS) == set(B12_STOPS)
     assert al.SAFARI_IDENTITY_READ_SAFE is False
@@ -1524,7 +1552,9 @@ def test_the_dsm_pair_routes_only_the_held_account(
 ) -> None:
     ro, adm = "dsm-readonly", "dsm-albert"
     admin_row = {"privilege": "admin"}
-    # undecided (B11 step 0 pending): no group reason, the admin rule only
+    # undecided: no group reason, the admin rule only (B11 step 0 decided
+    # the live table since: not held)
+    monkeypatch.delitem(al.SAFARI_HELD, "dsm")
     assert al.safari_why(ro, {}) == "" and not al.safari_routed(ro)
     assert al.safari_why(adm, admin_row) == "admin_account"
     labels = alsafari.BrokerLabels("one_page", pass_submit="Sign in")
@@ -2014,6 +2044,18 @@ def test_b12_the_fills_pass_their_field_selectors_to_safari_py() -> None:
 # tp#1644 B13: zoho-desk's labels (sign-in page markup, 2026-11-09)
 # ---------------------------------------------------------------------------
 
+# tp#1644 B11: the self-hosted sites whose login page the probe read
+B11_LABELLED = {
+    "aurral",
+    "calibre",
+    "kavita-admin",
+    "komga",
+    "npm-nixos",
+    "npm-raspi",
+    "portainer-ds218",
+    "qbittorrent",
+    "stirling",
+}
 B13_LABELLED = {"zoho-desk"}
 B15_LABELLED = {"cscs"}  # tp#1644 B15: the SSO batch's labels read so far
 # the real cscs labels, captured before any fixture swaps them
@@ -3031,3 +3073,48 @@ def test_cscs_needs_a_safari_py_that_splits_codes(
     out = capsys.readouterr().out
     assert "safari_py_outdated" in out and "split_otp" in out
     assert not cscs["safari"].ops(*FILLS)
+
+
+# ---------------------------------------------------------------------------
+# tp#1644 B11: the self-hosted labels (live read-only probe, 2026-11-18)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("site", sorted(B11_LABELLED))
+def test_b11_self_hosted_recipe_is_one_page_on_its_own_host(site: str) -> None:
+    row = {**BROW, "site": site, "identity": None, **LISTED_FILL[site]}
+    labels = alsafari.BROKER_SAFARI_LABELS[site]
+    recipe = alsafari.broker_recipe(row, labels)
+    assert recipe is not None
+    host = alsafari.safe_host(row["check_url"])
+    assert recipe.hosts == (host,) and recipe.sentinel_host == host
+    assert recipe.start_url == row["check_url"] and not recipe.import_after
+    assert recipe.steps[0].kind == "login" and recipe.steps[0].host == host
+    assert recipe.steps[0].submit == labels.pass_submit
+    kinds = [s.kind for s in recipe.steps]
+    otp = site in {"npm-nixos", "npm-raspi"}
+    assert kinds == (["login", "otp"] if otp else ["login"])
+    if otp:
+        assert recipe.steps[1].submit == "Verify" and recipe.steps[1].after == "login"
+    # no Albert wait, no prompt clicks, no site stops on these hosts
+    assert labels.albert_wait is None and not labels.post_clicks
+    assert site not in alsafari.BROKER_SAFARI_STOPS
+
+
+def test_b11_dsm_is_not_held_and_unlabelled_sites_stay_unbuilt() -> None:
+    assert al.SAFARI_HELD["dsm"] == ""
+    assert al.safari_why("dsm-readonly", {}) == "not_held"
+    assert al.safari_why("dsm-albert", {"privilege": "admin"}) == "admin_account"
+    # no label read (Access interstitial, server error, shadow-DOM submit,
+    # moved domain) or an identity row: no labels, never a guessed one
+    for site in (
+        "abs-albert",
+        "homeassistant",
+        "immich",
+        "jellyfin",
+        "navidrome-albert",
+        "syncthing-nixos",
+        "welib",
+        "dsm-readonly",
+    ):
+        assert site not in alsafari.BROKER_SAFARI_LABELS
