@@ -2821,7 +2821,11 @@ def test_cscs_labels_build_the_one_page_login_then_the_six_box_code(
     assert (otp.kind, otp.host, otp.submit) == ("otp", "auth.cscs.ch", "Verify Code")
     # the visible boxes, never the hidden #otp; only after the password
     assert otp.when == alsafari.CSCS_CODE_BOXES and otp.after == "login"
-    assert "maxlength" in otp.when and "#otp" not in otp.when
+    # tp#1644 B19: the login code page's boxes carry no maxlength (that was
+    # the set-up page's markup), but their own "Digit N" labels
+    assert 'aria-label^="Digit "' in otp.when and 'inputmode="numeric"' in otp.when
+    assert "maxlength" not in otp.when and "#otp" not in otp.when
+    assert otp.self_submits  # the page submits itself on the sixth digit
     assert not otp.fields  # safari.py's default code field → its one box group
     assert otp.needs == "split_otp" and "split_otp" in recipe.features()
     assert recipe.sentinel == alsafari.CSCS_SENTINEL
@@ -2866,10 +2870,99 @@ def test_cscs_login_then_the_code_boxes_then_the_portal(cscs: dict[str, Any]) ->
     login, otp = fills
     assert login[login.index("--submit") + 1] == "Sign in" and "--no-user" not in login
     assert otp[:2] == ["--otp", "Cscs Item"]
-    assert otp[otp.index("--submit") + 1] == "Verify Code"
+    assert "--submit" not in otp  # the code page submits itself (tp#1644 B19)
     assert not any(a.startswith("--otp-field") for a in otp)
     assert _host(login) == _host(otp) == "auth.cscs.ch"
     assert cscs["safari"].landing_opens() == [["--open", CSCS_HOME, "--wait", "20"]]
+
+
+class SelfSubmitSafari(Safari):
+    """safari.py on CSCS's self-submitting code page: the `--otp` fill
+    answers `otp_reply` (the page goes on when its rc is 1 with the code
+    in the page, or 0)."""
+
+    def __init__(self, recipe: alsafari.Recipe, script: list, otp_reply: Any) -> None:
+        super().__init__(recipe, script)
+        self.otp_reply = otp_reply
+
+    def __call__(self, args: list[str]) -> alsafari.Reply:
+        if args[0] != "--otp":
+            return super().__call__(args)
+        self.calls.append(list(args))
+        reply: alsafari.Reply = self.otp_reply
+        if reply.rc == 0 or reply.data.get("filled") is True:
+            self.pos += 1
+        return reply
+
+
+# safari.py's answer when its second fill call found the page gone on
+# (exit 1, the code in the page, not submitted BY safari.py)
+WENT_ON = alsafari.Reply(
+    1, {"ok": False, "exit": 1, "filled": True, "submitted": False}, "pasted"
+)
+CSCS_FORM = (
+    CSCS_LOGIN,
+    w._page(user=True, password=True, steps=[[True, False], [False, False]]),
+)
+CSCS_BOXES = (CSCS_LOGIN, w._page(code=True, steps=[[False, False], [True, False]]))
+
+
+def _go_cscs_self(st: dict[str, Any], script: list, otp_reply: Any) -> int:
+    recipe = al.safari_recipe("cscs")
+    assert recipe is not None
+    st["safari"] = SelfSubmitSafari(recipe, script, otp_reply)
+    rc: int = al.safari_target_action("cscs", "")
+    return rc
+
+
+@pytest.mark.parametrize(
+    "otp_reply", [WENT_ON, alsafari.Reply(0, {"ok": True})], ids=["went-on", "ok"]
+)
+def test_cscs_code_page_that_submitted_itself_lands_without_a_second_fill(
+    cscs: dict[str, Any], otp_reply: alsafari.Reply
+) -> None:
+    flow = [CSCS_FORM, CSCS_BOXES, (CSCS_HOME, w._page(sentinel=True))]
+    assert _go_cscs_self(cscs, flow, otp_reply) == 0
+    fake = cscs["safari"]
+    assert [c[0] for c in fake.ops(*FILLS)] == ["--login", "--otp"]
+    assert not any("--submit" in c for c in fake.ops("--otp"))
+    assert not fake.ops("--click")  # "Verify Code" is never clicked
+    assert al.als.quarantined("cscs") is None
+    assert fake.landing_opens() == [["--open", CSCS_HOME, "--wait", "20"]]
+
+
+def test_cscs_code_page_that_stays_types_the_code_once_and_quarantines(
+    cscs: dict[str, Any], capsys: pytest.CaptureFixture[str]
+) -> None:
+    # a wrong / refused code: the page shows the boxes again — the run waits
+    # out the post-submit window and stops, never typing the code again
+    flow = [CSCS_FORM, CSCS_BOXES]
+    assert _go_cscs_self(cscs, flow, WENT_ON) == 2
+    fake = cscs["safari"]
+    assert [c[0] for c in fake.ops(*FILLS)] == ["--login", "--otp"]
+    out = capsys.readouterr().out
+    assert "recipe_stuck" in out or "after_submit" in out
+    assert al.als.quarantined("cscs") is not None
+
+
+def test_cscs_code_fill_refused_before_the_fill_is_a_failure(
+    cscs: dict[str, Any],
+) -> None:
+    refused = alsafari.Reply(2, {"ok": False, "exit": 2}, "no visible field")
+    flow = [CSCS_FORM, CSCS_BOXES]
+    assert _go_cscs_self(cscs, flow, refused) == 2
+    fake = cscs["safari"]
+    assert [c[0] for c in fake.ops(*FILLS)] == ["--login", "--otp"]
+    assert al.als.quarantined("cscs") is not None  # the password went out
+
+
+def test_cscs_code_fill_killed_is_never_read_as_self_submitted() -> None:
+    killed = alsafari.Reply(1, {"filled": True}, "", killed=True)
+    assert not alsafari.Machine._self_submitted(killed)
+    assert not alsafari.Machine._self_submitted(alsafari.Reply(1, {}, "x"))
+    assert not alsafari.Machine._self_submitted(alsafari.Reply(2, {"filled": True}))
+    assert alsafari.Machine._self_submitted(WENT_ON)
+    assert alsafari.Machine._self_submitted(alsafari.Reply(0, {"ok": True}))
 
 
 def test_cscs_needs_a_safari_py_that_splits_codes(

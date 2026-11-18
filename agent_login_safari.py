@@ -259,6 +259,13 @@ class Step:  # pylint: disable=too-many-instance-attributes
     # `split_otp` — an older safari.py would fill one box after the password
     # was sent ('' = none).
     needs: str = ""
+    # tp#1644 B19: an otp step on a page that submits itself once the code
+    # is in (CSCS's six boxes): safari.py fills without `--submit` (a click
+    # next to the page's own submit could send the code twice); a fill that
+    # answered — ok, or exit 1 with the code in the page (the page went on
+    # under safari.py's second fill call) — counts as submitted: the run
+    # waits for the sentinel (`POST_SUBMIT_S`), never types it again.
+    self_submits: bool = False
 
 
 @dataclass(frozen=True)
@@ -641,6 +648,9 @@ class BrokerLabels:  # pylint: disable=too-many-instance-attributes
     # tp#1644 B15: the TOTP page splits the code into one-digit boxes (the
     # code step needs safari.py's `split_otp`)
     otp_split: bool = False
+    # tp#1644 B19: the code page submits itself once the code is in (CSCS):
+    # the code step fills without `--submit` (`Step.self_submits`)
+    otp_self_submits: bool = False
 
 
 BROKER_SHAPES = frozenset({"one_page", "two_step"})
@@ -661,12 +671,20 @@ ZOHO_PASSWORD = '#password_container:not(.zeroheight) input[type="password"]'
 ZOHO_WAIT_S = 90.0  # Albert's Touch ID / OneAuth approval (tp#1644)
 # tp#1644 B15, CSCS (auth.cscs.ch, Keycloak theme `cscs-v2`; the login page
 # read live in Albert's Safari 2026-11-12, the code page from the theme's
-# public bundle KcPage-*.js, component for login-otp.ftl): the code page
-# shows six visible `input[type=text][inputmode=numeric][maxlength=1]` boxes
-# plus a hidden `#otp` its script keeps in sync; "Verify Code" (a <button>,
-# type submit) stays disabled until all six hold a digit; nothing submits on
-# the sixth digit. The `when` names the boxes, never the hidden field.
-CSCS_CODE_BOXES = 'input[inputmode="numeric"][maxlength="1"]'
+# public bundle KcPage-*.js, component for login-otp.ftl). Re-read
+# 2026-11-17 after the keep-alive stalled on it (heading "Two-Factor
+# Authentication", label "One-Time Code", button "Verify Code", one form
+# without an id, fields: text): six visible `input[type=text]
+# [inputmode=numeric]` boxes WITHOUT a maxlength, `aria-label` "Digit 1" ..
+# "Digit 6" (the first also `autocomplete=one-time-code`), plus a hidden
+# `#otp` its script keeps in sync. The `maxlength=1` boxes of the first read
+# belong to the theme's OTHER code pages (the TOTP set-up page "Set Up
+# Two-Factor Authentication", the "Verification Code" page) — that selector
+# never matched this one. The page SUBMITS ITSELF once all six boxes hold a
+# digit (its effect calls `form.requestSubmit()`); "Verify Code" stays
+# disabled until then and while it verifies. The `when` names the boxes by
+# their own labels, never the hidden field.
+CSCS_CODE_BOXES = 'input[inputmode="numeric"][aria-label^="Digit "]'
 # The portal (Waldur, portal.cscs.ch): the header's user-menu toggle holds
 # the user's avatar (`.symbol-label`: initials or picture) when logged in, an
 # `.image-placeholder` for a guest (Layout-*.js `UserMenuToggle`, Avatar-*.js,
@@ -686,6 +704,8 @@ BROKER_SAFARI_LABELS: dict[str, BrokerLabels] = {
     # anonymous /profile/ falls through to /api-auth/default/init/ →
     # auth.cscs.ch (a Kerberos 401 page that posts itself on). No SMS / push /
     # passkey / CAPTCHA up to the code page. The listing has no sentinel.
+    # The code page submits itself on the sixth digit: the code step clicks
+    # nothing (`otp_self_submits`).
     "cscs": BrokerLabels(
         "one_page",
         pass_submit="Sign in",
@@ -694,6 +714,7 @@ BROKER_SAFARI_LABELS: dict[str, BrokerLabels] = {
         sentinel=CSCS_SENTINEL,
         otp_when=CSCS_CODE_BOXES,
         otp_split=True,
+        otp_self_submits=True,
     ),
     # `#login_id` (autocomplete "webauthn username email", type text):
     # safari.py's default user field misses it. One `#nextbtn` reads "Next"
@@ -883,6 +904,7 @@ def _broker_steps(labels: BrokerLabels, idp: str, pre_click: str) -> tuple[Step,
                 after="login",
                 fields=_fields(("--otp-field", labels.otp_field)),
                 needs="split_otp" if labels.otp_split else "",
+                self_submits=labels.otp_self_submits,
             )
         )
     steps += [
@@ -2464,6 +2486,12 @@ class Machine:  # pylint: disable=too-many-instance-attributes
             self.out.credential = True
         if reply.rc == 2 and step.optional and not interrupted(reply):
             return None  # refused before anything was copied: not offered here
+        if step.self_submits and self._self_submitted(reply):
+            # the page sends the code itself: wait for the sentinel, never
+            # type or click again (the step is done)
+            self.submitted = True
+            self.submit_deadline = self.clock() + POST_SUBMIT_S
+            return None
         if reply.rc != 0:
             return self._fail(reply, step.kind, args)
         if step.prompt:
@@ -2471,6 +2499,17 @@ class Machine:  # pylint: disable=too-many-instance-attributes
                 f"▶ {self.recipe.site}: clicked {step.trigger} on {step.prompt}"
             )
         return None
+
+    @staticmethod
+    def _self_submitted(reply: Reply) -> bool:
+        """tp#1644 B19: a fill on a self-submitting code page answered — ok,
+        or exit 1 with ``"filled": true`` (the code went into the page, then
+        safari.py's second fill call found the page gone on: it submitted
+        itself). Anything else (a refusal before the fill, a timeout, a
+        signal) is a failure as before."""
+        if interrupted(reply):
+            return False
+        return reply.rc == 0 or (reply.rc == 1 and reply.data.get("filled") is True)
 
     def _step_args(self, step: Step) -> list[str] | None:
         on = self._on(step.host)
@@ -2483,7 +2522,9 @@ class Machine:  # pylint: disable=too-many-instance-attributes
         # `--opt=SEL`: a selector is never read as an option of its own
         fields = [f"{opt}={sel}" for opt, sel in step.fields if opt in FIELD_OPTS]
         if step.kind == "otp":
-            return ["--otp", self.plan.item, *on, "--submit", step.submit, *fields]
+            # a self-submitting page gets no `--submit` (the page submits)
+            submit = [] if step.self_submits else ["--submit", step.submit]
+            return ["--otp", self.plan.item, *on, *submit, *fields]
         if step.kind == "user":
             return [
                 "--login",
