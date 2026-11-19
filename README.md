@@ -1555,8 +1555,22 @@ the schema ccc reads as `balance_json:<path>`. A failed run keeps the last good
 figures and their `measured_at` and sets a typed `status` (`logged_out`,
 `wrong_account`, `browser_down`, `busy`, `timeout`, `page_error`); a logged-out
 account is not retried for 6 h (`-f` retries now), so the 4-hourly run does not
-start the private browser for a session only you can restore. Exit 0 all read,
+start the private browser for a dead session. Exit 0 all read,
 2 logged out / wrong account, 1 other failure.
+
+**Logging in.** A `logged_out` or `wrong_account` reading carries the hint
+`agent: -L console` (work) or `agent: -L console-private` (private) as its `error`
+(ccc's card line); the expected account is named in the run's log line
+(`wrong_account — … (expected <account>)`). An agent renews the session by magic link;
+`-g` is the hand fallback:
+
+```commands
+./agent-login.py -L console           # agent: work (shared Chromium)
+./agent-login.py -L console-private   # agent: private instance
+./agent-login.py -g <site>            # by hand: guided login, same <site>
+bin/browser.py logged-in console      # check the session
+./console-balance.py -a work -f       # read now, skipping the 6 h back-off (or -a private -f)
+```
 
 Same run, a second fresh tab on `claude.ai/new` reads the one-time **Claude Code
 cloud-session credit** (tp#1429; GET only): `/v1/code/promo/cloud_credit` (state,

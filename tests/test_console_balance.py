@@ -207,7 +207,48 @@ def test_main_exit_codes(tmp_path: Path, fake_browser: dict, capsys) -> None:
     assert "✅ work: promo $498.03 of $500.00" in capsys.readouterr().out
     fake_browser["page"] = {"state": "logged_out"}
     assert cb.main(["-a", "work", "-o", str(tmp_path), "-f"]) == 2
-    assert "❌ work: logged_out" in capsys.readouterr().out
+    assert "❌ work: logged_out — agent: -L console" in capsys.readouterr().out
+
+
+def _page_answer(page: dict[str, Any]) -> str:
+    return json.dumps(json.dumps(page)) + "\n"
+
+
+@pytest.mark.parametrize(
+    ("label", "site"), [("work", "console"), ("private", "console-private")]
+)
+def test_logged_out_and_wrong_account_hints_tell_an_agent_to_run_l(
+    label: str, site: str
+) -> None:
+    hint = f"agent: -L {site}"
+    assert cb.ACCOUNTS[label] == site
+    out = cb.interpret(site, _page_answer({"state": "logged_out"}))
+    assert out == ("logged_out", hint, None)
+    out = cb.interpret(site, _page_answer(dict(PAGE, email="someone@example.org")))
+    assert out == ("wrong_account", hint, None)
+
+
+@pytest.mark.parametrize("site", sorted(cb.ACCOUNTS.values()))
+def test_every_hint_fits_the_card_line(site: str) -> None:
+    hints = {
+        cb.interpret(site, _page_answer(page))[1]
+        for page in ({"state": "logged_out"}, dict(PAGE, email="someone@example.org"))
+    }
+    assert hints == {cb.renew_hint(site)}
+    assert all(len(hint) <= cb.CARD_LINE_MAX == 34 for hint in hints)
+
+
+def test_wrong_account_log_line_names_the_expected_account(
+    tmp_path: Path, fake_browser: dict, capsys
+) -> None:
+    fake_browser["page"] = dict(PAGE, email="someone@example.org")
+    assert cb.main(["-a", "work", "-o", str(tmp_path), "-f"]) == 2
+    out = capsys.readouterr().out
+    want = cb.CONSOLE_ACCOUNTS["console"]
+    assert f"❌ work: wrong_account — agent: -L console (expected {want})" in out
+    assert json.loads((tmp_path / "work.json").read_text())["error"] == (
+        "agent: -L console"
+    )
 
 
 def test_console_sites_are_wired_per_account() -> None:

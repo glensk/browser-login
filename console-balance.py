@@ -26,8 +26,9 @@ file (0600, written atomically) that ccc reads as ``balance_json:<path>``
 
 A logged-out (or wrong-account) account is not re-tried for
 BACKOFF_S unless -f is given, so a scheduled run does not start the private
-browser every 4 hours for a session only Albert can restore
-(``./agent-login.py -g console-private``).
+browser every 4 hours for a dead session. An agent renews it by magic link
+with ``./agent-login.py -L console`` / ``-L console-private``; the file's
+``error`` says so as ``agent: -L <site>`` (short enough for ccc's card line).
 
 Exit: 0 every account read, 2 some account logged out / wrong account,
 1 any other failure (browser, page, file).
@@ -82,6 +83,15 @@ UP_WAIT_S = 60.0
 # `browser.py down` of a busy Mac can outlast agent-login's 60 s budget (2026-10-29).
 DOWN_S = 240.0
 LOGGED_OUT = frozenset({"logged_out", "wrong_account"})
+# ccc shows a failed reading's `error` as one card line, clipped at this width.
+CARD_LINE_MAX = 34
+
+
+def renew_hint(site: str) -> str:
+    """The `error` of a logged-out / wrong-account reading: an instruction to an
+    agent (`agent-login.py -L` is agent-invoked only), not a command for Albert."""
+    return f"agent: -L {site}"
+
 
 # Runs in the fresh tab. Waits (≤ 30 s) for the page to name its organisation
 # (an /api/organizations/<uuid>/ request) or to land on /login, then GETs the
@@ -506,14 +516,12 @@ def interpret(site: str, stdout: str) -> tuple[str, str, dict[str, Any] | None]:
     state = raw.get("state")
     want = CONSOLE_ACCOUNTS[site].lower()
     if state == "logged_out":
-        status, error = "logged_out", f"log in once: ./agent-login.py -g {site}"
+        status, error = "logged_out", renew_hint(site)
     elif state != "ok":
         status, error = "page_error", str(raw.get("why") or state)
     elif str(raw.get("email") or "").lower() != want:
-        status, error = (
-            "wrong_account",
-            f"the browser holds another Console account, not {want}",
-        )
+        # The expected account goes to the log via `_summary`, not the card line.
+        status, error = "wrong_account", renew_hint(site)
     else:
         try:
             return "ok", "", parse_page(raw)
@@ -563,6 +571,9 @@ def _summary(label: str, status: str, data: dict[str, Any]) -> str:
             f"⏸  {label}: skipped — {data.get('status')} {ago} min ago "
             f"({data.get('error')}); -f retries now"
         )
+    if status == "wrong_account":
+        want = CONSOLE_ACCOUNTS[ACCOUNTS[label]]
+        return f"❌ {label}: {status} — {data.get('error')} (expected {want})"
     if status != "ok":
         return f"❌ {label}: {status} — {data.get('error')}"
     promo = ", ".join(
