@@ -37,20 +37,21 @@ import argparse
 import http.server
 import json
 import os
-import socket
-import subprocess
 import sys
 import tempfile
 import threading
 import time
-import urllib.request
 from pathlib import Path
 from typing import Any
 
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
 
-from chromium_page import chromium_executable, load_script  # noqa: E402
+from chromium_page import (  # noqa: E402
+    chromium_executable,
+    disposable_chromium,
+    load_script,
+)
 
 PAIR_HTML = b"""<!doctype html><html><head><title>pending</title></head>
 <body><p id=p>pair</p>
@@ -60,12 +61,6 @@ PAIR_HTML = b"""<!doctype html><html><head><title>pending</title></head>
 FRAGMENT = "#code-123"
 # Generous: the host may be loaded; a reply at all is what B1 asks.
 EVAL_BUDGET_S = 20.0
-
-
-def _free_port() -> int:
-    with socket.socket() as s:
-        s.bind(("127.0.0.1", 0))
-        return int(s.getsockname()[1])
 
 
 class _Server:
@@ -217,7 +212,7 @@ def _case_open(browser: Any, port: int, ws_url: str, url: str) -> dict[str, Any]
     browser._cdp_create_background_target = create_spy
     t0 = time.monotonic()
     try:
-        tid, why = browser._open_create_target(port, ws_url, url)
+        tid, why, _info = browser._open_create_target(port, ws_url, url)
         t_nav = time.monotonic() - t0
         info = browser._await_target_load(port, tid) if tid else {}
         t_load = time.monotonic() - t0
@@ -295,62 +290,33 @@ def _case_late_navigate(
 
 
 def _run_order(
-    browser: Any, exe: str, order: list[str], tmp: Path, urls: list[str] | None = None
+    browser: Any, order: list[str], tmp: Path, urls: list[str] | None = None
 ) -> dict[str, Any]:
     """One fresh browser + one fresh server; the cases of `order` in sequence.
 
     With `urls` (the attended H3 run): those URLs in sequence instead, no
     local `/pair` cases and no H2 probe."""
-    port = _free_port()
-    assert port not in browser.INSTANCE_PORTS.values()
     server = _Server()
-    proc = subprocess.Popen(  # pylint: disable=consider-using-with
-        [
-            exe,
-            "--headless=new",
-            f"--remote-debugging-port={port}",
-            f"--user-data-dir={tmp / 'profile'}",
-            "--no-first-run",
-            "--no-default-browser-check",
-            "about:blank",
-        ],
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-    )
     try:
-        deadline = time.monotonic() + 60
-        version: dict[str, Any] = {}
-        while True:
-            try:
-                with urllib.request.urlopen(
-                    f"http://127.0.0.1:{port}/json/version", timeout=1
-                ) as r:
-                    version = json.loads(r.read())
-                break
-            except OSError:
-                if time.monotonic() > deadline:
-                    raise
-                time.sleep(0.1)
-        ws_url = version["webSocketDebuggerUrl"]
-        base = f"http://127.0.0.1:{server.port}/pair"
-        if urls:
-            cases = [_case_open(browser, port, ws_url, u) for u in urls]
-        else:
-            cases = [_case_open(browser, port, ws_url, base + s) for s in order]
-            cases.append(_case_late_navigate(browser, port, ws_url, base + FRAGMENT))
-        return {
-            "browser": version.get("Browser"),
-            "mode": browser._browser_mode(port),
-            "cases": cases,
-            "server_log": server.log,
-        }
+        with disposable_chromium(
+            tmp / "profile", 60, browser.INSTANCE_PORTS.values()
+        ) as (port, version):
+            ws_url = version["webSocketDebuggerUrl"]
+            base = f"http://127.0.0.1:{server.port}/pair"
+            if urls:
+                cases = [_case_open(browser, port, ws_url, u) for u in urls]
+            else:
+                cases = [_case_open(browser, port, ws_url, base + s) for s in order]
+                cases.append(
+                    _case_late_navigate(browser, port, ws_url, base + FRAGMENT)
+                )
+            return {
+                "browser": version.get("Browser"),
+                "mode": browser._browser_mode(port),
+                "cases": cases,
+                "server_log": server.log,
+            }
     finally:
-        proc.terminate()
-        try:
-            proc.wait(timeout=10)
-        except subprocess.TimeoutExpired:
-            proc.kill()
-            proc.wait(timeout=10)
         server.stop()
 
 
@@ -372,16 +338,15 @@ def main() -> int:
     os.environ.pop("CLAUDE_BROWSER_LEASE_HELD", None)
     (root / "cache").mkdir()
     browser = load_script("bin/browser.py", "tp1900_browser")
-    exe = chromium_executable()
-    if not exe:
+    if not chromium_executable():
         print("no Playwright Chromium", file=sys.stderr)
         return 2
     evidence = (
-        {"urls": _run_order(browser, exe, [], root / "u", args.url)}
+        {"urls": _run_order(browser, [], root / "u", args.url)}
         if args.url
         else {
-            "plain-first": _run_order(browser, exe, ["", FRAGMENT], root / "a"),
-            "fragment-first": _run_order(browser, exe, [FRAGMENT, ""], root / "b"),
+            "plain-first": _run_order(browser, ["", FRAGMENT], root / "a"),
+            "fragment-first": _run_order(browser, [FRAGMENT, ""], root / "b"),
         }
     )
     Path(args.out).write_text(json.dumps(evidence, indent=2) + "\n", encoding="utf-8")

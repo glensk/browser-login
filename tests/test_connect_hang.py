@@ -912,3 +912,119 @@ def test_cli_close_rejects_ids_and_urls_together(tmp_path):
     )
     assert proc.returncode == 2
     assert "not both" in proc.stderr
+
+
+# --- open verifies the navigation (tp#1900) ----------------------------------
+
+FRAG_URL = "https://hub.example.test/pair#code-123"
+
+
+def _navigate_params(fake: FakeCdp, tid: str) -> list[str]:
+    return [
+        m["params"]["url"]
+        for m in fake.targets[tid].received
+        if m.get("method") == "Page.navigate"
+    ]
+
+
+@pytest.mark.parametrize(
+    "url", [FRAG_URL, "https://hub.example.test/pair"], ids=["fragment", "plain"]
+)
+def test_open_passes_the_url_through_untouched(fake, cache, capsys, url):
+    """(a)/(b) the fragment reaches Page.navigate byte for byte; the marker is
+    only ever the createTarget URL."""
+    fake.add("EXIST001", "https://ok.example/", "ok")
+    assert browser.cmd_open(fake.port, url, new=True) == 0
+    (tid,) = fake.created
+    assert f"target={tid}" in capsys.readouterr().out
+    assert _navigate_params(fake, tid) == [url]
+    (create,) = fake.create_params
+    assert browser._is_owned_marker(create["url"])
+    marker = browser._marker_of_url(create["url"])
+    assert marker is not None
+    assert marker not in _navigate_params(fake, tid)[0]
+    assert fake.targets[tid].url == url
+
+
+def test_open_that_never_leaves_its_marker_fails_and_closes_the_tab(
+    fake, cache, monkeypatch, capsys
+):
+    """(c) a navigate acknowledged without a loader that never commits."""
+    fake.add("EXIST001", "https://ok.example/", "ok")
+    fake.navigate_noop = True
+    monkeypatch.setattr(browser, "OPEN_LOAD_BUDGET_S", 0.3, raising=False)
+    assert browser.cmd_open(fake.port, FRAG_URL, new=True) == 1
+    cap = capsys.readouterr()
+    assert "target=" not in cap.out
+    assert cap.err.count("❌") == 1
+    assert "hub.example.test" in cap.err
+    assert "code-123" not in cap.err + cap.out
+    (tid,) = fake.created
+    assert tid in fake.closed and set(fake.targets) == {"EXIST001"}
+
+
+def test_open_redirect_to_another_origin_succeeds_with_one_warning(fake, cache, capsys):
+    """(d)"""
+    fake.add("EXIST001", "https://ok.example/", "ok")
+    fake.navigate_redirect_to = "https://sso.example.test/login?next=secret"
+    assert browser.cmd_open(fake.port, FRAG_URL, new=True) == 0
+    cap = capsys.readouterr()
+    (tid,) = fake.created
+    assert f"target={tid}" in cap.out
+    assert cap.err.count("⚠") == 1
+    assert "redirected to" in cap.err and "sso.example.test" in cap.err
+    assert "secret" not in cap.err and "code-123" not in cap.err
+    assert tid not in fake.closed
+
+
+def test_open_wait_option_reaches_cmd_open_and_is_clamped(cache, monkeypatch):
+    """(e) `-w` parses; cmd_open clamps it to OPEN_WAIT_MAX_S (50 s)."""
+    real_open = browser.cmd_open
+    seen: list[object] = []
+
+    def fake_open(_port, _url, **kw):
+        seen.append(kw.get("wait_s"))
+        return 0
+
+    monkeypatch.setattr(browser, "cmd_open", fake_open)
+    monkeypatch.setattr(browser, "_preflight", lambda *_a, **_k: None)
+    monkeypatch.setattr(browser, "_ensure_cmd_deps", lambda _cmd: None)
+    monkeypatch.setattr(
+        sys, "argv", ["browser.py", "--cdp-port", "1", "open", "-w", "7", FRAG_URL]
+    )
+    rc = browser.main()
+    assert (rc, seen) == (0, [7.0])
+
+    raw: list[object] = []
+
+    def fake_raw(_port, _url, **kw):
+        raw.append(kw["wait_s"])
+        return 0
+
+    monkeypatch.setattr(browser, "_open_new_raw", fake_raw)
+    monkeypatch.setattr(browser, "cmd_open", real_open)
+    assert browser.cmd_open(1, FRAG_URL, wait_s=90.0) == 0
+    assert browser.cmd_open(1, FRAG_URL, wait_s=7.0) == 0
+    assert browser.cmd_open(1, FRAG_URL) == 0
+    assert raw == [50.0, 7.0, None]
+
+
+def test_open_about_blank_succeeds_once_the_tab_left_its_marker(fake, cache):
+    """(f)"""
+    fake.add("EXIST001", "https://ok.example/", "ok")
+    assert browser.cmd_open(fake.port, "about:blank", new=True) == 0
+    (tid,) = fake.created
+    assert fake.targets[tid].url == "about:blank"
+    assert tid not in fake.closed
+
+
+def test_open_commit_to_a_data_url_succeeds(fake, cache, capsys):
+    """(g) a non-http(s) commit needs no origin comparison."""
+    fake.add("EXIST001", "https://ok.example/", "ok")
+    fake.navigate_redirect_to = "data:text/html,x"
+    assert browser.cmd_open(fake.port, FRAG_URL, new=True) == 0
+    cap = capsys.readouterr()
+    (tid,) = fake.created
+    assert f"target={tid}" in cap.out
+    assert "❌" not in cap.err
+    assert tid not in fake.closed

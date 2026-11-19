@@ -205,13 +205,13 @@ websocket or moves to O5's attached session is B1's output, not a guess here.
   no pairing request). Output: a `## Root cause` section handed back to the
   overseer (plan edits are the overseer's), naming the chosen B2 variant, or
   "not reproduced → verification-only B2 + follow-up ticket".
-- [ ] B2 [opus] (after B1) `bin/browser.py` in the worktree: the B1 navigation fix
+- [x] B2 [opus] (after B1) `bin/browser.py` in the worktree: the B1 navigation fix
   (Design 1) + navigation verification and `-w/--wait` (Design 2) + the
   `open_navigate` journal event (Design 3); `open`'s help/description names the
   exit-1 case. Touches `_open_create_target`, `_cdp_navigate_target`,
   `_await_target_load`, `_open_new_raw`, `cmd_open`, `_add_open_eval_parsers`,
   the `open` dispatch (21761). Nothing else reads the marker differently.
-- [ ] B3 [sonnet/tests] `tests/fake_cdp.py` + `tests/test_connect_hang.py`
+- [x] B3 [sonnet/tests] `tests/fake_cdp.py` + `tests/test_connect_hang.py`
   (no real browser): fake `_navigate` (fake_cdp.py:241) gains `navigate_noop`
   (returns `{"frameId": <tid>}` with NO `loaderId` and NO `errorText`, leaves
   `target.url` on the marker — the incident's shape per the journal) and
@@ -225,18 +225,18 @@ websocket or moves to O5's attached session is B1's output, not a guess here.
   and `-w 90` is clamped to 50; (f) `open about:blank` → exit 0 once the tab left
   its marker; (g) a commit to `data:text/html,x` → exit 0. (c) must fail on HEAD
   (today it exits 0): the builder shows that once before B2's code is in.
-- [ ] B4 [sonnet/tests] `tests/test_open_fragment_chromium.py` (new,
+- [x] B4 [sonnet/tests] `tests/test_open_fragment_chromium.py` (new,
   `@pytest.mark.launches_chrome`, skipped when Playwright's Chromium is missing;
   disposable Chromium + local `http.server` as in B1, never the shared browser):
   `cmd_open` on `/pair` and on `/pair#code-123` → both exit 0; `eval -T <id>`
   (`_eval_target_raw`) returns `location.hash` `""` and `"#code-123"`
   respectively; the browser is stopped in a `finally`. Deterministic: the server
   answers instantly, one open per case, no repeats.
-- [ ] B5 [sonnet/docs] README `open` rows (around line 76): exit 1 when the tab
+- [x] B5 [sonnet/docs] README `open` rows (around line 76): exit 1 when the tab
   did not navigate within `-w` (default 15 s), the ⚠ redirect line, fragments are
   passed through untouched; one line in the owned-tabs section that the marker is
   only ever the initial `about:blank` of the tab.
-- [ ] B6 [opus] Verify + install the LIVE `bin/browser.py` + land: `ruff format`, `ruff check`,
+- [x] B6 [opus] Verify + install the LIVE `bin/browser.py` + land: `ruff format`, `ruff check`,
   `mypy`, `uv run pylint` on the touched files; targeted tests
   (`tests/test_connect_hang.py`, `tests/test_owned_tabs_tp845.py`,
   `tests/test_tab_reaper.py`, `tests/test_guided_login.py`, the B4 file); full

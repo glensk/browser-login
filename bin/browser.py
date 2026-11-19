@@ -451,10 +451,27 @@ def _add_open_eval_parsers(sub: Any) -> None:
             "the ✓ line. That id is the caller's tab: pass it to `eval -T` and "
             "`close -i`. Never navigates a tab it did not create — not even a "
             "blank one, which may be another client's fresh `open -N` tab "
-            "(tp#863)."
+            "(tp#863). The URL, fragment included, is passed to Chrome "
+            "untouched. Exit 1 — the tab closed, no `target=` line — when "
+            "the new tab did not leave its initial blank page within -w "
+            "seconds (tp#1900). A redirect to another origin still "
+            "succeeds, with one `⚠ open: redirected to <origin>` line on "
+            "stderr; a Chrome error page (DNS, refused …) still succeeds."
         ),
     )
     po.add_argument("url", help="URL to open.")
+    po.add_argument(
+        "-w",
+        "--wait",
+        type=_positive_seconds,
+        default=None,
+        metavar="SECONDS",
+        help=f"total deadline for the new tab to navigate, Page.navigate "
+        f"included (default {OPEN_LOAD_BUDGET_S:g}, at most "
+        f"{OPEN_WAIT_MAX_S:g}: larger values are clamped). On expiry the tab "
+        "is closed: a ❌ line naming only the origin, exit 1. Not used with "
+        "-r when an existing tab is reused.",
+    )
     pog = po.add_mutually_exclusive_group()
     pog.add_argument(
         "-r",
@@ -6025,33 +6042,98 @@ def _is_blank(url: str) -> bool:
     return not url or url == "about:blank" or url.startswith("chrome://")
 
 
-def _await_target_load(port: int, tid: str, timeout_s: float = 15.0) -> dict:
-    """Poll ``/json/list`` until target `tid` left the blank page; its listing.
+def _await_target_load(
+    port: int, tid: str, timeout_s: float = 15.0, blank_ok: bool = False
+) -> dict:
+    """Poll ``/json/list`` until target `tid` left its marker; its listing.
 
     Returns the last listing seen for `tid` (``{}`` if it never appeared).
+    Left = listed on a URL that is neither its owner marker nor
+    ``about:blank`` (``about:blank`` counts as left when `blank_ok`: the
+    caller asked for it). A listed URL of ``""`` is undecided — Chromium
+    briefly lists one right after a commit (tp#1900 B1) — so the poll goes
+    on; it never reads as "still on the marker".
     """
     info: dict = {}
-    deadline = time.time() + timeout_s
-    while time.time() < deadline:
-        targets = _cdp_get(port, "/json/list")
+    deadline = time.monotonic() + timeout_s
+    while True:
+        left = deadline - time.monotonic()
+        targets = _cdp_get(port, "/json/list", timeout=max(0.01, min(2.0, left)))
         for t in targets if isinstance(targets, list) else []:
             if isinstance(t, dict) and t.get("id") == tid:
                 info = t
                 break
-        url = info.get("url")
-        if url not in (None, "", "about:blank") and not _is_owned_marker(url):
+        if _open_nav_state(info.get("url"), blank_ok) == "left":
             break
-        time.sleep(0.25)
+        left = deadline - time.monotonic()
+        if left <= 0:
+            break
+        time.sleep(min(0.25, left))
     return info
 
 
+def _open_nav_state(url: object, blank_ok: bool) -> str:
+    """Where a new `open` tab's listed URL stands: ``left`` its marker,
+    ``stuck`` (still on its marker or ``about:blank``, unless `blank_ok`), or
+    ``undecided`` (not listed, or the transient ``""``)."""
+    if not isinstance(url, str) or not url:
+        return "undecided"
+    if _is_owned_marker(url):
+        return "stuck"
+    if url == "about:blank" and not blank_ok:
+        return "stuck"
+    return "left"
+
+
+def _open_origin_key(url: object) -> tuple[str, str, int] | None:
+    """``(scheme, host, port)`` of an http(s) URL, default ports filled in and
+    the host lower-cased/IDNA-encoded; None for any other URL or a malformed one."""
+    if not isinstance(url, str):
+        return None
+    try:
+        parts = urllib.parse.urlsplit(url)
+        host, port = parts.hostname, parts.port
+    except ValueError:
+        return None
+    scheme = parts.scheme.lower()
+    if scheme not in ("http", "https") or not host:
+        return None
+    try:
+        host = host.encode("idna").decode("ascii")
+    except UnicodeError:
+        pass
+    return scheme, host.lower(), port or (443 if scheme == "https" else 80)
+
+
+def _open_committed(requested: str, landed: object) -> str:
+    """`open`'s verdict on a tab that left its marker: ``target``, or
+    ``redirect`` when it is on an http(s) origin other than the requested
+    one's. Non-http(s) commits (``data:``, ``file:``, ``chrome://…``,
+    ``about:…``) are ``target``: no origin to compare."""
+    got = _open_origin_key(landed)
+    if got is None or got == _open_origin_key(requested):
+        return "target"
+    return "redirect"
+
+
 # `open -N` (tp#1792): how long the new tab's ``Page.navigate`` may take to
-# answer (it answers on commit), its page websocket included.
+# answer (it answers on commit), its page websocket included — capped by
+# what is left of OPEN_LOAD_BUDGET_S.
 OPEN_NAVIGATE_BUDGET_S = 10.0
+# `open` (tp#1900): the TOTAL deadline, after the tab is created, for
+# ``Page.navigate`` plus the wait for the tab to leave its marker; a tab
+# still on it then is closed and `open` exits 1. `-w/--wait` overrides it,
+# clamped to OPEN_WAIT_MAX_S so guided login's 60 s `_self_run` kill of an
+# `open` stays out of reach.
+OPEN_LOAD_BUDGET_S = 15.0
+OPEN_WAIT_MAX_S = 50.0
 
 
-def _open_create_target(port: int, ws_url: str, url: str) -> tuple[str | None, str]:
-    """`open -N`'s tab → ``(tid, "")``, or ``(None, why)`` with nothing left open.
+def _open_create_target(
+    port: int, ws_url: str, url: str, wait_s: float | None = None
+) -> tuple[str | None, str, dict]:
+    """`open -N`'s tab → ``(tid, "", listing)``, or ``(None, why, {})`` with
+    nothing left open.
 
     Created like an owned tab (tp#1759): ``Target.createTarget`` on a fresh
     v2 marker URL naming this process, then navigated to `url`
@@ -6062,7 +6144,17 @@ def _open_create_target(port: int, ws_url: str, url: str) -> tuple[str | None, s
     closes the tab by its id (a failed close leaves it on its marker: same
     rule). Before tp#1792 the tab was created on `url` itself, so a late one
     was an unowned content tab no reap rule closes.
+
+    After the navigate (tp#1900), the tab must leave its marker within
+    `wait_s` (default OPEN_LOAD_BUDGET_S, one deadline over the navigate and
+    the poll): a tab still on it — or on ``about:blank`` when `url` is not
+    ``about:blank`` — is closed, a failure. A ``Page.navigate`` that answered
+    ``errorText`` is not (Chrome's error page counts, tp#1792), nor a tab
+    still listed on ``""`` or not listed at all. One ``open_navigate``
+    journal event, origin only. `listing` is the tab's last ``/json/list``
+    entry (``{}`` when it was never listed).
     """
+    budget = OPEN_LOAD_BUDGET_S if wait_s is None else wait_s
     marker = _new_owned_marker()
     tid = _cdp_create_background_target(
         ws_url, _owned_marker_url(marker), OWNED_CREATE_BUDGET_S
@@ -6077,20 +6169,76 @@ def _open_create_target(port: int, ws_url: str, url: str) -> tuple[str | None, s
         if late is not None:
             closed = _cdp_close_target(port, late, ws_url=ws_url)
             _journal("open_lost_reply", target=_id8(late), closed=closed)
-        return None, "could not create a background tab (Target.createTarget)."
-    err = _cdp_navigate_target(port, tid, url, OPEN_NAVIGATE_BUDGET_S)
-    if err is None:
-        return tid, ""
-    _cdp_close_target(port, tid, ws_url=ws_url)
-    return None, f"could not navigate the new tab {_id8(tid)}: {err} (tab closed)."
+        return None, "could not create a background tab (Target.createTarget).", {}
+    t0 = time.monotonic()
+    deadline = t0 + budget
+
+    def event(loader: bool, error: str, committed: str) -> None:
+        _journal(
+            "open_navigate",
+            target=_id8(tid),
+            origin=_journal_origin(url),
+            loader=loader,
+            error=error,
+            committed=committed,
+            ms=round((time.monotonic() - t0) * 1000),
+        )
+
+    err, reply = _cdp_navigate_target(
+        port,
+        tid,
+        url,
+        min(OPEN_NAVIGATE_BUDGET_S, max(0.0, deadline - time.monotonic())),
+    )
+    if err is not None:
+        event(False, err, "none")
+        _cdp_close_target(port, tid, ws_url=ws_url)
+        return (
+            None,
+            f"could not navigate the new tab {_id8(tid)}: {err} (tab closed).",
+            {},
+        )
+    loader = bool(reply.get("loaderId"))
+    page_error = reply.get("errorText")
+    page_error = page_error if isinstance(page_error, str) else ""
+    blank_ok = url == "about:blank" or url.startswith("about:blank#")
+    info = _await_target_load(
+        port, tid, max(0.0, deadline - time.monotonic()), blank_ok=blank_ok
+    )
+    landed = info.get("url")
+    state = _open_nav_state(landed, blank_ok)
+    if state == "stuck" and not page_error:
+        event(loader, page_error, "none")
+        closed = _cdp_close_target(port, tid, ws_url=ws_url)
+        tail = "tab closed" if closed else "the tab could not be closed"
+        return (
+            None,
+            f"open: the new tab did not navigate to {_tab_hint(url)} within "
+            f"{budget:g}s ({tail}).",
+            {},
+        )
+    if state == "left":
+        committed = _open_committed(url, landed)
+    elif state == "stuck":  # after an errorText: Chrome's error page, exit 0
+        committed = "none"
+    else:  # undecided: still listed on "" or not listed at all
+        committed = "unknown"
+    event(loader, page_error, committed)
+    if committed == "redirect":
+        print(f"⚠ open: redirected to {_tab_hint(str(landed))}", file=sys.stderr)
+    return tid, "", info
 
 
-def _cdp_navigate_target(port: int, tid: str, url: str, budget_s: float) -> str | None:
-    """``Page.navigate`` target `tid` to `url` over its own websocket; None on
-    success, else why. A page error (``errorText``: DNS, refused …) still
-    counts as success — the tab shows Chrome's error page, as a tab created
-    on `url` would. The target's websocket URL is looked for in
-    ``/json/list`` until it is listed, within the same budget."""
+def _cdp_navigate_target(
+    port: int, tid: str, url: str, budget_s: float
+) -> tuple[str | None, dict]:
+    """``Page.navigate`` target `tid` to `url` over its own websocket →
+    ``(None, reply)`` on success, else ``(why, {})``; `reply` is the CDP
+    result (``frameId``, ``loaderId`` — absent for a same-document
+    navigation — and ``errorText``). A page error (``errorText``: DNS,
+    refused …) still counts as success — the tab shows Chrome's error page,
+    as a tab created on `url` would. The target's websocket URL is looked
+    for in ``/json/list`` until it is listed, within the same budget."""
     deadline = time.monotonic() + budget_s
 
     def left() -> float:
@@ -6105,12 +6253,12 @@ def _cdp_navigate_target(port: int, tid: str, url: str, budget_s: float) -> str 
         if isinstance(page_ws, str) and page_ws:
             break
         if left() <= 0:
-            return "the new tab is not listed"
+            return "the new tab is not listed", {}
         time.sleep(min(0.1, left()))
     res = _cdp_ws_call(page_ws, "Page.navigate", {"url": url}, left())
     if res.status != "ok" or res.error:
-        return res.error or res.status
-    return None
+        return res.error or res.status, {}
+    return None, res.result or {}
 
 
 def _open_background_tab(port: int, browser, url: str) -> dict:
@@ -6304,13 +6452,17 @@ def _tab_line(target: dict[str, object], full_urls: bool = False) -> str:
     return f"   - {title}  →  {hint}"
 
 
-def _open_new_raw(port: int, url: str, keep: bool = False) -> int:
+def _open_new_raw(
+    port: int, url: str, keep: bool = False, wait_s: float | None = None
+) -> int:
     """`open` (and `open -N`): a NEW background tab over raw CDP; prints
     ``target=<id>``.
 
     No Playwright attach (it waits for every page target, so one heavy or
     wedged foreign tab would slow this down — tp#786). Registers; takes no
-    lease. Exit 1 when the tab cannot be created. The tab's opener (agent
+    lease. Exit 1 when the tab cannot be created, or did not navigate within
+    `wait_s` (`-w`, default OPEN_LOAD_BUDGET_S; the tab is closed and no
+    ``target=`` line is printed — tp#1900). The tab's opener (agent
     session, cwd) goes to the tab state (tp#1109, best effort); with `keep`
     (`-k`) it is also pinned, and a pin that cannot be recorded is exit 1
     (the tab stays open, its ``target=`` line is printed).
@@ -6325,10 +6477,9 @@ def _open_new_raw(port: int, url: str, keep: bool = False) -> int:
         ws_url = _browser_ws_url(port)
         if not ws_url:
             return _fail("could not create a background tab (Target.createTarget).")
-        tid, why = _open_create_target(port, ws_url, url)
+        tid, why, info = _open_create_target(port, ws_url, url, wait_s)
         if tid is None:
             return _fail(why)
-        info = _await_target_load(port, tid)
         print(f"✓ Opened: {info.get('url', url)}  (title: {info.get('title', '')!r})")
         print(f"target={tid}")
         try:
@@ -6363,7 +6514,13 @@ def _reuse_same_url_tab(port: int, url: str) -> bool:
 
 
 def cmd_open(
-    port: int, url: str, reuse: bool = False, new: bool = False, keep: bool = False
+    port: int,
+    url: str,
+    *,
+    reuse: bool = False,
+    new: bool = False,
+    keep: bool = False,
+    wait_s: float | None = None,
 ) -> int:
     """Open URL in a NEW background tab; prints ``target=<id>`` (tp#863).
 
@@ -6372,10 +6529,14 @@ def cmd_open(
     so there is no blank-tab reuse. `reuse` (-r, manual use only) first
     navigates an existing tab already on this URL and opens a new tab only
     when there is none. `new` (-N) is the default, kept as an explicit flag.
+    `wait_s` (-w) is the new tab's total navigate deadline (default
+    OPEN_LOAD_BUDGET_S), clamped to OPEN_WAIT_MAX_S (tp#1900).
     """
     if reuse and not new and _reuse_same_url_tab(port, url):
         return 0
-    return _open_new_raw(port, url, keep=keep)
+    if wait_s is not None:
+        wait_s = min(wait_s, OPEN_WAIT_MAX_S)
+    return _open_new_raw(port, url, keep=keep, wait_s=wait_s)
 
 
 def _eval_watchdog_fire(timeout_s: float) -> None:
@@ -21759,7 +21920,14 @@ def _dispatch(args: argparse.Namespace, port: int) -> int:  # pylint: disable=to
     if args.cmd == "down":
         return cmd_down(port, args.force, getattr(args, "force_maintenance", False))
     if args.cmd == "open":
-        return cmd_open(port, args.url, reuse=args.reuse, new=args.new, keep=args.keep)
+        return cmd_open(
+            port,
+            args.url,
+            reuse=args.reuse,
+            new=args.new,
+            keep=args.keep,
+            wait_s=args.wait,
+        )
     if args.cmd == "tabs":
         return cmd_tabs(args, port)
     if args.cmd == "keep":

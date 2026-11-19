@@ -86,6 +86,12 @@ def _text_frame(payload: bytes) -> bytes:
 class FakeCdp:
     """HTTP ``/json/*`` + a websockets server + a raw-socket stall server."""
 
+    # Page.navigate is acknowledged with only a frameId (no loaderId, no
+    # errorText) and the tab stays on its marker: tp#1900's incident shape.
+    navigate_noop = False
+    # Page.navigate commits this URL instead of the requested one (a redirect).
+    navigate_redirect_to: str | None = None
+
     def __init__(self) -> None:
         self.targets: dict[str, FakeTarget] = {}
         self.browser_mode = "ok"  # or "silent"
@@ -242,7 +248,11 @@ class FakeCdp:
         """``Page.navigate``: the target commits at once (tp#1792)."""
         if self.navigate_fail:
             return {"id": msg["id"], "error": {"code": -32000, "message": "nope"}}
-        target.url = str((msg.get("params") or {}).get("url") or "")
+        if self.navigate_noop:
+            return {"id": msg["id"], "result": {"frameId": target.tid}}
+        target.url = self.navigate_redirect_to or str(
+            (msg.get("params") or {}).get("url") or ""
+        )
         return {"id": msg["id"], "result": {"frameId": target.tid, "loaderId": "L"}}
 
     @staticmethod

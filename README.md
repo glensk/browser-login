@@ -76,6 +76,11 @@ browser.py doctor             # full health check on a disposable tab (never tou
 browser.py open https://…     # a NEW background tab (raw CDP, no Playwright attach, no focus
                               #   steal); prints `target=<id>` — the tab you own (tp#786). Never
                               #   navigates a tab it did not create, not even a blank one (tp#863)
+                              #   The URL is passed through untouched (a #fragment too). Exit 1 if
+                              #   the tab did not leave its blank start page within `-w/--wait
+                              #   SECONDS` (default 15, max 50; tab closed, no `target=` line,
+                              #   origin-only ❌). A redirect to another origin still exits 0 with
+                              #   one `⚠ open: redirected to <origin>` line on stderr (tp#1900)
 browser.py open -r https://…  # --reuse: navigate an existing same-URL tab instead (manual use
                               #   only; matches sans query/fragment; none → a new tab)
 browser.py open -N https://…  # --new: the default, explicitly (tools pass it)
@@ -141,6 +146,8 @@ reused; anything unreadable is left alone), descendants first, plus orphan
 markers no ledger names (see "Tabs: who opened what…"); the guided
 login reaps at its start, after a window-flow `login` child, and in its
 watchdog. `open -N` tabs are the caller's and are never ledgered or reaped.
+The owner marker is only ever the tab's initial `about:blank#owned-…`: `open`
+navigates the URL away from it and never appends it to a URL.
 `status` is never destructive (it never reaps); `doctor` only reports dead
 ledgers (⚠, with the `reap-owned` hint).
 

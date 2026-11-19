@@ -8,8 +8,13 @@ from __future__ import annotations
 import contextlib
 import functools
 import importlib.util
+import json
+import socket
+import subprocess
 import sys
-from collections.abc import Callable, Iterator
+import time
+import urllib.request
+from collections.abc import Callable, Collection, Iterator
 from pathlib import Path
 from typing import Any
 
@@ -74,3 +79,51 @@ def routed_context(handler: Callable[[Any], None]) -> Iterator[Any]:
             yield context
         finally:
             chromium.close()
+
+
+@contextlib.contextmanager
+def disposable_chromium(
+    profile: Path, start_s: float, avoid: Collection[int] = ()
+) -> Iterator[tuple[int, dict[str, Any]]]:
+    """A headless Chromium on a free DevTools port (never one of `avoid`, the
+    shared instances) with its own `profile`; yields (port, its
+    ``/json/version``) once the port answers, TimeoutError after `start_s`.
+    Terminated (killed if it lingers) on exit."""
+    with socket.socket() as s:
+        s.bind(("127.0.0.1", 0))
+        port = int(s.getsockname()[1])
+    assert port not in avoid, port
+    proc = subprocess.Popen(  # pylint: disable=consider-using-with
+        [
+            chromium_executable(),
+            "--headless=new",
+            f"--remote-debugging-port={port}",
+            f"--user-data-dir={profile}",
+            "--no-first-run",
+            "--no-default-browser-check",
+            "about:blank",
+        ],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    try:
+        deadline = time.monotonic() + start_s
+        while True:
+            try:
+                with urllib.request.urlopen(
+                    f"http://127.0.0.1:{port}/json/version", timeout=1
+                ) as r:
+                    version: dict[str, Any] = json.loads(r.read())
+                break
+            except OSError as exc:
+                if time.monotonic() > deadline:
+                    raise TimeoutError("disposable Chromium did not start") from exc
+                time.sleep(0.1)
+        yield port, version
+    finally:
+        proc.terminate()
+        try:
+            proc.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait(timeout=10)
