@@ -1500,6 +1500,140 @@ def _chromium_binary() -> str:
     return found[0]
 
 
+# Keychain grant check (tp#2537 B2). Chromium encrypts its cookies with a key
+# from the login Keychain item "Chromium Safe Storage"; a build whose `.app` is
+# not on that item's ACL application list cannot read the key, and the profile
+# then writes NO cookies to disk (every login dies on the next restart). Each
+# Playwright build is a new `.app` path, so every pin move needs one attended
+# "Always Allow" (docs/chromium-build-bump.md). The check is read-only
+# (`security dump-keychain -a`: ACLs and attribute names, never a secret) and
+# slow (~1 min), so its outcome is cached per revision + `.app` path: a grant
+# for good, a missing grant for KEYCHAIN_ACL_MISS_TTL_S (re-checked after the
+# grant). Missing → an unattended launch (AGENT_LOGIN_SCHEDULED) is refused,
+# an attended one warns.
+KEYCHAIN_SAFE_STORAGE_SERVICE = "Chromium Safe Storage"
+KEYCHAIN_ACL_CACHE = CHROMIUM_PIN_ROOT / "keychain-acl.json"
+KEYCHAIN_ACL_MISS_TTL_S = 600.0
+CHROMIUM_BUMP_RUNBOOK = Path(__file__).resolve().parent.parent / (
+    "docs/chromium-build-bump.md"
+)
+
+
+def _chromium_app_path(binary: str) -> str:
+    """The ``.app`` bundle of a Chromium executable (``….app/Contents/MacOS/x``);
+    the executable itself when it lives in no bundle."""
+    path = Path(binary)
+    app = next((p for p in path.parents if p.suffix == ".app"), None)
+    return str(app or path)
+
+
+def _keychain_acl_apps(dump: str, service: str) -> list[list[str]] | None:
+    """The decrypt-ACL application lists of every `service` item in `dump`.
+
+    `dump` is ``security dump-keychain -a`` output. One list per matching
+    item: the application paths of its ACL entry whose authorizations include
+    ``decrypt``; ``["*"]`` when that entry's applications are ``<null>`` (any
+    app may read). None when no item has that service.
+    """
+    lists: list[list[str]] = []
+    for block in re.split(r'(?m)^keychain: "', dump)[1:]:
+        if f'"svce"<blob>="{service}"' not in block:
+            continue
+        apps: list[str] = []
+        in_decrypt = False
+        for line in block.splitlines():
+            text = line.strip()
+            if text.startswith("entry "):
+                in_decrypt = False
+            elif text.startswith("authorizations"):
+                in_decrypt = " decrypt" in f" {text.split(':', 1)[-1]}"
+            elif in_decrypt and text == "applications: <null>":
+                apps.append("*")
+            elif in_decrypt and re.match(r"\d+: /", text):
+                path = text.split(": ", 1)[1]
+                apps.append(re.sub(r" \((OK|status -?\d+)\)$", "", path))
+        lists.append(apps)
+    return lists or None
+
+
+def _keychain_acl_query(app: str) -> str:
+    """``granted`` / ``missing`` / ``absent`` (no item yet) / ``unknown`` for `app`.
+
+    Read-only, through `_security_run`; nothing of the dump is printed.
+    """
+    try:
+        res = _security_run(["security", "dump-keychain", "-a"])
+    except Exception:  # pylint: disable=broad-exception-caught  # never blocks a launch
+        return "unknown"
+    if res.state != "done" or res.rc != 0:
+        return "unknown"
+    lists = _keychain_acl_apps(
+        res.stdout.decode("utf-8", errors="replace"), KEYCHAIN_SAFE_STORAGE_SERVICE
+    )
+    if lists is None:
+        return "absent"
+    granted = [a for a in list(lists) if "*" in a or app in a]
+    return "granted" if granted else "missing"
+
+
+def _keychain_grant_state(revision: int, app: str, now: float | None = None) -> str:
+    """`_keychain_acl_query` for `app`, cached per revision (see the block above)."""
+    now = time.time() if now is None else now
+    key = str(revision)
+    cache = _read_json_dict(KEYCHAIN_ACL_CACHE) or {}
+    hit = cache.get(key)
+    if isinstance(hit, dict) and hit.get("app") == app:
+        state, at = hit.get("state"), hit.get("at")
+        if state == "granted":
+            return "granted"
+        if (
+            state == "missing"
+            and isinstance(at, (int, float))
+            and 0 <= now - at < KEYCHAIN_ACL_MISS_TTL_S
+        ):
+            return "missing"
+    state = _keychain_acl_query(app)
+    if state in ("granted", "missing"):
+        cache[key] = {"app": app, "state": state, "at": now}
+        try:
+            _json_write_atomic(KEYCHAIN_ACL_CACHE, cache)
+        except OSError:
+            pass  # a cache miss only costs the next launch another query
+    return state
+
+
+def _keychain_grant_gate(binary: str) -> str | None:
+    """Pre-launch check: the refusal message, or None to go on (maybe warned).
+
+    Missing grant + ``AGENT_LOGIN_SCHEDULED`` → refuse; attended → a ⚠ on
+    stderr and launch. ``absent`` (the build creates the item) and
+    ``unknown`` (query failed: nothing proven) never refuse.
+    """
+    revision = _chromium_revision()
+    app = _chromium_app_path(binary)
+    state = _keychain_grant_state(revision, app)
+    if state == "granted":
+        return None
+    if state != "missing":
+        if state == "unknown":
+            print(
+                f"⚠ keychain grant for Chromium {revision}: unknown (the "
+                f"read-only `security dump-keychain -a` failed); runbook: "
+                f"{CHROMIUM_BUMP_RUNBOOK}",
+                file=sys.stderr,
+            )
+        return None
+    msg = (
+        f"Chromium {revision} ({app}) is not on the {KEYCHAIN_SAFE_STORAGE_SERVICE!r} "
+        "Keychain ACL — it would keep no cookies across a restart. "
+        f"grant needed: {CHROMIUM_BUMP_RUNBOOK}"
+    )
+    if os.environ.get(SCHEDULED_ENV):
+        return msg
+    print(f"⚠ {msg}", file=sys.stderr)
+    return None
+
+
 def _cdp_get(port: int, path: str, timeout: float = 2.0) -> object | None:
     """GET a CDP JSON endpoint; return parsed JSON or None if unreachable.
 
@@ -3439,6 +3573,9 @@ def _launch_and_record(port: int, headless: bool) -> int:
     # last session.
     _clear_session_restore()
     binary = _chromium_binary()
+    refusal = _keychain_grant_gate(binary)
+    if refusal is not None:
+        return _fail(f"Not launching: {refusal}")
     flags = [
         f"--user-data-dir={PROFILE_DIR}",
         f"--remote-debugging-port={port}",
@@ -7682,6 +7819,7 @@ def cmd_doctor(port: int) -> int:
     _doctor_coordination(log, port)
     _doctor_owned_ledgers(log)
     _doctor_access_team(log, port)
+    _doctor_cookie_canary(log, port)
     _doctor_access_sweep(log)
     before = _doctor_windows_before(log)
     release = _registry_register("browser.py", _purpose(), port)
@@ -13926,6 +14064,159 @@ def _doctor_access_team(log: list[str], port: int) -> None:
         "session can open decide; `browser.py sweep-access` drops it now (the "
         "LaunchAgent within 60 s; a failure names the cause)",
     )
+
+
+# Cookie canary (tp#2537 B2). A Chromium build that cannot read its Keychain
+# cookie key keeps every cookie in memory only: logins work until the next
+# restart, then all are gone. The canary compares the persistent cookies the
+# running browser holds (CDP ``Storage.getCookies``, ``session`` false) with
+# the rows of the profile's Cookies db on disk, read with SQLite's read-only
+# immutable open (no lock, no journal, never a write to a live profile).
+# Chromium flushes cookies lazily, so a browser younger than
+# COOKIE_CANARY_MIN_UPTIME_S is not judged. Counts only — never a value.
+COOKIE_CANARY_MIN_UPTIME_S = 60.0
+
+
+@dataclass(frozen=True)
+class CookieCanary:
+    """One canary reading. ``status``: ``ok`` / ``fail`` (memory > 0, disk
+    missing or 0 rows) / ``wait`` (uptime below the threshold) / ``unknown``
+    (memory or uptime unreadable). Only ``ok`` proves cookies persist — a
+    gate (tp#2537 B3b) treats every other status as red."""
+
+    status: str
+    memory: int | None
+    disk: int | None
+    uptime_s: float | None
+    db: Path | None
+
+    @property
+    def ok(self) -> bool:
+        """True only for a judged, green reading."""
+        return self.status == "ok"
+
+
+def _cookie_db_path(profile: Path) -> Path | None:
+    """The profile's Cookies db: ``Default/Network/Cookies``, else the legacy
+    ``Default/Cookies``; None when neither exists."""
+    for rel in (("Default", "Network", "Cookies"), ("Default", "Cookies")):
+        path = profile.joinpath(*rel)
+        if path.is_file():
+            return path
+    return None
+
+
+def _cookie_db_rows(path: Path | None) -> int | None:
+    """Row count of a Cookies db opened read-only + immutable; None when the
+    db is missing or unreadable."""
+    import sqlite3
+
+    if path is None:
+        return None
+    uri = f"file:{urllib.parse.quote(str(path))}?mode=ro&immutable=1"
+    try:
+        con = sqlite3.connect(uri, uri=True)
+        try:
+            row = con.execute("SELECT COUNT(*) FROM cookies").fetchone()
+        finally:
+            con.close()
+    except sqlite3.Error:
+        return None
+    return int(row[0]) if row else None
+
+
+def cookie_canary_verdict(
+    memory: int | None, disk: int | None, uptime_s: float | None
+) -> str:
+    """The canary predicate (pure): ``ok`` / ``fail`` / ``wait`` / ``unknown``.
+
+    Fails exactly when the browser holds persistent cookies (memory > 0) and
+    the db is missing/unreadable (None) or empty, after the uptime threshold.
+    """
+    if uptime_s is None or memory is None:
+        return "unknown"
+    if uptime_s < COOKIE_CANARY_MIN_UPTIME_S:
+        return "wait"
+    if memory > 0 and not disk:
+        return "fail"
+    return "ok"
+
+
+def _etime_s(etime: str | None) -> float | None:
+    """Seconds of a ``ps -o etime`` value (``[[dd-]hh:]mm:ss``), or None."""
+    m = re.fullmatch(r"(?:(\d+)-)?(?:(\d+):)?(\d+):(\d+)", (etime or "").strip())
+    if not m:
+        return None
+    days, hours, mins, secs = (int(g) if g else 0 for g in m.groups())
+    return float(((days * 24 + hours) * 60 + mins) * 60 + secs)
+
+
+def _browser_uptime_s(port: int) -> float | None:
+    """Uptime of the one root browser process on `port`; None when unknown."""
+    pids = _find_root_pids(port)
+    if len(pids) != 1:
+        return None
+    return _etime_s(_ps_field(pids[0], "etime="))
+
+
+def _memory_persistent_cookies(port: int) -> int | None:
+    """Count of the running browser's non-session cookies (raw CDP), or None."""
+    ws_url = _browser_ws_url(port)
+    res = _cdp_ws_call(ws_url, "Storage.getCookies", {}, 5.0) if ws_url else None
+    if res is None or res.status != "ok" or res.error:
+        return None
+    raw = res.result.get("cookies") if isinstance(res.result, dict) else None
+    if not isinstance(raw, list):
+        return None
+    return sum(1 for c in raw if isinstance(c, dict) and not c.get("session"))
+
+
+def cookie_canary(port: int, profile: Path | None = None) -> CookieCanary:
+    """Read the canary for the instance on `port` (profile: this instance's)."""
+    db = _cookie_db_path(PROFILE_DIR if profile is None else profile)
+    uptime = _browser_uptime_s(port)
+    memory = _memory_persistent_cookies(port)
+    disk = _cookie_db_rows(db)
+    return CookieCanary(
+        cookie_canary_verdict(memory, disk, uptime), memory, disk, uptime, db
+    )
+
+
+def _doctor_cookie_canary(log: list[str], port: int) -> None:
+    """Doctor's cookie-persistence line (tp#2537): ❌ when cookies live only in
+    memory; ⚠ when not judged yet (young browser) or unreadable."""
+    c = cookie_canary(port)
+    where = str(c.db) if c.db else "no Cookies db"
+    counts = (
+        f"{'?' if c.memory is None else c.memory} persistent in memory, "
+        f"{'missing' if c.disk is None else c.disk} on disk ({where})"
+    )
+    if c.status == "ok":
+        _doctor_add(log, "ok", "cookie canary", counts)
+    elif c.status == "fail":
+        _doctor_add(
+            log,
+            "fail",
+            "cookie canary",
+            f"{counts} — cookies are NOT persisted (Keychain grant for this "
+            f"Chromium build? runbook: {CHROMIUM_BUMP_RUNBOOK})",
+        )
+    elif c.status == "wait":
+        _doctor_add(
+            log,
+            "warn",
+            "cookie canary",
+            f"not judged: browser up {c.uptime_s:.0f}s < "
+            f"{COOKIE_CANARY_MIN_UPTIME_S:.0f}s; {counts}",
+        )
+    else:
+        _doctor_add(
+            log,
+            "warn",
+            "cookie canary",
+            f"not judged: {'uptime' if c.uptime_s is None else 'memory jar'} "
+            f"unreadable; {counts}",
+        )
 
 
 def _broker_fail(rc: int, msg: str) -> int:
