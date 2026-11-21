@@ -131,7 +131,8 @@ CSCS aliases (kept for back-compat; cscs-api.py depends on them):
   cscs-store-creds  = store-creds cscs   ·   cscs-forget-creds = forget-creds cscs
 
 The chromium binary is Playwright's bundled "Chrome for Testing" (already on
-disk). No system browser is touched, so this never collides with your daily Brave.
+disk), pinned to one revision (PINNED_CHROMIUM_REVISION, tp#2537). No system
+browser is touched, so this never collides with your daily Brave.
 """
 
 # Two pylint messages are properties of this tool's documented architecture, not
@@ -1386,34 +1387,117 @@ def _ensure_cmd_deps(cmd: str | None) -> None:
     ensure_deps()
 
 
+# Chromium pin (tp#2537, Albert 2026-11-21, decision A). Playwright's
+# chromium-1254 (Chrome 158) cannot get its macOS Keychain cookie-encryption key,
+# so a profile launched on it writes NO cookies to disk: every login lives only
+# in memory and is gone on the next restart. Every instance (default, private,
+# admin, alt) therefore launches exactly this revision — never "the newest one
+# on disk", so a `playwright install` from any other repo can no longer switch
+# the shared browser underneath its logins. Moving the pin is a deliberate edit
+# here after the new build kept cookies across a restart (tp#2537 B2: a one-time
+# Keychain "Always Allow" for the new build; never `--use-mock-keychain`).
+PINNED_CHROMIUM_REVISION = 1248
+# A disposable instance (CLAUDE_BROWSER_CACHE_DIR set) may try another revision —
+# how B2 tests a new build; the live instances ignore it.
+CHROMIUM_REVISION_ENV = "CLAUDE_BROWSER_CHROMIUM_REVISION"
+# A durable stand-in "Playwright package" whose browsers.json names only the
+# pinned chromium. Playwright's install-time GC deletes every browser dir that
+# no `.links` entry references; this entry keeps the pinned build alive after
+# the last real package that shipped it (a uv cache entry) is gone.
+CHROMIUM_PIN_ROOT = (
+    Path.home() / ".local" / "share" / "claude-browser" / "playwright-pin"
+)
+
+
+def _chromium_revision() -> int:
+    """The Chromium revision this instance launches: the pin, or a test override."""
+    raw = os.environ.get(CHROMIUM_REVISION_ENV, "").strip()
+    if not raw or not _test_mode():
+        return PINNED_CHROMIUM_REVISION
+    if not raw.isdigit():
+        sys.exit(f"❌ {CHROMIUM_REVISION_ENV}={raw!r} is not a revision number")
+    return int(raw)
+
+
+def _ensure_chromium_pin_link(revision: int) -> None:
+    """Register `revision` with Playwright's browser GC so no install deletes it.
+
+    Writes ``CHROMIUM_PIN_ROOT/chromium-<rev>/browsers.json`` (only that
+    chromium) and the ``.links/<sha1(dir)>`` file Playwright reads on every
+    ``playwright install``. Idempotent; a failure only warns — the pin itself is
+    enforced by `_chromium_binary`, this only keeps the build on disk.
+    """
+    pin_dir = CHROMIUM_PIN_ROOT / f"chromium-{revision}"
+    manifest = pin_dir / "browsers.json"
+    link = (
+        _playwright_cache_root()
+        / ".links"
+        / hashlib.sha1(str(pin_dir).encode(), usedforsecurity=False).hexdigest()
+    )
+    body = (
+        json.dumps(
+            {
+                "comment": (
+                    "browser-login (bin/browser.py) pins this Chromium build for "
+                    "its shared browser instances (tp#2537); this entry keeps "
+                    "Playwright's install-time GC from deleting it."
+                ),
+                "browsers": [
+                    {
+                        "name": "chromium",
+                        "revision": str(revision),
+                        "installByDefault": False,
+                    }
+                ],
+            },
+            indent=2,
+        )
+        + "\n"
+    )
+    try:
+        pin_dir.mkdir(parents=True, exist_ok=True)
+        if not manifest.is_file() or manifest.read_text(encoding="utf-8") != body:
+            tmp = _unique_tmp(manifest)
+            tmp.write_text(body, encoding="utf-8")
+            os.replace(tmp, manifest)
+        if not link.is_file() or link.read_text(encoding="utf-8") != str(pin_dir):
+            link.parent.mkdir(parents=True, exist_ok=True)
+            # Staged in pin_dir, not .links/: Playwright's GC would read (and
+            # unlink) a half-written file there.
+            tmp = _unique_tmp(pin_dir / link.name)
+            tmp.write_text(str(pin_dir), encoding="utf-8")
+            os.replace(tmp, link)
+    except OSError as exc:
+        print(
+            f"⚠ chromium pin: could not register chromium-{revision} with "
+            f"Playwright's GC ({exc}); a `playwright install` may delete it",
+            file=sys.stderr,
+        )
+
+
 def _chromium_binary() -> str:
-    """Resolve Playwright's bundled Chromium executable (newest revision)."""
-    cache = Path.home() / "Library" / "Caches" / "ms-playwright"
-    pats = [
-        str(
-            cache
-            / "chromium-*"
-            / "chrome-mac-arm64"
-            / "*.app"
-            / "Contents"
-            / "MacOS"
-            / "*"
-        ),
-        str(cache / "chromium-*" / "chrome-mac" / "*.app" / "Contents" / "MacOS" / "*"),
-    ]
-    found: list[tuple[int, str]] = []
-    for pat in pats:
-        for path in glob.glob(pat):
-            if os.access(path, os.X_OK) and os.path.isfile(path):
-                m = re.search(r"chromium-(\d+)", path)
-                found.append((int(m.group(1)) if m else 0, path))
+    """Playwright's bundled Chromium executable of the PINNED revision.
+
+    Never falls back to another revision: a missing pinned build is a hard
+    error naming how to restore it (tp#2537).
+    """
+    revision = _chromium_revision()
+    build = _playwright_cache_root() / f"chromium-{revision}"
+    found = sorted(
+        path
+        for arch in ("chrome-mac-arm64", "chrome-mac")
+        for path in glob.glob(str(build / arch / "*.app" / "Contents" / "MacOS" / "*"))
+        if os.access(path, os.X_OK) and os.path.isfile(path)
+    )
     if not found:
         sys.exit(
-            "No Playwright Chromium found. Run: "
-            "uv run --with playwright playwright install chromium"
+            f"❌ The pinned Playwright Chromium {revision} is missing ({build}).\n"
+            "   browser.py launches only this build (newer ones lose every "
+            "cookie on restart, tp#2537). Restore it: "
+            "`uv run --with playwright==1.64.1 playwright install chromium`"
         )
-    found.sort(reverse=True)
-    return found[0][1]
+    _ensure_chromium_pin_link(revision)
+    return found[0]
 
 
 def _cdp_get(port: int, path: str, timeout: float = 2.0) -> object | None:
