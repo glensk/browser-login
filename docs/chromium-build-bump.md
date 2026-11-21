@@ -32,7 +32,8 @@ Guards in `bin/browser.py`:
    ```
 
    The launch warns "grant needed" (attended). Load any page that sets a persistent
-   cookie (`… browser.py --cdp-port 9333 open -N https://example.com/`).
+   cookie (`… browser.py --cdp-port 9333 open -N https://www.google.com/`;
+   example.com sets none, so it neither triggers the prompt nor tests the canary).
 3. macOS asks: "Google Chrome for Testing wants to use your confidential information
    stored in 'Chromium Safe Storage' in your keychain." Albert types his login password
    and clicks **Always Allow** (not "Allow": that grants one read only). If the prompt
