@@ -71,12 +71,55 @@ Guards in `bin/browser.py`:
 4. Prove it on the disposable instance: wait 60 s, then `… browser.py --cdp-port 9333
    doctor` shows `✅ cookie canary`; `down`, `up` again, the cookie is still there and
    the canary is still green. Then `down` and remove `/tmp/cb-bump`.
-5. Pin move, in this order:
+5. Pin move, in this order (tp#2537 B2b):
    1. The grant is proven (step 4).
-   2. Back up each profile's `Default/Network/Cookies` and `Local State`
-      (`~/.cache/claude-browser[-<instance>]/profile/`), set
-      `PINNED_CHROMIUM_REVISION = <new>`, land it, restart the PRIVATE instance only:
-      canary green and `agent-login.py -L console-private` / `logged-in` ✅.
-   3. default/admin/alt move at their natural next restart — an agent never restarts
-      them. Keep the old build's `.links` entry (`_ensure_chromium_pin_link`) until
-      every instance passed the canary on the new revision.
+   2. Prove the migration on a disposable COPY of the default profile first: copy
+      `Default/Cookies` (or `Default/Network/`), `Local State`, `Last Version` and
+      `Default/Preferences` into `/tmp/cb-mig/profile/`, then
+      `env CLAUDE_BROWSER_CACHE_DIR=/tmp/cb-mig CLAUDE_BROWSER_CHROMIUM_REVISION=<new>
+      bin/browser.py --cdp-port 9333 up` (attended): it prints the backup, "✓ cookies
+      migrated … N exported, N written", and after 60 s `doctor` shows the canary green
+      with about the exported count. `down`, `up` again (no second migration), `down`,
+      remove `/tmp/cb-mig`.
+   3. Set `PINNED_CHROMIUM_REVISION = <new>`, land it. Keep the old build installed:
+      the migration exports through it.
+   4. Restart the PRIVATE instance attended (`env CLAUDE_BROWSER_INSTANCE=private
+      browser.py down`, then `… up` from a terminal): the `Last Version` guard backs the
+      profile up and migrates the cookies; canary green and `agent-login.py -L
+      console-private` / `logged-in` ✅.
+   5. default/admin/alt move at their natural next restart — an agent never restarts
+      them. An attended `up` migrates them the same way; an unattended launch
+      (`AGENT_LOGIN_SCHEDULED=1`) refuses. Keep the old build and its `.links` entry
+      (`_ensure_chromium_pin_link`) until every instance passed the canary on the new
+      revision.
+
+## Why a new Chrome major can wipe the jar (Last Version guard, migration)
+
+Measured 2026-11-22 on disposable copies (tp#2537 B2b): Chrome 158 (chromium-1254)
+enables the feature `KeychainKeyProviderUserDataDirProtection` and encrypts its
+cookies with a NEW key (rows start with `v11`); Chrome 156 (chromium-1248) uses the
+legacy `v10` key from the same "Chromium Safe Storage" password. Each build deletes
+every row it cannot decrypt at startup: 1254 wipes a 1248 jar (1555 rows → 0), 1248
+wipes a 1254 jar. Not the cause: the Keychain item (only one exists, both builds read
+it; with the feature disabled 1254 reads the `v10` rows), `Local State` (no `os_crypt`
+key on macOS), the Cookies schema (24 on both) or the move of `Default/Cookies` into
+`Default/Network/`.
+
+So `_launch_and_record` compares the profile's `Last Version` major with the pinned
+build's. When the pinned build is newer: unattended → refuse naming this file;
+attended → (1) a full backup into `~/.cache/claude-browser[-<instance>]/profile-backups/
+<time>-chrome<old>-to-<new>/` (`Default/Network/`, `Default/Cookies`, `Default/Preferences`,
+`Local State`, `Last Version`; `manifest.json` records each cookie db's row count and
+the backup is checked against the source), (2) the old build (an installed revision
+of the profile's major) starts headless on the profile, its persistent cookies are read
+over raw CDP (`Storage.getCookies`, in memory only), it is closed, (3) the pinned build
+starts and they are written back (`Storage.setCookies`; never a cloudflareaccess.com
+cookie, the Access team sweep in a `finally`). Fewer than 90 % in memory afterwards
+→ ❌ with the rollback command. A downgrade (profile newer than the pin) only warns:
+the old build deletes the `v11` rows too.
+
+Rollback (browser down): `browser.py cookie-rollback -l` lists the backups;
+`browser.py cookie-rollback [-b <backup dir>]` moves the current items aside into
+`<backup>/replaced-<time>/` (nothing is deleted), restores the backup and fails unless
+each restored cookie db's row count equals the recorded one. Then pin the old build
+again before the next start (a start on the new build would migrate again).

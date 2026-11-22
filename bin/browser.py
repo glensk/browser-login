@@ -1196,6 +1196,28 @@ def parse_args() -> argparse.Namespace:
         "coordination, and a drivability probe on a disposable page — never "
         "touches real tabs.",
     )
+    prb = sub.add_parser(
+        "cookie-rollback",
+        help="Restore a pre-migration profile backup (tp#2537: the backup an "
+        "attended launch on a newer Chrome major takes before it migrates the "
+        "cookies) and check the restored cookie rows equal the recorded ones. "
+        "The browser must be down; replaced files are kept, nothing is "
+        "deleted. Examples: `browser.py cookie-rollback -l`, `browser.py "
+        "cookie-rollback -b <backup dir>`.",
+    )
+    prb.add_argument(
+        "-b",
+        "--backup",
+        help="Backup folder to restore (default: this instance's newest, "
+        "<cache>/profile-backups/).",
+    )
+    prb.add_argument(
+        "-l",
+        "--list",
+        action="store_true",
+        help="List this instance's backups with their recorded row counts; "
+        "change nothing.",
+    )
     pre = sub.add_parser(
         "register-exec",
         help="Run CMD as a REGISTERED CDP client: hold a registry registration "
@@ -3682,7 +3704,7 @@ def _pac_status_line(port: int) -> str:
     return f"Proxy PAC: {_pac_summary(hosts)} ({state}){warn}"
 
 
-def _launch_and_record(port: int, headless: bool) -> int:
+def _launch_and_record(port: int, headless: bool) -> int:  # pylint: disable=too-many-branches
     """Cold-launch the shared browser and record it. Shared by ``up``/``switch``.
 
     Order matters: `_launch_guard` first (never a second root on one profile),
@@ -3708,6 +3730,22 @@ def _launch_and_record(port: int, headless: bool) -> int:
     refusal = _keychain_grant_gate(binary)
     if refusal is not None:
         return _fail(f"Not launching: {refusal}")
+    # A profile last run by an older Chrome major (tp#2537 B2b): its first start
+    # on the pinned build would delete every cookie. Unattended → refuse;
+    # attended → full backup + export through the old build now, import below.
+    gate = _profile_version_gate(binary)
+    if gate.refusal is not None:
+        return _fail(f"Not launching: {gate.refusal}")
+    migration: CookieMigration | None = None
+    if gate.export_with is not None:
+        try:
+            migration = _cookie_migrate_prepare(gate, PROFILE_DIR)
+        except (OSError, RuntimeError) as exc:
+            return _fail(
+                f"Not launching: the cookie migration {gate.profile_version} → "
+                f"{gate.build_version} failed before the start ({_exc_line(exc)}); "
+                f"the profile is unchanged. Runbook: {CHROMIUM_BUMP_RUNBOOK}"
+            )
     # The canary's drop baseline (tp#2537 B2c): the jar's size before this spawn.
     _cookie_baseline_record()
     flags = [
@@ -3768,6 +3806,9 @@ def _launch_and_record(port: int, headless: bool) -> int:
         if _is_up(port):
             pid = _record_running(port, want, pid, rec["nonce"])
             _tabstate_record_startup(port)
+            migrated = (
+                0 if migration is None else _cookie_migrate_finish(port, migration)
+            )
             if headless:
                 print(
                     f"✓ Shared browser launched HEADLESS "
@@ -3782,8 +3823,15 @@ def _launch_and_record(port: int, headless: bool) -> int:
                     f"(pid {pid or '?'}, CDP http://127.0.0.1:{port}).\n"
                     f"  Profile: {PROFILE_DIR}"
                 )
-            return 0
+            return migrated
         time.sleep(0.2)
+    if migration is not None:
+        print(
+            f"❌ the exported cookies were not written back (no CDP); the "
+            f"pre-migration backup is {migration.backup} — "
+            f"`browser.py cookie-rollback -b {migration.backup}`",
+            file=sys.stderr,
+        )
     return _fail(
         "Browser started but CDP endpoint never came up — lifecycle record left "
         "in state 'starting' (see `browser.py status`)."
@@ -4485,6 +4533,7 @@ _PREFLIGHT_SKIP_CMDS = frozenset(
         "broker-sites",
         # Recovery tools: they must work in exactly the state a revert is for.
         "doctor",
+        "cookie-rollback",
         "close-hung",
         "close",
         "reap-owned",
@@ -14418,6 +14467,525 @@ def _doctor_cookie_canary(log: list[str], port: int) -> None:
         )
 
 
+# Profile version guard + cookie migration (tp#2537 B2b). Root cause, measured
+# 2026-11-22 on disposable copies: Chrome 158 (chromium-1254) enables the
+# `KeychainKeyProviderUserDataDirProtection` feature, so its cookie key is a
+# new one (rows written as ``v11``) instead of the legacy ``v10`` key Chrome 156
+# (chromium-1248) derives from the same "Chromium Safe Storage" password. Each
+# build deletes every row it cannot decrypt at startup: 1254 wipes a 1248 jar
+# and 1248 wipes a 1254 jar (same Keychain item, both ad-hoc signed, same
+# Cookies schema 24; `Local State` holds no os_crypt key on macOS). So a profile
+# whose `Last Version` major is older than the pinned build is migrated before
+# the first start: a full backup (`profile_backup`), its persistent cookies read
+# over CDP from the OLD build on the same profile (`_cookie_export`), then the
+# new build starts and they are written back (`cookie_import`, never a
+# cloudflareaccess.com cookie, the team sweep in a `finally`). An unattended
+# launch refuses. `cookie-rollback` restores the backup and checks the counts.
+PROFILE_LAST_VERSION_NAME = "Last Version"
+PROFILE_BACKUP_DIRNAME = "profile-backups"
+PROFILE_BACKUP_MANIFEST = "manifest.json"
+# What a backup holds (relative to the profile dir): the whole network data
+# folder, the legacy cookie db (the default instance still keeps its jar there
+# on 1248) and the files a profile downgrade/upgrade rewrites.
+PROFILE_BACKUP_ITEMS: tuple[tuple[str, ...], ...] = (
+    ("Default", "Network"),
+    ("Default", "Cookies"),
+    ("Default", "Cookies-journal"),
+    ("Default", "Preferences"),
+    ("Local State",),
+    (PROFILE_LAST_VERSION_NAME,),
+)
+PROFILE_BACKUP_DBS: tuple[tuple[str, ...], ...] = (
+    ("Default", "Network", "Cookies"),
+    ("Default", "Cookies"),
+)
+COOKIE_MIGRATE_UP_WAIT_S = 30.0
+COOKIE_MIGRATE_EXIT_WAIT_S = 30.0
+COOKIE_MIGRATE_CDP_BUDGET_S = 30.0
+# An import that keeps less than this share of the exported cookies is a ❌
+# (with the rollback command): Chrome may refuse a few odd cookies, not many.
+COOKIE_MIGRATE_MIN_FRACTION = 0.9
+# The CDP CookieParam fields carried over from a `Storage.getCookies` cookie
+# (besides name/value/domain-or-url/path/expires).
+_COOKIE_PARAM_FIELDS = (
+    "secure",
+    "httpOnly",
+    "sameSite",
+    "priority",
+    "sourceScheme",
+    "sourcePort",
+    "partitionKey",
+)
+
+
+def _version_major(text: str | None) -> int | None:
+    """The major of a Chrome version string (``156.0.8078.4`` → 156), or None."""
+    m = re.match(r"\s*(\d+)\.", text or "")
+    return int(m.group(1)) if m else None
+
+
+def _profile_last_version(profile: Path) -> str | None:
+    """The Chrome version that last ran `profile` (its ``Last Version`` file)."""
+    try:
+        text = (profile / PROFILE_LAST_VERSION_NAME).read_text(encoding="utf-8")
+    except OSError:
+        return None
+    return text.strip() or None
+
+
+def _chromium_build_version(binary: str) -> str | None:
+    """The Chrome version of a Chromium executable (its ``.app``'s Info.plist)."""
+    import plistlib
+
+    plist = Path(_chromium_app_path(binary)) / "Contents" / "Info.plist"
+    try:
+        with plist.open("rb") as fh:
+            data = plistlib.load(fh)
+    except (OSError, ValueError, plistlib.InvalidFileException):
+        return None
+    ver = data.get("CFBundleShortVersionString") if isinstance(data, dict) else None
+    return ver if isinstance(ver, str) and ver else None
+
+
+def _chromium_builds_by_major(major: int) -> list[str]:
+    """Installed Playwright Chromium executables of Chrome `major`, newest
+    revision first (the build that can still read an older profile's jar)."""
+    found: list[tuple[int, str]] = []
+    for build in _playwright_cache_root().glob("chromium-*"):
+        rev = build.name.removeprefix("chromium-")
+        if not rev.isdigit():
+            continue
+        for arch in ("chrome-mac-arm64", "chrome-mac"):
+            for path in sorted(glob.glob(str(build / arch / "*.app/Contents/MacOS/*"))):
+                if not (os.path.isfile(path) and os.access(path, os.X_OK)):
+                    continue
+                if _version_major(_chromium_build_version(path)) == major:
+                    found.append((int(rev), path))
+    return [path for _rev, path in sorted(found, reverse=True)]
+
+
+def profile_version_verdict(profile_major: int | None, build_major: int | None) -> str:
+    """``same`` / ``unknown`` (no Last Version or unreadable build version) /
+    ``upgrade`` (the pinned build is newer: its first start would delete the
+    jar) / ``downgrade`` (the profile is newer). Pure."""
+    if profile_major is None or build_major is None:
+        return "unknown"
+    if build_major > profile_major:
+        return "upgrade"
+    if build_major < profile_major:
+        return "downgrade"
+    return "same"
+
+
+@dataclass(frozen=True)
+class ProfileGate:
+    """`_profile_version_gate`'s answer: a refusal, or the OLD build to export
+    the cookies with before the launch (None: launch as usual)."""
+
+    refusal: str | None = None
+    export_with: str | None = None
+    profile_version: str | None = None
+    build_version: str | None = None
+
+
+def _profile_version_gate(binary: str, profile: Path | None = None) -> ProfileGate:
+    """Pre-launch check (tp#2537 B2b): compare the profile's ``Last Version``
+    major with the pinned build's. ``upgrade`` + ``AGENT_LOGIN_SCHEDULED`` →
+    refuse naming the runbook; attended → the old build to migrate with (no
+    such build installed → refuse). A downgrade only warns: the older build
+    deletes the newer one's cookies too — `cookie-rollback` restores them."""
+    prof = PROFILE_DIR if profile is None else profile
+    last = _profile_last_version(prof)
+    build = _chromium_build_version(binary)
+    pmaj, bmaj = _version_major(last), _version_major(build)
+    verdict = profile_version_verdict(pmaj, bmaj)
+    if verdict == "downgrade":
+        print(
+            f"⚠ the profile was last run by Chrome {last}, the pinned build is "
+            f"Chrome {build}: the older build deletes every cookie the newer one "
+            f"wrote — `browser.py cookie-rollback` restores the pre-migration "
+            f"backup; runbook: {CHROMIUM_BUMP_RUNBOOK}",
+            file=sys.stderr,
+        )
+    if verdict != "upgrade" or pmaj is None:
+        return ProfileGate(profile_version=last, build_version=build)
+    why = (
+        f"the profile was last run by Chrome {last} and the pinned build is "
+        f"Chrome {build}: its first start would delete every cookie the older "
+        "build wrote (tp#2537)"
+    )
+    if os.environ.get(SCHEDULED_ENV):
+        return ProfileGate(
+            f"{why}. An attended `browser.py up` backs the profile up and "
+            f"migrates the cookies; runbook: {CHROMIUM_BUMP_RUNBOOK}",
+            None,
+            last,
+            build,
+        )
+    old = _chromium_builds_by_major(pmaj)
+    if not old:
+        return ProfileGate(
+            f"{why}, and no installed Chrome {pmaj} build can export them. "
+            f"Install it again (see the runbook) or accept the loss by hand; "
+            f"runbook: {CHROMIUM_BUMP_RUNBOOK}",
+            None,
+            last,
+            build,
+        )
+    return ProfileGate(None, old[0], last, build)
+
+
+def _profile_backup_root() -> Path:
+    """This instance's backup folder (outside the profile)."""
+    return CACHE_DIR / PROFILE_BACKUP_DIRNAME
+
+
+def _profile_db_rows(profile: Path) -> dict[str, int | None]:
+    """Row count of every cookie db (`PROFILE_BACKUP_DBS`) present in `profile`."""
+    rows: dict[str, int | None] = {}
+    for rel in PROFILE_BACKUP_DBS:
+        path = profile.joinpath(*rel)
+        if path.is_file():
+            rows["/".join(rel)] = _cookie_db_rows(path)
+    return rows
+
+
+def _copy_item(src: Path, dst: Path) -> None:
+    """Copy a file or a folder (metadata kept); the parent is created 0700."""
+    dst.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    if src.is_dir():
+        shutil.copytree(src, dst, symlinks=True)
+    else:
+        shutil.copy2(src, dst)
+
+
+def profile_backup(profile: Path, dest_root: Path, label: str) -> Path:
+    """Back up `profile`'s `PROFILE_BACKUP_ITEMS` (browser STOPPED) into a new
+    0700 folder under `dest_root` with a manifest of the cookie dbs' row
+    counts; raises OSError when a copied db's count differs from the source's."""
+    dest = dest_root / f"{time.strftime('%Y%m%d-%H%M%S')}-{label}"
+    dest.mkdir(parents=True, mode=0o700)
+    items: list[str] = []
+    for rel in PROFILE_BACKUP_ITEMS:
+        src = profile.joinpath(*rel)
+        if src.exists():
+            _copy_item(src, dest / "profile" / Path(*rel))
+            items.append("/".join(rel))
+    source_rows = _profile_db_rows(profile)
+    rows = _profile_db_rows(dest / "profile")
+    if rows != source_rows:
+        raise OSError(
+            f"backup row counts {rows} differ from the profile's {source_rows}"
+        )
+    _json_write_atomic(
+        dest / PROFILE_BACKUP_MANIFEST,
+        {
+            "profile": str(profile),
+            "items": items,
+            "rows": rows,
+            "last_version": _profile_last_version(profile),
+            "at": time.time(),
+        },
+    )
+    return dest
+
+
+def profile_restore(backup: Path, profile: Path) -> tuple[bool, str]:
+    """Roll `profile` back to `backup` (browser STOPPED): every
+    `PROFILE_BACKUP_ITEMS` entry now in the profile is moved aside into
+    ``<backup>/replaced-<time>/`` (nothing is deleted), the backup's copies go
+    back in, and each cookie db's row count must equal the manifest's.
+    Returns (ok, one-line summary)."""
+    manifest = _read_json_dict(backup / PROFILE_BACKUP_MANIFEST)
+    if not manifest or not isinstance(manifest.get("rows"), dict):
+        return False, f"no readable {PROFILE_BACKUP_MANIFEST} in {backup}"
+    aside = backup / f"replaced-{time.strftime('%Y%m%d-%H%M%S')}"
+    for rel in PROFILE_BACKUP_ITEMS:
+        cur = profile.joinpath(*rel)
+        if cur.exists() or cur.is_symlink():
+            target = aside.joinpath(*rel)
+            target.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+            shutil.move(str(cur), str(target))
+    for item in manifest.get("items") or []:
+        rel = tuple(str(item).split("/"))
+        if rel not in PROFILE_BACKUP_ITEMS:
+            continue  # never write outside the fixed item list
+        _copy_item(backup / "profile" / Path(*rel), profile.joinpath(*rel))
+    want = manifest["rows"]
+    got = _profile_db_rows(profile)
+    summary = f"restored rows {got}, recorded {want}; replaced files kept in {aside}"
+    return got == want, summary
+
+
+def _cookie_param(ck: Mapping[str, Any]) -> dict[str, Any]:
+    """The ``Storage.setCookies`` CookieParam that recreates the
+    ``Storage.getCookies`` cookie `ck` with its exact identity: a host-only
+    cookie (no leading dot) by ``url`` and NO ``domain`` (a domain would turn
+    it into a ``.domain`` cookie, see `_team_cookie_kill`), a domain cookie by
+    its ``.domain``."""
+    domain = str(ck.get("domain") or "")
+    path = str(ck.get("path") or "/")
+    param: dict[str, Any] = {
+        "name": ck.get("name"),
+        "value": ck.get("value", ""),
+        "path": path,
+    }
+    if domain.startswith("."):
+        param["domain"] = domain
+    else:
+        secure = ck.get("secure") or ck.get("sourceScheme") == "Secure"
+        param["url"] = f"{'https' if secure else 'http'}://{domain}{path}"
+    expires = ck.get("expires")
+    if isinstance(expires, (int, float)) and expires > 0:
+        param["expires"] = expires
+    for key in _COOKIE_PARAM_FIELDS:
+        if ck.get(key) is not None:
+            param[key] = ck[key]
+    return param
+
+
+@dataclass(frozen=True)
+class CookieImport:
+    """`cookie_import`'s counts (never a value): ``written`` cookies accepted,
+    ``rejected`` refused by Chrome, ``access_skipped`` Cloudflare Access team
+    cookies never moved."""
+
+    written: int
+    rejected: int
+    access_skipped: int
+
+
+def cookie_import(
+    send: Callable[[str, dict], dict], cookies: Sequence[Mapping[str, Any]]
+) -> CookieImport:
+    """Write the persistent `cookies` into the browser behind `send` (a
+    browser-level CDP transport, raises on failure) with ``Storage.setCookies``:
+    one batch, and cookie by cookie when Chrome refuses the batch. Session
+    cookies and every Cloudflare Access team cookie (cloudflareaccess.com or
+    the team domain) are skipped — the caller sweeps after, in a `finally`."""
+    team, _src = _access_team.configured_team_domain()
+    keep: list[dict[str, Any]] = []
+    skipped = 0
+    for ck in cookies:
+        if ck.get("session"):
+            continue
+        if _access_team.is_team_host(str(ck.get("domain") or ""), team):
+            skipped += 1
+            continue
+        keep.append(_cookie_param(ck))
+    if not keep:
+        return CookieImport(0, 0, skipped)
+    try:
+        send("Storage.setCookies", {"cookies": keep})
+        return CookieImport(len(keep), 0, skipped)
+    except Exception:  # pylint: disable=broad-exception-caught
+        pass  # one bad cookie fails the batch: retry one by one
+    rejected = 0
+    for param in keep:
+        try:
+            send("Storage.setCookies", {"cookies": [param]})
+        except Exception:  # pylint: disable=broad-exception-caught
+            rejected += 1
+    return CookieImport(len(keep) - rejected, rejected, skipped)
+
+
+def _cdp_sender(ws_url: str, budget_s: float) -> Callable[[str, dict], dict]:
+    """A `send(method, params) -> result` over `_cdp_ws_call` (raises on failure)."""
+
+    def _send(method: str, params: dict) -> dict:
+        res = _cdp_ws_call(ws_url, method, params, budget_s)
+        if res.status != "ok" or res.error or not isinstance(res.result, dict):
+            raise _CdpSendError(res.error or res.status)
+        return res.result
+
+    return _send
+
+
+def _free_local_port() -> int:
+    """A currently free TCP port on 127.0.0.1 (for the export browser)."""
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        sock.bind(("127.0.0.1", 0))
+        return int(sock.getsockname()[1])
+
+
+def _wait_pid_exit(pid: int, wait_s: float) -> bool:
+    """Wait until the child `pid` exited (reaped here); True when it did."""
+    end = time.monotonic() + wait_s
+    while time.monotonic() < end:
+        try:
+            done, _status = os.waitpid(pid, os.WNOHANG)
+        except ChildProcessError:
+            return not _pid_alive(pid)
+        if done:
+            return True
+        time.sleep(0.2)
+    return False
+
+
+def _cookie_export(old_binary: str, profile: Path) -> list[dict]:
+    """The persistent cookies of `profile`, read over raw CDP from the OLD
+    build `old_binary` started headless on it (on a free port, browser
+    stopped before), which is then closed (``Browser.close``) and waited for.
+    Raises RuntimeError when the jar cannot be read. Held in memory only."""
+    port = _free_local_port()
+    flags = [
+        f"--user-data-dir={profile}",
+        f"--remote-debugging-port={port}",
+        "--no-first-run",
+        "--no-default-browser-check",
+        "--headless=new",
+        "--disable-background-networking",
+        "--disable-component-update",
+        "--disable-default-apps",
+        "--disable-sync",
+        "about:blank",
+    ]
+    pid = _launch_browser(old_binary, flags, headless=True)
+    ws_url = None
+    try:
+        end = time.monotonic() + COOKIE_MIGRATE_UP_WAIT_S
+        while ws_url is None and time.monotonic() < end:
+            ws_url = _browser_ws_url(port, timeout=1.0)
+            if ws_url is None:
+                time.sleep(0.2)
+        if ws_url is None:
+            raise RuntimeError(f"the export browser's CDP never came up (port {port})")
+        res = _cdp_ws_call(
+            ws_url, "Storage.getCookies", {}, COOKIE_MIGRATE_CDP_BUDGET_S
+        )
+        raw = res.result.get("cookies") if isinstance(res.result, dict) else None
+        if res.status != "ok" or res.error or not isinstance(raw, list):
+            raise RuntimeError(f"Storage.getCookies failed ({res.error or res.status})")
+        return [c for c in raw if isinstance(c, dict) and not c.get("session")]
+    finally:
+        if ws_url is not None:
+            _cdp_ws_call(ws_url, "Browser.close", {}, 5.0)
+        if pid is not None and not _wait_pid_exit(pid, COOKIE_MIGRATE_EXIT_WAIT_S):
+            with contextlib.suppress(OSError):
+                os.kill(pid, signal.SIGTERM)
+            _wait_pid_exit(pid, 10.0)
+
+
+@dataclass(frozen=True)
+class CookieMigration:
+    """A prepared migration: the backup folder and the exported cookies."""
+
+    backup: Path
+    cookies: list[dict]
+    from_version: str | None
+    to_version: str | None
+
+
+def _cookie_migrate_prepare(gate: ProfileGate, profile: Path) -> CookieMigration:
+    """Attended migration, part 1 (browser stopped): the full backup, then the
+    export through the old build. Raises OSError/RuntimeError on a failure —
+    the caller does not launch then (the profile is unchanged)."""
+    assert gate.export_with is not None
+    label = (
+        f"chrome{_version_major(gate.profile_version)}-to-"
+        f"{_version_major(gate.build_version)}"
+    )
+    backup = profile_backup(profile, _profile_backup_root(), label)
+    rows = (_read_json_dict(backup / PROFILE_BACKUP_MANIFEST) or {}).get("rows")
+    print(
+        f"⚠ {gate.profile_version} → {gate.build_version}: profile backed up to "
+        f"{backup} (cookie rows {rows}); exporting the cookies with "
+        f"{_chromium_app_path(gate.export_with)}…",
+        file=sys.stderr,
+    )
+    cookies = _cookie_export(gate.export_with, profile)
+    _clear_session_restore()
+    return CookieMigration(backup, cookies, gate.profile_version, gate.build_version)
+
+
+def _cookie_migrate_finish(port: int, mig: CookieMigration) -> int:
+    """Attended migration, part 2 (the new build is up on `port`): write the
+    exported cookies back (`cookie_import`), the Access team sweep in a
+    `finally`, then compare the in-memory count. 0 = ok, 1 = short (the
+    rollback command is printed)."""
+    ws_url = _browser_ws_url(port)
+    result: CookieImport | None = None
+    error = ""
+    try:
+        if ws_url is None:
+            error = "no browser websocket"
+        else:
+            result = cookie_import(
+                _cdp_sender(ws_url, COOKIE_MIGRATE_CDP_BUDGET_S), mig.cookies
+            )
+    except Exception as exc:  # pylint: disable=broad-exception-caught
+        error = _exc_line(exc)
+    finally:
+        _access_team_sweep_cdp(port, "cookie-migrate", COOKIE_MIGRATE_CDP_BUDGET_S)
+    memory = _memory_persistent_cookies(port)
+    wanted = len(mig.cookies) - (result.access_skipped if result else 0)
+    counts = (
+        f"{len(mig.cookies)} exported, "
+        + (
+            f"{result.written} written, {result.rejected} refused, "
+            f"{result.access_skipped} Access cookies not moved"
+            if result
+            else f"import failed ({error})"
+        )
+        + f", {'?' if memory is None else memory} persistent in memory now"
+    )
+    _journal_note(cookie_migration=counts, cookie_backup=str(mig.backup))
+    if result and memory is not None and memory >= COOKIE_MIGRATE_MIN_FRACTION * wanted:
+        print(f"✓ cookies migrated {mig.from_version} → {mig.to_version}: {counts}")
+        return 0
+    print(
+        f"❌ cookie migration {mig.from_version} → {mig.to_version} short: "
+        f"{counts}. Roll back: {_instance_prefix(INSTANCE)}browser.py down && "
+        f"{_instance_prefix(INSTANCE)}browser.py cookie-rollback -b {mig.backup} "
+        f"(then pin the old build again); runbook: {CHROMIUM_BUMP_RUNBOOK}",
+        file=sys.stderr,
+    )
+    return 1
+
+
+def _profile_backups() -> list[Path]:
+    """This instance's backups, newest first."""
+    root = _profile_backup_root()
+    if not root.is_dir():
+        return []
+    return sorted(
+        (p for p in root.iterdir() if (p / PROFILE_BACKUP_MANIFEST).is_file()),
+        reverse=True,
+    )
+
+
+def cmd_cookie_rollback(port: int, backup: str | None, list_only: bool) -> int:
+    """`cookie-rollback` (tp#2537 B2b): restore a pre-migration profile backup
+    (browser must be down) and check the restored cookie rows equal the
+    recorded ones; `-l` lists the backups and changes nothing."""
+    backups = _profile_backups()
+    if list_only:
+        for b in backups:
+            data = _read_json_dict(b / PROFILE_BACKUP_MANIFEST) or {}
+            print(
+                f"{b}  rows {data.get('rows')}  last version {data.get('last_version')}"
+            )
+        if not backups:
+            print(f"no backups under {_profile_backup_root()}")
+        return 0
+    chosen = Path(backup).expanduser() if backup else (backups[0] if backups else None)
+    if chosen is None or not (chosen / PROFILE_BACKUP_MANIFEST).is_file():
+        return _fail(f"no backup to restore ({chosen or _profile_backup_root()})")
+    if _is_up(port) or _launch_guard(port) is not None:
+        return _fail(
+            "the browser runs on this profile — stop it first: "
+            f"{_instance_prefix(INSTANCE)}browser.py down"
+        )
+    ok, summary = profile_restore(chosen, PROFILE_DIR)
+    if not ok:
+        return _fail(f"rollback from {chosen}: row counts differ — {summary}")
+    print(
+        f"✓ rolled back from {chosen}: {summary}. Launch it only on the build "
+        f"that wrote it (pin it again first); runbook: {CHROMIUM_BUMP_RUNBOOK}"
+    )
+    return 0
+
+
 def _broker_fail(rc: int, msg: str) -> int:
     print(f"❌ {msg}", file=sys.stderr)
     return rc
@@ -22489,6 +23057,8 @@ def _dispatch(args: argparse.Namespace, port: int) -> int:  # pylint: disable=to
         return cmd_journal(args.lines, args.event, args.json)
     if args.cmd == "doctor":
         return cmd_doctor(port)
+    if args.cmd == "cookie-rollback":
+        return cmd_cookie_rollback(port, args.backup, args.list)
     if args.cmd == "register-exec":
         return cmd_register_exec(port, args.tool, args.cmd_)
     if args.cmd == "down":
