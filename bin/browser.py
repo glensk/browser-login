@@ -9300,6 +9300,100 @@ def _claude_logged_in(page) -> bool:
     return False  # never confirmed — treat as not logged in (fail closed)
 
 
+# claude.ai's cookie-consent banner (tp#2537 B4): a `region` carrying
+# data-testid="consent-banner" with Customize / Reject all / Accept all buttons.
+# It sat over /magic-link while the SPA showed "Loading…", and a Playwright
+# role click on "Reject all cookies" timed out on the actionability checks, so
+# the dismissal clicks through the DOM as a fallback. Privacy-preserving
+# choices only: reject / necessary-only, else a close button — never
+# "Accept all".
+_CONSENT_JS = r"""(click) => {
+  const REJECT = /^(reject( all)?( cookies)?|decline( all)?( cookies)?|(use )?necessary( cookies)? only|(accept|allow) (only )?(strictly )?necessary( cookies)?( only)?)$/i;
+  const CLOSE = /^(close|dismiss)$/i;
+  const label = (b) =>
+    ((b.innerText || '').trim() || (b.getAttribute('aria-label') || '').trim());
+  const shown = (el) => !!el && el.isConnected && el.getClientRects().length > 0
+    && getComputedStyle(el).visibility !== 'hidden';
+  let banner = document.querySelector('[data-testid="consent-banner"]');
+  if (!banner) {
+    const hit = [...document.querySelectorAll('button')].find((b) => {
+      const box = b.closest('[role=region],[role=dialog],[role=alertdialog]');
+      return REJECT.test(label(b)) && !!box && /cookie/i.test(box.innerText || '');
+    });
+    banner = hit
+      ? hit.closest('[role=region],[role=dialog],[role=alertdialog]') : null;
+  }
+  if (!shown(banner)) return {present: false, clicked: null};
+  if (!click) return {present: true, clicked: null};
+  const btns = [...banner.querySelectorAll('button,[role=button]')].filter(shown);
+  const pick = banner.querySelector('[data-testid="consent-reject"]')
+    || btns.find((b) => REJECT.test(label(b)))
+    || btns.find((b) => CLOSE.test(label(b)));
+  if (!pick) return {present: true, clicked: null};
+  pick.click();
+  return {present: true, clicked: label(pick).slice(0, 40)};
+}"""
+_CONSENT_REJECT_SEL = '[data-testid="consent-banner"] [data-testid="consent-reject"]'
+
+
+def _claude_consent_state(page, click: bool = False) -> dict:
+    """The consent banner's state ({present, clicked}); `click` DOM-clicks its
+    reject/necessary/close button. Any failure reads as "no banner"."""
+    try:
+        res = page.evaluate(_CONSENT_JS, click)
+    except Exception:  # pylint: disable=broad-exception-caught
+        return {"present": False, "clicked": None}
+    return res if isinstance(res, dict) else {"present": False, "clicked": None}
+
+
+def _claude_consent_gone(page, wait_ms: int) -> bool:
+    """Poll (bounded by `wait_ms`) until the consent banner is gone."""
+    for _ in range(max(1, wait_ms // 250)):
+        if not _claude_consent_state(page).get("present"):
+            return True
+        try:
+            page.wait_for_timeout(250)
+        except Exception:  # pylint: disable=broad-exception-caught
+            return False
+    return not _claude_consent_state(page).get("present")
+
+
+def _claude_dismiss_consent(page, click_timeout_ms: int = 3000) -> bool | None:
+    """Dismiss claude.ai's cookie-consent banner (tp#2537 B4), bounded (~13 s).
+
+    None: no banner showing (nothing done). True: it was showing and is gone.
+    False: it is still showing after every attempt. Order: a real Playwright
+    click on the reject button (short timeout), then a DOM click on
+    reject / necessary-only / close; each followed by a bounded wait for the
+    banner to disappear. Never raises — a stuck banner must not abort a login.
+    """
+    if not _claude_consent_state(page).get("present"):
+        return None
+    try:
+        btn = page.locator(_CONSENT_REJECT_SEL).first
+        if btn.count():
+            btn.click(timeout=click_timeout_ms)
+            if _claude_consent_gone(page, 5000):
+                return True
+    except Exception:  # pylint: disable=broad-exception-caught
+        pass  # actionability timeout (the tp#2537 symptom) → DOM click below
+    res = _claude_consent_state(page, click=True)
+    if not res.get("present"):
+        return True
+    if not res.get("clicked"):
+        return False  # no reject/necessary/close button to press
+    return _claude_consent_gone(page, 5000)
+
+
+def _claude_page_loading(page) -> bool:
+    """True while the claude.ai SPA shows its "Loading…" interstitial."""
+    try:
+        text = page.evaluate("() => (document.body && document.body.innerText) || ''")
+    except Exception:  # pylint: disable=broad-exception-caught
+        return False
+    return bool(re.search(r"^\s*Loading(\.\.\.|…)?\s*$", str(text), re.MULTILINE))
+
+
 def _claude_fill_email_and_continue(page, email: str) -> bool:
     """On /login: fill the email field and click 'Continue with email' (which makes
     Anthropic send the magic-link email). Returns True if it got that far. Tolerant
@@ -9326,6 +9420,9 @@ def _claude_fill_email_and_continue(page, email: str) -> bool:
                     field = None
         if field is None:
             return False
+        # The consent banner overlays the form; dismissing it here also stores
+        # the choice, so it does not reappear over /magic-link (tp#2537 B4).
+        _claude_dismiss_consent(page)
         field.fill(email)
         btn = page.get_by_role("button", name=cont).first
         if not btn.count():
@@ -9934,12 +10031,19 @@ def _claude_auto_login(  # pylint: disable=too-many-locals,too-many-statements
     # CRITICAL: let the SPA finish consuming the #token and redirect to the app
     # BEFORE navigating anywhere. Navigating mid-exchange (e.g. straight to billing)
     # aborts sign-in — that race is what made earlier attempts fail.
-    for _ in range(25):  # up to ~25s for /magic-link → /new
+    # Up to ~25 s for /magic-link → /new, stretched to ~45 s while the SPA still
+    # shows its "Loading…" interstitial; a consent banner over it is dismissed
+    # (tp#2537 B4) — at most once every ~5 s, each try itself bounded.
+    for i in range(45):
         try:
             url = page.url
         except Exception:  # pylint: disable=broad-exception-caught
             url = ""
         if app_host in url and "/magic-link" not in url and "/login" not in url:
+            break
+        if i % 5 == 0:
+            _claude_dismiss_consent(page)
+        if i >= 25 and not _claude_page_loading(page):
             break
         page.wait_for_timeout(1000)
     page.wait_for_timeout(1500)  # settle the app shell
