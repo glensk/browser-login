@@ -1500,23 +1500,66 @@ def _chromium_binary() -> str:
     return found[0]
 
 
-# Keychain grant check (tp#2537 B2). Chromium encrypts its cookies with a key
-# from the login Keychain item "Chromium Safe Storage"; a build whose `.app` is
-# not on that item's ACL application list cannot read the key, and the profile
-# then writes NO cookies to disk (every login dies on the next restart). Each
-# Playwright build is a new `.app` path, so every pin move needs one attended
+# Keychain grant check (tp#2537 B2, hardened in B2c). Chromium encrypts its
+# cookies with a key from the login Keychain item "Chromium Safe Storage"; a
+# build that macOS does not let read that key writes NO cookies to disk (every
+# login dies on the next restart). Each Playwright build is a new `.app` path
+# with a new CDHash (ad-hoc signed), so every pin move needs one attended
 # "Always Allow" (docs/chromium-build-bump.md). The check is read-only
-# (`security dump-keychain -a`: ACLs and attribute names, never a secret) and
-# slow (~1 min), so its outcome is cached per revision + `.app` path: a grant
-# for good, a missing grant for KEYCHAIN_ACL_MISS_TTL_S (re-checked after the
-# grant). Missing → an unattended launch (AGENT_LOGIN_SCHEDULED) is refused,
-# an attended one warns.
+# (`security dump-keychain -a`: ACLs and attribute names, never a secret; the
+# password itself is never read) and slow (~1 min). A build counts as granted
+# only when the item's decrypt ACL lists its `.app` with a verified entry AND
+# the item's `partition_id` list holds `cdhash:<the binary's CDHash>`
+# (`codesign -dvvv`). An ACL entry's ` (status N)` is kept: any status other
+# than OK makes the entry unproven ("unknown"), except
+# KEYCHAIN_ACL_STATUS_UNSEALED whose stored requirement is exactly the
+# binary's CDHash (see that constant). States: granted / missing (the `.app`
+# is not on the list) / unknown (listed but unproven, or no CDHash) / absent
+# (no item yet: the build creates it) / error (the query itself failed).
+# granted is cached for good per revision + `.app` + CDHash, missing for
+# KEYCHAIN_ACL_MISS_TTL_S. missing and unknown refuse an unattended launch
+# (AGENT_LOGIN_SCHEDULED) and warn an attended one; absent and error only warn.
 KEYCHAIN_SAFE_STORAGE_SERVICE = "Chromium Safe Storage"
 KEYCHAIN_ACL_CACHE = CHROMIUM_PIN_ROOT / "keychain-acl.json"
 KEYCHAIN_ACL_MISS_TTL_S = 600.0
+# CSSMERR_CSP_VERIFY_FAILED (0x8001094A; `security error -2147415734`).
+# `security` re-validates each ACL application statically against its stored
+# designated requirement; the Playwright Chromium bundles are linker-signed
+# ad hoc with no sealed resources, so that full-bundle validation fails ("code
+# has no resources but signature indicates they must be present") on every
+# listed build, granted ones included (seen 2026-11-22 on 1223/1243/1248/1254;
+# 1254 provably read the key). The stored requirement is `cdhash H"<hex>"`, so
+# an entry with this status still proves the grant when that hex equals the
+# binary's CDHash. Every other non-OK status (e.g. -67068, errSecCSStaticCode
+# NotFound: the build is gone) leaves the entry unproven.
+KEYCHAIN_ACL_STATUS_UNSEALED = -2147415734
 CHROMIUM_BUMP_RUNBOOK = Path(__file__).resolve().parent.parent / (
     "docs/chromium-build-bump.md"
 )
+
+
+@dataclass(frozen=True)
+class KeychainAclApp:
+    """One application of a decrypt ACL entry: its path (``*`` for
+    ``<null>``, any app), its status (0 = ``(OK)``, None = none shown) and the
+    hex of its ``requirement: cdhash H"…"`` line (lower case), if any."""
+
+    path: str
+    status: int | None
+    requirement_cdhash: str | None = None
+
+
+@dataclass(frozen=True)
+class KeychainAclItem:
+    """One Keychain item's decrypt applications and its ``partition_id`` list
+    (None when the item has no ``partition_id`` entry)."""
+
+    apps: tuple[KeychainAclApp, ...]
+    partitions: tuple[str, ...] | None
+
+
+_ACL_APP_RE = re.compile(r"\d+: (/.*?)(?: \((OK|status (-?\d+))\))?")
+_ACL_REQ_CDHASH_RE = re.compile(r'requirement: cdhash H"([0-9A-Fa-f]+)"')
 
 
 def _chromium_app_path(binary: str) -> str:
@@ -1527,62 +1570,140 @@ def _chromium_app_path(binary: str) -> str:
     return str(app or path)
 
 
-def _keychain_acl_apps(dump: str, service: str) -> list[list[str]] | None:
-    """The decrypt-ACL application lists of every `service` item in `dump`.
+def _chromium_cdhash(app: str) -> str | None:
+    """The CDHash (lower-case hex) ``codesign -dvvv`` reports for `app`, or None."""
+    try:
+        res = subprocess.run(
+            ["codesign", "-dvvv", app],
+            capture_output=True,
+            timeout=30,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    text = (res.stdout + res.stderr).decode("utf-8", errors="replace")
+    m = re.search(r"(?m)^CDHash=([0-9A-Fa-f]+)\s*$", text)
+    return m.group(1).lower() if res.returncode == 0 and m else None
 
-    `dump` is ``security dump-keychain -a`` output. One list per matching
-    item: the application paths of its ACL entry whose authorizations include
-    ``decrypt``; ``["*"]`` when that entry's applications are ``<null>`` (any
-    app may read). None when no item has that service.
+
+def _keychain_acl_apps(dump: str, service: str) -> list[KeychainAclItem] | None:
+    """The decrypt ACL applications and partition list of every `service` item.
+
+    `dump` is ``security dump-keychain -a`` output. One `KeychainAclItem` per
+    matching item: the applications of its ACL entries whose authorizations
+    include ``decrypt`` (with their status codes and cdhash requirements;
+    ``*`` when the applications are ``<null>``), and the ``cdhash:``/``teamid:``
+    terms of its ``partition_id`` entry. None when no item has that service.
     """
-    lists: list[list[str]] = []
+    items: list[KeychainAclItem] = []
     for block in re.split(r'(?m)^keychain: "', dump)[1:]:
         if f'"svce"<blob>="{service}"' not in block:
             continue
-        apps: list[str] = []
-        in_decrypt = False
+        apps: list[KeychainAclApp] = []
+        partitions: list[str] | None = None
+        kind = ""
         for line in block.splitlines():
             text = line.strip()
             if text.startswith("entry "):
-                in_decrypt = False
+                kind = ""
             elif text.startswith("authorizations"):
-                in_decrypt = " decrypt" in f" {text.split(':', 1)[-1]}"
-            elif in_decrypt and text == "applications: <null>":
-                apps.append("*")
-            elif in_decrypt and re.match(r"\d+: /", text):
-                path = text.split(": ", 1)[1]
-                apps.append(re.sub(r" \((OK|status -?\d+)\)$", "", path))
-        lists.append(apps)
-    return lists or None
+                auths = text.split(":", 1)[-1].split()
+                kind = (
+                    "decrypt"
+                    if "decrypt" in auths
+                    else "partition"
+                    if "partition_id" in auths
+                    else ""
+                )
+            elif kind == "partition" and text.startswith("description:"):
+                terms = text.split(":", 1)[1].split(",")
+                partitions = [*(partitions or []), *(t.strip() for t in terms)]
+            elif kind == "decrypt" and text == "applications: <null>":
+                apps.append(KeychainAclApp("*", 0))
+            elif kind == "decrypt" and (m := _ACL_APP_RE.fullmatch(text)):
+                code = 0 if m.group(2) == "OK" else m.group(3)
+                apps.append(
+                    KeychainAclApp(m.group(1), None if code is None else int(code))
+                )
+            elif (
+                kind == "decrypt" and apps and (m := _ACL_REQ_CDHASH_RE.fullmatch(text))
+            ):
+                apps[-1] = dataclasses.replace(
+                    apps[-1], requirement_cdhash=m.group(1).lower()
+                )
+        items.append(
+            KeychainAclItem(
+                tuple(apps), None if partitions is None else tuple(partitions)
+            )
+        )
+    return items or None
 
 
-def _keychain_acl_query(app: str) -> str:
-    """``granted`` / ``missing`` / ``absent`` (no item yet) / ``unknown`` for `app`.
+def _keychain_acl_entry_ok(entry: KeychainAclApp, cdhash: str) -> bool:
+    """True when this ACL application entry is verified for the binary."""
+    if entry.path == "*" or entry.status == 0:
+        return True
+    return (
+        entry.status == KEYCHAIN_ACL_STATUS_UNSEALED
+        and entry.requirement_cdhash == cdhash
+    )
+
+
+def _keychain_acl_verdict(
+    items: Sequence[KeychainAclItem], app: str, cdhash: str | None
+) -> str:
+    """``granted`` / ``unknown`` / ``missing`` for `app` (binary CDHash
+    `cdhash`) over the parsed items; the best item wins (pure)."""
+    states = []
+    for item in items:
+        entries = [a for a in item.apps if a.path in ("*", app)]
+        if not entries:
+            states.append("missing")
+        elif (
+            cdhash is not None
+            and any(_keychain_acl_entry_ok(a, cdhash) for a in entries)
+            and f"cdhash:{cdhash}" in {p.lower() for p in item.partitions or ()}
+        ):
+            states.append("granted")
+        else:
+            states.append("unknown")
+    return next((s for s in ("granted", "unknown") if s in states), "missing")
+
+
+def _keychain_acl_query(app: str, cdhash: str | None) -> str:
+    """``granted`` / ``missing`` / ``unknown`` / ``absent`` (no item yet) /
+    ``error`` (the dump failed) for `app` whose binary has `cdhash`.
 
     Read-only, through `_security_run`; nothing of the dump is printed.
     """
     try:
         res = _security_run(["security", "dump-keychain", "-a"])
     except Exception:  # pylint: disable=broad-exception-caught  # never blocks a launch
-        return "unknown"
+        return "error"
     if res.state != "done" or res.rc != 0:
-        return "unknown"
-    lists = _keychain_acl_apps(
+        return "error"
+    items = _keychain_acl_apps(
         res.stdout.decode("utf-8", errors="replace"), KEYCHAIN_SAFE_STORAGE_SERVICE
     )
-    if lists is None:
+    if items is None:
         return "absent"
-    granted = [a for a in list(lists) if "*" in a or app in a]
-    return "granted" if granted else "missing"
+    return _keychain_acl_verdict(items, app, cdhash)
 
 
-def _keychain_grant_state(revision: int, app: str, now: float | None = None) -> str:
+def _keychain_grant_state(
+    revision: int, app: str, cdhash: str | None, now: float | None = None
+) -> str:
     """`_keychain_acl_query` for `app`, cached per revision (see the block above)."""
     now = time.time() if now is None else now
     key = str(revision)
     cache = _read_json_dict(KEYCHAIN_ACL_CACHE) or {}
     hit = cache.get(key)
-    if isinstance(hit, dict) and hit.get("app") == app:
+    if (
+        cdhash is not None
+        and isinstance(hit, dict)
+        and hit.get("app") == app
+        and hit.get("cdhash") == cdhash
+    ):
         state, at = hit.get("state"), hit.get("at")
         if state == "granted":
             return "granted"
@@ -1592,9 +1713,9 @@ def _keychain_grant_state(revision: int, app: str, now: float | None = None) -> 
             and 0 <= now - at < KEYCHAIN_ACL_MISS_TTL_S
         ):
             return "missing"
-    state = _keychain_acl_query(app)
-    if state in ("granted", "missing"):
-        cache[key] = {"app": app, "state": state, "at": now}
+    state = _keychain_acl_query(app, cdhash)
+    if cdhash is not None and state in ("granted", "missing"):
+        cache[key] = {"app": app, "cdhash": cdhash, "state": state, "at": now}
         try:
             _json_write_atomic(KEYCHAIN_ACL_CACHE, cache)
         except OSError:
@@ -1605,29 +1726,40 @@ def _keychain_grant_state(revision: int, app: str, now: float | None = None) -> 
 def _keychain_grant_gate(binary: str) -> str | None:
     """Pre-launch check: the refusal message, or None to go on (maybe warned).
 
-    Missing grant + ``AGENT_LOGIN_SCHEDULED`` → refuse; attended → a ⚠ on
-    stderr and launch. ``absent`` (the build creates the item) and
-    ``unknown`` (query failed: nothing proven) never refuse.
+    ``missing`` or ``unknown`` + ``AGENT_LOGIN_SCHEDULED`` → refuse; attended
+    → a ⚠ on stderr and launch. ``absent`` (the build creates the item) and
+    ``error`` (the query failed) never refuse.
     """
     revision = _chromium_revision()
     app = _chromium_app_path(binary)
-    state = _keychain_grant_state(revision, app)
+    cdhash = _chromium_cdhash(app)
+    state = _keychain_grant_state(revision, app, cdhash)
     if state == "granted":
         return None
-    if state != "missing":
-        if state == "unknown":
-            print(
-                f"⚠ keychain grant for Chromium {revision}: unknown (the "
-                f"read-only `security dump-keychain -a` failed); runbook: "
-                f"{CHROMIUM_BUMP_RUNBOOK}",
-                file=sys.stderr,
-            )
+    if state == "error":
+        print(
+            f"⚠ keychain grant for Chromium {revision}: not checked (the "
+            f"read-only `security dump-keychain -a` failed); runbook: "
+            f"{CHROMIUM_BUMP_RUNBOOK}",
+            file=sys.stderr,
+        )
         return None
-    msg = (
-        f"Chromium {revision} ({app}) is not on the {KEYCHAIN_SAFE_STORAGE_SERVICE!r} "
-        "Keychain ACL — it would keep no cookies across a restart. "
-        f"grant needed: {CHROMIUM_BUMP_RUNBOOK}"
-    )
+    if state == "missing":
+        msg = (
+            f"Chromium {revision} ({app}) is not on the "
+            f"{KEYCHAIN_SAFE_STORAGE_SERVICE!r} Keychain ACL — it would keep no "
+            f"cookies across a restart. grant needed: {CHROMIUM_BUMP_RUNBOOK}"
+        )
+    elif state == "unknown":
+        msg = (
+            f"Chromium {revision} ({app}): the {KEYCHAIN_SAFE_STORAGE_SERVICE!r} "
+            "Keychain grant is unknown — its ACL entry is not verified (status not "
+            "OK and no matching cdhash requirement), or the binary's CDHash "
+            f"({cdhash or 'unreadable'}) is not on the item's partition_id list. "
+            f"grant needed: {CHROMIUM_BUMP_RUNBOOK}"
+        )
+    else:
+        return None
     if os.environ.get(SCHEDULED_ENV):
         return msg
     print(f"⚠ {msg}", file=sys.stderr)
@@ -3576,6 +3708,8 @@ def _launch_and_record(port: int, headless: bool) -> int:
     refusal = _keychain_grant_gate(binary)
     if refusal is not None:
         return _fail(f"Not launching: {refusal}")
+    # The canary's drop baseline (tp#2537 B2c): the jar's size before this spawn.
+    _cookie_baseline_record()
     flags = [
         f"--user-data-dir={PROFILE_DIR}",
         f"--remote-debugging-port={port}",
@@ -14074,21 +14208,32 @@ def _doctor_access_team(log: list[str], port: int) -> None:
 # immutable open (no lock, no journal, never a write to a live profile).
 # Chromium flushes cookies lazily, so a browser younger than
 # COOKIE_CANARY_MIN_UPTIME_S is not judged. Counts only — never a value.
+# Hardened in B2c: memory 0 with disk > 0 fails too (the jar on disk is
+# unreadable), and `_launch_and_record` records the db's row count right
+# before each spawn (`_cookie_baseline_file`); a drop of more than
+# COOKIE_CANARY_DROP_FRACTION and more than COOKIE_CANARY_DROP_MIN_ROWS rows
+# against it fails (a build that wipes the jar at startup reads 0/0, which
+# alone would look green).
 COOKIE_CANARY_MIN_UPTIME_S = 60.0
+COOKIE_CANARY_DROP_FRACTION = 0.5
+COOKIE_CANARY_DROP_MIN_ROWS = 10
+COOKIE_BASELINE_NAME = "cookie-baseline.json"
 
 
 @dataclass(frozen=True)
 class CookieCanary:
-    """One canary reading. ``status``: ``ok`` / ``fail`` (memory > 0, disk
-    missing or 0 rows) / ``wait`` (uptime below the threshold) / ``unknown``
-    (memory or uptime unreadable). Only ``ok`` proves cookies persist — a
-    gate (tp#2537 B3b) treats every other status as red."""
+    """One canary reading. ``status``: ``ok`` / ``fail`` (see
+    `cookie_canary_verdict`) / ``wait`` (uptime below the threshold) /
+    ``unknown`` (memory or uptime unreadable). ``baseline``: the db's row count
+    recorded before this browser's spawn, if any. Only ``ok`` proves cookies
+    persist — a gate (tp#2537 B3b) treats every other status as red."""
 
     status: str
     memory: int | None
     disk: int | None
     uptime_s: float | None
     db: Path | None
+    baseline: int | None = None
 
     @property
     def ok(self) -> bool:
@@ -14126,12 +14271,19 @@ def _cookie_db_rows(path: Path | None) -> int | None:
 
 
 def cookie_canary_verdict(
-    memory: int | None, disk: int | None, uptime_s: float | None
+    memory: int | None,
+    disk: int | None,
+    uptime_s: float | None,
+    baseline: int | None = None,
 ) -> str:
     """The canary predicate (pure): ``ok`` / ``fail`` / ``wait`` / ``unknown``.
 
-    Fails exactly when the browser holds persistent cookies (memory > 0) and
-    the db is missing/unreadable (None) or empty, after the uptime threshold.
+    After the uptime threshold it fails when the browser holds persistent
+    cookies (memory > 0) and the db is missing/unreadable (None) or empty;
+    when it holds none (memory 0) but the db has rows (an unreadable jar); and
+    when the db's rows dropped by more than COOKIE_CANARY_DROP_FRACTION and
+    more than COOKIE_CANARY_DROP_MIN_ROWS against `baseline`, the count
+    recorded before the spawn (a missing db counts as 0 rows there).
     """
     if uptime_s is None or memory is None:
         return "unknown"
@@ -14139,7 +14291,46 @@ def cookie_canary_verdict(
         return "wait"
     if memory > 0 and not disk:
         return "fail"
+    if memory == 0 and disk:
+        return "fail"
+    if baseline is not None:
+        drop = baseline - (disk or 0)
+        if (
+            drop > COOKIE_CANARY_DROP_FRACTION * baseline
+            and drop > COOKIE_CANARY_DROP_MIN_ROWS
+        ):
+            return "fail"
     return "ok"
+
+
+def _cookie_baseline_file() -> Path:
+    """This instance's pre-launch row-count record (resolved per call, so a
+    test's CACHE_DIR override covers it)."""
+    return CACHE_DIR / COOKIE_BASELINE_NAME
+
+
+def _cookie_baseline_record(profile: Path | None = None) -> int | None:
+    """Record the profile's on-disk Cookies row count before a spawn
+    (`_launch_and_record`, tp#2537 B2c) in `_cookie_baseline_file`: 0 when no db
+    exists yet, None (recorded as such) when the db is unreadable. Never
+    raises; returns the recorded count."""
+    db = _cookie_db_path(PROFILE_DIR if profile is None else profile)
+    rows = 0 if db is None else _cookie_db_rows(db)
+    try:
+        _json_write_atomic(
+            _cookie_baseline_file(),
+            {"rows": rows, "db": str(db) if db else None, "at": time.time()},
+        )
+    except OSError as exc:
+        print(f"⚠ cookie baseline not recorded: {exc}", file=sys.stderr)
+    return rows
+
+
+def _cookie_baseline() -> int | None:
+    """The row count `_cookie_baseline_record` stored, or None (none/garbage)."""
+    data = _read_json_dict(_cookie_baseline_file()) or {}
+    rows = data.get("rows")
+    return rows if isinstance(rows, int) and not isinstance(rows, bool) else None
 
 
 def _etime_s(etime: str | None) -> float | None:
@@ -14177,8 +14368,14 @@ def cookie_canary(port: int, profile: Path | None = None) -> CookieCanary:
     uptime = _browser_uptime_s(port)
     memory = _memory_persistent_cookies(port)
     disk = _cookie_db_rows(db)
+    baseline = _cookie_baseline()
     return CookieCanary(
-        cookie_canary_verdict(memory, disk, uptime), memory, disk, uptime, db
+        cookie_canary_verdict(memory, disk, uptime, baseline),
+        memory,
+        disk,
+        uptime,
+        db,
+        baseline,
     )
 
 
@@ -14190,6 +14387,7 @@ def _doctor_cookie_canary(log: list[str], port: int) -> None:
     counts = (
         f"{'?' if c.memory is None else c.memory} persistent in memory, "
         f"{'missing' if c.disk is None else c.disk} on disk ({where})"
+        + ("" if c.baseline is None else f", {c.baseline} before launch")
     )
     if c.status == "ok":
         _doctor_add(log, "ok", "cookie canary", counts)
@@ -14198,8 +14396,9 @@ def _doctor_cookie_canary(log: list[str], port: int) -> None:
             log,
             "fail",
             "cookie canary",
-            f"{counts} — cookies are NOT persisted (Keychain grant for this "
-            f"Chromium build? runbook: {CHROMIUM_BUMP_RUNBOOK})",
+            f"{counts} — cookies are NOT persisted or the jar is unreadable or "
+            f"wiped (Keychain grant for this Chromium build? runbook: "
+            f"{CHROMIUM_BUMP_RUNBOOK})",
         )
     elif c.status == "wait":
         _doctor_add(

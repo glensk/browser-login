@@ -1,14 +1,18 @@
-"""Cookie canary and Keychain grant check (tp#2537 B2).
+"""Cookie canary and Keychain grant check (tp#2537 B2, hardened in B2c).
 
 A Chromium build that cannot read its Keychain cookie key keeps cookies in
 memory only. Pinned here:
 
 * the canary resolves ``Default/Network/Cookies``, falls back to
   ``Default/Cookies``, opens the db read-only + immutable, judges only after
-  the uptime threshold, and fails when memory > 0 and disk is missing or 0;
-* the pre-launch Keychain ACL check parses ``security dump-keychain -a``,
-  caches per revision, refuses an unattended (``AGENT_LOGIN_SCHEDULED``)
-  launch with "grant needed: <runbook>" and only warns an attended one.
+  the uptime threshold, and fails when memory > 0 and disk is missing or 0,
+  when memory is 0 and disk > 0, and when the disk rows dropped by > 50 % and
+  > 10 rows against the count recorded before the spawn (B2c);
+* the pre-launch Keychain ACL check parses ``security dump-keychain -a``
+  (status codes, cdhash requirements, the ``partition_id`` list), checks the
+  binary's CDHash, caches per revision + CDHash, refuses an unattended
+  (``AGENT_LOGIN_SCHEDULED``) launch on "missing" or "unknown" with
+  "grant needed: <runbook>" and only warns an attended one.
 
 Hermetic: every path lives in tmp_path, no browser, no real ``security``.
 
@@ -111,6 +115,8 @@ def test_db_rows_none_for_missing_or_garbage(tmp_path):
         (5, 4, 120.0, "ok"),
         (0, 0, 120.0, "ok"),
         (0, None, 120.0, "ok"),
+        (0, 13, 120.0, "fail"),
+        (0, 13, 59.0, "wait"),
         (5, 0, 59.0, "wait"),
         (5, 0, 60.0, "fail"),
         (None, 0, 120.0, "unknown"),
@@ -119,6 +125,98 @@ def test_db_rows_none_for_missing_or_garbage(tmp_path):
 )
 def test_verdict(memory, disk, uptime, want):
     assert browser.cookie_canary_verdict(memory, disk, uptime) == want
+
+
+@pytest.mark.parametrize(
+    ("memory", "disk", "baseline", "want"),
+    [
+        (0, 13, None, "fail"),  # 0/13: the jar on disk is unreadable
+        (0, 0, 1555, "fail"),  # 0/0 right after a wipe of 1555 rows
+        (0, None, 1555, "fail"),  # db gone after 1555 rows
+        (0, 0, 0, "ok"),  # 0/0 with recorded 0: a fresh profile
+        (1500, 1480, 1555, "ok"),
+        (1500, 1480, None, "ok"),
+        (8, 8, 20, "fail"),  # 60 % and 12 rows: both thresholds crossed
+        (5, 5, 14, "ok"),  # 64 % drop, 9 rows: not > 10
+        (900, 700, 1555, "fail"),  # 55 % drop, 855 rows
+        (900, 800, 1555, "ok"),  # 48.6 % drop
+    ],
+)
+def test_verdict_against_pre_launch_baseline(memory, disk, baseline, want):
+    assert browser.cookie_canary_verdict(memory, disk, 120.0, baseline) == want
+
+
+def test_baseline_recorded_before_spawn(tmp_path, monkeypatch):
+    monkeypatch.setattr(browser, "CACHE_DIR", tmp_path / "state")
+    base = tmp_path / "state" / "cookie-baseline.json"
+    assert browser._cookie_baseline() is None
+    assert browser._cookie_baseline_record(tmp_path) == 0  # no db yet
+    assert browser._cookie_baseline() == 0
+    _cookies_db(tmp_path / "Default" / "Network" / "Cookies", 12)
+    assert browser._cookie_baseline_record(tmp_path) == 12
+    rec = json.loads(base.read_text())
+    assert rec["rows"] == 12 and rec["db"].endswith("Network/Cookies")
+    assert browser._cookie_baseline() == 12
+    base.write_text('{"rows": true}')
+    assert browser._cookie_baseline() is None
+
+
+def test_baseline_read_only_immutable(tmp_path, monkeypatch):
+    monkeypatch.setattr(browser, "CACHE_DIR", tmp_path / "state")
+    db = _cookies_db(tmp_path / "Default" / "Network" / "Cookies", 2)
+    uris: list[str] = []
+    real = sqlite3.connect
+
+    def spy(database, *a, **kw):
+        uris.append(database)
+        return real(database, *a, **kw)
+
+    monkeypatch.setattr(sqlite3, "connect", spy)
+    browser._cookie_baseline_record(tmp_path)
+    assert uris == [f"file:{db}?mode=ro&immutable=1"]
+
+
+def test_canary_fails_after_wipe_against_baseline(tmp_path, monkeypatch, capsys):
+    monkeypatch.setattr(browser, "CACHE_DIR", tmp_path / "state")
+    db = _cookies_db(tmp_path / "Default" / "Network" / "Cookies", 30)
+    browser._cookie_baseline_record(tmp_path)
+    db.unlink()
+    _cookies_db(db, 0)
+    _wire(monkeypatch, memory=0, uptime=300.0)
+    c = browser.cookie_canary(9999, tmp_path)
+    assert (c.status, c.memory, c.disk, c.baseline) == ("fail", 0, 0, 30)
+    monkeypatch.setattr(browser, "PROFILE_DIR", tmp_path)
+    log: list[str] = []
+    browser._doctor_cookie_canary(log, 9999)
+    assert log == ["fail"]
+    assert "30 before launch" in capsys.readouterr().out
+
+
+def test_launch_records_baseline_before_spawn(tmp_path, monkeypatch):
+    """`_launch_and_record` writes the baseline after the grant gate and
+    before `_launch_browser` (the spawn)."""
+    calls: list[str] = []
+    monkeypatch.setattr(browser, "_launch_guard", lambda port: None)
+    monkeypatch.setattr(browser, "PROFILE_DIR", tmp_path / "profile")
+    monkeypatch.setattr(browser, "_clear_session_restore", lambda: None)
+    monkeypatch.setattr(browser, "_chromium_binary", lambda: "/x/chrome")
+    monkeypatch.setattr(browser, "_keychain_grant_gate", lambda b: None)
+    monkeypatch.setattr(
+        browser, "_cookie_baseline_record", lambda: calls.append("baseline")
+    )
+    monkeypatch.setattr(browser, "_apply_profile_prefs", lambda: None)
+    monkeypatch.setattr(browser, "_proxy_flags", lambda: [])
+    monkeypatch.setattr(browser, "_headless_user_agent", lambda b: None)
+    monkeypatch.setattr(browser, "_lifecycle_write", lambda *a, **k: {"nonce": "n"})
+
+    def spawn(*a, **k):
+        calls.append("spawn")
+        raise RuntimeError("stop here")
+
+    monkeypatch.setattr(browser, "_launch_browser", spawn)
+    with pytest.raises(RuntimeError, match="stop here"):
+        browser._launch_and_record(9999, True)
+    assert calls == ["baseline", "spawn"]
 
 
 @pytest.mark.parametrize(
@@ -172,11 +270,29 @@ def test_memory_count_skips_session_cookies(monkeypatch):
 # --- Keychain ACL check ------------------------------------------------------
 
 
-def _dump(*apps: str, service: str = "Chromium Safe Storage") -> str:
+CD_OK = "a69e8d0057c641e087d9bcc7f23cdacc41cc05d8"
+CD_NEW = "9499ec77cdd4bf7ad2d5c900445ef45ad9ed43b1"
+CDHASH = {APP_OK: CD_OK, APP_NEW: CD_NEW}
+
+
+def _dump(
+    *apps: str,
+    service: str = "Chromium Safe Storage",
+    status: str = "status -2147415734",
+    req: dict[str, str] | None = None,
+    partitions: list[str] | None = None,
+) -> str:
+    """A ``security dump-keychain -a`` shaped dump (as seen 2026-11-22)."""
+    req = CDHASH if req is None else req
     listed = "".join(
-        f"            {i}: {a} (status -2147415734)\n"
-        f'                requirement: cdhash H"00"\n'
+        f"            {i}: {a} ({status})\n"
+        f'                requirement: cdhash H"{req.get(a, "00")}"\n'
         for i, a in enumerate(apps)
+    )
+    parts = (
+        ", ".join(f"cdhash:{CDHASH[a]}" for a in apps if a in CDHASH)
+        if partitions is None
+        else ", ".join(partitions)
     )
     return (
         'keychain: "/k/login.keychain-db"\nclass: "genp"\nattributes:\n'
@@ -190,15 +306,70 @@ def _dump(*apps: str, service: str = "Chromium Safe Storage") -> str:
         f"        applications ({len(apps)}):\n{listed}"
         "    entry 1:\n        authorizations (1): encrypt\n"
         "        applications: <null>\n"
-        "    entry 2:\n        authorizations (1): change_acl\n"
+        "    entry 2:\n        authorizations (1): partition_id\n"
+        "        don't-require-password\n"
+        f"        description: {parts}\n"
+        "        applications: <null>\n"
+        "    entry 3:\n        authorizations (1): change_acl\n"
         "        applications (0):\n"
     )
 
 
-def test_acl_parse_decrypt_entry_only():
-    lists = browser._keychain_acl_apps(_dump(APP_OK), "Chromium Safe Storage")
-    assert lists == [[APP_OK]]
+def test_acl_parse_keeps_status_requirement_and_partitions():
+    items = browser._keychain_acl_apps(_dump(APP_OK), "Chromium Safe Storage")
+    assert items == [
+        browser.KeychainAclItem(
+            (browser.KeychainAclApp(APP_OK, -2147415734, CD_OK),),
+            (f"cdhash:{CD_OK}",),
+        )
+    ]
     assert browser._keychain_acl_apps(_dump(APP_OK), "Nope") is None
+    ok = browser._keychain_acl_apps(_dump(APP_OK, status="OK"), "Chromium Safe Storage")
+    assert ok is not None and ok[0].apps[0].status == 0
+
+
+@pytest.mark.parametrize(
+    ("dump", "cdhash", "want"),
+    [
+        # the live 1248 shape: unsealed status, requirement == CDHash, partitioned
+        (_dump(APP_OK), CD_OK, "granted"),
+        (_dump(APP_OK, status="OK"), CD_OK, "granted"),
+        # status non-OK (build gone) → unknown
+        (_dump(APP_OK, status="status -67068"), CD_OK, "unknown"),
+        # unsealed status but the requirement names another binary → unknown
+        (_dump(APP_OK, req={APP_OK: CD_NEW}), CD_OK, "unknown"),
+        # CDHash missing from the partition list → unknown
+        (_dump(APP_OK, status="OK", partitions=[f"cdhash:{CD_NEW}"]), CD_OK, "unknown"),
+        (_dump(APP_OK, status="OK", partitions=["teamid:X"]), CD_OK, "unknown"),
+        # the binary's CDHash unreadable → unknown
+        (_dump(APP_OK, status="OK"), None, "unknown"),
+        # not listed at all → missing
+        (_dump(APP_NEW), CD_OK, "missing"),
+    ],
+)
+def test_acl_verdict(dump, cdhash, want):
+    items = browser._keychain_acl_apps(dump, "Chromium Safe Storage")
+    assert browser._keychain_acl_verdict(items, APP_OK, cdhash) == want
+
+
+def test_cdhash_from_codesign(monkeypatch):
+    out = (
+        "Identifier=Google Chrome for Testing\n"
+        f"CandidateCDHash sha256={CD_OK}\nCDHash={CD_OK.upper()}\n"
+    )
+
+    def run(argv, **kw):
+        assert argv == ["codesign", "-dvvv", APP_OK]
+        return browser.subprocess.CompletedProcess(argv, 0, b"", out.encode())
+
+    monkeypatch.setattr(browser.subprocess, "run", run)
+    assert browser._chromium_cdhash(APP_OK) == CD_OK
+
+    def fail(argv, **kw):
+        return browser.subprocess.CompletedProcess(argv, 1, b"", b"not signed")
+
+    monkeypatch.setattr(browser.subprocess, "run", fail)
+    assert browser._chromium_cdhash(APP_OK) is None
 
 
 class _Sec:
@@ -215,35 +386,53 @@ class _Sec:
 def acl_cache(tmp_path, monkeypatch):
     cache = tmp_path / "pin" / "keychain-acl.json"
     monkeypatch.setattr(browser, "KEYCHAIN_ACL_CACHE", cache)
+    monkeypatch.setattr(browser, "_chromium_cdhash", CDHASH.get)
     return cache
 
 
 def test_grant_state_granted_cached_per_revision(acl_cache, monkeypatch):
     sec = _Sec(_dump(APP_OK))
     monkeypatch.setattr(browser, "_security_run", sec)
-    assert browser._keychain_grant_state(1248, APP_OK, now=1000.0) == "granted"
-    assert browser._keychain_grant_state(1248, APP_OK, now=9e9) == "granted"
+    assert browser._keychain_grant_state(1248, APP_OK, CD_OK, now=1000.0) == "granted"
+    assert browser._keychain_grant_state(1248, APP_OK, CD_OK, now=9e9) == "granted"
     assert sec.calls == 1
-    assert json.loads(acl_cache.read_text())["1248"]["state"] == "granted"
+    assert json.loads(acl_cache.read_text())["1248"] == {
+        "app": APP_OK,
+        "cdhash": CD_OK,
+        "state": "granted",
+        "at": 1000.0,
+    }
+    # a rebuilt binary (new CDHash) or a pre-B2c entry is re-checked
+    browser._keychain_grant_state(1248, APP_OK, CD_NEW, now=9e9)
+    assert sec.calls == 2
+    acl_cache.write_text(json.dumps({"1248": {"app": APP_OK, "state": "granted"}}))
+    browser._keychain_grant_state(1248, APP_OK, CD_OK, now=9e9)
+    assert sec.calls == 3
 
 
 def test_grant_state_missing_rechecked_after_ttl(acl_cache, monkeypatch):
     sec = _Sec(_dump(APP_OK))
     monkeypatch.setattr(browser, "_security_run", sec)
-    assert browser._keychain_grant_state(1254, APP_NEW, now=1000.0) == "missing"
-    assert browser._keychain_grant_state(1254, APP_NEW, now=1100.0) == "missing"
+    assert browser._keychain_grant_state(1254, APP_NEW, CD_NEW, now=1000.0) == "missing"
+    assert browser._keychain_grant_state(1254, APP_NEW, CD_NEW, now=1100.0) == "missing"
     assert sec.calls == 1
     sec.out = _dump(APP_OK, APP_NEW)  # Albert clicked "Always Allow"
     ttl = browser.KEYCHAIN_ACL_MISS_TTL_S
-    assert browser._keychain_grant_state(1254, APP_NEW, now=1001.0 + ttl) == "granted"
+    now = 1001.0 + ttl
+    assert browser._keychain_grant_state(1254, APP_NEW, CD_NEW, now=now) == "granted"
     assert sec.calls == 2
 
 
-def test_grant_state_absent_and_unknown_not_cached(acl_cache, monkeypatch):
+def test_grant_state_absent_unknown_error_not_cached(acl_cache, monkeypatch):
     monkeypatch.setattr(browser, "_security_run", _Sec(_dump(APP_OK, service="x")))
-    assert browser._keychain_grant_state(1254, APP_NEW) == "absent"
+    assert browser._keychain_grant_state(1254, APP_NEW, CD_NEW) == "absent"
+    bad = _dump(APP_NEW, status="status -67068")
+    monkeypatch.setattr(browser, "_security_run", _Sec(bad))
+    assert browser._keychain_grant_state(1254, APP_NEW, CD_NEW) == "unknown"
+    monkeypatch.setattr(browser, "_security_run", _Sec(_dump(APP_NEW)))
+    assert browser._keychain_grant_state(1254, APP_NEW, None) == "unknown"
     monkeypatch.setattr(browser, "_security_run", _Sec("", rc=51))
-    assert browser._keychain_grant_state(1254, APP_NEW) == "unknown"
+    assert browser._keychain_grant_state(1254, APP_NEW, CD_NEW) == "error"
     assert not acl_cache.exists()
 
 
@@ -273,13 +462,44 @@ def test_gate_passes_granted_build(acl_cache, monkeypatch, capsys):
     assert capsys.readouterr().err == ""
 
 
-def test_gate_unknown_never_refuses(acl_cache, monkeypatch):
+def test_gate_query_error_never_refuses(acl_cache, monkeypatch, capsys):
     def boom(argv, **kw):
         raise RuntimeError("denied")
 
     monkeypatch.setattr(browser, "_security_run", boom)
     monkeypatch.setenv("AGENT_LOGIN_SCHEDULED", "1")
     assert browser._keychain_grant_gate(BIN_NEW) is None
+    assert "not checked" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize(
+    "dump",
+    [
+        _dump(APP_NEW, status="status -67068"),  # status non-OK → unknown
+        _dump(APP_NEW, partitions=[f"cdhash:{CD_OK}"]),  # cdhash not partitioned
+    ],
+)
+def test_gate_unknown_refuses_unattended_warns_attended(
+    acl_cache, monkeypatch, capsys, dump
+):
+    monkeypatch.setattr(browser, "_security_run", _Sec(dump))
+    monkeypatch.setattr(browser, "_chromium_revision", lambda: 1254)
+    monkeypatch.setenv("AGENT_LOGIN_SCHEDULED", "1")
+    msg = browser._keychain_grant_gate(BIN_NEW)
+    assert msg is not None and "grant is unknown" in msg
+    assert f"grant needed: {browser.CHROMIUM_BUMP_RUNBOOK}" in msg
+    monkeypatch.delenv("AGENT_LOGIN_SCHEDULED")
+    assert browser._keychain_grant_gate(BIN_NEW) is None
+    assert "grant is unknown" in capsys.readouterr().err
+
+
+def test_gate_unknown_without_cdhash(acl_cache, monkeypatch):
+    monkeypatch.setattr(browser, "_security_run", _Sec(_dump(APP_NEW)))
+    monkeypatch.setattr(browser, "_chromium_revision", lambda: 1254)
+    monkeypatch.setattr(browser, "_chromium_cdhash", lambda app: None)
+    monkeypatch.setenv("AGENT_LOGIN_SCHEDULED", "1")
+    msg = browser._keychain_grant_gate(BIN_NEW)
+    assert msg is not None and "(unreadable)" in msg
 
 
 def test_runbook_exists():
