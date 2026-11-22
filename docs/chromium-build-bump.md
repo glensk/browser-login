@@ -15,8 +15,8 @@ Guards in `bin/browser.py`:
   -a`; the password is never read, `security … -w` is forbidden). Granted means: the
   pinned build's `.app` is on the item's decrypt ACL with a verified entry (see "ACL
   status codes" below) AND the binary's CDHash (`codesign -dvvv <app>`, line
-  `CDHash=`) is on the item's `partition_id` list (`cdhash:<hex>`). Cached per revision
-  - `.app` + CDHash in `~/.local/share/claude-browser/playwright-pin/keychain-acl.json`
+  `CDHash=`) is on the item's `partition_id` list (`cdhash:<hex>`). Cached per
+  revision, `.app` and CDHash in `~/.local/share/claude-browser/playwright-pin/keychain-acl.json`
   (granted for good, a miss re-checked after 10 min). States: `missing` (not listed),
   `unknown` (listed but the entry is unverified, the CDHash is not partitioned, or
   `codesign` gave no CDHash) → an unattended launch (`AGENT_LOGIN_SCHEDULED=1`) is
