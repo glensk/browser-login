@@ -1138,6 +1138,8 @@ SAFARI_ROUTES: dict[str, SafariRoute] = {
             ("infomaniak", "https://manager.infomaniak.com"),
             ("zoho-desk", "https://desk.zoho.eu/agent"),
             ("smartsheet", "https://app.smartsheet.com/b/home"),
+            # tp#2761: myVisana; the SMS code is Albert's (the run waits)
+            ("visana", "https://my.visana.ch/"),
         )
     },
     # tp#1644 B14: the SSO batch, proven in Safari. eduid and cscs are broker

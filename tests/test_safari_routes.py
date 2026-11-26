@@ -86,6 +86,14 @@ LISTED_FILL: dict[str, dict[str, Any]] = {
     "portainer-ds218": _self_hosted("portainer.dom42.space", "/#!/home", "/#!/auth"),
     "qbittorrent": _self_hosted("qbittorrent.dom42.space", "", ""),
     "stirling": _self_hosted("stirling.dom42.space", "/", "/login"),
+    # tp#2761: myVisana, a SaaS broker route with probe labels
+    "visana": {
+        "safari_fill": True,
+        "fill_only": False,
+        "fill_origins": ["https://my.visana.ch"],
+        "check_url": "https://my.visana.ch/",
+        "login_url": "https://my.visana.ch/",
+    },
 }
 LISTING: list[dict[str, Any]] = [
     {
@@ -142,6 +150,7 @@ LISTING: list[dict[str, Any]] = [
         ("tutti", None, None),
         ("welib", None, None),
         ("zoho-desk", None, None),
+        ("visana", None, None),
     )
 ] + [
     {"site": "cloudflare", "refused": True, "reason": "x"},
@@ -181,6 +190,8 @@ EXPECTED: dict[str, str] = {
             "portainer-ds218",
             "qbittorrent",
             "stirling",
+            # tp#2761: myVisana (SMS code = Albert's, the run waits)
+            "visana",
         ),
         ROUTE,
     ),
@@ -1328,7 +1339,8 @@ def test_pre_click_is_a_click_step_before_the_form() -> None:
 def test_b10_ships_no_labels_no_stops_and_no_identity_route() -> None:
     # tp#1644 B13 / B15: zoho-desk's and cscs' probe labels are the only ones
     assert (
-        set(alsafari.BROKER_SAFARI_LABELS) == B11_LABELLED | B13_LABELLED | B15_LABELLED
+        set(alsafari.BROKER_SAFARI_LABELS)
+        == B11_LABELLED | B13_LABELLED | B15_LABELLED | T2761_LABELLED
     )
     # tp#1644 B12: the SaaS sites' own stops only, none for B10's sites
     assert set(alsafari.BROKER_SAFARI_STOPS) == set(B12_STOPS)
@@ -1622,12 +1634,14 @@ B12_LANDINGS = {
     "infomaniak": "https://manager.infomaniak.com",
     "zoho-desk": "https://desk.zoho.eu/agent",
     "smartsheet": "https://app.smartsheet.com/b/home",
+    "visana": "https://my.visana.ch/",
 }
 B12_IDP = {
     "github": "github.com",
     "infomaniak": "login.infomaniak.com",
     "zoho-desk": "accounts.zoho.eu",
     "smartsheet": "app.smartsheet.com",
+    "visana": "my.visana.ch",
 }
 # site → its stops as (code, after, page)
 B12_STOPS = {
@@ -1644,6 +1658,7 @@ B12_STOPS = {
         ("needs_albert_push", "login", "fieldless"),
     ],
     "smartsheet": [("email_code_unwired", "", "code")],
+    "visana": [("needs_albert_sms", "login", "any")],
 }
 
 # The normal login pages' text (synthetic, after the live wording): no stop
@@ -1687,6 +1702,16 @@ LOGIN_TEXT = {
     "smartsheet": [
         "Log in\nEmail\nContinue\nOr\nLog in with Google\nLog in with Microsoft",
         "Enter your password\nForgot password?\nLog in\nEmail me a login link",
+    ],
+    # tp#2761: the password page as read live (German), its French /
+    # Italian captions and the portal's own header link
+    "visana": [
+        "Zur Visana Website\nVisana Login\nAnmeldung\nUm sich anzumelden, "
+        "benötigen Sie Ihre Versichertennummer (User-ID) und Ihr Passwort.\n"
+        "User-ID (Versichertennummer)\nPasswort\nPasswort vergessen\nAnmelden",
+        "Inscription\nUser-ID (numéro d'assuré/e)\nMot de passe\nConnexion",
+        "Login\nUser-ID (numero d’assicurato)\nPassword\nLogin",
+        "Zurück zu myVisana\nÜbersicht\nDokumente\nRechnungen",
     ],
 }
 # site → (stop index, the challenge page's text) — each matches its stop only
@@ -1736,6 +1761,22 @@ CHALLENGE_TEXT = {
         (0, "Check your email\nWe sent a 6-digit code to albert@example.org"),
         (0, "Enter the code we emailed to you\nContinue"),
     ],
+    # tp#2761: the login app's own mTAN strings (i18n de / fr / it)
+    "visana": [
+        (
+            0,
+            "Anmeldung mit SMS-Code\nWir haben den SMS-Code an Ihre "
+            "Mobiltelefonnummer +41 79 *** ** 12 gesendet.\nSicherheitscode\n"
+            "Anmelden\nNeuen Code anfordern",
+        ),
+        (0, "Auswahl Mobiltelefonnummer\nSMS senden"),
+        (
+            0,
+            "Inscription avec code SMS\nNous avons envoyé le code SMS à votre "
+            "numéro de téléphone portable +41 79 *** ** 12.",
+        ),
+        (0, "Login con codice SMS\nAbbiamo inviato il codice SMS al Suo numero"),
+    ],
 }
 
 
@@ -1751,7 +1792,7 @@ def _hits(site: str, text: str) -> list[bool]:
 def test_b12_routes_are_listed_and_unbuilt_without_labels() -> None:
     for site, landing in B12_LANDINGS.items():
         assert al.SAFARI_ROUTES[site] == al.SafariRoute(landing, "in_safari")
-        if site in B13_LABELLED:
+        if site in B13_LABELLED | T2761_LABELLED:
             continue
         assert al.safari_recipe(site) is None and not al.safari_routed(site)
         assert site not in alsafari.BROKER_SAFARI_LABELS
@@ -2057,6 +2098,7 @@ B11_LABELLED = {
     "stirling",
 }
 B13_LABELLED = {"zoho-desk"}
+T2761_LABELLED = {"visana"}  # tp#2761: myVisana's login page, read live
 B15_LABELLED = {"cscs"}  # tp#1644 B15: the SSO batch's labels read so far
 # the real cscs labels, captured before any fixture swaps them
 CSCS_REAL = alsafari.BROKER_SAFARI_LABELS["cscs"]
@@ -3118,3 +3160,98 @@ def test_b11_dsm_is_not_held_and_unlabelled_sites_stay_unbuilt() -> None:
         "dsm-readonly",
     ):
         assert site not in alsafari.BROKER_SAFARI_LABELS
+
+
+# ---------------------------------------------------------------------------
+# tp#2761: myVisana — the SMS code is Albert's; the run waits for it
+# ---------------------------------------------------------------------------
+
+VISANA_LOGIN = "https://my.visana.ch/auth-ui/ui/app/auth/flow/web-login/password"
+VISANA_SMS = "https://my.visana.ch/auth-ui/ui/app/auth/flow/web-login/mtan"
+VISANA_SMS_TEXT = CHALLENGE_TEXT["visana"][0][1]
+
+
+class _AlbertTypes(w.FakeSafari):
+    """A scripted Safari where the page at `wait_at` moves on by itself after
+    `reads` detector reads (Albert typed the SMS code; nothing was filled)."""
+
+    def __init__(self, *args: Any, wait_at: int, reads: int, **kw: Any) -> None:
+        super().__init__(*args, **kw)
+        self.wait_at, self.reads = wait_at, reads
+
+    def __call__(self, args: list[str]) -> alsafari.Reply:
+        reply = super().__call__(args)
+        if args[0] == "--eval" and self.pos == self.wait_at:
+            self.reads -= 1
+            if self.reads <= 0:
+                self.pos += 1
+        return reply
+
+
+def _visana_recipe() -> alsafari.Recipe:
+    recipe = alsafari.broker_recipe(
+        {**BROW, **LISTED_FILL["visana"], "site": "visana"},
+        alsafari.BROKER_SAFARI_LABELS["visana"],
+        alsafari.BROKER_SAFARI_STOPS["visana"],
+    )
+    assert recipe is not None
+    return recipe
+
+
+def _visana_pages(stops: bool = True) -> list[tuple[str, dict[str, Any]]]:
+    """The login page, the SMS-code page, the portal (the detector's `stops`
+    answer for the recipe's own stops; none for a recipe without)."""
+    hits = [
+        re.search(s.text, VISANA_SMS_TEXT, re.IGNORECASE) is not None
+        for s in alsafari.BROKER_SAFARI_STOPS["visana"]
+    ]
+    none = [False] * len(hits)
+    if not stops:
+        hits = none = []
+    return [
+        (
+            VISANA_LOGIN,
+            w._page(user=True, password=True, steps=[[True, False]], stops=none),
+        ),
+        # the generic detector flags the page `sms` (a code field + "SMS")
+        (VISANA_SMS, w._page(code=True, sms=True, stops=hits)),
+        ("https://my.visana.ch/#/dashboard", w._page(sentinel=True, stops=none)),
+    ]
+
+
+def test_visana_recipe_is_one_page_on_my_visana_with_its_sms_wait() -> None:
+    recipe = _visana_recipe()
+    assert recipe.hosts == ("my.visana.ch",) and recipe.sentinel_host == "my.visana.ch"
+    assert [(s.kind, s.submit) for s in recipe.steps] == [("login", "Anmelden")]
+    assert recipe.start_url == "https://my.visana.ch/" and not recipe.import_after
+    (stop,) = recipe.stops
+    assert stop.wait_s > 0 and alsafari.WAIT_WHAT[stop.code] == "SMS code"
+
+
+def test_visana_waits_for_albert_to_type_the_sms_code_then_lands() -> None:
+    fake = _AlbertTypes(_visana_recipe(), _visana_pages(), wait_at=1, reads=3)
+    lines: list[str] = []
+    out = _timed(fake, notify=lines.append).run()
+    assert (out.code, out.rc) == ("ok", 0)
+    assert [c[0] for c in fake.calls if c[0] in FILLS] == ["--login"]  # no code typed
+    assert any("SMS code" in line for line in lines)
+
+
+def test_visana_sms_wait_runs_out_with_the_window_left_open() -> None:
+    fake = w.FakeSafari(_visana_recipe(), _visana_pages())
+    out = _timed(fake).run()
+    assert (out.code, out.rc) == ("needs_albert_sms", alsafari.NEEDS_ALBERT_RC)
+    assert out.window_open and out.credential  # the password was sent
+    assert not any(c[0] == "--close" for c in fake.calls)
+
+
+def test_a_generic_sms_page_still_ends_at_once_without_a_waiting_stop() -> None:
+    recipe = _visana_recipe()
+    bare = alsafari.Recipe(**{**recipe.__dict__, "stops": ()})
+    fake = w.FakeSafari(bare, _visana_pages(stops=False))
+    out = _timed(fake).run()
+    assert (out.code, out.rc) == ("needs_albert_sms", alsafari.NEEDS_ALBERT_RC)
+    assert not out.window_open
+    assert alsafari._waits_for(recipe.stops[0], "sms")
+    assert not alsafari._waits_for(recipe.stops[0], "push")
+    assert not alsafari._waits_for(None, "sms")

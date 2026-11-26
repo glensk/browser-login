@@ -326,7 +326,15 @@ class AlbertWait:
 WAIT_WHAT = {
     "needs_albert_push": "push approval",
     "needs_albert_hardware_key": "passkey / Touch ID",
+    "needs_albert_sms": "SMS code",
 }
+
+
+def _waits_for(stop: SiteStop | None, flag: str) -> bool:
+    """tp#2761: the page's site stop `stop` is a WAIT for the very challenge
+    the generic page flag `flag` names (myVisana's SMS code): the run waits
+    for Albert there instead of ending at the flag."""
+    return stop is not None and stop.wait_s > 0 and stop.code == f"needs_albert_{flag}"
 
 
 @dataclass(frozen=True)
@@ -922,6 +930,15 @@ BROKER_SAFARI_LABELS: dict[str, BrokerLabels] = {
     "portainer-ds218": BrokerLabels("one_page", pass_submit="Login"),
     "qbittorrent": BrokerLabels("one_page", pass_submit="Login"),
     "stirling": BrokerLabels("one_page", pass_submit="Login"),
+    # tp#2761, myVisana (my.visana.ch, Ergon Airlock IAM login app), read
+    # live in Albert's logged-out Safari 2026-11-26 (German UI): ONE form on
+    # my.visana.ch/auth-ui/…/web-login/password with `#username` (name
+    # username, autocomplete username: the Versichertennummer) and
+    # `#password` (autocomplete current-password), submit "Anmelden" (plus
+    # unlabelled icon buttons). No CAPTCHA. The second factor is an SMS code
+    # (no TOTP for private customers): `VISANA_SMS_RE` below waits for
+    # Albert to type it in the same window.
+    "visana": BrokerLabels("one_page", pass_submit="Anmelden"),
 }
 
 # tp#1644 B12: the sites' own Albert stops. Each regex names the challenge
@@ -984,6 +1001,23 @@ SMARTSHEET_MAIL_RE = (
     r"|check your (e-?mail|inbox)"
     r"|enter the code (we|that was) (sent|emailed)"
 )
+# tp#2761, myVisana (Airlock IAM): the SMS-code page (`iamAuthMtan`, code
+# field `#otp`) and the phone-number choice before it, in the login app's
+# own strings (assets/airlock/i18n/{de,fr,it}.json, read 2026-11-26):
+# "Anmeldung mit SMS-Code" / "Wir haben den SMS-Code an Ihre
+# Mobiltelefonnummer … gesendet", "Auswahl Mobiltelefonnummer" (button "SMS
+# senden"); French / Italian alike. The password page says none of them.
+VISANA_SMS_RE = (
+    r"Anmeldung mit SMS-Code|SMS-Code an Ihre Mobiltelefonnummer"
+    r"|Auswahl Mobiltelefonnummer"
+    r"|Inscription avec code SMS|code SMS (à|a) votre num(é|e)ro"
+    r"|S(é|e)lection du num(é|e)ro de t(é|e)l(é|e)phone portable"
+    r"|Login con codice SMS|inviato il codice SMS"
+    r"|Selezione del numero di cellulare"
+)
+# Albert reads the SMS on his phone and types the code (the text can take a
+# minute or two, says the page).
+VISANA_SMS_WAIT_S = 240.0
 # site → its own Albert stops (push / passkey / SMS pages, B12).
 BROKER_SAFARI_STOPS: dict[str, tuple[SiteStop, ...]] = {
     "zoho-desk": (
@@ -1002,6 +1036,11 @@ BROKER_SAFARI_STOPS: dict[str, tuple[SiteStop, ...]] = {
         SiteStop("needs_albert_push", INFOMANIAK_PUSH_RE, after="login"),
     ),
     "smartsheet": (SiteStop("email_code_unwired", SMARTSHEET_MAIL_RE, page="code"),),
+    # tp#2761: Albert types the SMS code himself in the login window; the
+    # run waits for it instead of ending at the generic `sms` page flag
+    "visana": (
+        SiteStop("needs_albert_sms", VISANA_SMS_RE, "login", "any", VISANA_SMS_WAIT_S),
+    ),
 }
 
 
@@ -2574,10 +2613,10 @@ class Machine:  # pylint: disable=too-many-instance-attributes
                 continue
             if page["sentinel"] and self.recipe.proves_on(host):
                 return self._sentinel_reached(host)
-            for flag in ALBERT_STOPS:
-                if page[flag]:
-                    return self._end(NEEDS_ALBERT_RC, f"needs_albert_{flag}")
             hit = self._site_stop(page)
+            for flag in ALBERT_STOPS:
+                if page[flag] and not _waits_for(hit, flag):
+                    return self._end(NEEDS_ALBERT_RC, f"needs_albert_{flag}")
             if hit is not None:
                 waited = self._stop_wait(hit)
                 if waited is not None:
